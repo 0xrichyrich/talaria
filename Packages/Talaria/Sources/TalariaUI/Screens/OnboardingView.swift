@@ -14,6 +14,7 @@ public struct OnboardingView: View {
     private let model: AppModel
 
     @State private var auth = AuthController()
+    @State private var choseDemoData = false
     @State private var step = 0
     @State private var gatewayMode: GatewayModeChoice = .tailscale
     @State private var urlString = ""
@@ -52,6 +53,19 @@ public struct OnboardingView: View {
 
     private var topBar: some View {
         HStack {
+            if step > 0 {
+                Button {
+                    withAnimation(.easeOut(duration: 0.3)) { step -= 1 }
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(theme.accent)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, 2)
+            }
             HStack(spacing: 5) {
                 ForEach(0..<4, id: \.self) { i in
                     RoundedRectangle(cornerRadius: 2)
@@ -61,7 +75,7 @@ public struct OnboardingView: View {
                 }
             }
             Spacer()
-            Button(action: skipToDemo) {
+            Button(action: skipOnboarding) {
                 skipLabel
             }
             .buttonStyle(.plain)
@@ -140,7 +154,7 @@ public struct OnboardingView: View {
                     withAnimation(.easeOut(duration: 0.3)) { step = 1 }
                 }
                 GatewayFlowButton(theme: theme, label: copy.obAlt0, role: .secondary) {
-                    skipToDemo()
+                    enterDemoWorld()
                 }
             }
             .padding(.horizontal, 22)
@@ -183,15 +197,16 @@ public struct OnboardingView: View {
                     }
                 }
 
-                // The prototype hides the URL field for Hermes Cloud
-                // (`obUrlShow: st.obMode === 'tailscale'`).
-                if gatewayMode == .tailscale {
-                    TextField(Self.placeholderURL, text: $urlString)
-                        .gatewayFieldTraits()
-                        .modifier(GatewayFlowInputChrome(theme: theme))
+                // Both modes take a URL: tailscale/LAN gateways directly, and
+                // Hermes Cloud agents via their dashboard URL (they are the
+                // same gated gateway underneath; in-app discovery is future).
+                TextField(gatewayMode == .tailscale ? Self.placeholderURL : copy.cloudURLPlaceholder,
+                          text: $urlString)
+                    .gatewayFieldTraits()
+                    .modifier(GatewayFlowInputChrome(theme: theme))
 
-                    GatewayFootnote(theme: theme, text: copy.obNote1)
-                }
+                GatewayFootnote(theme: theme,
+                                text: gatewayMode == .tailscale ? copy.obNote1 : copy.cloudURLHint)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 22)
@@ -210,11 +225,10 @@ public struct OnboardingView: View {
     private func continueFromStep1() {
         withAnimation(.easeOut(duration: 0.3)) { step = 2 }
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        if gatewayMode == .tailscale, !trimmed.isEmpty {
+        if !trimmed.isEmpty {
             Task { await auth.probe(trimmed) }
         } else {
-            // No URL to probe (Hermes Cloud pick, or an empty field): step 2
-            // falls back to the prototype's static buttons → demo path.
+            // Nothing to probe: step 2 offers only the explicit demo path.
             auth.reset()
         }
     }
@@ -233,8 +247,8 @@ public struct OnboardingView: View {
                     Task { await auth.probe(trimmed) }
                 },
                 onDemoSelect: {
-                    // Prototype parity: with no gateway probed the two static
-                    // buttons simply advance (the demo experience).
+                    // Explicit demo choice; finish() honors it after step 3.
+                    choseDemoData = true
                     withAnimation(.easeOut(duration: 0.3)) { step = 3 }
                 })
         }
@@ -369,16 +383,24 @@ public struct OnboardingView: View {
 
     // MARK: - Finish
 
-    private func skipToDemo() {
+    /// Top-bar Skip: out of onboarding onto the real (possibly empty) roster.
+    /// Demo data loads only when explicitly chosen.
+    private func skipOnboarding() {
+        auth.cancelSignIn()
+        model.completeOnboarding()
+    }
+
+    /// The explicit "Explore with demo data" choice.
+    private func enterDemoWorld() {
         auth.cancelSignIn()
         model.enterDemoMode()
         model.completeOnboarding()
     }
 
     private func finish() {
-        // A live link keeps its roster; anything else enters the demo world
-        // so the app is never empty behind onboarding.
-        if model.client == nil, model.bots.isEmpty {
+        // A live link keeps its roster; the demo world loads only if the user
+        // explicitly picked it on the way through.
+        if choseDemoData, model.client == nil {
             model.enterDemoMode()
         }
         model.completeOnboarding()
@@ -462,10 +484,10 @@ struct GatewayAuthPhasePanel: View {
         } else if auth.isGated {
             providerSection
         } else if let onDemoSelect {
-            // Nothing probed: the prototype's static pair of buttons.
-            GatewayFlowButton(theme: theme, label: copy.obOauth, role: .primary) { onDemoSelect() }
-            GatewayFlowButton(theme: theme, label: copy.obBasic, role: .secondary) { onDemoSelect() }
-            GatewayFootnote(theme: theme, text: copy.obNote2)
+            // Nothing probed — be honest: there is no gateway to sign in to,
+            // so the only real offer here is the demo world.
+            GatewayFlowButton(theme: theme, label: copy.obAlt0, role: .primary) { onDemoSelect() }
+            GatewayFootnote(theme: theme, text: copy.noGatewayNote)
         } else {
             GatewayFootnote(theme: theme, text: copy.obNote2)
         }

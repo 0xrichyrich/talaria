@@ -94,6 +94,12 @@ public struct CopyPack: Sendable {
     public var obCta3: String
     /// Tab bar labels in order: home, activity, approvals, a2a, artifacts.
     public var tabs: [(label: String, tab: Tab)]
+    // Post-prototype copy (defaulted so every theme inherits the base voice).
+    public var cloudURLPlaceholder: String = "agent dashboard URL — https://…"
+    public var cloudURLHint: String = "Paste your cloud agent's dashboard URL from portal.nousresearch.com — in-app agent discovery is coming. It signs in with the same Nous OAuth flow."
+    public var noGatewayNote: String = "No gateway to sign in to yet — go back and enter your gateway's URL, or explore with demo data."
+    public var emptyRosterTitle: String = "No bots yet"
+    public var emptyRosterBody: String = "Connect a gateway and your Hermes profiles appear here — same roster as your desktop."
     /// Composer placeholder for a given bot id.
     public var composer: @Sendable (String) -> String
 

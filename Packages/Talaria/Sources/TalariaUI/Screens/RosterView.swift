@@ -31,6 +31,41 @@ public struct RosterView: View {
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
 
+    /// Skipped onboarding with no gateway: an honest empty roster with a way
+    /// forward, instead of silently faked demo data.
+    private var emptyState: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 12) {
+                AvatarView(shape: .hexagon, hue: .violet, size: 40, theme: theme)
+                    .opacity(0.35)
+                AvatarView(shape: .squircle, hue: .amber, size: 32, theme: theme)
+                    .opacity(0.25)
+                AvatarView(shape: .diamond, hue: .pink, size: 28, theme: theme)
+                    .opacity(0.18)
+            }
+            Text(copy.emptyRosterTitle)
+                .font(theme.display(20))
+                .foregroundStyle(theme.ink)
+            Text(copy.emptyRosterBody)
+                .font(theme.body(14))
+                .foregroundStyle(theme.sub)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 300)
+            Button(action: onConnections) {
+                Text(copy.obCta0)
+                    .font(theme.mono(12, weight: .bold))
+                    .foregroundStyle(theme.accentFg)
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 12)
+                    .background(theme.accent,
+                                in: RoundedRectangle(cornerRadius: theme.buttonRadius == 0 ? 0 : theme.buttonRadius + 2))
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 6)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
     private var listGap: CGFloat {
         switch theme.rowStyle {
         case .ledger: 0
@@ -51,12 +86,17 @@ public struct RosterView: View {
             }
             ScrollView {
                 LazyVStack(spacing: listGap) {
-                    ForEach(Array(model.bots.enumerated()), id: \.element.id) { index, bot in
-                        row(for: bot, index: index)
-                            .modifier(RosterEntrance(delay: Double(index) * 0.045))
+                    if model.bots.isEmpty {
+                        emptyState
+                            .padding(.top, 60)
+                    } else {
+                        ForEach(Array(model.bots.enumerated()), id: \.element.id) { index, bot in
+                            row(for: bot, index: index)
+                                .modifier(RosterEntrance(delay: Double(index) * 0.045))
+                        }
+                        footer
+                            .padding(.top, 10)
                     }
-                    footer
-                        .padding(.top, 10)
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
