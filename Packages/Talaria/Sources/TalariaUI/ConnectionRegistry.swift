@@ -492,14 +492,15 @@ public final class ConnectionRegistry {
     }
 
     static func secondaryProfile(from profile: HermesProfile) -> SecondaryProfile {
-        // Same precedence the live roster uses: desktop Bot Mode's own block
-        // wins over Talaria's, so a bot titled or recolored on desktop reads
-        // identically here (plugin.js mergeServerMeta:432-482).
+        // The live roster's precedence, not a second copy of it: desktop Bot
+        // Mode's own block wins over Talaria's mirror, so a bot titled or
+        // recolored on desktop reads identically here (plugin.js
+        // mergeServerMeta:432-482). Left optional deliberately — a secondary row
+        // that stores no cosmetics falls back to the name hash at the point of
+        // use, where the disambiguated profile name is known.
         let desk = BotModeMeta(uiMeta: profile.uiMeta)
-        let shape = desk?.talariaShape
-            ?? profile.uiMeta?["talaria"]?["shape"]?.stringValue.flatMap(AvatarShape.init(rawValue:))
-        let hue = desk?.talariaHue
-            ?? profile.uiMeta?["talaria"]?["hue"]?.stringValue.flatMap(AvatarHue.init(rawValue:))
+        let shape = BotCosmetics.storedShape(for: profile)
+        let hue = BotCosmetics.storedHue(for: profile)
         return SecondaryProfile(name: profile.name,
                                 title: desk?.title,
                                 job: profile.description ?? "",

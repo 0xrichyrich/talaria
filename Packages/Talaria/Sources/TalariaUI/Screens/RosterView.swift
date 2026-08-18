@@ -552,17 +552,12 @@ public struct RosterView: View {
                              lineWidth: theme.id == .soft ? 2 : 1.5)
                     .frame(width: 54, height: 54)
             }
-            // The real profile portrait when the roster row says there is one
-            // (`has_avatar`), the geometric face otherwise — asking only for
-            // the faces the gateway has already confirmed exist.
-            Group {
-                if model.hasStoredAvatar(bot.id) {
-                    BotPortraitView(model: model, bot: bot, size: 46, theme: theme)
-                } else {
-                    AvatarView(bot: bot, size: 46, theme: theme)
-                }
-            }
-            .modifier(AvatarSway(botID: bot.id, working: live))
+            // One face path. `BotPortraitView` draws the profile's own portrait
+            // when one has been fetched AND judged a real picture, and the live
+            // geometric face otherwise — so the row cannot decide one way on
+            // the first paint and the other way on the next poll.
+            BotPortraitView(model: model, bot: bot, size: 46, theme: theme)
+                .modifier(AvatarSway(botID: bot.id, working: live))
         }
         .frame(width: 46, height: 46)
         // Bot Mode's petMode: the profile's mascot keeps a working bot

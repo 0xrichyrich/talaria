@@ -26,6 +26,7 @@ public enum ProtocolChecks {
         try rosterSearchSemantics()
         try mentionRouting()
         try agentHandleRules()
+        try rosterCosmeticsSurviveRefresh()
     }
 
     static func eventEnvelopeDecoding() throws {

@@ -126,8 +126,8 @@ public extension AppModel {
         let handle = entry.handle == entry.profile ? plain.handle : entry.handle
         return Bot(id: entry.id,
                    job: entry.job,
-                   shape: entry.shape ?? Self.rosterShape(forProfileName: entry.profile),
-                   hue: entry.hue ?? Self.rosterHue(forProfileName: entry.profile),
+                   shape: entry.shape ?? BotCosmetics.derivedShape(forName: entry.profile),
+                   hue: entry.hue ?? BotCosmetics.derivedHue(forName: entry.profile),
                    status: .idle,
                    preview: entry.preview,
                    previewTime: Self.shortTime(entry.lastActive),
@@ -304,24 +304,11 @@ public extension AppModel {
         await switchGateway(to: gateway)
     }
 
-    // MARK: - Cosmetics for a profile we have only a name for
-
-    // The live roster derives shape/hue from a stable hash of the profile name
-    // when `ui_meta` carries no cosmetics (AppModelLive.derivedShape/derivedHue).
-    // These are the same functions keyed by name alone, so a bot's face does
-    // not change the instant the switch completes and the real row replaces
-    // the foreign one.
-
-    static func rosterShape(forProfileName name: String) -> AvatarShape {
-        let cases = AvatarShape.allCases
-        return cases[(stableHash(name) & Int.max) % cases.count]
-    }
-
-    static func rosterHue(forProfileName name: String) -> AvatarHue {
-        // .gateway is reserved for gateway-originated feed items.
-        let cases: [AvatarHue] = [.teal, .violet, .amber, .green, .pink, .blue]
-        return cases[(stableHash(name + "hue") & Int.max) % cases.count]
-    }
+    // Cosmetics for a profile we have only a name for live in
+    // `BotCosmetics.derivedShape(forName:)` / `derivedHue(forName:)`, the same
+    // last-resort the live roster uses — so a bot's face does not change the
+    // instant the switch completes and the real row replaces the foreign one.
+    // This file used to carry its own byte-identical copy of that hash.
 }
 
 // MARK: - Searching a foreign row

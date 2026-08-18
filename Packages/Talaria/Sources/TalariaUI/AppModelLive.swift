@@ -5,7 +5,10 @@ import TalariaKit
 // and back the shared actions with real RPCs. Demo mode never touches this.
 //
 // Protocol contract: .research/ws-protocol.md / auth-flows.md. Key behaviors:
-// - profiles.list is the roster; cosmetics ride ui_meta["talaria"].
+// - profiles.list is the roster; cosmetics ride ui_meta — desktop Bot Mode's
+//   own ui_meta["hermes-bots"] block first, Talaria's ui_meta["talaria"]
+//   mirror second, a hash of the profile name only when there is neither
+//   (TalariaKit/BotCosmetics.swift).
 // - Turn events (message.*/tool.*/session.usage) route by runtime session id.
 // - approval.request blocks the agent until approval.respond.
 // - On socket loss the server parks live sessions for ~20 s; we reconnect with
@@ -210,10 +213,7 @@ extension AppModel {
 
     // MARK: - Roster (profiles.list → bots)
 
-    /// Map the gateway roster (profiles) into bots. Shape/hue cosmetics come
-    /// from ui_meta["talaria"] when present, else a stable hash of the name.
-    /// Status folds in live sessions and pending approvals; unread counts and
-    /// task lines survive the refresh.
+    /// Ask the gateway for the roster and fold the answer in.
     public func refreshRoster() async throws {
         guard let client else { return }
         // Sampled BEFORE the await: any pin written while this poll was in
@@ -221,8 +221,43 @@ extension AppModel {
         // missing `chat` key as an authoritative deletion.
         let pinWrites = CanonicalChatRuntime.shared.writeCount
         let profiles = try await client.listProfiles()
+        applyRosterAnswer(profiles, pinWrites: pinWrites)
+    }
+
+    /// THE roster builder. Every path holding a `profiles.list` answer — the
+    /// connect-time refresh, the 10 s signals poll, a create/duplicate/delete,
+    /// a `sessions.changed` event — folds it in here, and nothing else writes a
+    /// row's cosmetics, its ranking signal or its timestamp.
+    ///
+    /// It is one function because it used to be two, and the split WAS the bug.
+    /// This map owned cosmetics and ignored `has_avatar`; `RosterSignals.ingest`
+    /// owned recency, liveness and `has_avatar` and ignored cosmetics. A cold
+    /// launch ran only the first (the poll's opening tick bails until the socket
+    /// lands), the poll's second tick then ran only the second, and the roster
+    /// visibly changed identity between them: avatars swapped to the gateway's
+    /// stored rasters, timestamps flipped absolute → relative, the rows
+    /// reordered and an Active Now rail appeared, all on one tick about eight
+    /// seconds in. One answer in, one roster out, one instant.
+    func applyRosterAnswer(_ profiles: [HermesProfile], pinWrites: [String: Int]) {
         let runtime = LiveRuntime.shared
         runtime.defaultBotID = profiles.first(where: \.isDefault)?.name ?? profiles.first?.name
+
+        // Scoped to this gateway BEFORE the fold, with no await in between.
+        // `rescope` clears every table when the gateway changes, and the roster
+        // screen arms its poll with a rescope of its own — so an answer folded
+        // in while the scope was still unset would be wiped moments later by
+        // that arming call, leaving the rows with no recency, no liveness and
+        // no `has_avatar` until the next poll landed. Which is the same flip
+        // this whole path exists to prevent, one layer down.
+        RosterSignals.shared.rescope(to: runtime.baseURL)
+        // Ranking, the 90 s liveness window, unread watermarks and `has_avatar`,
+        // taken from the SAME answer the map below reads — not from a second
+        // call landing seconds later.
+        let moved = RosterSignals.shared.ingest(profiles)
+        // A bot with a cosmetics write in flight keeps the look the user just
+        // picked: this answer was composed before that write, and reading it as
+        // authority would flip the row back under their thumb.
+        let writing = RosterSignals.shared.writing
 
         bots = profiles.map { profile in
             if let last = profile.lastSession?.id {
@@ -230,7 +265,10 @@ extension AppModel {
             }
             let existing = bots.first { $0.id == profile.name }
             // Desktop Bot Mode's own metadata block wins over Talaria's, so a
-            // bot titled/recolored on desktop reads identically here.
+            // bot titled/recolored on desktop reads identically here. The
+            // precedence — desktop's block, then Talaria's mirror, then a hash
+            // of the name as a last resort — lives in one place for the whole
+            // app (TalariaKit/BotCosmetics.swift).
             let deskMeta = BotModeMeta(uiMeta: profile.uiMeta)
             // The canonical-chat pin travels in that same block, and desktop's
             // mergeServerMeta is precise about it (plugin.js:441-470): when the
@@ -242,28 +280,51 @@ extension AppModel {
             // out — is skipped: that answer predates the write, and reading it
             // as a deletion would drop the pin just made.
             let canonical = CanonicalChatRuntime.shared
-            if profile.uiMeta?["hermes-bots"]?.objectValue != nil,
-               !canonical.hasLocalPinWrite(profile.name, since: pinWrites) {
-                canonical.pins[profile.name] = profile.uiMeta?["hermes-bots"]?["chat"]?.stringValue
+            if let deskMeta, !canonical.hasLocalPinWrite(profile.name, since: pinWrites) {
+                canonical.pins[profile.name] = deskMeta.pinnedChat
             }
+            // `stripPreviewMarkdown` (plugin.js:2991-3007): without it a bot
+            // that answers with a bulleted list puts literal asterisks in the
+            // roster. Folded in here because the 10 s poll used to do it in a
+            // second pass of its own, and a row's text and its face must land
+            // on the same tick.
+            let fresh = (profile.lastSession?.preview).map(Self.flattenPreview) ?? ""
             var bot = Bot(
                 id: profile.name,
                 job: profile.description ?? "",
-                shape: deskMeta?.talariaShape ?? Self.derivedShape(for: profile),
-                hue: deskMeta?.talariaHue ?? Self.derivedHue(for: profile),
+                shape: BotCosmetics.shape(for: profile),
+                hue: BotCosmetics.hue(for: profile),
                 status: .idle,
                 task: existing?.task,
                 minutesElapsed: existing?.minutesElapsed ?? 0,
-                preview: profile.lastSession?.preview ?? existing?.preview ?? "Ready when you are.",
+                preview: fresh.isEmpty ? (existing?.preview ?? "Ready when you are.") : fresh,
                 previewTime: Self.shortTime(profile.lastSession?.lastActive),
                 unread: existing?.unread ?? 0,
                 mentionsYou: existing?.mentionsYou ?? false,
                 description: profile.description,
                 pinnedModel: profile.model,
                 title: deskMeta?.title)
+            // A look whose write is still in flight keeps the value the user
+            // just picked — this answer was composed before it.
+            if let existing, writing.contains(profile.name) {
+                bot.shape = existing.shape
+                bot.hue = existing.hue
+                bot.title = existing.title
+            }
             if approvals.contains(where: { $0.botID == bot.id }) { bot.status = .approval }
             if runtime.workingBotIDs.contains(bot.id) { bot.status = .working }
             return bot
+        }
+
+        applyUnreadWatermark(moved)
+        // `has_avatar` drives the FETCH and only the fetch — never which face a
+        // row draws. Desktop reads the same flag the same way, walking the whole
+        // roster fire-and-forget (`pullServerAvatars`, plugin.js:397-409), which
+        // is also what keeps a shape-only roster at zero `profiles.get_asset`
+        // calls instead of one per row.
+        for profile in profiles where profile.hasAvatar
+            && !ProfileAssetStore.shared.isResolved(profile.name) {
+            Task { await self.refreshAvatar(botID: profile.name) }
         }
 
         if let base = runtime.baseURL {
@@ -272,27 +333,10 @@ extension AppModel {
         }
     }
 
-    static func derivedShape(for profile: HermesProfile) -> AvatarShape {
-        if let raw = profile.uiMeta?["talaria"]?["shape"]?.stringValue,
-           let shape = AvatarShape(rawValue: raw) { return shape }
-        let cases = AvatarShape.allCases
-        return cases[(stableHash(profile.name) & Int.max) % cases.count]
-    }
-
-    static func derivedHue(for profile: HermesProfile) -> AvatarHue {
-        if let raw = profile.uiMeta?["talaria"]?["hue"]?.stringValue,
-           let hue = AvatarHue(rawValue: raw) { return hue }
-        // .gateway is reserved for gateway-originated feed items.
-        let cases: [AvatarHue] = [.teal, .violet, .amber, .green, .pink, .blue]
-        return cases[(stableHash(profile.name + "hue") & Int.max) % cases.count]
-    }
-
     /// Deterministic across launches (String.hashValue is seeded per-process).
-    static func stableHash(_ s: String) -> Int {
-        var h = 5381
-        for b in s.utf8 { h = ((h << 5) &+ h) &+ Int(b) }
-        return h
-    }
+    /// The roster's own use of it lives in `BotCosmetics`; this stays as the
+    /// spelling the feed dedupe keys and the row-sway offsets already use.
+    static func stableHash(_ s: String) -> Int { BotCosmetics.stableHash(s) }
 
     static func shortTime(_ unix: Double?) -> String {
         guard let unix, unix > 0 else { return "" }

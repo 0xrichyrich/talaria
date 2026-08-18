@@ -40,55 +40,12 @@ import AppKit
 // that catches deliveries the phone slept through.
 
 // MARK: - Vocabulary mapping (write direction)
-
-/// Talaria's six silhouettes and six hues expressed in desktop Bot Mode's own
-/// vocabulary, so a look chosen on the phone renders on the laptop.
-///
-/// The read direction lives in `TalariaKit/BotModeMeta.swift`; these tables are
-/// its exact inverse, which is what makes a round trip stable — write, poll,
-/// read back, and the bot still wears what the user picked.
-enum BotModeLook {
-
-    /// `AVATAR_SHAPES` (plugin.js:606) = circle, squircle, pill, triangle,
-    /// hexagon, cloud, drop. Four of Talaria's six have an exact counterpart;
-    /// `diamond` writes as `drop`, the same pairing `BotModeMeta.talariaShape`
-    /// reads back. `pentagon` has no upstream shape at all, so it travels as
-    /// its own literal word: desktop's `shapeNode` default draws an unknown
-    /// shape as a circle (plugin.js:783) rather than dropping the bot, and
-    /// `BotModeMeta` maps "pentagon" straight back — the pick survives the
-    /// round trip instead of silently becoming a hexagon on the next poll.
-    static func shapeWord(_ shape: AvatarShape) -> String {
-        switch shape {
-        case .circle: "circle"
-        case .squircle: "squircle"
-        case .hexagon: "hexagon"
-        case .triangle: "triangle"
-        case .diamond: "drop"
-        case .pentagon: "pentagon"
-        }
-    }
-
-    /// Desktop stores a literal hex and renders it literally (`shapeNode`
-    /// takes the color as a fill), so these are the reference values
-    /// `BotModeMeta.talariaHue` matches against — five of them are literal
-    /// `AVATAR_COLORS` entries (plugin.js:660: teal, cyan, violet, magenta,
-    /// orange) and green is off-palette but renders exactly the same way.
-    /// Writing anything else would round-trip through nearest-neighbour and
-    /// change the user's hue.
-    static func colorHex(_ hue: AvatarHue) -> String {
-        switch hue {
-        case .teal: "#14b8a6"
-        case .blue: "#38bdf8"
-        case .violet: "#8b5cf6"
-        case .pink: "#ec4899"
-        case .amber: "#f97316"
-        case .green: "#22c55e"
-        // Reserved for gateway-originated feed rows; never a bot's own hue,
-        // but the switch has to be total.
-        case .gateway: "#9ca3af"
-        }
-    }
-}
+//
+// `BotModeLook` — the tables that turn a picked `AvatarShape`/`AvatarHue` into
+// desktop's own shape word and hex — now lives in `TalariaKit/BotModeMeta.swift`,
+// directly beneath the read direction it has to invert. It moved there so
+// `ProtocolChecks` can execute the round trip instead of a comment asserting it;
+// the write path below calls it unchanged.
 
 /// Desktop's three-valued save outcome (plugin.js:246-269), ported because the
 /// distinction is the difference between a silent legacy fallback and a real
@@ -134,7 +91,21 @@ public final class RosterSignals {
     /// `has_avatar` from the same roster row. Consulting it is what keeps the
     /// first roster paint from firing one `profiles.get_asset` per bot for
     /// faces the gateway has already said do not exist.
+    ///
+    /// A fetch hint and nothing more. It says bytes EXIST, never that they are
+    /// worth showing — on the maintainer's gateway all five profiles answer
+    /// `has_avatar: true` with a 160×160 raster of their own vector face, and a
+    /// client that let this flag pick the renderer swapped five live faces for
+    /// five stills. What the bytes turn out to be is `ProfileAssetStore`'s
+    /// verdict alone (AppModelLive+Profiles.swift `refreshAvatar`).
     private(set) var hasAvatar: Set<String> = []
+
+    /// `ui_meta["hermes-bots"].imageKind` — the profile's own record of what
+    /// its stored asset IS: `"photo"` for a picture a human chose, `"shape"`
+    /// for a machine-made raster of the vector face. Desktop's fetch guard
+    /// consults exactly this before refusing a 160×160 asset (plugin.js:415),
+    /// which is what keeps a deliberately-chosen 160×160 photo displayable.
+    private(set) var imageKind: [String: String] = [:]
 
     /// The bot whose chat was opened last. Sticky, exactly as desktop's
     /// `$selectedBot` is (plugin.js:129 + 3901): leaving a chat does not make
@@ -182,6 +153,7 @@ public final class RosterSignals {
         created.removeAll()
         pinned.removeAll()
         hasAvatar.removeAll()
+        imageKind.removeAll()
         selected = nil
         watermarks.removeAll()
         watermarksSeeded = false
@@ -203,15 +175,19 @@ public final class RosterSignals {
         for profile in profiles {
             seen.insert(profile.name)
             if profile.hasAvatar { hasAvatar.insert(profile.name) } else { hasAvatar.remove(profile.name) }
+            // One parser for the desktop block, the same one the roster map and
+            // the secondary rosters read (TalariaKit/BotModeMeta.swift). Nil
+            // here means the block is absent, never that it is empty.
+            let block = BotModeMeta(uiMeta: profile.uiMeta)
             // A bot with a write in flight keeps the value the user just chose:
             // this answer was composed before that write and reading it as
             // authority would flip the row back under their thumb.
             if !writing.contains(profile.name) {
-                let block = profile.uiMeta?["hermes-bots"]
-                created[profile.name] = block?["created"]?.doubleValue ?? 0
-                if block?["pinned"]?.boolValue == true {
+                created[profile.name] = block?.created ?? 0
+                imageKind[profile.name] = block?.imageKind
+                if block?.pinned == true {
                     pinned.insert(profile.name)
-                } else if block?.objectValue != nil {
+                } else if block != nil {
                     // The server block exists and does not claim the pin: that
                     // is an unpin from another machine, and it is authoritative
                     // (plugin.js:441-470).
@@ -231,10 +207,20 @@ public final class RosterSignals {
         // A profile deleted elsewhere leaves no row to badge or rank.
         lastActive = lastActive.filter { seen.contains($0.key) }
         created = created.filter { seen.contains($0.key) }
+        imageKind = imageKind.filter { seen.contains($0.key) }
         pinned = pinned.intersection(seen)
         hasAvatar = hasAvatar.intersection(seen)
         return moved
     }
+
+    /// This profile's stored asset is a photo a human chose, so a 160×160 one
+    /// is a real portrait rather than a rasterized face (plugin.js:415).
+    func wantsStoredPhoto(_ botID: String) -> Bool { imageKind[botID] == "photo" }
+
+    /// Record what this app just wrote to `imageKind`, so the guard above does
+    /// not reject a portrait uploaded seconds ago just because the next
+    /// `profiles.list` answer has not landed yet.
+    func noteImageKind(_ botID: String, _ kind: String) { imageKind[botID] = kind }
 
     /// A chat was opened. Clears the way for its unread — desktop deletes the
     /// key before any RPC runs (plugin.js:3915) — and keeps the selection so
@@ -317,12 +303,16 @@ extension AppModel {
         await pollRosterSignals()
     }
 
-    /// One poll: `profiles.list` in, ranking + liveness + unread out.
+    /// One poll: `profiles.list` in, the whole roster out.
     ///
-    /// Deliberately the same single call the full roster refresh makes, not a
+    /// Deliberately the same single call the connect-time refresh makes, not a
     /// second one beside it — `include_sessions` costs a per-profile DB scan
-    /// gateway-side (methods_profiles.py:196). When membership changed the full
-    /// remap runs; otherwise the cheap freshening below is enough.
+    /// gateway-side (methods_profiles.py:196) — and now deliberately the same
+    /// single *builder* too. This used to freshen a subset of fields in place
+    /// and re-derive cosmetics only when roster membership had changed, which
+    /// meant a bot recolored on the laptop kept its old face here until someone
+    /// created or deleted a profile, and meant the poll's own signals arrived on
+    /// a different tick from the map that was supposed to agree with them.
     func pollRosterSignals() async {
         // Re-scoped on every tick, not only when the roster arms the poll: a
         // gateway switch has to invalidate pins and watermarks even if the user
@@ -331,51 +321,21 @@ extension AppModel {
         guard mode == .live, !isOffline, let client else { return }
         RosterSignals.shared.polling = true
         defer { RosterSignals.shared.polling = false }
+        // Sampled before the await for the same reason `refreshRoster` samples
+        // it: a pin written while this call was in flight must not be read back
+        // out of a staler answer.
+        let pinWrites = CanonicalChatRuntime.shared.writeCount
         guard let profiles = try? await client.listProfiles() else { return }
-
-        let moved = RosterSignals.shared.ingest(profiles)
-        let known = Set(bots.map(\.id))
-        guard known == Set(profiles.map(\.name)) else {
-            // A profile appeared or vanished — cosmetics, model pins and status
-            // all have to be re-derived, which is refreshRoster's job.
-            try? await refreshRoster()
-            applyUnreadWatermark(moved)
-            return
-        }
-        freshenRows(from: profiles)
-        applyUnreadWatermark(moved)
+        applyRosterAnswer(profiles, pinWrites: pinWrites)
     }
 
-    /// Preview text and timestamps between full refreshes. Cosmetics, status
-    /// and model pins are deliberately untouched: this runs on a 10 s timer and
-    /// must never fight `refreshRoster` for the fields it owns.
-    private func freshenRows(from profiles: [HermesProfile]) {
-        let writing = RosterSignals.shared.writing
-        for profile in profiles {
-            guard let index = bots.firstIndex(where: { $0.id == profile.name }) else { continue }
-            // A row whose look is mid-write keeps the value the user just
-            // picked; the roster answer in hand predates the write.
-            guard !writing.contains(profile.name) else { continue }
-            if let preview = profile.lastSession?.preview, !preview.isEmpty {
-                bots[index].preview = Self.flattenPreview(preview)
-            }
-            bots[index].previewTime = Self.shortTime(profile.lastSession?.lastActive)
-            // Where the desktop block exists it is authoritative, a missing
-            // title included — that is how a title cleared on the laptop stops
-            // showing here (plugin.js:441-470).
-            if let block = profile.uiMeta?["hermes-bots"]?.objectValue {
-                let title = block["title"]?.stringValue ?? ""
-                bots[index].title = title.isEmpty ? nil : title
-            }
-        }
-    }
-
-    /// The unread half of the poll. Talaria counts unread where desktop keeps a
-    /// boolean, so a watermark move raises the count to at least one rather than
-    /// inflating it — a turn this app watched has already been counted by the
-    /// event path (AppModelLive.swift), and double-counting it would make the
-    /// badge lie. The bot on screen is never badged (plugin.js:129).
-    private func applyUnreadWatermark(_ moved: [String]) {
+    /// The unread half of the roster answer. Talaria counts unread where desktop
+    /// keeps a boolean, so a watermark move raises the count to at least one
+    /// rather than inflating it — a turn this app watched has already been
+    /// counted by the event path (AppModelLive.swift), and double-counting it
+    /// would make the badge lie. The bot on screen is never badged
+    /// (plugin.js:129).
+    func applyUnreadWatermark(_ moved: [String]) {
         let signals = RosterSignals.shared
         if let open = openBotID { signals.noteOpened(open) }
         for botID in moved where botID != signals.selected {
@@ -415,14 +375,15 @@ extension AppModel {
         RosterSignals.shared.activeNow(botID, now: now)
     }
 
-    /// Does this bot have a portrait worth asking the gateway for?
-    /// `profiles.list` already answers that per row (`has_avatar`), so a roster
-    /// of shape-only bots costs zero `profiles.get_asset` calls instead of one
-    /// per row on every cold start.
-    public func hasStoredAvatar(_ botID: String) -> Bool {
-        ProfileAssetStore.shared.hasPortrait(botID)
-            || RosterSignals.shared.hasAvatar.contains(botID)
-    }
+    // There is deliberately no `hasStoredAvatar(_:)` here any more. It answered
+    // "does a portrait exist?" from `has_avatar` — a promise about bytes nobody
+    // had looked at yet — and every surface that drew a face branched on it,
+    // choosing between `BotPortraitView` and `AvatarView` a second time when
+    // `BotPortraitView` already makes exactly that choice from bytes actually
+    // held. Two renderers picked by two different inputs is how a roster came
+    // up correct and then changed identity on the next poll. One path now:
+    // draw `BotPortraitView`, which shows a portrait when one has been fetched
+    // AND passed the provenance guard, and the live vector face otherwise.
 
     /// Every route into a chat should tell the signals table, so the bot you
     /// are reading is never the bot that badges you.
@@ -712,8 +673,15 @@ extension AppModel {
     /// Talaria-set portrait safe from a laptop's own housekeeping.
     private func stampImageKind(botID: String, photo: Bool) async {
         guard mode == .live else { return }
+        let kind = photo ? "photo" : "shape"
+        // Locally too, ahead of the roster answer that will carry it: Talaria's
+        // own fetch guard reads `imageKind` (AppModelLive+Profiles.swift
+        // `refreshAvatar`), and a portrait uploaded seconds ago must not be
+        // refused for the ten seconds it takes the next `profiles.list` to say
+        // what this write just said.
+        RosterSignals.shared.noteImageKind(botID, kind)
         _ = await writeBotModeMeta(botID: botID,
-                                   patch: ["imageKind": .string(photo ? "photo" : "shape")],
+                                   patch: ["imageKind": .string(kind)],
                                    alsoTalaria: nil)
     }
 
