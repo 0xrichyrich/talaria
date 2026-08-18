@@ -474,6 +474,7 @@ struct GatewayAuthPhasePanel: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(WebAuthPresenter(auth: auth, theme: theme))
     }
 
     // MARK: idle — the actionable states

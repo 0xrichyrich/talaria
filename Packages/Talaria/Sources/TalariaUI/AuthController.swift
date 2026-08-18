@@ -145,6 +145,23 @@ public final class AuthController {
     }
 
     private func runNativeFlow(base: URL, provider: AuthProviderInfo?) async {
+        #if os(iOS)
+        // In-app web sheet: no loopback listener at all. WKWebView intercepts
+        // the 127.0.0.1 callback as a *navigation* before any socket is
+        // dialed — Safari under Lockdown Mode refuses http://127.0.0.1:<port>
+        // ("restricted network port"), so the system-browser flow cannot
+        // complete there. The port in the redirect URI is never contacted.
+        let flow = NativePKCEFlow()
+        guard let authorizeURL = flow.authorizeURL(base: base, redirectPort: 43210,
+                                                   provider: provider?.name) else {
+            phase = .failed("Could not build the authorize URL.")
+            return
+        }
+        pendingFlow = flow
+        pendingBase = base
+        phase = .waitingForBrowser
+        webAuthRequest = WebAuthRequest(url: authorizeURL)
+        #else
         let listener = LoopbackListener()
         self.listener = listener
         do {
@@ -181,12 +198,76 @@ public final class AuthController {
             guard !Task.isCancelled else { return }   // cancelSignIn already reset phase
             phase = .failed(message(for: error))
         }
+        #endif
+    }
+
+    // MARK: - In-app web sign-in (iOS sheet)
+
+    /// A pending in-app sign-in: the sheet loads `url` and hands back the
+    /// loopback callback navigation.
+    public struct WebAuthRequest: Identifiable, Sendable {
+        public let id = UUID()
+        public let url: URL
+    }
+
+    public private(set) var webAuthRequest: WebAuthRequest?
+    @ObservationIgnored private var pendingFlow: NativePKCEFlow?
+    @ObservationIgnored private var pendingBase: URL?
+
+    /// The auth sheet intercepted the gateway's redirect to
+    /// `http://127.0.0.1:<port>/callback`. Verify state, redeem, store.
+    public func handleWebCallback(_ url: URL) {
+        webAuthRequest = nil
+        guard let flow = pendingFlow, let base = pendingBase else { return }
+        pendingFlow = nil
+        pendingBase = nil
+
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
+
+        if let error = value("error") {
+            phase = .failed(value("error_description") ?? error)
+            return
+        }
+        guard value("state") == flow.state else {
+            phase = .failed("The sign-in state did not match — try again.")
+            return
+        }
+        guard let code = value("code") else {
+            phase = .failed("The callback carried no code.")
+            return
+        }
+
+        phase = .exchanging
+        flowTask = Task {
+            do {
+                let tokens = try await flow.redeem(code: code, base: base, session: urlSession)
+                let cred = GatewayCredential.oauth(tokens)
+                try keychain.save(cred, for: base)
+                credential = cred
+                phase = .done
+            } catch {
+                guard !Task.isCancelled else { return }
+                phase = .failed(message(for: error))
+            }
+        }
+    }
+
+    /// The sheet was dismissed without completing.
+    public func webAuthCancelled() {
+        webAuthRequest = nil
+        pendingFlow = nil
+        pendingBase = nil
+        if case .waitingForBrowser = phase { phase = .idle }
     }
 
     /// Abort an in-flight browser flow (or probe) and go back to idle.
     public func cancelSignIn() {
         flowTask?.cancel()
         flowTask = nil
+        webAuthRequest = nil
+        pendingFlow = nil
+        pendingBase = nil
         if let listener {
             Task { await listener.stop() }
         }
