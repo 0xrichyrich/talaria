@@ -34,11 +34,67 @@ public struct ConnectionsView: View {
         }
     }
 
+    /// The way out of the demo world: leave to the empty real state, or
+    /// re-run onboarding from the top.
+    private var demoBanner: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(theme.warn)
+                    .frame(width: 7, height: 7)
+                Text(copy.demoBannerTitle)
+                    .font(theme.body(14, weight: .bold))
+                    .foregroundStyle(theme.ink)
+            }
+            Text(copy.demoBannerBody)
+                .font(theme.body(12.5))
+                .foregroundStyle(theme.sub)
+            HStack(spacing: 8) {
+                Button {
+                    model.exitDemoMode()
+                } label: {
+                    Text(copy.demoLeave)
+                        .font(theme.mono(11, weight: .bold))
+                        .foregroundStyle(theme.accentFg)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                        .background(theme.accent, in: RoundedRectangle(cornerRadius: theme.buttonRadius))
+                }
+                .buttonStyle(.plain)
+                Button {
+                    model.exitDemoMode()
+                    model.resetOnboarding()
+                } label: {
+                    Text(copy.demoReonboard)
+                        .font(theme.mono(11, weight: .semibold))
+                        .foregroundStyle(theme.ink)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                        .background(theme.inset, in: RoundedRectangle(cornerRadius: theme.buttonRadius))
+                        .overlay(RoundedRectangle(cornerRadius: theme.buttonRadius)
+                            .stroke(theme.lineStrong, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.top, 2)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.panel, in: RoundedRectangle(cornerRadius: theme.cardRadius))
+        .overlay(RoundedRectangle(cornerRadius: theme.cardRadius)
+            .stroke(theme.warn.opacity(0.45), lineWidth: 1))
+    }
+
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             ScrollView {
                 VStack(alignment: .leading, spacing: listGap) {
+                    if model.demoDataLoaded {
+                        demoBanner
+                            .padding(.bottom, 8)
+                    }
+
                     GatewaySectionLabel(theme: theme, text: copy.appearance)
                         .padding(.horizontal, 2)
 

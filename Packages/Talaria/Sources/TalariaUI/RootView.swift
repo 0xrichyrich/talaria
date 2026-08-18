@@ -47,8 +47,10 @@ public struct TalariaRootView: View {
     }
 
     /// The prototype suppresses banner pushes on voice / onboarding / search.
+    /// They also require the demo world to actually be loaded — the empty
+    /// real state gets no fake pushes.
     private var bannersAllowed: Bool {
-        model.mode == .demo && !model.showOnboarding && !showSearch && !showVoice
+        model.demoDataLoaded && !model.showOnboarding && !showSearch && !showVoice
     }
 
     // MARK: - Body
@@ -236,10 +238,9 @@ public struct TalariaRootView: View {
     // MARK: - Wiring
 
     private func wireUp() {
-        // Relaunch in demo mode after onboarding once completed earlier.
-        if model.mode == .demo && model.bots.isEmpty && !model.showOnboarding {
-            model.enterDemoMode()
-        }
+        // Restore the last world: saved gateway → live; explicit demo choice
+        // → demo; otherwise the honest empty roster.
+        Task { await model.restoreWorldAtLaunch() }
         PushCoordinator.shared.configure(model: model)
         LiveActivityController.shared.attach(to: model)
     }

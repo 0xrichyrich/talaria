@@ -100,6 +100,10 @@ public struct CopyPack: Sendable {
     public var noGatewayNote: String = "No gateway to sign in to yet — go back and enter your gateway's URL, or explore with demo data."
     public var emptyRosterTitle: String = "No bots yet"
     public var emptyRosterBody: String = "Connect a gateway and your Hermes profiles appear here — same roster as your desktop."
+    public var demoBannerTitle: String = "Exploring demo data"
+    public var demoBannerBody: String = "Everything here is canned. Connect a real gateway below, or step out."
+    public var demoLeave: String = "Leave demo mode"
+    public var demoReonboard: String = "Show onboarding again"
     /// Composer placeholder for a given bot id.
     public var composer: @Sendable (String) -> String
 

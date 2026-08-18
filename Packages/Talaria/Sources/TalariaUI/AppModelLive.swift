@@ -95,6 +95,9 @@ extension AppModel {
         }
 
         try await client.connect()
+        // Entering the real world: the canned demo content must not survive
+        // next to live data.
+        if demoDataLoaded { flushDemoWorld() }
         mode = .live
         isOffline = false
 

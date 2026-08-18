@@ -70,8 +70,18 @@ public final class AppModel {
 
     // MARK: - Demo mode
 
+    /// True while the canned demo world is loaded. Drives the exit affordance
+    /// in Connections and the flush when a real gateway connects.
+    public internal(set) var demoDataLoaded = false
+
+    /// UserDefaults key remembering that demo was the user's explicit choice,
+    /// so relaunches restore the same world.
+    public static let demoChoiceKey = "talaria-demo-chosen"
+
     public func enterDemoMode() {
         mode = .demo
+        demoDataLoaded = true
+        UserDefaults.standard.set(true, forKey: Self.demoChoiceKey)
         bots = DemoData.bots
         approvals = DemoData.approvals
         activity = DemoData.activity
@@ -91,6 +101,63 @@ public final class AppModel {
     public func completeOnboarding() {
         UserDefaults.standard.set(true, forKey: "talaria-onboarded")
         showOnboarding = false
+    }
+
+    /// Leave the demo world for the honest empty state (notification prefs
+    /// are real device settings and survive; saved gateways re-appear from
+    /// the registry).
+    public func exitDemoMode() {
+        flushDemoWorld()
+        connections = ConnectionRegistry.shared.rows
+    }
+
+    /// Re-run onboarding from the first step.
+    public func resetOnboarding() {
+        UserDefaults.standard.removeObject(forKey: "talaria-onboarded")
+        showOnboarding = true
+    }
+
+    /// Launch restore, in order of intent: reconnect the most recent saved
+    /// gateway; else reload the demo world if that was the explicit choice;
+    /// else stay on the honest empty state.
+    public func restoreWorldAtLaunch() async {
+        guard mode == .demo, bots.isEmpty, !showOnboarding else { return }
+        let registry = ConnectionRegistry.shared
+        for gateway in registry.saved {
+            guard let base = gateway.baseURL,
+                  let credential = registry.credential(for: gateway) else { continue }
+            do {
+                try await connectGateway(baseURL: base, credential: credential)
+                return
+            } catch {
+                registry.noteState(.offline, forURL: base)
+            }
+        }
+        if UserDefaults.standard.bool(forKey: Self.demoChoiceKey) {
+            enterDemoMode()
+        } else {
+            connections = registry.rows
+        }
+    }
+
+    /// Drop every demo-populated surface. Called on exit and when a real
+    /// gateway connection replaces the demo world.
+    func flushDemoWorld() {
+        demoDataLoaded = false
+        UserDefaults.standard.removeObject(forKey: Self.demoChoiceKey)
+        bots = []
+        approvals = []
+        activity = []
+        agentInbox = []
+        routines = []
+        artifacts = []
+        chats = [:]
+        memory = [:]
+        sessions = [:]
+        contextMeter = []
+        composeQueue = []
+        openBotID = nil
+        selectedTab = .home
     }
 
     // MARK: - Shared actions (mode-dispatched; live paths in AppModel+Live)
