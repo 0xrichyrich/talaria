@@ -240,7 +240,20 @@ public struct ChatView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
                 .padding(.bottom, 8)
+                // Tapping the transcript puts the keyboard away. A bot's
+                // answer is usually longer than the third of the screen left
+                // above an open keyboard, so reading is the common intent and
+                // it deserves the cheapest possible gesture.
+                //
+                // `.contentShape` first: a VStack of bubbles only receives
+                // taps where a bubble actually is, and the gaps between them
+                // are exactly where a thumb lands when it means "dismiss".
+                .contentShape(Rectangle())
+                .onTapGesture { composerFocused = false }
             }
+            // Drag the transcript down and the keyboard follows the finger,
+            // rather than vanishing at some threshold.
+            .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
             .onChange(of: messages.count) {
                 withAnimation(.easeOut(duration: 0.25)) {
