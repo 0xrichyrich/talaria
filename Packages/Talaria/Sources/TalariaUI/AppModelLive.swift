@@ -142,6 +142,9 @@ extension AppModel {
         detachApprovalBridges()
         detachSessionEventRouter()
         detachVoiceRouter()
+        // ~11 MB of decoded spritesheets and a per-profile pet cache belong to
+        // the gateway that served them, not to the next one.
+        detachPetEventRouter()
         connections = ConnectionRegistry.shared.rows
     }
 

@@ -299,6 +299,16 @@ public struct RosterView: View {
             AvatarView(bot: bot, size: 46, theme: theme)
         }
         .frame(width: 46, height: 46)
+        // Bot Mode's petMode: the profile's mascot keeps a working bot
+        // company. Pinned to the avatar's corner like the prototype's marker —
+        // an overlay, so a pet appearing never reflows the row, and it renders
+        // nothing at all on a gateway without pets.
+        .overlay(alignment: .bottomTrailing) {
+            if bot.status == .working {
+                PetCompanionView(model: model, bot: bot)
+                    .offset(x: 4, y: 2)
+            }
+        }
     }
 
     private func nameText(for bot: Bot) -> some View {

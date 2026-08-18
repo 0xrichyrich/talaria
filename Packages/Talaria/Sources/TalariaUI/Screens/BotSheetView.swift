@@ -23,6 +23,7 @@ public struct BotSheetView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var showEditor = false
+    @State private var showPets = false
 
     /// profiles.describe snapshot — skills/toolsets counts and the pin.
     @State private var snapshot: ProfileSnapshot?
@@ -117,6 +118,17 @@ public struct BotSheetView: View {
                     modelChips
                     sectionLabel(copy.memorySec)
                     memoryCard
+                    // Pets are profile-scoped cosmetics; the row exists only
+                    // when this gateway actually has a pet surface (see
+                    // AppModelLive+Pets). The sheet hangs off the row rather
+                    // than the container — two `.sheet` modifiers on one view
+                    // compete, and the editor owns that slot.
+                    if model.pets(for: botID).hasSurface {
+                        actionRow(copy.petRow(theme.id)) { showPets = true }
+                            .sheet(isPresented: $showPets) {
+                                PetGalleryView(model: model, botID: botID)
+                            }
+                    }
                     actionRow(duplicating ? CopyPack.duplicating(theme.id) : copy.duplicate) {
                         duplicateBot()
                     }
@@ -154,6 +166,10 @@ public struct BotSheetView: View {
         // session.list + session.context_breakdown live in AppModelLive+Sessions.
         await model.refreshSessions(botID: botID)
         await model.refreshContext(botID: botID)
+        // Two small RPCs that decide whether this profile has a pet surface at
+        // all; a gateway without one answers {enabled:false} / -32601 and the
+        // row simply never appears.
+        await model.probePets(profile: botID)
         modelChoices = await choices
         snapshot = await described
         hydrated = true

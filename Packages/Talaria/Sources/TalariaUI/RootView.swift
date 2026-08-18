@@ -426,6 +426,7 @@ public struct TalariaRootView: View {
         model.attachActivityRouter()
         model.attachVoiceRouter()
         model.attachCommandsEventRouter()
+        model.attachPetEventRouter()
     }
 
     // MARK: - Demo push banners
