@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Dev-install variant: no app group (the shared group container can't be
+	     registered from CLI automatic signing; the widget theme read falls back
+	     gracefully). Full entitlements live in Talaria.entitlements. -->
+	<key>aps-environment</key>
+	<string>development</string>
+</dict>
+</plist>

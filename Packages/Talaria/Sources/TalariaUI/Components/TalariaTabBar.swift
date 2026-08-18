@@ -61,7 +61,7 @@ public struct TalariaTabBar: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
                 .background(on ? theme.ink : Color.clear, in: Capsule())
-                .overlay(alignment: .topTrailing) { badge(for: tab).offset(x: -10, y: 1) }
+                .overlay(alignment: .topTrailing) { badge(for: tab).offset(x: 4, y: -5) }
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
@@ -108,7 +108,7 @@ public struct TalariaTabBar: View {
             .frame(maxWidth: .infinity)
             .padding(.top, 8)
             .padding(.bottom, 4)
-            .overlay(alignment: .topTrailing) { badge(for: tab).offset(x: -10, y: 1) }
+            .overlay(alignment: .topTrailing) { badge(for: tab).offset(x: 4, y: -5) }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -155,7 +155,7 @@ public struct TalariaTabBar: View {
             .frame(maxWidth: .infinity)
             .padding(.top, 6)
             .padding(.bottom, 2)
-            .overlay(alignment: .topTrailing) { badge(for: tab).offset(x: -10, y: 1) }
+            .overlay(alignment: .topTrailing) { badge(for: tab).offset(x: 4, y: -5) }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
