@@ -82,6 +82,12 @@ extension AppModel {
         // Session ids are per-gateway; a pin from the previous one resolves to
         // nothing (or worse, something else) here.
         CanonicalChatRuntime.shared.reset()
+        // Switching gateways reaches here WITHOUT going through
+        // disconnectGateway (switchGateway calls connectGateway directly), so
+        // the per-gateway caches have to be dropped on both paths. Done before
+        // the old socket closes, so the pairing watch can still surrender its
+        // handler to the client that owns it.
+        dropPerGatewayCaches()
         if let old = client { await old.disconnect() }
 
         let client = GatewayClient(baseURL: baseURL, credential: credential)
@@ -163,7 +169,31 @@ extension AppModel {
         // contract version — which is precisely the number a client uses to
         // decide which RPC shapes it may send.
         detachSettingsDiagnostics()
+        dropPerGatewayCaches()
         connections = ConnectionRegistry.shared.rows
+    }
+
+    /// Everything Phase 3 caches per gateway, dropped in one place because two
+    /// paths end a link: `disconnectGateway()` (sign out, Connections →
+    /// disconnect) and `connectGateway()` (a switch, which never disconnects
+    /// first). A cache that only one of them clears is a cache that survives
+    /// half the time — which is worse than one that never clears, because the
+    /// bug only reproduces on one route.
+    private func dropPerGatewayCaches() {
+        // Cron detail: the `cron.changed` subscription, per-job records, run
+        // histories, and the "this gateway has no cron REST router" verdict —
+        // the last of which decides whether editing and history exist at all.
+        detachCronDetailRouter()
+        // The approval-policy store re-probes itself on the next load, but its
+        // `pairing.changed` subscription is a live registration on the socket
+        // being closed and has to be surrendered while that client is still
+        // around to surrender it to.
+        detachPairingWatch()
+        // Up to 40 MB of decoded artifact bodies and thumbnails fetched from
+        // the departing gateway. Keys are gateway-scoped, so this is about the
+        // memory rather than a mix-up — but holding another machine's files
+        // resident after leaving it is not a thing to do quietly.
+        ArtifactStore.shared.flush()
     }
 
     /// Probe every saved gateway and sync the Connections rows.

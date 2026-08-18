@@ -79,6 +79,13 @@ targets:
       path: Talaria/Support/TalariaWidgets-Info.plist
       properties:
         CFBundleDisplayName: Talaria Widgets
+        # XcodeGen's generated plist defaults these to a literal "1.0"/"1",
+        # which does not track MARKETING_VERSION — and App Store Connect
+        # rejects a bundle whose extension version differs from its parent
+        # app's. Take them from the same build settings the app's own
+        # Info.plist reads.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSSupportsLiveActivities: true
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
@@ -106,6 +113,9 @@ targets:
       path: Talaria/Support/TalariaNotificationService-Info.plist
       properties:
         CFBundleDisplayName: Talaria Notification Service
+        # Same reason as the widgets extension above.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
           NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).NotificationService"

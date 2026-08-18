@@ -115,6 +115,10 @@ public struct TalariaRootView: View {
                 // preferences screen.
                 screenGraph
                     .talariaSettings(model: model)
+                    // Approval policy stacks ABOVE Settings, because Settings is
+                    // one of the two places that opens it — pushing it under
+                    // would hide it behind the screen that asked for it.
+                    .talariaApprovalPolicy(model: model)
             }
             .opacity(themeSwapDim ? 0.3 : 1)
             .scaleEffect(themeSwapDim ? 0.982 : 1)
@@ -348,6 +352,8 @@ public struct TalariaRootView: View {
             // Same shape as capabilities: the request is a notification, so
             // the presenter mounted on the screen graph does the push.
             model.requestSettings()
+        case .approvalPolicy:
+            model.requestApprovalPolicy()
         case .sessions(let botID):
             openSessions(for: botID)
         case .openSession(let botID, let sessionID):

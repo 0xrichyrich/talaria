@@ -3,19 +3,27 @@ import TalariaKit
 import TalariaTheme
 
 // Routines — pushed from a bot's chat. This bot's routines (with themed
-// toggles, run-now and delete), a "+ new routine" composer, an "Other bots"
-// ledger, and the Hermes-cron footnote. Ported from Talaria.dc.html
-// `data-screen-label="Routines"`.
+// toggles, a state pip, run-now and delete), a "+ new routine" composer, an
+// "Other bots" ledger, and the Hermes-cron footnote. Ported from
+// Talaria.dc.html `data-screen-label="Routines"`.
 //
-// Live wiring (AppModelLive+Feeds.swift + GatewayClient+Cron.swift):
+// Live wiring (AppModelLive+Feeds.swift, AppModelLive+Cron2.swift,
+// GatewayClient+Cron.swift, GatewayClient+Cron2.swift):
 //   list   → cron.manage {action:"list", include_disabled:true, profile?}
 //   toggle → cron.manage {action:"pause"|"resume", name:<job_id>}  ← the
 //            gateway's real vocabulary; there is no enable/disable action.
-//   create → cron.manage {action:"add", name:"[bot:<id>] <title>", schedule,
-//            prompt, profile}
+//   create → cron.manage {action:"add", …} then PUT for deliver/model, which
+//            the socket's add cannot carry
 //   delete → cron.manage {action:"remove", name:<job_id>}
 //   run    → POST /api/cron/jobs/<job_id>/trigger (no WS equivalent exists)
+//   detail → GET  /api/cron/jobs/<job_id> (+ /runs) — the editor screen
 // Demo mode keeps flipping the canned rows locally and hides the live actions.
+//
+// One security behaviour lives here rather than in the editor: a routine
+// carrying the PRE-v2 delegation wrapper interpolated unescaped text into a
+// shell command, so every armed one is paused on sight and can never be
+// re-armed from the phone (AppModel.quarantineLegacyRoutines; desktop does the
+// same at plugin.js:5990).
 
 public struct RoutinesView: View {
     private let model: AppModel
@@ -24,7 +32,8 @@ public struct RoutinesView: View {
 
     @Environment(\.dismiss) private var dismiss
 
-    @State private var showCompose = false
+    @State private var composing = false
+    @State private var editing: Routine?
     @State private var busyRoutineID: String?
     @State private var actionError: String?
     @State private var actionNote: String?
@@ -50,7 +59,40 @@ public struct RoutinesView: View {
         }
     }
 
+    private var pushTransition: AnyTransition {
+        .move(edge: .trailing).combined(with: .opacity)
+    }
+
     public var body: some View {
+        ZStack {
+            listScreen
+
+            // The detail/editor screen, pushed over the list. RoutinesView is
+            // itself a push from chat, so this keeps the same gesture grammar
+            // rather than stacking a sheet on top of a pushed screen.
+            if let routine = editing {
+                ZStack {
+                    theme.bg.ignoresSafeArea()
+                    RoutineEditorView(model: model, mode: .edit(routine), botID: botID) {
+                        withAnimation(.easeOut(duration: 0.32)) { editing = nil }
+                    }
+                }
+                .transition(pushTransition)
+            }
+
+            if composing {
+                ZStack {
+                    theme.bg.ignoresSafeArea()
+                    RoutineEditorView(model: model, mode: .create, botID: botID) {
+                        withAnimation(.easeOut(duration: 0.32)) { composing = false }
+                    }
+                }
+                .transition(pushTransition)
+            }
+        }
+    }
+
+    private var listScreen: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             ScrollView {
@@ -63,8 +105,11 @@ public struct RoutinesView: View {
 
                     ForEach(Array(mine.enumerated()), id: \.element.id) { index, routine in
                         RoutineRow(routine: routine, theme: theme, copy: copy,
+                                   state: state(of: routine),
+                                   quarantined: model.routineIsQuarantined(routine),
                                    isBusy: busyRoutineID == routine.id,
                                    showsActions: model.mode == .live,
+                                   open: { open(routine) },
                                    toggle: { model.setRoutineEnabled(routine, enabled: !routine.isOn) },
                                    runNow: { runNow(routine) },
                                    remove: { remove(routine) })
@@ -112,14 +157,27 @@ public struct RoutinesView: View {
         .background(theme.bg)
         .task {
             model.attachActivityRouter()
+            model.attachCronDetailRouter()
             await model.refreshRoutinesLive()
+            await model.quarantineLegacyRoutines()
         }
-        .sheet(isPresented: $showCompose) {
-            NewRoutineSheet(model: model, botID: botID)
+        .onChange(of: CronDetailRuntime.shared.changeTick) {
+            // A job added from the CLI or desktop lands here as cron.changed;
+            // the quarantine has to see it too, not just what was on screen at
+            // first paint. It is a no-op when nothing matches.
+            Task { await model.quarantineLegacyRoutines() }
         }
     }
 
     // MARK: Actions
+
+    /// Demo mode opens the same screen; it just has nothing live to read, so
+    /// the REST-backed sections stay hidden and nothing can be saved.
+    private func open(_ routine: Routine) {
+        actionError = nil
+        actionNote = nil
+        withAnimation(.easeOut(duration: 0.32)) { editing = routine }
+    }
 
     private func runNow(_ routine: Routine) {
         busyRoutineID = routine.id
@@ -133,7 +191,7 @@ public struct RoutinesView: View {
                 _ = try await model.runRoutineNow(routine)
                 actionNote = copy.routineRunStarted(theme.id)
             } catch {
-                actionError = (error as? GatewayError)?.message ?? error.localizedDescription
+                actionError = AppModel.reason(error)
             }
         }
     }
@@ -147,9 +205,21 @@ public struct RoutinesView: View {
             do {
                 try await model.deleteRoutine(routine)
             } catch {
-                actionError = (error as? GatewayError)?.message ?? error.localizedDescription
+                actionError = AppModel.reason(error)
             }
         }
+    }
+
+    /// The row's lifecycle state, from the socket listing. Desktop keys its
+    /// status pip off the same field (`jobState`, app/cron/job-state.ts:16).
+    private func state(of routine: Routine) -> String {
+        guard let job = feeds.cronJobs[routine.id] else {
+            return routine.isOn ? "scheduled" : "disabled"
+        }
+        if (job.lastStatus ?? "").lowercased() == "error"
+            || (job.lastStatus ?? "") == "blocked_config" { return "error" }
+        let state = job.state.trimmingCharacters(in: .whitespaces)
+        return state.isEmpty ? (job.enabled ? "scheduled" : "disabled") : state
     }
 
     // MARK: Header
@@ -248,7 +318,7 @@ public struct RoutinesView: View {
 
     private var newRoutineRow: some View {
         Button {
-            showCompose = true
+            withAnimation(.easeOut(duration: 0.32)) { composing = true }
         } label: {
             Text(copy.newRoutine)
                 .font(newRoutineFont)
@@ -310,33 +380,57 @@ private struct RoutineRow: View {
     let routine: Routine
     let theme: ThemePack
     let copy: CopyPack
+    /// Lifecycle state as the gateway reports it, for the status pip.
+    let state: String
+    /// A pre-v2 delegated routine: readable and deletable, never re-armable.
+    let quarantined: Bool
     let isBusy: Bool
     let showsActions: Bool
+    let open: () -> Void
     let toggle: () -> Void
     let runNow: () -> Void
     let remove: () -> Void
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(routine.name)
-                    .font(nameFont)
-                    .foregroundStyle(theme.ink)
-                Text(verbatim: scheduleLine)
-                    .font(theme.id == .soft ? theme.body(11) : theme.mono(theme.id == .ink ? 8.5 : 9.5))
-                    .foregroundStyle(theme.sub)
-                if !routine.last.isEmpty {
-                    Text(routine.last)
-                        .font(theme.id == .control ? theme.mono(10) : theme.body(theme.id == .ink ? 13 : 12))
-                        .italic(theme.id == .ink)
-                        .foregroundStyle(routine.isOn ? theme.ok : theme.faint)
+            // Pinned to the title line, not the row's vertical centre — the
+            // pip answers "what state is this in", which reads as part of the
+            // name rather than of the schedule underneath it.
+            Circle()
+                .fill(pipTone)
+                .frame(width: 6, height: 6)
+                .padding(.top, pipDrop)
+                .frame(maxHeight: .infinity, alignment: .top)
+
+            Button(action: open) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(routine.name)
+                        .font(nameFont)
+                        .foregroundStyle(theme.ink)
+                    Text(verbatim: scheduleLine)
+                        .font(theme.id == .soft ? theme.body(11) : theme.mono(theme.id == .ink ? 8.5 : 9.5))
+                        .foregroundStyle(theme.sub)
+                    if quarantined {
+                        Text(copy.routineQuarantineWhy(theme.id))
+                            .font(theme.id == .control ? theme.mono(9) : theme.body(theme.id == .ink ? 12.5 : 11))
+                            .foregroundStyle(theme.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if !routine.last.isEmpty {
+                        Text(routine.last)
+                            .font(theme.id == .control ? theme.mono(10) : theme.body(theme.id == .ink ? 13 : 12))
+                            .italic(theme.id == .ink)
+                            .foregroundStyle(routine.isOn ? theme.ok : theme.faint)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .buttonStyle(.plain)
 
             if showsActions {
                 Menu {
-                    Button(copy.runNow(theme.id), action: runNow)
+                    Button(copy.routineEditAction(theme.id), action: open)
+                    Button(copy.runNow(theme.id), action: runNow).disabled(quarantined)
                     Button(copy.deleteRoutineLabel(theme.id), role: .destructive, action: remove)
                 } label: {
                     Text(verbatim: "···")
@@ -350,14 +444,44 @@ private struct RoutineRow: View {
                 .opacity(isBusy ? 0.4 : 1)
             }
 
-            ThemedToggle(isOn: routine.isOn, theme: theme, action: toggle)
+            // A quarantined routine's switch is dead on purpose: re-arming it
+            // would run the unescaped shell wrapper it was written with.
+            RoutineSwitch(isOn: routine.isOn && !quarantined, theme: theme) {
+                guard !quarantined else { return }
+                toggle()
+            }
+            .opacity(quarantined ? 0.4 : 1)
         }
         .modifier(RoutineRowChrome(theme: theme))
         .contextMenu {
             if showsActions {
-                Button(copy.runNow(theme.id), action: runNow)
+                Button(copy.routineEditAction(theme.id), action: open)
+                Button(copy.runNow(theme.id), action: runNow).disabled(quarantined)
                 Button(copy.deleteRoutineLabel(theme.id), role: .destructive, action: remove)
             }
+        }
+    }
+
+    /// Where the pip sits relative to the row's top edge, so it lands on the
+    /// title's x-height in each theme's type scale.
+    private var pipDrop: CGFloat {
+        switch theme.id {
+        case .soft: 7
+        case .control: 7
+        case .ink: 9
+        }
+    }
+
+    /// Desktop's STATE_DOT palette (app/cron/job-state.ts:5) in theme tokens:
+    /// live states take the accent, paused amber, error destructive, and a
+    /// spent or disabled job goes quiet.
+    private var pipTone: Color {
+        if quarantined { return theme.danger }
+        switch state.lowercased() {
+        case "error": return theme.danger
+        case "paused": return theme.warn
+        case "completed", "disabled": return theme.faint
+        default: return routine.isOn ? theme.accent : theme.faint
         }
     }
 
@@ -373,211 +497,6 @@ private struct RoutineRow: View {
         case .soft: theme.body(14.5, weight: .bold)
         case .control: theme.body(14, weight: .bold)
         case .ink: theme.body(17.5, weight: .bold)
-        }
-    }
-}
-
-// MARK: - New routine composer
-
-/// Schedule + prompt, the two things a Hermes cron job needs. The schedule
-/// field takes the phrases people actually type and normalizes them into the
-/// gateway's narrow grammar (HermesSchedule), showing the result before send.
-private struct NewRoutineSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    let model: AppModel
-    let botID: String
-
-    @State private var title = ""
-    @State private var schedule = ""
-    @State private var prompt = ""
-    @State private var repeatForever = true
-    @State private var continuity = false
-    @State private var saving = false
-    @State private var error: String?
-
-    private var theme: ThemePack { model.theme.pack }
-    private var copy: CopyPack { model.theme.copy }
-
-    private static let presets: [(soft: String, control: String, ink: String, value: String)] = [
-        ("every morning at 7", "0 7 * * *", "every morning at seven", "0 7 * * *"),
-        ("weekdays at 9", "0 9 * * 1-5", "weekdays at nine", "0 9 * * 1-5"),
-        ("every hour", "every 1h", "hourly", "every 1h"),
-        ("every 30m", "every 30m", "every half hour", "every 30m"),
-    ]
-
-    private var normalized: String? { HermesSchedule.normalize(schedule) }
-
-    private var canCreate: Bool {
-        !title.trimmingCharacters(in: .whitespaces).isEmpty
-            && !prompt.trimmingCharacters(in: .whitespaces).isEmpty
-            && normalized != nil && !saving
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            header
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    field(copy.routineNamePlaceholder(theme.id), text: $title, lines: 1)
-                    field(copy.routineSchedulePlaceholder(theme.id), text: $schedule, lines: 1)
-                    presetRow
-                    scheduleEcho
-                    field(copy.routinePromptPlaceholder(theme.id), text: $prompt, lines: 4)
-                    optionRow(copy.repeatForever(theme.id), isOn: $repeatForever)
-                    optionRow(copy.continuityLabel(theme.id), isOn: $continuity)
-                    if let error {
-                        Text(error)
-                            .font(footFont)
-                            .foregroundStyle(theme.danger)
-                    }
-                    Text(copy.cronNote)
-                        .font(footFont)
-                        .italic(theme.id == .ink)
-                        .foregroundStyle(theme.faint)
-                        .lineSpacing(3)
-                }
-                .padding(.horizontal, 18)
-                .padding(.top, 10)
-                .padding(.bottom, 40)
-            }
-        }
-        .background(theme.bg.ignoresSafeArea())
-    }
-
-    private var header: some View {
-        HStack {
-            Button(copy.cancel) { dismiss() }
-                .buttonStyle(.plain)
-                .font(headerButtonFont)
-                .foregroundStyle(theme.id == .soft ? theme.accent : theme.sub)
-            Spacer()
-            Text(copy.newRoutineTitle(theme.id))
-                .font(titleFont)
-                .foregroundStyle(theme.ink)
-            Spacer()
-            Button(copy.createOk) { create() }
-                .buttonStyle(.plain)
-                .font(headerButtonFont)
-                .foregroundStyle(canCreate ? (theme.id == .ink ? theme.accent : theme.accent) : theme.faint)
-                .disabled(!canCreate)
-        }
-        .padding(.horizontal, 18)
-        .padding(.top, 16)
-        .padding(.bottom, 10)
-        .overlay(alignment: .bottom) { theme.line.frame(height: 1) }
-    }
-
-    private var presetRow: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 7) {
-                ForEach(Self.presets, id: \.value) { preset in
-                    let label = theme.id == .soft ? preset.soft
-                        : theme.id == .control ? preset.control : preset.ink
-                    Button {
-                        schedule = preset.value
-                    } label: {
-                        Text(label)
-                            .font(theme.id == .control ? theme.mono(10) : theme.body(12))
-                            .foregroundStyle(schedule == preset.value ? theme.accent : theme.sub)
-                            .padding(.vertical, 6)
-                            .padding(.horizontal, 11)
-                            .chipShell(theme)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.vertical, 1)
-        }
-    }
-
-    @ViewBuilder private var scheduleEcho: some View {
-        if schedule.trimmingCharacters(in: .whitespaces).isEmpty {
-            EmptyView()
-        } else if let normalized {
-            Text(verbatim: "→ \(normalized)")
-                .font(theme.mono(theme.id == .ink ? 10 : 10.5))
-                .foregroundStyle(theme.ok)
-        } else {
-            Text(copy.scheduleHelp(theme.id))
-                .font(footFont)
-                .foregroundStyle(theme.warn)
-        }
-    }
-
-    private func field(_ placeholder: String, text: Binding<String>, lines: Int) -> some View {
-        TextField(placeholder, text: text, axis: lines > 1 ? .vertical : .horizontal)
-            .textFieldStyle(.plain)
-            .lineLimit(lines > 1 ? lines...(lines + 6) : 1...1)
-            .font(fieldFont)
-            .foregroundStyle(theme.ink)
-            .tint(theme.accent)
-            .autocorrectionDisabled(lines == 1)
-            .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
-            .background(theme.id == .ink ? Color.clear : theme.panel)
-            .clipShape(RoundedRectangle(cornerRadius: theme.inputRadius > 100 ? 14 : theme.inputRadius,
-                                        style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: theme.inputRadius > 100 ? 14 : theme.inputRadius,
-                                      style: .continuous)
-                .strokeBorder(theme.id == .soft ? theme.line : theme.lineStrong, lineWidth: 1))
-    }
-
-    private func optionRow(_ label: String, isOn: Binding<Bool>) -> some View {
-        HStack {
-            Text(label)
-                .font(theme.id == .control ? theme.mono(11) : theme.body(theme.id == .ink ? 14.5 : 13))
-                .foregroundStyle(theme.sub)
-            Spacer(minLength: 8)
-            ThemedToggle(isOn: isOn.wrappedValue, theme: theme) { isOn.wrappedValue.toggle() }
-        }
-        .padding(.vertical, 2)
-    }
-
-    private func create() {
-        saving = true
-        error = nil
-        Task { @MainActor in
-            defer { saving = false }
-            do {
-                try await model.createRoutine(botID: botID, title: title,
-                                              schedule: schedule, prompt: prompt,
-                                              repeatCount: repeatForever ? nil : 1,
-                                              continuity: continuity)
-                dismiss()
-            } catch {
-                self.error = (error as? GatewayError)?.message ?? error.localizedDescription
-            }
-        }
-    }
-
-    private var titleFont: Font {
-        switch theme.id {
-        case .soft: theme.body(17, weight: .heavy)
-        case .control: theme.mono(13, weight: .bold)
-        case .ink: theme.display(20, weight: .bold).smallCaps()
-        }
-    }
-
-    private var headerButtonFont: Font {
-        switch theme.id {
-        case .soft: theme.body(14, weight: .semibold)
-        case .control: theme.mono(11, weight: .semibold)
-        case .ink: theme.body(14, weight: .semibold).smallCaps()
-        }
-    }
-
-    private var fieldFont: Font {
-        switch theme.id {
-        case .soft: theme.body(14)
-        case .control: theme.mono(12)
-        case .ink: theme.body(15.5)
-        }
-    }
-
-    private var footFont: Font {
-        switch theme.id {
-        case .soft: theme.body(11.5)
-        case .control: theme.mono(9.5)
-        case .ink: theme.body(13)
         }
     }
 }
@@ -615,8 +534,9 @@ private struct RoutineRowChrome: ViewModifier {
     }
 }
 
-/// The design's 46×27 custom switch (trackOn/trackOff/knobCss tokens).
-private struct ThemedToggle: View {
+/// The design's 46×27 custom switch (trackOn/trackOff/knobCss tokens). Shared
+/// with the routine editor's option rows.
+struct RoutineSwitch: View {
     let isOn: Bool
     let theme: ThemePack
     let action: () -> Void

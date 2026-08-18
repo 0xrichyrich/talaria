@@ -1,17 +1,30 @@
+import Foundation
+import Observation
 import SwiftUI
 import TalariaKit
 import TalariaTheme
 
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
+
 // The bot's stored sessions — desktop's sidebar session list, folded into one
 // phone sheet (PARITY.md §4 "Sessions & history").
 //
-// Rows come from session.list {limit:200, profile}; tapping one resumes it by
-// durable key and rebinds the chat. Swiping a row renames (session.title /
-// PATCH) or deletes it (session.delete, which refuses a live session with
-// 4023). The overflow carries the turn controls that act on the bot's current
-// session: branch, compress and export. Typing filters the loaded rows and,
-// past two characters, also runs the gateway's full-text index so a phrase
-// from inside a conversation finds it.
+// This is a POWER-USER surface and stays one. The canonical forever-chat is the
+// mobile model: you tap a bot and you are in its conversation, always. Session
+// management is a desktop concern, so every verb past "open" lives behind a
+// long-press or a swipe inside this sheet and none of it is ever primary
+// navigation (ROADMAP decision #4).
+//
+// Rows come from session.list {limit:200, profile, include_hidden}; tapping one
+// resumes it by durable key and rebinds the chat. Long-press carries the verbs:
+// pin, rename, export, archive, delete, and — on the row that is currently
+// bound to this bot's chat — branch and compress. Typing filters the loaded
+// rows and, past two characters, also runs the gateway's full-text index so a
+// phrase from inside a conversation finds it.
 
 @MainActor
 public struct SessionsSheet: View {
@@ -31,6 +44,8 @@ public struct SessionsSheet: View {
     @State private var working = false
     @State private var renameTarget: String?
     @State private var renameText = ""
+    @State private var showArchived = false
+    @State private var exported: ExportedFile?
     @FocusState private var renameFocused: Bool
 
     /// `onOpen` fires after the chat has been rebound onto the tapped
@@ -43,7 +58,6 @@ public struct SessionsSheet: View {
 
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
-
     // MARK: - Rows
 
     /// One list row, from either the loaded page or the full-text index.
@@ -55,23 +69,29 @@ public struct SessionsSheet: View {
         let preview: String
         /// A full-text hit outside the loaded page — no local counts for it.
         let remote: Bool
+        var pinned: Bool = false
     }
 
     private var trimmedQuery: String {
         query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
+    /// Loaded rows, pinned first. A pin is a "this must always be reachable"
+    /// statement, so it outranks recency — the same rule the desktop sidebar's
+    /// Pinned section encodes.
     private var storedRows: [Row] {
         let stored = model.chats[botID]?.storedSessions ?? []
         let needle = trimmedQuery
-        return stored.compactMap { session in
+        let rows: [Row] = stored.compactMap { session in
             let preview = model.sessionPreview(session.id) ?? ""
             guard needle.isEmpty
                     || session.title.lowercased().contains(needle)
                     || preview.lowercased().contains(needle) else { return nil }
             return Row(id: session.id, title: session.title, when: session.when,
-                       messageCount: session.messageCount, preview: preview, remote: false)
+                       messageCount: session.messageCount, preview: preview, remote: false,
+                       pinned: model.isSessionPinned(session.id, botID: botID))
         }
+        return rows.filter(\.pinned) + rows.filter { !$0.pinned }
     }
 
     private var remoteRows: [Row] {
@@ -83,7 +103,15 @@ public struct SessionsSheet: View {
         }
     }
 
+    private var archived: [ArchivedSessionRecord] { model.archivedSessions(botID: botID) }
+
     private var isEmpty: Bool { storedRows.isEmpty && remoteRows.isEmpty }
+
+    /// The session this bot's chat is currently bound to. Branch and compress
+    /// resolve RUNTIME sids, so they are only offered on the row the gateway
+    /// already holds live — anything else would need a silent resume behind the
+    /// user's back (GatewayClient+Sessions.swift, ws-protocol.md §7.4).
+    private var currentSessionID: String? { model.chats[botID]?.storedSessionID }
 
     // MARK: - Body
 
@@ -117,12 +145,22 @@ public struct SessionsSheet: View {
         .presentationBackground(theme.bg)
         .presentationDetents([.large])
         .overlay { if renameTarget != nil { renameOverlay } }
+        .sheet(item: $exported) { file in
+            #if os(iOS)
+            TalariaShareSheet(items: [file.url]) { exported = nil }
+            #else
+            EmptyView()
+            #endif
+        }
         .task(id: botID) { await load() }
         .onDisappear { searchTask?.cancel() }
     }
 
     // MARK: - Header pieces
 
+    /// Turn controls for the session the chat is on right now. These are the
+    /// ones that act on a LIVE session (runtime sid), which is why they hang off
+    /// the header rather than off an arbitrary row.
     private var overflow: some View {
         Menu {
             Button(copy.sessBranch(theme.id)) { run { await model.branchSession(botID: botID) } }
@@ -249,8 +287,11 @@ public struct SessionsSheet: View {
                 ForEach(remoteRows) { row in sessionRow(row) }
             }
 
+            if !archived.isEmpty { archivedSection }
+
             if !loading, !isEmpty {
-                noteRow(copy.sessFootnote(theme.id), tone: theme.faint)
+                noteRow(copy.sessFootnote(theme.id, canArchive: model.sessionFlagsSupported),
+                        tone: theme.faint)
             }
         }
         .listStyle(.plain)
@@ -265,11 +306,18 @@ public struct SessionsSheet: View {
         } label: {
             HStack(alignment: .top, spacing: 10) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(row.title)
-                        .font(theme.id == .ink ? theme.body(15.5, weight: .semibold)
-                                               : theme.body(13.5, weight: .semibold))
-                        .foregroundStyle(theme.ink)
-                        .lineLimit(1)
+                    HStack(spacing: 5) {
+                        if row.pinned {
+                            Text(verbatim: "◆")
+                                .font(theme.mono(9, weight: .bold))
+                                .foregroundStyle(theme.accent)
+                        }
+                        Text(row.title)
+                            .font(theme.id == .ink ? theme.body(15.5, weight: .semibold)
+                                                   : theme.body(13.5, weight: .semibold))
+                            .foregroundStyle(theme.ink)
+                            .lineLimit(1)
+                    }
                     Text(metaLine(row))
                         .font(theme.id == .soft ? theme.body(11, weight: .medium)
                                                 : theme.mono(theme.id == .ink ? 9 : 10))
@@ -301,23 +349,130 @@ public struct SessionsSheet: View {
         .listRowSeparator(.hidden)
         .listRowBackground(theme.bg)
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-            Button(role: .destructive) { delete(row) } label: {
-                Text(copy.sessDelete(theme.id))
+            // Archive is the safe phone gesture, so it takes the swipe slot and
+            // delete moves to the long-press menu (PARITY.md §sidebars-nav:249).
+            // A row that cannot be archived keeps the old pair, or delete would
+            // have no reachable affordance at all.
+            if canArchive(row) {
+                Button { archive(row) } label: { Text(copy.sessArchive(theme.id)) }
+                    .tint(theme.warn)
+            } else {
+                Button(role: .destructive) { delete(row) } label: {
+                    Text(copy.sessDelete(theme.id))
+                }
             }
             Button { startRename(row) } label: {
                 Text(copy.sessRename(theme.id))
             }
             .tint(theme.accent)
         }
-        .contextMenu {
-            Button(copy.sessRename(theme.id)) { startRename(row) }
-            Button(copy.sessDelete(theme.id), role: .destructive) { delete(row) }
+        .contextMenu { rowMenu(row) }
+    }
+
+    /// The tucked-away verb set. Long-press is deliberately the only door: none
+    /// of this competes with tapping a bot and being in its chat.
+    @ViewBuilder private func rowMenu(_ row: Row) -> some View {
+        if model.sessionFlagsSupported, !row.remote {
+            Button(row.pinned ? copy.sessUnpin(theme.id) : copy.sessPin(theme.id)) {
+                pin(row, pinned: !row.pinned)
+            }
         }
+        Button(copy.sessRename(theme.id)) { startRename(row) }
+        if row.id == currentSessionID {
+            Button(copy.sessBranch(theme.id)) { run { await model.branchSession(botID: botID) } }
+            Button(copy.sessCompress(theme.id)) { run { await model.compressSession(botID: botID) } }
+        }
+        Button(copy.sessShare(theme.id)) { share(row) }
+        Button(copy.sessCopyID(theme.id)) { model.copySessionID(row.id) }
+        if canArchive(row) {
+            Button(copy.sessArchive(theme.id)) { archive(row) }
+        }
+        Button(copy.sessDelete(theme.id), role: .destructive) { delete(row) }
+    }
+
+    /// The bot's forever-chat is deliberately not archivable. Archiving drops a
+    /// row out of `session.list`, and canonical resolution's last-resort probe
+    /// reads that list to decide whether a bot has any history at all
+    /// (AppModelLive+CanonicalChat.swift, step (c)) — so archiving the one chat
+    /// that IS the product could send the next open down the birth path and
+    /// fork the conversation. Delete stays available; it clears the binding
+    /// honestly instead of hiding it.
+    private func canArchive(_ row: Row) -> Bool {
+        guard model.sessionFlagsSupported, !row.remote else { return false }
+        return !model.isCanonicalChat(row.id, botID: botID)
     }
 
     private func metaLine(_ row: Row) -> String {
         guard !row.remote, row.messageCount > 0 else { return row.when }
         return "\(row.when) · \(row.messageCount) \(copy.sessMessages(theme.id))"
+    }
+
+    // MARK: Archived
+
+    /// Archived rows are gone from `session.list` (it filters `archived = 0`),
+    /// and the REST archived listing cannot return the hidden Bot Mode ones —
+    /// so the ledger this device wrote when it archived them is what keeps
+    /// Restore reachable. Collapsed by default; this is not a destination.
+    @ViewBuilder private var archivedSection: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.2)) { showArchived.toggle() }
+        } label: {
+            HStack(spacing: 6) {
+                Text(verbatim: showArchived ? "▾" : "▸")
+                    .font(theme.mono(9, weight: .bold))
+                    .foregroundStyle(theme.faint)
+                Text("\(copy.sessArchivedSection(theme.id)) \(archived.count)")
+                    .font(theme.id == .soft ? theme.body(11, weight: .heavy)
+                                            : theme.mono(9, weight: .bold))
+                    .tracking(theme.id == .soft ? 1 : 2)
+                    .foregroundStyle(theme.faint)
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 12)
+        .padding(.bottom, 2)
+        .listRowInsets(EdgeInsets(top: 0, leading: 20, bottom: 0, trailing: 20))
+        .listRowSeparator(.hidden)
+        .listRowBackground(theme.bg)
+
+        if showArchived {
+            ForEach(archived) { record in archivedRow(record) }
+        }
+    }
+
+    private func archivedRow(_ record: ArchivedSessionRecord) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(record.title)
+                    .font(theme.id == .ink ? theme.body(15, weight: .semibold)
+                                           : theme.body(13, weight: .semibold))
+                    .foregroundStyle(theme.sub)
+                    .lineLimit(1)
+                Text(record.when)
+                    .font(theme.mono(theme.id == .ink ? 9 : 10))
+                    .foregroundStyle(theme.faint)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button(copy.sessRestore(theme.id)) { restore(record) }
+                .font(theme.id == .control ? theme.mono(10, weight: .semibold)
+                                           : theme.body(12, weight: .semibold))
+                .foregroundStyle(theme.accent)
+                .buttonStyle(.plain)
+        }
+        .padding(EdgeInsets(top: 10, leading: 13, bottom: 10, trailing: 13))
+        .opacity(0.85)
+        .modifier(SessionRowChrome(theme: theme))
+        .listRowInsets(EdgeInsets(top: theme.rowStyle == .ledger ? 0 : 3, leading: 20,
+                                  bottom: theme.rowStyle == .ledger ? 0 : 3, trailing: 20))
+        .listRowSeparator(.hidden)
+        .listRowBackground(theme.bg)
+        .contextMenu {
+            Button(copy.sessRestore(theme.id)) { restore(record) }
+            Button(copy.sessDelete(theme.id), role: .destructive) { deleteArchived(record) }
+        }
     }
 
     private var loadingRow: some View {
@@ -420,6 +575,9 @@ public struct SessionsSheet: View {
         await model.refreshSessions(botID: botID)
         loadError = model.sessionsLoadError(for: botID)
         loading = false
+        // Pins are written through to the gateway but read back from it too,
+        // so a reinstalled phone recovers what desktop pinned.
+        await model.syncSessionFlags(botID: botID)
     }
 
     private func open(_ row: Row) {
@@ -437,6 +595,94 @@ public struct SessionsSheet: View {
             if let failure {
                 withAnimation(.easeOut(duration: 0.2)) {
                     outcome = SessionActionOutcome(ok: false, headline: failure)
+                }
+            } else {
+                model.forgetSessionFlags(row.id, botID: botID)
+            }
+        }
+    }
+
+    private func deleteArchived(_ record: ArchivedSessionRecord) {
+        Task { @MainActor in
+            working = true
+            let failure = await model.deleteStoredSession(record.sessionID, botID: botID)
+            working = false
+            if let failure {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    outcome = SessionActionOutcome(ok: false, headline: failure)
+                }
+            } else {
+                model.forgetSessionFlags(record.sessionID, botID: botID)
+            }
+        }
+    }
+
+    private func pin(_ row: Row, pinned: Bool) {
+        Task { @MainActor in
+            working = true
+            let failure = await model.setSessionPinned(row.id, botID: botID, pinned: pinned)
+            working = false
+            if let failure {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    outcome = SessionActionOutcome(ok: false, headline: failure)
+                }
+            }
+        }
+    }
+
+    private func archive(_ row: Row) {
+        Task { @MainActor in
+            working = true
+            let failure = await model.archiveStoredSession(row.id, botID: botID, title: row.title,
+                                                           when: row.when)
+            working = false
+            hits.removeAll { $0.sessionID == row.id }
+            withAnimation(.easeOut(duration: 0.2)) {
+                outcome = failure.map { SessionActionOutcome(ok: false, headline: $0) }
+                    ?? SessionActionOutcome(ok: true, headline: copy.sessArchived(theme.id),
+                                            detail: row.title)
+            }
+        }
+    }
+
+    private func restore(_ record: ArchivedSessionRecord) {
+        Task { @MainActor in
+            working = true
+            let failure = await model.restoreArchivedSession(record)
+            working = false
+            if let failure {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    outcome = SessionActionOutcome(ok: false, headline: failure)
+                }
+            } else {
+                await load()
+            }
+        }
+    }
+
+    /// Pull the whole transcript as JSON and hand it to the share sheet. This
+    /// is the phone's export: `session.save` writes a snapshot on the GATEWAY
+    /// host (still in the header overflow, still useful), but a copy you can
+    /// actually send someone has to come over the wire.
+    private func share(_ row: Row) {
+        Task { @MainActor in
+            working = true
+            let result = await model.exportStoredSession(row.id, botID: botID, title: row.title)
+            working = false
+            switch result {
+            case .ready(let url):
+                #if os(iOS)
+                exported = ExportedFile(url: url)
+                #else
+                withAnimation(.easeOut(duration: 0.2)) {
+                    outcome = SessionActionOutcome(ok: true,
+                                                   headline: copy.sessShared(theme.id),
+                                                   detail: url.path)
+                }
+                #endif
+            case .failed(let reason):
+                withAnimation(.easeOut(duration: 0.2)) {
+                    outcome = SessionActionOutcome(ok: false, headline: reason)
                 }
             }
         }
@@ -536,6 +782,380 @@ private struct SessionRowChrome: ViewModifier {
     }
 }
 
+// MARK: - Durable session flags (pin / archive)
+
+/// One session this device archived, kept so Restore stays reachable.
+///
+/// It has to be kept: `session.list` filters `archived = 0`
+/// (hermes_state.py:8766) and the REST archived listing never returns hidden
+/// rows — and every Bot Mode session, the canonical forever-chat included, is
+/// born hidden (plugin.js:2540, 2759-2763). Without this ledger, archiving a
+/// bot's own chat from the phone would put it somewhere the phone cannot look.
+public struct ArchivedSessionRecord: Codable, Sendable, Identifiable, Equatable {
+    public var sessionID: String
+    public var botID: String
+    public var gateway: String
+    public var title: String
+    public var when: String
+    public var at: Double
+
+    public var id: String { gateway + "|" + botID + "|" + sessionID }
+}
+
+/// Pin state and the archive ledger, per gateway. Observable so the sheet
+/// repaints the moment a verb lands.
+///
+/// Pins are a hybrid on purpose, and desktop's sidebar is the same shape: the
+/// durable flag is written to the gateway (`PATCH /api/sessions/{id} {pinned}`)
+/// so a pin made on the phone shows up on the desktop, while the local set is
+/// what the list actually sorts on — because the gateway's session listing
+/// cannot report the flag for hidden Bot Mode rows, which is most of them.
+@MainActor
+@Observable
+public final class SessionVerbStore {
+    public static let shared = SessionVerbStore()
+
+    /// "<gateway>|<bot>|<session>" for every pinned session.
+    private(set) var pinned: Set<String> = []
+    private(set) var archived: [ArchivedSessionRecord] = []
+    /// nil until probed on this gateway; false once it proves it has no
+    /// session-flags route, which hides pin and archive rather than offering
+    /// buttons that cannot work.
+    var supported: Bool?
+    @ObservationIgnored private var probedGateway: String?
+
+    static let pinsKey = "talaria-session-pins"
+    static let archiveKey = "talaria-session-archive"
+
+    /// Restored eagerly rather than lazily: the sheet reads pin state inside
+    /// `body`, and a lazy load would mutate observed state mid-render.
+    private init() {
+        let defaults = UserDefaults.standard
+        if let raw = defaults.array(forKey: Self.pinsKey) as? [String] {
+            pinned = Set(raw)
+        }
+        if let data = defaults.data(forKey: Self.archiveKey),
+           let rows = try? JSONDecoder().decode([ArchivedSessionRecord].self, from: data) {
+            archived = rows
+        }
+    }
+
+    func gateway() -> String {
+        LiveRuntime.shared.baseURL?.absoluteString ?? "demo"
+    }
+
+    func key(_ sessionID: String, botID: String) -> String {
+        gateway() + "|" + botID + "|" + sessionID
+    }
+
+    func isPinned(_ sessionID: String, botID: String) -> Bool {
+        pinned.contains(key(sessionID, botID: botID))
+    }
+
+    func setPinned(_ sessionID: String, botID: String, _ value: Bool) {
+        let id = key(sessionID, botID: botID)
+        if value { pinned.insert(id) } else { pinned.remove(id) }
+        UserDefaults.standard.set(Array(pinned), forKey: Self.pinsKey)
+    }
+
+    /// Replace this bot's pins with the gateway's own answer, keeping every pin
+    /// the server could not speak for (hidden rows it never lists).
+    func adoptServerPins(_ ids: Set<String>, seen: Set<String>, botID: String) {
+        let prefix = gateway() + "|" + botID + "|"
+        for sessionID in seen {
+            let id = prefix + sessionID
+            if ids.contains(sessionID) { pinned.insert(id) } else { pinned.remove(id) }
+        }
+        UserDefaults.standard.set(Array(pinned), forKey: Self.pinsKey)
+    }
+
+    func rows(botID: String) -> [ArchivedSessionRecord] {
+        let gateway = gateway()
+        return archived
+            .filter { $0.gateway == gateway && $0.botID == botID }
+            .sorted { $0.at > $1.at }
+    }
+
+    func remember(_ record: ArchivedSessionRecord) {
+        archived.removeAll { $0.id == record.id }
+        archived.insert(record, at: 0)
+        if archived.count > 200 { archived.removeLast(archived.count - 200) }
+        persistArchive()
+    }
+
+    func forget(_ sessionID: String, botID: String) {
+        let id = key(sessionID, botID: botID)
+        archived.removeAll { $0.id == id }
+        pinned.remove(id)
+        UserDefaults.standard.set(Array(pinned), forKey: Self.pinsKey)
+        persistArchive()
+    }
+
+    private func persistArchive() {
+        guard let data = try? JSONEncoder().encode(archived) else { return }
+        UserDefaults.standard.set(data, forKey: Self.archiveKey)
+    }
+
+    /// A gateway swap re-opens the question of whether these routes exist.
+    func noteGateway() {
+        let current = gateway()
+        guard probedGateway != current else { return }
+        probedGateway = current
+        supported = nil
+    }
+}
+
+// MARK: - Session verbs (durable-key REST)
+
+public extension AppModel {
+
+    /// True while pin/archive are worth offering: live, with a reachable HTTP
+    /// credential, and on a gateway that has not refused the route. A gateway
+    /// without it simply never shows those two verbs.
+    var sessionFlagsSupported: Bool {
+        guard mode == .live, !isOffline, gatewayRESTContext() != nil else { return false }
+        return SessionVerbStore.shared.supported != false
+    }
+
+    func isSessionPinned(_ sessionID: String, botID: String) -> Bool {
+        SessionVerbStore.shared.isPinned(sessionID, botID: botID)
+    }
+
+    /// Is this row the bot's canonical forever-chat? The pin lives in
+    /// `ui_meta["hermes-bots"].chat` and is mirrored into the canonical-chat
+    /// runtime on every roster poll, so this is the same answer `openChat`
+    /// resolves against.
+    func isCanonicalChat(_ sessionID: String, botID: String) -> Bool {
+        !sessionID.isEmpty && CanonicalChatRuntime.shared.pins[botID] == sessionID
+    }
+
+    func archivedSessions(botID: String) -> [ArchivedSessionRecord] {
+        SessionVerbStore.shared.rows(botID: botID)
+    }
+
+    /// Drop every local trace of a session (after a delete).
+    func forgetSessionFlags(_ sessionID: String, botID: String) {
+        SessionVerbStore.shared.forget(sessionID, botID: botID)
+    }
+
+    /// Pin or unpin. Optimistic — the row jumps immediately — and rolled back
+    /// if the gateway refuses, because a pin that silently did not take is
+    /// worse than one that visibly failed.
+    func setSessionPinned(_ sessionID: String, botID: String, pinned: Bool) async -> String? {
+        let store = SessionVerbStore.shared
+        guard let (base, credential) = gatewayRESTContext() else {
+            return theme.copy.needsRESTNote(theme.themeID)
+        }
+        store.setPinned(sessionID, botID: botID, pinned)
+        do {
+            try await GatewayREST.patchSession(baseURL: base, credential: credential,
+                                               sessionID: sessionID, profile: botID,
+                                               pinned: pinned)
+            return nil
+        } catch {
+            store.setPinned(sessionID, botID: botID, !pinned)
+            noteFlagsRoute(error)
+            return Self.sessionFailure(error, theme: theme)
+        }
+    }
+
+    /// Soft-archive: the row leaves every list without the transcript being
+    /// destroyed. Deliberately NOT `session.set_hidden` — Bot Mode sessions are
+    /// already born hidden (plugin.js:2540, 2759-2763), so clearing `hidden` on
+    /// a restore would leak a bot's forever-chat into desktop's global sidebar.
+    /// `archived` is the flag that means "put this away", and it is reversible.
+    func archiveStoredSession(_ sessionID: String, botID: String, title: String,
+                              when: String) async -> String? {
+        guard let (base, credential) = gatewayRESTContext() else {
+            return theme.copy.needsRESTNote(theme.themeID)
+        }
+        do {
+            try await GatewayREST.patchSession(baseURL: base, credential: credential,
+                                               sessionID: sessionID, profile: botID,
+                                               archived: true)
+        } catch {
+            noteFlagsRoute(error)
+            return Self.sessionFailure(error, theme: theme)
+        }
+        SessionVerbStore.shared.remember(
+            ArchivedSessionRecord(sessionID: sessionID, botID: botID,
+                                  gateway: SessionVerbStore.shared.gateway(),
+                                  title: title, when: when,
+                                  at: Date().timeIntervalSince1970))
+        await refreshSessions(botID: botID)
+        return nil
+    }
+
+    func restoreArchivedSession(_ record: ArchivedSessionRecord) async -> String? {
+        guard let (base, credential) = gatewayRESTContext() else {
+            return theme.copy.needsRESTNote(theme.themeID)
+        }
+        do {
+            try await GatewayREST.patchSession(baseURL: base, credential: credential,
+                                               sessionID: record.sessionID,
+                                               profile: record.botID, archived: false)
+        } catch let error as GatewayError where error.code == 404 {
+            // Already gone from the store; the ledger row is the stale thing.
+            SessionVerbStore.shared.forget(record.sessionID, botID: record.botID)
+            return nil
+        } catch {
+            noteFlagsRoute(error)
+            return Self.sessionFailure(error, theme: theme)
+        }
+        SessionVerbStore.shared.forget(record.sessionID, botID: record.botID)
+        return nil
+    }
+
+    /// Reconcile local pins against the gateway's own flags, and prove the
+    /// route exists at the same time. The listing cannot see hidden rows, so
+    /// only the sessions it DID return are reconciled — a local pin on a hidden
+    /// Bot Mode chat is left exactly as it was rather than being cleared by an
+    /// answer that was never about it.
+    func syncSessionFlags(botID: String) async {
+        let store = SessionVerbStore.shared
+        store.noteGateway()
+        guard mode == .live, !isOffline, let (base, credential) = gatewayRESTContext() else {
+            return
+        }
+        do {
+            let rows = try await GatewayREST.sessionFlags(baseURL: base, credential: credential,
+                                                          profile: botID)
+            store.supported = true
+            store.adoptServerPins(Set(rows.filter(\.value.pinned).map(\.key)),
+                                  seen: Set(rows.keys), botID: botID)
+        } catch {
+            noteFlagsRoute(error)
+        }
+    }
+
+    /// A 404/405 from the flags routes means this gateway predates them; hide
+    /// the verbs rather than showing buttons that answer with an error the user
+    /// cannot act on. Anything else (a dropped link, a 500) is transient and
+    /// leaves the surface alone.
+    private func noteFlagsRoute(_ error: Error) {
+        guard let gateway = error as? GatewayError else { return }
+        if gateway.code == 404 || gateway.code == 405 || gateway.code == 501 {
+            SessionVerbStore.shared.supported = false
+        }
+    }
+
+    /// Copy the durable session key — the id every gateway RPC, the CLI's
+    /// `--continue` and the desktop's own row menu speak.
+    func copySessionID(_ sessionID: String) {
+        #if canImport(UIKit)
+        UIPasteboard.general.string = sessionID
+        #elseif canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(sessionID, forType: .string)
+        #endif
+    }
+
+    /// Whole transcript as JSON, staged as a file for the share sheet
+    /// (`GET /api/sessions/{id}/export`, web_routers/sessions.py:735 — metadata
+    /// plus every message, keyset-paginated server-side).
+    func exportStoredSession(_ sessionID: String, botID: String,
+                             title: String) async -> SessionExport {
+        guard mode == .live, !isOffline else {
+            return .failed(theme.copy.sessUnreachable(theme.themeID))
+        }
+        guard let (base, credential) = gatewayRESTContext() else {
+            return .failed(theme.copy.needsRESTNote(theme.themeID))
+        }
+        do {
+            let data = try await GatewayREST.exportSession(baseURL: base, credential: credential,
+                                                           sessionID: sessionID, profile: botID)
+            let name = Self.exportFilename(title: title, sessionID: sessionID)
+            return .ready(try TalariaExportBox.write(data, named: name))
+        } catch {
+            return .failed(Self.sessionFailure(error, theme: theme))
+        }
+    }
+
+    /// "morning-triage-4f1c8b.json" — the session's own name where it has one,
+    /// always suffixed with the key so two exports never collide.
+    static func exportFilename(title: String, sessionID: String) -> String {
+        let cleaned = title.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" }
+        let slug = String(cleaned).split(separator: "-").joined(separator: "-")
+        let stem = slug.isEmpty ? "session" : String(slug.prefix(48))
+        return stem + "-" + String(sessionID.prefix(8)) + ".json"
+    }
+}
+
+// MARK: - REST (durable-key session routes)
+
+/// A staged transcript export, or why there is none.
+public enum SessionExport: Sendable {
+    case ready(URL)
+    case failed(String)
+}
+
+/// One session row's durable flags, as the REST listing reports them.
+public struct SessionRowFlags: Sendable, Equatable {
+    public var pinned: Bool
+    public var archived: Bool
+}
+
+public extension GatewayREST {
+
+    /// `PATCH /api/sessions/{id}` (web_routers/sessions.py:685) — title, pin,
+    /// archive and read-state on the DURABLE key. The WS `session.title` RPC
+    /// only resolves runtime sids, and there is no WS pin/archive at all, so
+    /// this is the only door for a row nobody has resumed.
+    static func patchSession(baseURL: URL, credential: GatewayCredential, sessionID: String,
+                             profile: String?, pinned: Bool? = nil,
+                             archived: Bool? = nil) async throws {
+        var payload: [String: JSONValue] = [:]
+        if let pinned { payload["pinned"] = .bool(pinned) }
+        if let archived { payload["archived"] = .bool(archived) }
+        if let profile, !profile.isEmpty { payload["profile"] = .string(profile) }
+        guard payload["pinned"] != nil || payload["archived"] != nil else { return }
+        let body = try JSONEncoder().encode(JSONValue.object(payload))
+        _ = try await restJSON(baseURL: baseURL, credential: credential,
+                               path: "api/sessions/\(sessionID)", method: "PATCH",
+                               body: body, what: "session")
+    }
+
+    /// `GET /api/sessions/{id}/export` (web_routers/sessions.py:735) — the
+    /// session's metadata and its whole transcript, streamed as one JSON
+    /// document. A big conversation is genuinely big, hence the long timeout.
+    static func exportSession(baseURL: URL, credential: GatewayCredential, sessionID: String,
+                              profile: String?) async throws -> Data {
+        var query: [URLQueryItem] = []
+        if let profile, !profile.isEmpty {
+            query.append(URLQueryItem(name: "profile", value: profile))
+        }
+        return try await restData(baseURL: baseURL, credential: credential,
+                                  path: "api/sessions/\(sessionID)/export",
+                                  query: query, timeout: 120, what: "export")
+    }
+
+    /// `GET /api/sessions` (web_routers/sessions.py:53) — the only listing that
+    /// reports the durable `pinned`/`archived` booleans.
+    ///
+    /// It cannot see hidden rows (`list_sessions_rich` defaults
+    /// `include_hidden=False`, hermes_state.py:8768) and Bot Mode sessions are
+    /// always hidden, so callers must treat this as "the flags for the rows it
+    /// DID return" and never as the complete picture.
+    static func sessionFlags(baseURL: URL, credential: GatewayCredential, profile: String?,
+                             limit: Int = 100) async throws -> [String: SessionRowFlags] {
+        var query = [URLQueryItem(name: "limit", value: String(min(limit, 100))),
+                     URLQueryItem(name: "archived", value: "include"),
+                     URLQueryItem(name: "order", value: "recent")]
+        if let profile, !profile.isEmpty {
+            query.append(URLQueryItem(name: "profile", value: profile))
+        }
+        let payload = try await restJSON(baseURL: baseURL, credential: credential,
+                                         path: "api/sessions", query: query, what: "sessions")
+        var out: [String: SessionRowFlags] = [:]
+        for row in payload["sessions"]?.arrayValue ?? [] {
+            guard let id = row["id"]?.stringValue, !id.isEmpty else { continue }
+            out[id] = SessionRowFlags(pinned: row["pinned"]?.boolValue ?? false,
+                                      archived: row["archived"]?.boolValue ?? false)
+        }
+        return out
+    }
+}
+
 // MARK: - Sessions copy (three voices, same shape as CopyPack proper)
 
 extension CopyPack {
@@ -587,11 +1207,22 @@ extension CopyPack {
         }
     }
 
-    func sessFootnote(_ t: ThemeID) -> String {
-        switch t {
-        case .soft: "Swipe a session to rename or delete it. Tap to pick up where it left off."
-        case .control: "SWIPE A ROW: RENAME / DELETE. TAP TO REATTACH."
-        case .ink: "Draw a row aside to rename or strike it out. Touch one to resume that audience."
+    /// Teaches the gesture vocabulary that is actually on this build — archive
+    /// only appears when the gateway can do it.
+    func sessFootnote(_ t: ThemeID, canArchive: Bool) -> String {
+        switch (t, canArchive) {
+        case (.soft, true):
+            return "Swipe a session to archive or rename it. Press and hold for pin, export and delete. Tap to pick up where it left off."
+        case (.soft, false):
+            return "Swipe a session to rename or delete it. Press and hold for export. Tap to pick up where it left off."
+        case (.control, true):
+            return "SWIPE: ARCHIVE / RENAME. HOLD: PIN · EXPORT · DELETE. TAP TO REATTACH."
+        case (.control, false):
+            return "SWIPE: RENAME / DELETE. HOLD: EXPORT. TAP TO REATTACH."
+        case (.ink, true):
+            return "Draw a row aside to set it by or rename it; hold it for the pin, a copy, or to strike it out. Touch one to resume that audience."
+        case (.ink, false):
+            return "Draw a row aside to rename or strike it out; hold it to take a copy. Touch one to resume that audience."
         }
     }
 
@@ -616,6 +1247,79 @@ extension CopyPack {
         case .soft: "Delete"
         case .control: "DELETE"
         case .ink: "strike out"
+        }
+    }
+
+    func sessPin(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Pin to top"
+        case .control: "PIN"
+        case .ink: "keep it foremost"
+        }
+    }
+
+    func sessUnpin(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Unpin"
+        case .control: "UNPIN"
+        case .ink: "let it fall back"
+        }
+    }
+
+    func sessArchive(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Archive"
+        case .control: "ARCHIVE"
+        case .ink: "set it by"
+        }
+    }
+
+    func sessArchived(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Archived — restore it from the section below."
+        case .control: "ARCHIVED — RESTORABLE BELOW."
+        case .ink: "Set by; it may be called back from below."
+        }
+    }
+
+    func sessArchivedSection(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Archived"
+        case .control: "ARCHIVED"
+        case .ink: "SET ASIDE"
+        }
+    }
+
+    func sessRestore(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Restore"
+        case .control: "RESTORE"
+        case .ink: "call it back"
+        }
+    }
+
+    func sessCopyID(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Copy session id"
+        case .control: "COPY SESSION ID"
+        case .ink: "copy its mark"
+        }
+    }
+
+    /// The row-level export: the transcript itself, on this phone.
+    func sessShare(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Share transcript…"
+        case .control: "EXPORT TRANSCRIPT"
+        case .ink: "carry the record away"
+        }
+    }
+
+    func sessShared(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Transcript written"
+        case .control: "TRANSCRIPT WRITTEN"
+        case .ink: "The record is copied out"
         }
     }
 
@@ -669,9 +1373,9 @@ extension CopyPack {
 
     func sessExport(_ t: ThemeID) -> String {
         switch t {
-        case .soft: "Export snapshot"
-        case .control: "EXPORT SNAPSHOT"
-        case .ink: "seal a copy"
+        case .soft: "Snapshot on the gateway"
+        case .control: "SNAPSHOT ON HOST"
+        case .ink: "seal a copy in the house"
         }
     }
 

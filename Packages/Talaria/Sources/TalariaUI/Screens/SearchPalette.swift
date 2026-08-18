@@ -29,6 +29,9 @@ public enum SearchPaletteAction: Sendable {
     /// Device settings. Tabless for the same reason Capabilities is, and
     /// reached the same two ways: here, and from Connections.
     case settings
+    /// Approval rules — mode, bypass, wait, the permanent allowlist, pairing.
+    /// Tabless like the two above; also reached from the Approvals tab header.
+    case approvalPolicy
     /// Browse stored sessions for a bot (the palette resolves which one).
     case sessions(botID: String)
     /// A cross-session search hit: open this bot on this stored session.
@@ -132,6 +135,8 @@ public struct SearchPalette: View {
             PaletteAction(id: "add-gateway", label: copy.paletteAddGateway(theme.id)) { onAction?(.addGateway) },
             PaletteAction(id: "capabilities", label: copy.paletteCapabilities(theme.id)) { onAction?(.capabilities) },
             PaletteAction(id: "settings", label: copy.paletteSettings(theme.id)) { onAction?(.settings) },
+            PaletteAction(id: "approval-policy",
+                          label: copy.policyTitle(theme.id)) { onAction?(.approvalPolicy) },
         ]
         if let botID = sessionsActionBot {
             all.append(PaletteAction(id: "sessions", label: copy.paletteSessionsAction(theme.id)) {

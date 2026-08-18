@@ -81,23 +81,39 @@ public struct ApprovalsView: View {
     // MARK: Header
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Unlike other kickers this one shows in every theme (soft
-            // included) — it is the pending count, warn-colored.
-            Text(pendingLabel)
-                .font(theme.mono(theme.id == .ink ? 9 : 9.5, weight: .semibold))
-                .tracking(theme.id == .control ? 2.5 : 2)
-                .foregroundStyle(theme.warn)
-                .padding(.bottom, theme.id == .control ? 3 : 1)
-            Text(copy.titleApprovals)
-                .font(titleFont)
-                .tracking(theme.smallCapsTitles ? 0.5 : -0.5)
-                .foregroundStyle(theme.ink)
-            Text(verbatim: "\(copy.approvalsLead) \(copy.approvalsSwipeHint(theme.id))")
-                .font(theme.body(theme.id == .ink ? 14 : 12.5))
-                .italic(theme.id == .ink)
-                .foregroundStyle(theme.id == .ink ? theme.sub : theme.faint)
-                .padding(.top, 4)
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 0) {
+                // Unlike other kickers this one shows in every theme (soft
+                // included) — it is the pending count, warn-colored.
+                Text(pendingLabel)
+                    .font(theme.mono(theme.id == .ink ? 9 : 9.5, weight: .semibold))
+                    .tracking(theme.id == .control ? 2.5 : 2)
+                    .foregroundStyle(theme.warn)
+                    .padding(.bottom, theme.id == .control ? 3 : 1)
+                Text(copy.titleApprovals)
+                    .font(titleFont)
+                    .tracking(theme.smallCapsTitles ? 0.5 : -0.5)
+                    .foregroundStyle(theme.ink)
+                Text(verbatim: "\(copy.approvalsLead) \(copy.approvalsSwipeHint(theme.id))")
+                    .font(theme.body(theme.id == .ink ? 14 : 12.5))
+                    .italic(theme.id == .ink)
+                    .foregroundStyle(theme.id == .ink ? theme.sub : theme.faint)
+                    .padding(.top, 4)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            // The rules behind the prompt. This screen answers one hold; the
+            // policy screen decides which holds happen at all, who may DM the
+            // bots, and takes back an "always" granted in a hurry — so it hangs
+            // off the surface that granted it.
+            HeaderIconButton(theme: theme, size: 32,
+                             action: { model.requestApprovalPolicy() }) {
+                Text(verbatim: "⚙")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
+            }
+            .accessibilityLabel(Text(copy.policyTitle(theme.id)))
+            .padding(.top, 2)
         }
         .padding(.horizontal, 20)
         .padding(.top, 12)
