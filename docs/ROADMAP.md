@@ -1,6 +1,9 @@
 # Talaria roadmap — phased plan to Bot Mode parity
 
-**Status: proposed, awaiting review. Nothing in here is implemented yet.**
+**Status: phases 0–5 landed in the overnight run of 2026-08-18. Nothing has been
+run against a live gateway.** See [OVERNIGHT-REPORT.md](OVERNIGHT-REPORT.md) for
+what shipped, what a reviewer flagged, and the live checks to run first — and
+[What is actually left](#what-is-actually-left) at the bottom of this file.
 
 Written 2026-08-18 from three sources: the 1,190-row desktop audit
 ([PARITY.md](../PARITY.md)), the 443-row Bot Mode plugin audit
@@ -14,7 +17,14 @@ screen on top of a chat that loses your history is a bad trade.
 
 ---
 
-## Phase 0 — Correctness (blocking; ~1 day)
+## Phase 0 — Correctness (blocking; ~1 day) · ✅ **landed 2026-08-18** (`4cc1d41`)
+
+> All three bugs fixed. 0.1 and 0.3 are one mechanism: `AppModelLive+CanonicalChat.swift`,
+> the single door every open and send funnels through (pin → canonical title →
+> previewed session → birth), with the pin written back to `ui_meta["hermes-bots"].chat`.
+> Every entry point now routes through `openChat(botID:)`. 0.2 is `Components/BotIdentity.swift` —
+> one identity path, and `CopyPack.composer` takes the resolved handle.
+> **Unverified against a gateway**, which is exactly where this phase's risk now lives.
 
 Three live bugs, all found in one session of real use. Everything else waits.
 
@@ -64,7 +74,14 @@ the single most load-bearing behavior in Bot Mode.
 
 ---
 
-## Phase 1 — Liveness (~2–3 days)
+## Phase 1 — Liveness (~2–3 days) · ✅ **landed 2026-08-18** (`ecfeb37`)
+
+> Items 1–3 and 5 landed: `AppModelLive+Liveness.swift` (foreground re-seed and
+> reaper over `session.active_list`, coalesced and generation-guarded),
+> `Components/NetworkMonitor.swift` (NWPathMonitor nudge with a settle delay and
+> nudge floor), and voice now submits through `sendOrSteer`, so a voice-started
+> turn has a stop button. **Item 4 remains open and cannot be closed without a
+> gateway** — the reconnect grace and `inflight` replay are still built-never-exercised.
 
 A phone suspends; desktop does not. This is the systemic theme behind the
 largest cluster of ⭕ rows, and it produces *wrong state*, not missing
@@ -87,7 +104,14 @@ the app was backgrounded.
 
 ---
 
-## Phase 2 — Settings (~3–4 days)
+## Phase 2 — Settings (~3–4 days) · ✅ **landed 2026-08-18** (`2b7610c`)
+
+> `Screens/SettingsView.swift` plus `Screens/Settings/*`: Gateways, Appearance
+> (themes, text size, motion), Notifications, Models & providers, Voice, Solo,
+> Privacy & data, About & diagnostics, and the desktop pointer. Scope is decision
+> 1 below, not desktop's 202 controls. One real bug fixed on the way: the
+> connect-time push handshake re-sends the stored `profile_filter`, which it
+> previously erased on every connect.
 
 Desktop has **202 discrete settings controls**; Talaria has no settings screen
 at all. That single absence is ~17% of the entire audit gap, and it is one
@@ -114,7 +138,14 @@ paths, update channels — those get a "manage on desktop" pointer.
 
 ---
 
-## Phase 3 — Managing the fleet (~4–5 days)
+## Phase 3 — Managing the fleet (~4–5 days) · ✅ **landed 2026-08-18** (`42be6e5`)
+
+> All five: cron CRUD with run history (`RoutineEditorView.swift`,
+> `AppModelLive+Cron2.swift`), session verbs behind long-press per decision 4
+> (`SessionsSheet.swift`), a real artifacts index that fetches and previews bytes,
+> approval policy (mode, bypass, wait, allowlist revoke — `ApprovalSettingsView.swift`),
+> and pairing approvals (`PairingView.swift`). Every one of these is a write path
+> to a gateway and none has been run against one.
 
 The audit's other big theme: Talaria reads and answers well, but cannot
 administer. Ordered by how often a phone-first operator needs it.
@@ -132,7 +163,15 @@ administer. Ordered by how often a phone-first operator needs it.
 
 ---
 
-## Phase 4 — Bot Mode depth (~4–5 days)
+## Phase 4 — Bot Mode depth (~4–5 days) · ✅ **landed 2026-08-18** (`de6063b`)
+
+> A2A with attribution and @mention routing (`AppModelLive+A2A.swift`,
+> `Components/MentionField.swift`), the multi-gateway union roster
+> (`AppModelLive+MultiGateway.swift`, `ConnectionRegistry.swift`), the cosmetics
+> bridge made two-way per decision 3 (`AppModelLive+Cosmetics.swift`), avatar
+> generation (`Components/AvatarPicker.swift`), and roster craft — recency, the
+> 90 s liveness window, pinning, the unread watermark. Group rooms are **not**
+> done (see below).
 
 The parts of the plugin that make it feel like a fleet rather than a list.
 
@@ -149,7 +188,15 @@ The parts of the plugin that make it feel like a fleet rather than a list.
 
 ---
 
-## Phase 5 — Solo mode (~1 week)
+## Phase 5 — Solo mode (~1 week) · ✅ **landed 2026-08-18** (`6f99ec0`)
+
+> `SoloEngine.swift`, `FoundationModelsProvider.swift` (Apple Foundation Models
+> as the default tier, gated three ways for an iOS 17 target), `SoloTools.swift`
+> (seven families, two gates: the permission keeps a tool out of the registry
+> entirely, the approval uses the same vocabulary as a gateway bot), and the
+> explainer plus Solo settings. MLX and Portal are **seams, not shipped tiers**.
+> This is the one phase whose core loop can be exercised without a gateway — and
+> it was not, because it needs a device with Apple Intelligence on.
 
 Per [SOLO-MODE.md](SOLO-MODE.md), already agreed: Apple Foundation Models as
 the default on-device tier, MLX as the power path, Portal as serverless, a
@@ -200,3 +247,74 @@ for automation, share sheet for export) it is named in
 4. **Session verbs — mostly a desktop concern.** The canonical forever-chat is
    the mobile model. Pin/archive/delete land as a tucked-away *power-user*
    surface (long-press in the sessions sheet), never as primary navigation.
+
+---
+
+<a id="what-is-actually-left"></a>
+
+## What is actually left (after the 2026-08-18 run)
+
+Recorded the morning after phases 0–5 landed. Ordered by what a phone-first
+operator loses, not by effort.
+
+### 1. Verification, which is now the whole critical path
+
+**No line of the run was executed against a live gateway** — none was reachable
+overnight. Everything below the word "landed" is a shape read from the upstream
+Python and compiled, not a shape seen on the wire. That is why 26 of the 30 rows
+this run moved in [PARITY.md](../PARITY.md) are 🔶 rather than ✅, and why the
+first real session matters more than any remaining feature. The ordered list of
+checks is in [OVERNIGHT-REPORT.md](OVERNIGHT-REPORT.md#live-checks-in-the-order-most-likely-to-find-a-bug);
+the three that carry the most risk are the canonical-chat resolver (Phase 0),
+the `session.active_list` reconcile (Phase 1), and the cron REST write path
+(Phase 3).
+
+Phase 1's own item 4 — kill the socket mid-turn, confirm the ~20 s park/reattach
+and the `inflight` replay — is unchanged from the original plan and is still the
+single best test of the client.
+
+### 2. Bot Mode gaps that survived Phase 4
+
+- **Group rooms / multi-bot chats.** Region 5 of
+  [BOT-MODE-PARITY.md](BOT-MODE-PARITY.md) is 30 rows still ⭕: the group row in
+  the roster, the room view with speaker attribution, `resolveGroupResponders`,
+  the bounded round-robin drive, per-member watermarks, `(pass)` semantics,
+  disband. A2A between two bots works; a *room* does not exist. This is the
+  largest single remaining Bot Mode idea.
+- **`/new` and `/reset` inside the canonical chat** are still offered as plain
+  slash commands with no reroute to `/compact` and no "this chat never resets"
+  explanation — so the app still hands the user a way to fork the one thing
+  Phase 0 exists to protect.
+- **`hideOwnedBotSessions` reconciliation sweep.** New chats are born hidden,
+  but nothing sweeps sessions that predate the fix or were created by another
+  client, so a stray "Bot Chat" can still surface in desktop's global lists.
+- **Pets** remain in flight rather than finished (Region 2).
+
+### 3. Settings that a phone genuinely wants and still lacks
+
+Out of the deliberately-not-202: `agent.max_turns` (the runaway brake),
+persistent-memory toggles, image attachment mode, and a log viewer over
+`GET /api/logs` for when a gateway misbehaves. Adding a *pattern* to the command
+allowlist is also still absent — the phone can revoke a standing grant but not
+mint one, which is the safe asymmetry to keep unless it proves annoying.
+
+### 4. Known-latent, not yet a bug
+
+- **APNs environment is hardcoded to `"dev"`** at `PushCoordinator.swift:194`.
+  Correct today — both entitlement files declare `aps-environment: development` —
+  and wrong the moment a TestFlight or App Store build is cut. It predates this
+  run; it is listed here so it is not discovered by way of silent pushes.
+- **`ConnectionRegistry.startAutoProbe` is still dead code** (PARITY.md row on
+  backstop polling). Harmless, but it is a probe nobody calls.
+- **Solo's `BridgedTool` silently drops any tool whose parameters are not a flat
+  object** of string/integer/number/boolean. Safe direction, but a future tool
+  with a nested or array argument would vanish from the on-device tier with no
+  diagnostic. Worth an assertion before the tool set grows.
+
+### 5. Not started, and deliberately so
+
+The transcript's *acting* half — message edit, rewind/restore, branch
+navigation, regenerate — is untouched and remains the biggest ⭕ cluster in
+`chat-transcript`. It was never in phases 0–5. It is the obvious Phase 6, and it
+is worth doing only after the verification in §1, because rewind writes to the
+same session the canonical-chat resolver now owns.
