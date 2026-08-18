@@ -13,3 +13,7 @@ xcuserdata/
 
 # Per-developer signing overrides (see ios/project.yml header).
 ios/Local.xcconfig
+
+# xcodebuild output dirs (make ios / device builds)
+ios/build/
+ios/build-device/
