@@ -786,26 +786,24 @@ extension AppModel {
         }
     }
 
-    /// Model ids offered by the gateway (model.options), demo list otherwise.
-    /// Defensive parse: the picker payload nests models under providers.
+    /// Model ids offered by the gateway. Payload shape
+    /// (hermes_cli/inventory.py build_models_payload):
+    /// {"providers":[{"slug","name","is_current","models":[<id strings>],…}],
+    ///  "model":<current>,"provider":<current>} — current model listed first.
     public func availableModels() async -> [String] {
         guard mode == .live, let client else { return DemoData.models }
         guard let payload = try? await client.modelOptions() else { return DemoData.models }
         var ids: [String] = []
-        func harvest(_ value: JSONValue) {
-            if let arr = value.arrayValue {
-                for item in arr { harvest(item) }
-            } else if let obj = value.objectValue {
-                if let id = (obj["id"] ?? obj["model"] ?? obj["name"])?.stringValue,
-                   obj["models"] == nil, ids.count < 200 {
+        if let current = payload["model"]?.stringValue, !current.isEmpty {
+            ids.append(current)
+        }
+        for provider in payload["providers"]?.arrayValue ?? [] {
+            for model in provider["models"]?.arrayValue ?? [] {
+                if let id = model.stringValue ?? (model["id"] ?? model["model"])?.stringValue {
                     ids.append(id)
-                }
-                for key in ["providers", "models", "groups", "items"] {
-                    if let nested = obj[key] { harvest(nested) }
                 }
             }
         }
-        harvest(payload)
         var seen = Set<String>()
         let unique = ids.filter { seen.insert($0).inserted }
         return unique.isEmpty ? DemoData.models : unique

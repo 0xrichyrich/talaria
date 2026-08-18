@@ -1,245 +1,381 @@
 # PARITY.md — the Hermes Desktop ↔ Talaria contract
 
-This is the 1:1 parity map against **Hermes Desktop 0.17.0** (feature inventory
-sourced from the upstream desktop checkout) and the contribution roadmap for
-this repo: pick a 🚧 or ⭕ row, check the gateway surface named in the row, and
-send a PR. Protocol shapes are documented in the desktop repo and mirrored in
-`Packages/Talaria/Sources/TalariaKit` (see file pointers per section).
+> **Changelog** · 2026-08-17 — full re-audit of all 10 areas (177 rows) against the live codebase; first on-device end-to-end verification pass (Lockdown-Mode iPhone → real tailnet gateway). Statuses reset from code-inspection guesses to audited fact.
 
-**Legend**
+This document is the 1:1 parity map between **Hermes Desktop** and **Talaria**
+(the native iOS client), and the contribution roadmap for this repo. Each row
+names the desktop behavior, the gateway surface that powers it (WS RPC, WS
+event, or REST), and Talaria's audited status. To contribute: pick a 🚧 or ⭕
+row, check the gateway surface named in the row, and send a PR. Protocol
+mirrors live in `Packages/Talaria/Sources/TalariaKit`; screens in
+`Packages/Talaria/Sources/TalariaUI`.
+
+**Status legend**
 
 | Mark | Meaning |
 |---|---|
-| ✅ built | Working end-to-end in this repo today |
-| 🚧 scaffolded | The protocol client / models / state / screen exist in `Sources`, but the end-to-end wiring is not finished |
-| ⭕ planned | On the roadmap; nothing usable in the repo yet |
-| ➖ n/a mobile | Deliberately not ported — reason given |
+| ✅ live-verified | Exercised end-to-end against a real gateway from a physical device |
+| 🚧 built-untested | Code-complete (client + wiring) but never exercised live |
+| 🔶 partial | Some of the path exists — a wrapper without UI, a UI fed by demo data, or a reduced behavior |
+| ⭕ missing | Not built |
+| ➖ n/a mobile | Deliberately not ported — reason given in the row |
 
-Honest snapshot: the transport, auth, event, theme, and state layers are built
-and exercised by `swift run talaria-verify`; live-mode wiring
-(`AppModel+Live`), the auth controller, the connections registry, the Live
-Activity and push pipelines, the app shell (`@main`, deep links, tab chrome,
-push banner), and all twelve prototype screens have landed and build clean
-for iOS. Demo mode is fully interactive. **Nothing below is marked ✅ until
-it has been verified against a live `hermes serve` gateway** — that
-end-to-end soak is the next milestone, so live-path rows sit at 🚧 on
-implementation-complete honesty.
-
----
-
-## 1. Connection & auth (desktop: connection-config / gateway settings)
-
-Code: `TalariaKit/GatewayAuth.swift`, `GatewayTransport.swift`,
-`GatewayClient.swift`, `KeychainStore.swift`, `LoopbackListener.swift`;
-`TalariaUI/AuthController.swift`, `ConnectionRegistry.swift`.
-
-| Feature | Desktop behavior | Gateway surface | Talaria status |
-|---|---|---|---|
-| JSON-RPC over WebSocket | One JSON object per text frame; out-of-order pooled responses; ~30 fps delta coalescing | `/api/ws` | ✅ built (`GatewayTransport` actor; id-correlated, event stream) |
-| `gateway.ready` handshake | First frame after accept; carries skin + `change_events` | `gateway.ready` event | ✅ built (connect blocks on it; skin captured) |
-| Remote gateway, token auth | Paste URL + dashboard session token; both HTTP and WS legs must pass | WS `?token=`, REST `X-Hermes-Session-Token` | 🚧 client + `AuthController` paste-token path (probe → validate → Keychain) built; onboarding screen pending |
-| Remote gateway, native OAuth (PKCE) | RFC 8252: system browser → loopback redirect → code redeem; encrypted token store; refresh at exp−60 s | `auth/native/authorize`, `POST auth/native/token`, `auth/native/refresh` | 🚧 flow, loopback listener, refresh, Keychain, and the `AuthController` browser hand-off (state check, phased UI states) built; onboarding screen pending |
-| WS tickets (gated mode) | Single-use 30 s ticket minted before every dial | `POST /api/auth/ws-ticket` → WS `?ticket=` | ✅ built (re-minted on every `GatewayClient.connect()`) |
-| Username & password (basic provider) | Desktop remote sign-in ladder | `GET /api/auth/providers` + native broker | 🚧 provider probe + ordering built (`AuthController`; password providers ride the same browser broker via the gateway's `/login`); screen pending |
-| Legacy OAuth cookie flow | Embedded BrowserWindow session cookies | `hermes_session_at`/`_rt` cookies | ➖ n/a mobile — native PKCE is the mobile-correct flow; cookies are the desktop fallback |
-| Hermes Cloud discovery | Nous Portal login, `/api/agents` roster, per-agent silent sign-in | Portal REST | ⭕ planned (`NousPortalClient` covers Portal OAuth for *direct inference* — see §14 — not agent discovery yet) |
-| SSH mode | Spawns/boots `hermes serve` over OpenSSH + port tunnel | ssh + remote lifecycle | ➖ n/a mobile — no OpenSSH/child processes on iOS; use Tailscale to reach the same box |
-| Multi-connection registry | Named agent sources, union roster, per-connection sockets | desktop-local registry | 🚧 `ConnectionRegistry` built (saved gateways in UserDefaults, credentials Keychain-only, parallel `/api/status` health probes with measured ping, asleep-vs-offline detection); Connections screen + multi-socket roster pending — single live gateway first |
-| Extra gateway headers (access proxies) | Per-connection header map for Cloudflare Access etc. | applied to gateway-origin requests | ⭕ planned |
-| Local backend spawn / first-run bootstrap | Installs runtime, spawns `hermes serve` locally | child process mgmt | ➖ n/a mobile — iOS cannot host the backend; Talaria is remote-only by design |
-| Reconnect + session parking | Full-jitter backoff; resume stored key within ~20 s grace reattaches in-flight turn | `session.resume` fast path | 🚧 resume, ticket re-mint, and offline-queue flush-on-connect built; automatic backoff loop and scene-phase observer pending |
-| Version-skew hygiene | `-32601` fallbacks, `desktop_contract` gate (v6) | `session.info.desktop_contract` | 🚧 contract surfaced in `SessionInfo`; gating logic pending |
-
-## 2. Chat & sessions (desktop: chat surface, transcript, composer)
-
-Code: `TalariaKit/GatewayClient.swift` (RPC wrappers),
-`GatewayEvents.swift` (typed events), `TalariaUI/AppModel.swift` +
-`AppModelLive.swift` (state + live event routing).
-
-| Feature | Desktop behavior | Gateway surface | Talaria status |
-|---|---|---|---|
-| Create / resume / activate sessions | Lazy create, resume by durable key, defer-history hydration | `session.create/resume/close`, `GET /api/sessions/{id}/messages` | 🚧 wrappers + REST hydration + per-bot lazy create/resume on first send (`AppModel+Live`) built; Chat screen pending |
-| Streaming transcript | Token deltas, interim segments, thinking/reasoning blocks | `message.start/delta/interim/complete`, `thinking.delta`, `reasoning.delta` | 🚧 typed events + live delta→`ChatState` routing (typing indicator, streaming row, completion reconcile) built; Chat screen pending |
-| Tool lifecycle rows | Start/complete cards with arg preview, duration, summaries, inline diffs | `tool.generating/start/complete` | 🚧 typed payloads built; `tool.start` drives the bot's working-task line; transcript cards pending (no inline-diff viewer) |
-| Rich rendering (markdown/mermaid/katex/embeds) | Full streamdown pipeline | client-side | ⭕ planned — plain-text-first, markdown next |
-| Prompt submit (incl. queue-behind-turn) | Busy sessions queue; `queued:true` avoids interrupt | `prompt.submit` | 🚧 wrapper + live send path built incl. `queued`; composer pending |
-| Stop / interrupt | Stop button; denies pending approvals too | `session.interrupt` | 🚧 wrapper built |
-| Steer / redirect mid-turn | Inject into next tool result / redirect active turn | `session.steer`, `session.redirect` | 🚧 steer wrapped; redirect not yet |
-| Rewind / truncation / retry / undo / compress / branch | Fail-closed truncation consent dance, history reconciliation | `prompt.submit` truncate params, `session.undo/compress/branch` | ⭕ planned |
-| Attachments (image/file/pdf/clipboard) | Drag-drop, paste, picker → `@file:` refs | `image.attach*`, `file.attach`, `pdf.attach` | ⭕ planned (photo picker + share sheet) |
-| Message queue panel / drafts | Queued prompts UI, per-thread drafts | client-side | ⭕ planned |
-| Session usage ticker + context meter | 1 Hz usage events; breakdown popover | `session.usage`, `session.context_breakdown` | 🚧 `Usage`/`ContextSegment` models, RPCs, and live usage routing built; context meter renders in the Bot sheet |
-| Per-session model pin | Model pill, deferred switch when busy | `config.set {key:"model"}`, `model.options` | 🚧 wrappers + Bot-sheet pin chips built; deferred-switch handling pending |
-| YOLO toggle (per-session approval bypass) | Statusbar zap; session or global scope | `config.set {key:"yolo"}` | 🚧 wrapper (session scope) + Bot-sheet toggle built |
-| Message reactions | Emoji on rows | `message.react` + `message.reaction` event | ⭕ planned |
-| Session list / search / archive / pin / unread | Batched cross-profile sidebar | `session.list`, REST sessions API | 🚧 `listSessions` built; recent sessions render in the Bot sheet |
-| Session tiles / split view / tabs / multi-window | Side-by-side panes, tab strip | client-side | ➖ n/a mobile — one screen at a time on a phone |
-| Transcript find-in-page | Electron `findInPage` | client-side | 🚧 search palette built (§10); transcript-scoped search pending |
-| Todos / goals / background delegation stack | Composer status stack | `todo` tool events, `subagent.*` | ⭕ planned (activity feed shows task-level state first) |
-| Subagent monitor (`/agents`) | Delegation tree with live tails | `subagent.*`, watch-window resume | ⭕ planned |
-
-## 3. Approvals & interactive prompts
-
-Code: `GatewayEvents.swift` (`ApprovalRequest`, `ClarifyRequest`),
-`GatewayClient.swift` (respond wrappers), `Models.swift` (`Approval`),
-`AppModelLive.swift` (event → roster/approvals routing).
-
-| Feature | Desktop behavior | Gateway surface | Talaria status |
-|---|---|---|---|
-| Approval request cards | Blocking card: command, why, choices incl. permanent-allow | `approval.request` event → `approval.respond` | 🚧 events, respond, and live routing (approval → roster badge, resolve → run resumes) built; swipeable card UI pending — this is Talaria's marquee feature |
-| Pending-approval replay on resume | Restored after reconnect | `approval.pending`, `pending_approval` in resume payload | 🚧 parsed in `LiveSession` and re-emitted into the approval flow on resume |
-| Clarify questions (multi-select) | Question card mid-turn | `clarify.request` → `clarify.respond` | 🚧 typed + respond built; UI pending |
-| Sudo / secret prompts | Password/secret dialogs; empty = refusal | `sudo.respond`, `secret.respond` | ⭕ planned (passthrough only; never stored) |
-| MCP setup prompts | Consent card for MCP server setup | `mcp.setup.request/respond` | ⭕ planned |
-| Approval-mode menu (manual/smart/off) | Global approvals policy | `config.get/set approvals.mode` | ⭕ planned |
-| Client-capability reads (terminal/preview/window) | Agent reads the desktop's panes | `terminal.read.request` etc. | ➖ n/a mobile — Talaria sends `source:"talaria"` and does not advertise these capabilities (nothing to read on a phone) |
-
-## 4. Roster & profiles (desktop: Bot Mode plugin, `/profiles` overlay)
-
-Code: `GatewayClient.swift` (profiles RPCs), `Models.swift` (`Bot`),
-`TalariaTheme/AvatarView.swift`, `AppModelLive.swift` (roster mapping),
-`TalariaUI/Screens/BotSheetView.swift`, `CreateBotView.swift`.
-
-| Feature | Desktop behavior | Gateway surface | Talaria status |
-|---|---|---|---|
-| Bot roster (one row per profile) | Avatars, unread, live working state | `profiles.list` (+ session events) | 🚧 `profiles.list` → `Bot` mapping built (`ui_meta["talaria"]` cosmetics with stable-hash fallback; working/approval status from live events); Roster screen pending |
-| Avatar language (shape × hue, scanning eyes) | Bot Mode's avatar system | client-side (`ui_meta`) | ✅ built (`AvatarSilhouette` + eye animation ports the prototype's `SHAPE_CSS`) |
-| Bot profile sheet (describe) | Description, skills/toolsets/MCP summary | `profiles.describe` | 🚧 `BotSheetView` built (stats, recent sessions, context meter, YOLO, model pin, memory star map, duplicate/edit, CLI-delete footnote); live soak pending |
-| Create bot (name, job, look, SOUL.md) | New Agent flow | `profiles.create` | 🚧 `CreateBotView` built (profile-id rules `[a-z0-9-]`, shape/hue pickers, personality → SOUL.md, advanced disclosure); live soak pending |
-| Edit / configure bot | Soul editor, model, skills exclusion, `ui_meta` | `profiles.configure` | 🚧 wrapper incl. `disabled_skills` + `ui_meta`; Edit-look-&-soul path reuses the create sheet |
-| Duplicate bot | Clone profile w/ history options | `profiles.create {clone_from}` | 🚧 wrapper (`cloneFrom` → `clone_all`) + Bot-sheet action built |
-| Custom avatar portrait | Image asset on profile | `profiles.set_asset/get_asset` | 🚧 wrappers built |
-| AI-generated portraits | Bot Mode avatar generation | `image.generate` | 🚧 wrapper built (data-URL result); flow pending |
-| Profile delete | CLI-only upstream; desktop mirrors that | — | ➖ n/a by design — `hermes profile delete` only (matches desktop + design) |
-| Profile export/import | tar.gz with appearance overlay | `POST /api/profiles/{name}/export` | ⭕ planned |
-| Per-profile themes | Desktop profile theming | client-side | ➖ n/a mobile — Talaria themes the whole app (Soft/Control/Ink); bot identity is the avatar |
-| Memory star map (per bot) | `/starmap` graph + memory cards | `GET /api/learning/graph` | 🚧 mini star-map card in the Bot sheet built (demo memory); live learning-graph feed pending — the full d3 overlay stays desktop |
-
-## 5. Routines (desktop: `/cron` overlay, Bot Mode Routines tile)
-
-Code: `GatewayClient.swift` (`cronManage`/`cronList`),
-`AppModelLive.swift` (`[bot:<name>]` namespace parse),
-`TalariaUI/Screens/RoutinesView.swift`.
-
-| Feature | Desktop behavior | Gateway surface | Talaria status |
-|---|---|---|---|
-| Routine list per bot | Cron jobs scoped to profile; `[bot:<name>]` namespace | `cron.manage` (WS) / REST cron API | 🚧 screen (`RoutinesView`: this bot + other bots + cron footnote), namespace parse, and live refresh built; live soak pending |
-| Toggle / pause / resume / trigger-now | Job controls | `cron.manage`, `POST /api/cron/jobs/{id}/pause…` | 🚧 enable/disable dispatch wired to the screen's toggles; pause/resume/trigger-now pending |
-| Create/edit routine (schedule builder) | Schedule, prompt, model override, delivery targets | `cron.manage` / `POST /api/cron/jobs` | ⭕ planned (natural-language "+ New routine" row per design) |
-| Run history → sessions | Runs land as sessions | cron runs API | ⭕ planned (runs land in the bot's chat) |
-| Automation blueprints gallery | Instantiate templates | `/api/cron/blueprints` | ➖ n/a mobile — admin surface; use desktop/web |
-| Live refresh | `cron.changed` broadcast | `cron.changed` | 🚧 typed + wired (`cron.changed` → `refreshRoutines()`) |
-
-## 6. Activity & notifications
-
-Code: `TalariaUI/PushCoordinator.swift`, `relay/talaria-push/`,
-`ios/TalariaNotificationService/` (target scaffold).
-
-| Feature | Desktop behavior | Gateway surface | Talaria status |
-|---|---|---|---|
-| Activity feed (day-grouped ledger) | Toast center + sidebar signals | client aggregation of events | 🚧 `ActivityDay`/`ActivityItem` + demo feed built; live aggregation + screen pending |
-| Agent notices | Sticky/TTL notices | `notification.show/clear` | 🚧 typed events built |
-| Native notifications w/ actions | OS notifications, approve from banner | desktop `hermes:notify` → Talaria: APNs via `relay/` | 🚧 app side built (`PushCoordinator`: authorization, `TALARIA_APPROVAL` actionable category in the current theme's voice, APNs registration, deep-link routing, demo-mode payload previews) + NSE target scaffolded; relay core landed (`config`/`devices`/`apns`), fan-out + hooks + sidecar pending |
-| Unread tracking | Server watermark | `PATCH /api/sessions/{id} {unread}` | 🚧 unread in `Bot` model; server sync pending |
-| Background-task completion | `background.complete` toast | `background.complete` | 🚧 typed event built |
-
-## 7. Agent Inbox (desktop: Bot Mode bot-to-bot)
-
-| Feature | Desktop behavior | Gateway surface | Talaria status |
-|---|---|---|---|
-| Cross-bot traffic feed | @-mention delivery between profiles | `session.create`+`prompt.submit` per bot; `cli.exec hermes -p <bot> chat` | 🚧 `A2AMessage` model + demo feed built; live delivery pending |
-| @mention a bot from chat | Mention → handoff + report back | same as above | ⭕ planned |
-| Messaging-platform handoff | Hand session to Telegram/Discord… | `handoff.request/state/fail` | ⭕ planned |
-
-## 8. Artifacts (desktop: `/artifacts` gallery)
-
-Code: `TalariaUI/Screens/ArtifactsView.swift`.
-
-| Feature | Desktop behavior | Gateway surface | Talaria status |
-|---|---|---|---|
-| Artifacts vault (files/images/links) | Client-side extraction from transcripts | `GET /api/sessions/{id}/messages` + media API | 🚧 screen built (`ArtifactsView` grid: image/file/link cards in the owner's color); live extraction pending |
-| Open-session jump | Tap artifact → owning session | client-side | 🚧 built (tap → owner bot's chat) |
-| Media download | Via gateway media endpoint | `GET /api/media` | ⭕ planned |
-
-## 9. Voice & wake
-
-| Feature | Desktop behavior | Gateway surface | Talaria status |
-|---|---|---|---|
-| Voice conversation mode | Record → transcribe → spoken replies, barge-in | `voice.toggle/record/tts`, `voice.transcript` events, `/api/audio/*` | 🚧 status/toggle wrappers + typed transcript events built; Voice overlay pending (transport for audio frames still an open question — see design HANDOFF) |
-| Push-to-talk from composer | Mic button | `POST /api/audio/transcribe` | ⭕ planned |
-| Wake word ("Hey Hermes") | Backend listener + client mic feed | `wake.*` | ➖ n/a mobile — iOS forbids always-on background mic for third-party apps |
-
-## 10. Search & command palette
-
-Code: `TalariaUI/Screens/SearchPalette.swift`.
-
-| Feature | Desktop behavior | Gateway surface | Talaria status |
-|---|---|---|---|
-| Search palette | ⌘K: sessions, routes, commands, actions | `GET /api/sessions/search` + client registry | 🚧 screen built (`SearchPalette`: "Live now" empty state; filters bots, sessions, artifacts, actions; routes on tap); server-side session search pending |
-| Slash commands / completions | `commands.catalog`, `complete.slash/path` | WS RPCs | ⭕ planned |
-
-## 11. Theming & appearance
-
-Code: `TalariaTheme/` (ThemePack, CopyPack, ThemeManager, Packs),
-`TalariaUI/Components/ScreenHeader.swift` (shared themed chrome).
-
-| Feature | Desktop behavior | Gateway surface | Talaria status |
-|---|---|---|---|
-| Theme system | Presets, VS Code import, per-profile, translucency | client-side | ✅ built as Talaria's own triple: Soft / Control / Ink token packs with exact design values |
-| Copy packs (voice per theme) | — (desktop has no copy-pack equivalent) | client-side | ✅ built (Approvals/Holds/Seals; RELEASE/grant-the-seal; even the push-action titles follow the pack) |
-| Runtime switch + persistence | Light/dark/system etc. | client-side | ✅ built (`ThemeManager`, cycle order soft→control→ink, persisted) |
-| Backend-synced skins | `/skin` command, `skin.changed` | `gateway.ready.skin`, `skin.changed` | 🚧 skin captured on ready; not yet applied to UI |
-| VS Code marketplace themes | Electron fetch | — | ➖ n/a mobile |
-| i18n (en/ar/ja/zh) | 4 locales incl. RTL | client-side | ⭕ planned — en only today |
-
-## 12. Admin surfaces intentionally left to desktop / web dashboard
-
-Talaria is a window onto the roster, not an admin console. These desktop
-surfaces stay ➖ n/a mobile — point your browser at the gateway's dashboard
-instead:
-
-| Desktop surface | Reason |
-|---|---|
-| Settings → Model/Chat/Workspace/Safety/Memory/Advanced config editor | Schema-driven config editing is a desktop/web job; a mistake here can strand the gateway |
-| Providers / API keys / env vault | Credential entry belongs on the machine that owns them |
-| Skills & toolsets & MCP management pages | Heavy admin flows (hub installs, mcp.json editing, OAuth connects); per-bot skill exclusion IS in scope (§4) |
-| Messaging platforms / pairing / webhooks | Server-side platform config |
-| Command Center (logs, doctor, backup, restart, update) | Ops surface; a Connections health probe (`/api/status`) is in scope (§1) and 🚧 built |
-| Billing / subscription | Nous portal + Apple IAP rules make this web-only |
-| Projects / worktrees / git review / files pane / PTY terminals | Filesystem + PTY + git are machine-local capabilities the phone doesn't have |
-| Plugin system (runtime-loaded JS plugins) | No runtime code loading on iOS (App Store rules); Talaria features are first-party Swift |
-
-## 13. Desktop features that don't map to mobile
-
-| Desktop feature | Why n/a |
-|---|---|
-| Embedded PTY terminals (node-pty/xterm) | No PTYs, no child processes on iOS |
-| HUD window / Quick Entry / wake-indicator / pet overlay windows | No floating always-on-top windows on iOS; Live Activity is the HUD analogue |
-| System tray / multi-window / session windows | iOS single-window model |
-| Local backend spawning & bootstrap installer | Cannot run Python/`hermes serve` on-device |
-| Find-in-page (Electron), zoom persistence, native theme titlebars | Electron-specific chrome |
-| Auto-update of local checkout | App Store / TestFlight handles app updates; gateway updates stay a desktop/web op |
-| Desktop pet sprite windows | The roster avatars carry the personality; a cosmetic in-chat pet sprite may come later (`petMode` in the design) |
-
-## 14. Mobile-native extras (not in desktop)
-
-The other half of the contract: things Talaria adds because it lives on a
-phone.
-
-| Feature | Notes | Status |
-|---|---|---|
-| Demo mode | Full six-bot roster, scripted replies, approvals, routines — no gateway needed; App Review path. Mirrors the design prototype's data | ✅ built (`DemoData`, `AppModel.enterDemoMode`; the landed screens all run demo-fed) |
-| Swipe approvals | Right = approve, left = deny, ≥90 pt commit; explicit buttons remain | ⭕ planned (design final; Approvals screen not yet ported) |
-| Offline compose queue | Messages typed while unreachable queue locally, flush on reconnect | 🚧 queue + flush-on-connect built (`AppModel`, `flushComposeQueue()`); reachability/offline detection wiring pending |
-| Live Activity / Dynamic Island | Working bot's avatar + elapsed timer; tap → chat (`talaria://bot/<id>`) | 🚧 `BotWorkAttributes` contract (TalariaKit, shared with the widget target), `LiveActivityController` (observation-driven, one activity, most-recent-working-bot policy), and the `TalariaWidgets` target built; the `BotWorkLiveActivity` render view is not yet written |
-| Actionable push banners (APNs) | Approve directly from the notification; approvals as critical alerts | 🚧 `PushCoordinator` + NSE target + relay core built; relay fan-out/hooks/sidecar and APNs credentials pending (see §6) |
-| Onboarding with gateway wizard | Mode chips (Tailscale/LAN vs Cloud), auth, theme pick, notifications | 🚧 `AuthController` (probe → token/PKCE → Keychain) + flow state in `AppModel` built; screens pending |
-| Gatewayless chat — Nous Portal direct | BYO inference: the CLI's device-code OAuth (`hermes-cli` client id, rotating single-use refresh token) + OpenAI-compatible streaming chat, no gateway required | 🚧 `NousPortalClient` + the `InferenceProvider` seam built (host allowlists enforced); not yet bound to a chat surface |
-| On-device local models | Fully offline chat via MLX (Qwen3 1.7B/4B, Llama 3.2 3B, 4-bit) in the optional `Packages/TalariaLocal` package — never linked unless the user opts in | 🚧 package + curated `ModelCatalog` (RAM guidance) built; `LocalModelProvider` + download manager pending |
-| Haptics & theme-tuned motion | Per-theme motion language | ⭕ planned |
+**Snapshot (2026-08-17).** Today Talaria completed its first live end-to-end
+session from a Lockdown-Mode iPhone against a real tailnet gateway: auth-mode
+probe → native PKCE sign-in (in-app WKWebView broker, loopback callback
+intercepted as navigation) → Keychain persistence → per-dial WS ticket →
+roster hydration → per-profile session resume → streaming chat with REST
+transcript history. That spine — connect, see your bots, talk to them — is
+now **live-verified**. Around it sits a large ring of code-complete-but-
+unexercised machinery (reconnect grace, approvals, cron list, the entire push
+relay) and an honest amount of missing surface (attachments, tool cards,
+slash commands, skills/MCP, voice audio, session management UI). Tally across
+177 audited rows: **11 ✅ · 32 🚧 · 52 🔶 · 70 ⭕ · 12 ➖**. Several rows
+marked "landing today" were mid-flight in the working tree during the audit
+(reasoning display, inline markdown, model/effort switching) and are recorded
+at their audited state, not their intended one.
 
 ---
 
-*Update this file in the same PR as the feature. A row moves ⭕ → 🚧 when the
-protocol/model layer lands with checks in `talaria-verify`, and 🚧 → ✅ only
-when the screen works against a live `hermes serve` gateway.*
+## 1. Connections & Auth
+
+The core single-gateway auth spine is real and proven: `/api/status` auth
+detection, native PKCE via a Lockdown-Mode-safe in-app WKWebView broker,
+Keychain credential storage, per-dial WS ticket minting, and status-probe
+health rows were all live-verified on a physical iPhone today. Token-paste
+auth, password providers, OAuth refresh, and backoff-reconnect-with-grace-
+resume are code-complete but unexercised. The registry persists multiple
+gateways but the app drives one live socket with no switch/remove UI.
+Key files: `TalariaKit/GatewayAuth.swift`, `GatewayClient.swift`,
+`GatewayTransport.swift`, `NousPortalClient.swift`, `KeychainStore.swift`;
+`TalariaUI/AuthController.swift`, `AuthWebSheet.swift`,
+`ConnectionRegistry.swift`, `AppModelLive.swift`,
+`Screens/ConnectionsView.swift`, `Screens/OnboardingView.swift`.
+
+| Feature | Desktop | Gateway surface | Talaria | Notes |
+|---|---|---|---|---|
+| Managed local install / spawn | First-run bootstrap into HERMES_HOME then spawns `hermes serve --port 0` with generated session token, boot-progress phases, WS-leg probe before ready | local process + stdout port announcement (no gateway RPC) | ➖ | iOS cannot spawn the Python hermes runtime. Nearest analogue is on-device MLX inference (TalariaLocal LocalModelProvider), a separate BYO-inference seam, not a gateway. |
+| First-run / onboarding connect UI | First-run setup gate: Connect to existing Hermes vs Install locally; boot progress + bootstrap controls | GET /api/status, /api/auth/providers | ✅ | 4-step OnboardingView: hero, gateway chips + URL, AuthController sign-in panel, roster preview. Demo mode stands in for install-locally. Used live today (probe→PKCE→connect). `TalariaUI/Screens/OnboardingView.swift` |
+| Auth-mode auto-detection probe | Probes public GET /api/status → auth_required decides token vs oauth; auth_flows advertises native_pkce | GET /api/status, GET /api/auth/providers | ✅ | AuthController.probe normalizes URL (scheme-less tolerated, prefix kept), reads auth_required/auth_flows/providers, and short-circuits to done when a stored Keychain credential still passes /api/auth/me. `GatewayAuth.swift`, `AuthController.swift` |
+| Remote gateway — token auth | Paste URL + dashboard session token; REST X-Hermes-Session-Token, WS ?token=; connection test must pass HTTP and WS | X-Hermes-Session-Token header, ws ?token=, /api/auth/me validation | 🚧 | Full path exists (submitSessionToken validates via /api/auth/me then Keychain-persists; webSocketURL builds ?token=). Today's live gateway was gated OAuth, so the open-gateway token path never ran live. **Next:** exercise once against a loopback/trusted `hermes serve` (token printed on stdout). |
+| Remote OAuth — native PKCE (RFC 8252) | System browser at /auth/native/authorize (S256+state), loopback 127.0.0.1 redirect, redeem POST /auth/native/token, encrypted token store, 5-min timeout | /auth/native/authorize, /auth/native/token, Keychain | ✅ | iOS uses an in-app WKWebView sheet that intercepts the 127.0.0.1/callback as a navigation (Lockdown-Mode-safe; loopback port never dialed); macOS branch keeps the true loopback listener + system browser. State verified before redeem. Verified today on-device under Lockdown Mode. |
+| OAuth cookie fallback (legacy embedded flow) | No native_pkce → embedded BrowserWindow login using hermes_session_at/rt cookies (incl. __Host-/__Secure- variants) | gateway session cookies | ⭕ | Deliberate: AuthController errors with "update hermes-agent, or paste a session token instead" when native_pkce is absent. The WKWebView sheet plays desktop's embedded-fallback role but only for the PKCE flow. **Next:** only needed if pre-native_pkce gateways must be supported; otherwise document the requirement. |
+| WS ticket mint per (re)connect | Single-use ticket minted at POST /api/auth/ws-ticket immediately before every dial; never reused; reauth error on 401/403 | POST /api/auth/ws-ticket, ws ?ticket= | ✅ | GatewayClient.connect re-mints on every attempt in oauth mode (30 s TTL honored by mint-right-before-dial). Verified today against the tailnet gateway. |
+| OAuth token refresh lifecycle | AT refreshed near expiry; session_expired drops tokens → re-login; provider-unreachable keeps tokens | POST /auth/native/refresh | 🚧 | Refresh at expiresAt−60 s on connect; 401→drop tokens+Keychain delete, 503→keep. Gap: when reconnect aborts on sessionExpired the app stays offline silently — no re-sign-in prompt UI (AppModelLive.scheduleReconnect). **Next:** surface a re-auth prompt/banner when reconnect stops on sessionExpired; live-test a forced expiry. |
+| Password-provider sign-in (basic auth) | Password providers ride the same broker; gateway serves its /login form in the browser | /auth/native/authorize?provider=…, gateway /login form | 🚧 | Provider buttons ordered OAuth-first then password; same WKWebView broker with a footnote explaining the flow. Never exercised against a password-provider gateway. **Next:** test against a gateway configured with the basic username/password provider. |
+| Hermes Cloud (Portal discovery) | Privy portal login, /api/agents discovery with org selection, silent per-agent sign-in, saves cloud-mode connection | portal /api/agents, hermes:cloud:* IPC | 🔶 | "Hermes Cloud" mode chip exists but only accepts a pasted agent dashboard URL, riding the same gated-PKCE path (code comment: "in-app discovery is future"). No portal login, agent list, or org selection. **Next:** add Portal sign-in + agent picker that resolves dashboard URLs, then reuse the existing PKCE path. |
+| SSH mode | System OpenSSH (ControlMaster), remote bootstrap/start of hermes serve, loopback -L tunnel, ~/.ssh/config host completion | ssh tunnels (no gateway RPC) | ⭕ | No SSH support anywhere in TalariaKit/UI. Would need an in-app SSH library (no system OpenSSH on iOS); plausibly low value on a phone vs Tailscale. **Next:** decide whether Tailscale-first coverage makes SSH mode a non-goal; document if so. |
+| v2 multi-connection registry | Named agent sources with ids; list/save/remove/set-primary/test/update-all; concurrent per-(connection,profile) sockets; union agent roster | hermes:connections:* IPC, hermes:agents:roster | 🔶 | ConnectionRegistry persists multiple SavedGateways (metadata→UserDefaults, creds→Keychain) with health + cached bot counts, but LiveRuntime drives ONE gateway link per process; launch auto-connects the first reachable saved gateway. remove()/rename() exist with no UI; no set-primary/switch control, no cross-connection union roster. **Next:** add switch/remove/rename actions to ConnectionsView rows; later, secondary sockets + union roster. |
+| Per-profile remote overrides | connection.json profiles[name] may carry its own remote/cloud/ssh block; global-remote serves all profiles via ?profile= scoping | resolveProfileBackendRoute; session.create{profile} | 🔶 | Single-host multi-profile scoping works — profile rides session.create/resume and profiles.list (live-verified roster + chat today). Routing a profile to a different host/connection is unsupported. **Next:** only needed alongside multi-connection sockets; fold into that work. |
+| Extra gateway headers (access proxies) | Per-connection remote.headers map, name-validated with forbidden list, applied to gateway-origin requests incl. WS | per-connection header map on REST + WS dial | ⭕ | No custom-header support in GatewayAuthClient, GatewayTransport, or the registry — Cloudflare-Access-style fronted gateways cannot connect. **Next:** add a headers map to SavedGateway/GatewayCredential path, applied to URLRequests and the WS handshake, reusing desktop's forbidden-name list. |
+| Provider onboarding (inference credentials) | Provider OAuth pkce/device_code/external via gateway REST (/api/providers/oauth/*), API-key via PUT /api/env + validate, reload.env RPC, model recommended-default confirm, skip persisted | POST /api/providers/oauth/&lt;id&gt;/start\|submit\|poll, PUT /api/env, reload.env | ⭕ | None of the gateway-side provider onboarding REST flow exists. TalariaKit does contain a complete, unwired NousPortalClient (device-code flow at parity with `hermes auth add nous`, rotating single-use RT, Keychain store) plus local MLX — a different BYO-inference seam with no UI entry point. **Next:** choose: port the gateway provider-onboarding flow, or wire NousPortalClient/local models into a visible settings surface. (See also §7 Models & Providers.) |
+| Connection testing & health | Connection test must pass both HTTP and WS; probe IPC for auth detection | GET /api/status (+ WS dial on connect) | ✅ | Registry probes GET /api/status per saved gateway (5 s timeout, measured ping, timeout→asleep vs offline), auto-probe every 20 s + on app foreground; live WS state flips rows instantly. Unlike desktop's test, the WS leg is only exercised by a real connect, not by the probe. **Next:** optionally add a WS-leg check to the add-gateway test to match desktop's both-legs gate. |
+| Reconnect with backoff + grace resume | Full-jitter exponential backoff; retry-once request path; sleep/wake reconnect; sessions parked ~20 s server-side | ws redial + session.resume (inflight/pending_approval replay) | 🚧 | Disconnect monitor → exp backoff 1→30 s with jitter → fresh ticket → resume every chat with inflight + pending-approval replay → compose-queue flush. In the known NOT-live-tested list (reconnect grace). No in-flight request retry-through-reconnect like desktop's. **Next:** live-test socket drop mid-turn within and beyond the 20 s grace window. |
+| Credential storage | connection.json in userData with safeStorage-encrypted secrets | Keychain (kSecClassGenericPassword, service wtf.talaria.gateway-credentials) | ✅ | Credentials only in Keychain keyed by normalized base URL (AfterFirstUnlock); metadata only in UserDefaults. Token redeem + Keychain persist verified on-device today. |
+| Sign-out / connection removal | Sign-out clears session cookies + native tokens; registry remove/rename per connection | Keychain delete + registry CRUD | 🔶 | ConnectionRegistry.remove deletes the Keychain credential and row, and disconnectGateway exists — but no UI invokes remove/rename/sign-out; Connections rows are display-only. **Next:** add swipe/context-menu actions (disconnect, sign out, rename, remove) to ConnectionRow. |
+
+## 2. Chat Core
+
+Chat-core is a solid streaming skeleton with the long tail missing. The spine
+is real and live-verified: token streaming (message.start/delta/complete),
+transcript hydration over REST, and send. Interim segments, inflight replay,
+and the offline queue are built but unexercised. Reasoning ThoughtBlock,
+inline-only markdown, and model/effort/YOLO plumbing all landed in the working
+tree during this audit (UI picker still unwired). Beyond that, everything that
+makes desktop chat rich is absent — most user-visibly, there is **no stop
+button for a running turn** even though interruptSession is already wrapped.
+
+| Feature | Desktop | Gateway surface | Talaria | Notes |
+|---|---|---|---|---|
+| Streaming assistant deltas (typing indicator, autoscroll) | assistant-ui incremental store streams tokens into markdown transcript with scroll-to-bottom | events message.start / message.delta / message.complete (+usage) | ✅ | AppModelLive.handle appends deltas to a streaming bubble in wire order via one AsyncStream pump; typing dots + animated scroll-to-bottom in ChatView. Verified on-device today against real gateway. |
+| Interim assistant segments between tool calls | complete interim messages rendered mid-turn between tool blocks | event message.interim {text, already_streamed} | 🚧 | Handled: finalizes the streaming bubble or appends when never streamed, honors already_streamed dedup, keeps isTyping on. **Next:** run a tool-heavy prompt live and confirm segment ordering. |
+| Transcript history hydration on open/resume | full stored transcript loads on session open | session.resume defer_history:true + REST GET /api/sessions/{id}/messages | ✅ | Hydrates over REST with fallback to resume-ack rows; normalizes newest-first pages, drops hidden/tool rows, maps reasoning column. Live-verified today on an existing session. **Next:** add load-older pagination (offset param already supported by fetchSessionMessages). |
+| In-flight turn replay after reconnect | inflight user/assistant/streaming/error snapshot replayed so a dropped socket loses nothing | session.resume → inflight {user, assistant, streaming, error} | 🚧 | replayInflight dedups the user bubble, restores the partial assistant bubble with streaming flag, surfaces error as system row. Reconnect grace not yet live-tested. **Next:** kill the socket mid-turn on device and verify the ~20 s park/reattach path. |
+| Reasoning / thinking display | collapsible reasoning blocks with disclosure store (reasoning-blocks.ts) | events thinking.delta / reasoning.delta / reasoning.available; message.complete.reasoning; stored reasoning columns | 🔶 | Landing today — just hit the tree: deltas accumulate per-message, ThoughtBlock renders live tail while streaming then a collapsible "Thought ›" row; complete-payload + transcript fallbacks wired. reasoning.available event still falls through unhandled; not built/run yet. **Next:** handle reasoning.available in AppModelLive; build + live-verify a reasoning-model turn. |
+| Markdown rendering in bubbles | full markdown via assistant-ui (headings, lists, tables, links) | message text (client-side render) | 🔶 | Landing today — chatMarkdown() just landed: inline-only AttributedString (bold/italic/code, whitespace preserved, graceful fallback). Block syntax (lists, headings, fenced code, tables) still renders as typed characters. **Next:** second pass for block-level rendering (lists/headings/fences), then live-verify. |
+| Rich blocks: fenced code, mermaid, KaTeX | syntax-highlighted code blocks, mermaid diagrams, KaTeX math in transcript | message text (client-side render) | ⭕ | Nothing in TalariaUI; today's markdown pass is inline-only. Mermaid/KaTeX would need a WKWebView or native renderer. **Next:** native styled code blocks first; scope mermaid/katex (likely WKWebView) separately. |
+| Tool-call display in transcript | inline tool blocks with structured result summaries, durations, inline diffs | events tool.generating / tool.start {name,context} / tool.complete {summary,duration_s,result_text} | 🔶 | tool.generating/tool.start only drive the header/roster task line ("name · context"); tool.complete is typed in GatewayEvents but dropped by AppModelLive — no inline tool cards, summaries, or durations in the transcript. **Next:** render collapsible tool chips inline from tool.start/complete (payloads already parsed). |
+| Generated images, embeds, inline diffs in transcript | generated images render inline; embed providers behind consent store; diff blocks | media via REST /api/media + transcript display_metadata | ⭕ | image.generate is used for avatar portraits only; no transcript image/embed/diff rendering. Text-only bubbles. **Next:** render image attachments/outputs from transcript rows via gateway media fetch. |
+| Timeline events (model switch, compaction, delegation markers) | typed timeline rows for model/personality switch, compaction, async delegation | transcript system rows + session events | 🔶 | Generic system pills render any system-role row (errors, hydrated system rows, approval outcomes) but no typed markers; compaction/model-switch arrive only if the server projects them as plain system text. **Next:** low priority; style known marker kinds when block markdown lands. |
+| Attachments (image / PDF / file / clipboard paste) | drag-drop, paste, file picker; attach RPCs accumulate onto next submit | RPCs image.attach_bytes (base64/data-URL), pdf.attach, file.attach (data_url), clipboard.paste; 384MB WS frame cap | ⭕ | No composer affordance (composer is mic + TextField + send) and no GatewayClient wrappers. Gateway surface is fully there and phone-friendly (image.attach_bytes takes base64). **Next:** add PhotosPicker/file importer + image.attach_bytes/pdf.attach wrappers; badge pending attachments on composer. |
+| Message reactions | react to messages, live sync via message.reaction event (store/reactions.ts) | RPC message.react {row_id\|newest_role, emoji}; events message.reaction, reaction (hearts) | ⭕ | No RPC wrapper, no UI, both events fall through to .other. ChatMessage model has no row_id, which reactions key on. **Next:** carry durable row_id through hydration, then add long-press react menu. |
+| Rewind / regenerate with truncation consent | rewind reconciles history + interrupts; regenerate via truncation-consent prompt.submit | prompt.submit truncate_before_row_id + confirm_truncate / confirm_empty_truncate (fail-closed 4028/4029/4030); session.undo | ⭕ | submitPrompt never passes truncation params; no UI; 4018/4028-4030 consent errors unmapped. Fail-closed server design means nothing dangerous can happen accidentally — it's simply absent. **Next:** add long-press "rewind to here" once row_ids are tracked, honoring the consent handshake. |
+| Turn controls: retry / undo / compress / branch | /retry, /undo, /compress commands + session.branch button | RPCs session.undo, session.compress, session.branch, slash.exec | ⭕ | None wrapped in GatewayClient, no UI entry points. **Next:** expose via a long-press/ellipsis menu on the chat header after rewind lands. |
+| Stop (interrupt) a running turn | stop button issues session.interrupt (also cancels queue + denies pending approvals) | RPC session.interrupt | 🔶 | GatewayClient.interruptSession exists but nothing calls it — no stop control anywhere in chat; the send button never morphs while a turn runs. Notable phone gap: no way to halt a runaway bot. **Next:** morph send button into stop while chat.isTyping/working; wire to interruptSession. |
+| Steer / redirect mid-turn | steer injects into next tool result; redirect re-aims the active turn preserving context | RPCs session.steer (wrapped), session.redirect (not wrapped) | 🔶 | client.steer() is built but has no caller; session.redirect has no wrapper. Sending while a turn runs goes through prompt.submit, which interrupts by default (desktop treats mid-turn sends as steer/redirect). **Next:** route composer sends during a working turn to steer/redirect (or queued:true) instead of default-interrupt submit. |
+| Quick replies / suggestion pills | server-driven suggestion pills + micro-actions under composer | demo-only today; desktop uses suggestion payloads | 🔶 | Themed chip row is built but gated model.mode == .demo (DemoData.quickReplies) — hidden entirely in live mode. **Next:** decide source for live suggestions (or drop the row live); ungate if kept. |
+| Composer @-mentions / path completion | @ triggers file/path completion popover (complete.path); URL + inline refs | RPC complete.path | ⭕ | Plain TextField, no completion machinery, complete.path unwrapped. Path completion is arguably desktop-centric but bot @-mentions matter for the A2A story. **Next:** start with @botname mention completion from the roster (client-side, no RPC needed). |
+| Slash commands + completion drawer | slash popover + completion drawer via commands.catalog / complete.slash; slash.exec | RPCs commands.catalog, complete.slash, slash.exec | ⭕ | No wrappers, no popover. Typed slash text goes through prompt.submit as literal prose (the agent may still honor some). **Next:** wrap commands.catalog + slash.exec; minimal command sheet on typing "/". (Full breakdown in §10.) |
+| Queue-while-busy + offline compose queue | queue panel with queued:true submits and auto-drain while session busy | prompt.submit queued:true; client-side offline queue | 🔶 | Offline path built: composes queue with a themed "queued" note on the bubble and flush on reconnect (untested live). Busy-queue differs: submitPrompt supports queued: but UI never passes it; no queue panel. **Next:** pass queued:true when chat is working; test offline flush during reconnect testing. |
+| Find-in-transcript | ⌘F Electron findInPage over the transcript | client-side (desktop uses findInPage; /api/sessions/search exists for cross-session) | ⭕ | SearchPalette filters bots/sessions/artifacts by title only, and its session index (model.sessions) is demo-seeded — empty in live mode. No in-transcript text search. **Next:** client-side filter + highlight over chat.messages behind a header search icon. |
+| Model + reasoning-effort switching from chat | model pill: per-session pin via config.set, reasoning-effort + fast-mode selectors, presets, visibility overlay | RPCs model.options, config.set model / reasoning_effort / yolo; profiles.configure (profile pin) | 🔶 | Landing today — mid-flight: AppModelLive setModel/setReasoningEffort/availableModels + GatewayClient wrappers landed within the hour, but ChatView's strip still routes the model tap to the bot sheet (profile-level pin; models list empty in live) and has no effort picker yet. No fast-mode or presets. **Next:** finish the strip picker UI on availableModels()/setModel, then live-verify a mid-session switch. (Deferred/confirm semantics in §7.) |
+| Chat strip: context gauge + YOLO chip | statusbar context meter (+breakdown popover) and per-session YOLO zap | session.usage events, session.context_breakdown RPC, config.set yolo | 🚧 | Gauge shows live usage.contextPercent (demo heuristic fallback); YOLO chip wired through setYolo→config.set as of today. contextBreakdown() is wrapped but only the bot sheet renders segments; no breakdown popover from the strip. **Next:** confirm context % updates during a live turn; surface breakdown on gauge tap. |
+| Composer misc (per-thread drafts, undo history, status stack, scope chip, drift guards) | persisted per-thread drafts, composer undo, todo/subagent/goal status stack, cwd/project scope chip, context drift guards | client-side + assorted RPCs | ⭕ | Grouped row. Draft is transient @State (lost on leaving the chat); none of the rest exists. Scope chip/drift guards are desktop-workspace concepts with low mobile value; drafts are the one real gap. **Next:** persist per-bot draft text; treat the rest as backlog. |
+
+## 3. Sessions
+
+Talaria's session core — create/resume with durable keys, deferred-history
+REST hydration, and the offline→reconnect→reattach pipeline — is solid:
+resume+hydration is live-verified and park/reattach is code-complete awaiting
+a live kill-the-socket test. Everything around **browsing and managing**
+stored sessions is the gap: session.list, cross-session search, context
+breakdown, and titles all have either an unused TalariaKit wrapper or a
+decoded-but-dropped event, while the visible UI still renders demo-only data
+that is empty in live mode. Highest-leverage: one pass wiring listSessions +
+/api/sessions/search + contextBreakdown into the already-built bot sheet and
+palette flips four partial rows at once.
+
+| Feature | Desktop | Gateway surface | Talaria | Notes |
+|---|---|---|---|---|
+| Session list (200 cap) | Sidebar recents via batched /api/profiles/sessions/sidebar + session.list (default limit 200) with date groups, filters, load-more | session.list {limit, include_hidden, profile}; REST /api/sessions, /api/profiles/sessions/sidebar | 🔶 | GatewayClient.listSessions(limit:200) exists (GatewayClient.swift:273) but has zero UI callers; roster shows only profiles.list last_session preview (live-verified); BotSheetView "Recent sessions" renders model.sessions which only DemoData populates — empty in live mode. **Next:** call listSessions(profile:) when the bot sheet opens and map rows into SessionSummary. |
+| Resume + transcript hydration | session.resume by durable key returns messages/inflight/queued/pending; tail hydration 120 rows over REST, backfill for older pages | session.resume {defer_history}; GET /api/sessions/&lt;id&gt;/messages | ✅ | ensureSession resumes the profile's last session with defer_history, hydrates one REST page (limit 200, newest-first normalized), falls back to resume projection rows, and creates on 4001. Live-tested today on device against the real gateway. **Next:** add offset-paged backfill for transcripts longer than one page. |
+| Park / reattach after disconnect | Server parks live sessions ~20 s on socket loss; renderer reconnects and session.resume reattaches the in-flight turn | session.resume live fast path (_live_session_payload); session.reclaimed event | 🚧 | AppModelLive: disconnect monitor (event pump completion), backoff 1→30 s w/ jitter, re-resume every open chat, replay inflight {user, assistant, streaming, error} + pending approval; session.reclaimed clears the cached sid so next send re-resumes. Explicitly not yet live-tested. **Next:** kill the socket mid-turn on device; confirm inflight snapshot and pending approval replay. |
+| Branch (fork conversation) | session.branch forks with parent_session_id lineage from turn controls | session.branch {session_id, name?, count?} | ⭕ | No RPC wrapper, no UI anywhere in TalariaKit/TalariaUI. **Next:** add GatewayClient.branch + a chat long-press/menu action. |
+| Compress | /compress → session.compress {focus_topic?} with before/after token stats; "compressing"/"compacting" status while running | session.compress | ⭕ | No wrapper or UI. Server-side auto-compaction still happens and its status.update text surfaces via the bot task line, so only manual trigger is absent. **Next:** wrapper + action next to the context card in BotSheetView. |
+| Save / export session | /save → session.save JSON snapshot; copy/export session via full-transcript REST fetch | session.save; GET /api/sessions/&lt;id&gt;/messages (full export) | ⭕ | No save, export, copy-transcript, or share-sheet path anywhere. **Next:** iOS share sheet fed by paged /messages fetch; optionally session.save for a server-side snapshot. |
+| Cross-session search | Server-backed GET /api/sessions/search?q= from sidebar and ⌘⇧F palette | GET /api/sessions/search | 🔶 | SearchPalette filters bots/sessions/artifacts client-side over model.sessions — a demo-only store, so live mode returns no session hits; the search endpoint is never called. **Next:** debounced /api/sessions/search call from the palette when mode == .live. |
+| Titles (auto + manual) | Auto-title lands as session.title event (durable key in payload); manual rename via session.title RPC in the row menu | session.title RPC + session.title event | 🔶 | .sessionTitle is decoded in TalariaKit (GatewayEvents.swift:32,71) but AppModelLive's switch drops it (falls to default: break); no rename UI; threads are named by profile, and session titles only appear on demo rows. **Next:** handle the event into SessionSummary rows once the live session list lands; add rename via session.title. |
+| Hidden sessions | session.set_hidden + session.list include_hidden — bot-mode plugin hides canonical bot chats from the normal list | session.set_hidden; session.list {include_hidden} | ⭕ | Never sent; Talaria's listSessions omits include_hidden so hidden sessions are correctly excluded by default. Low priority — Talaria's chat-per-bot model doesn't create scaffolding sessions to hide. |
+| Context meter | Statusbar gauge from usage.context_percent (session.info / session.usage) | session.usage + message.complete usage.context_percent | 🚧 | ChatView model-strip gauge reads chat.usage.contextPercent (ChatView.swift:560), fed by the sessionUsage and messageComplete handlers; falls back to a synthetic message-count formula when usage is absent (demo). Pipeline ran during today's live streaming test but the % was not specifically checked. **Next:** eyeball the strip against desktop's gauge during a long live turn. |
+| Context breakdown | session.context_breakdown → categories rendered in the statusbar popover | session.context_breakdown | 🔶 | GatewayClient.contextBreakdown maps categories → ContextSegment with percent-of-max, but nothing calls it; BotSheetView's context card renders model.contextMeter, populated only by DemoData (empty and 0% in live mode). **Next:** fetch breakdown on bot-sheet open and write it into model.contextMeter. |
+| Usage ticker | session.usage event at 1 Hz while a turn runs; live tokens/cost ticker; final usage on message.complete | session.usage event (1 Hz, deduped) | 🚧 | Event is handled into chat.usage every tick, but only context % is displayed; parsed input/output/total token counts are never shown anywhere. No cost/credits display (credits_lines not modeled). **Next:** decide whether tokens/cost belong in the bot sheet stat cards. |
+| Multi-window / multi-session | Unlimited secondary session windows, HUD, Quick Entry, split-view session tiles + tab strip, ⌃Tab/⌃1-9 switching, background sync via session.active_list | hermes:window:* IPC; session.activate / session.active_list | ➖ | Single-scene iPhone app — windows/HUD/tiles have no mobile equivalent. The analog that matters (several bots with concurrently attached live sessions, events routed per-sid, background bots keep streaming) is implemented and was exercised live. session.activate/active_list unused. |
+| Session row actions (pin/archive/delete/unread) | Sidebar row menu: rename, pin, archive, delete, mark unread, export; server flags via PATCH/DELETE /api/sessions/&lt;id&gt; | PATCH /api/sessions/&lt;id&gt; {pinned\|archived\|unread\|title}; DELETE /api/sessions/&lt;id&gt;; session.delete | ⭕ | No live session rows exist yet so no actions; per-bot unread badges exist but are client-side counts, not the server unread watermark. **Next:** after the live session list lands, add swipe actions backed by REST PATCH/DELETE. |
+
+## 4. Profiles / Bot Mode
+
+Bot Mode's core loop is real and live-verified: profiles.list drives the
+roster and each bot binds to a per-profile session with create/resume,
+streaming, and REST transcript hydration — though Talaria skips desktop's
+canonical "Bot Chat" title ladder, so clients can diverge onto different
+conversations. Create/duplicate/edit sheets are complete at the RPC layer but
+untested live, and the editor never calls profiles.describe — so live pickers
+render empty and an edit save can clobber SOUL.md with description text.
+Biggest single lever: hydrate the edit sheet and model/skills catalogs from
+profiles.describe + model.options.
+
+| Feature | Desktop | Gateway surface | Talaria | Notes |
+|---|---|---|---|---|
+| Roster (one row per profile) | Bots pane: row per profile with avatar, status, unread badge (last_active watermark poll), preview; click opens bot chat | profiles.list {include_sessions:true} + sessions.changed event | ✅ | RosterView verified today against real tailnet gateway: real bots, previews, last_active times. Working/approval status folded from live events; unread is an in-app counter on message.complete (no watermark poll persistence). Empty-state + offline banner present. |
+| Per-profile chat session | Canonical "Bot Chat": pinned ui_meta['hermes-bots'].chat id, else resume by title "Bot Chat", else hidden titled create | session.create/session.resume {profile}, prompt.submit, GET /api/sessions/{id}/messages | ✅ | Create/resume + streaming + transcript hydration live-verified today. Drift: Talaria resumes profiles.list last_session (else new untitled source:'talaria' session) — no Bot Chat title pinning, so iOS and desktop can land in different conversations for the same bot. Reconnect re-resume + inflight replay built-untested. **Next:** adopt desktop's canonical-chat ladder (ui_meta chat pin, resume by title "Bot Chat", titled create). |
+| Create profile (New Bot sheet) | "New Agent": profiles.create+configure with soul/model pin/skills, stamps ui_meta['hermes-bots'] so backend injects the Bot-Mode A2A protocol | profiles.create, profiles.configure | 🚧 | CreateBotView: slug validation, job=description, soul, model pin, skill exclusions, shape/hue ui_meta; optimistic append then roster refresh; RPC errors swallowed (try?). Never writes the hermes-bots ui_meta marker, so Talaria-created profiles are not Bot-Mode-managed server-side (no A2A protocol injection). No MCP/toolsets section (desktop advanced has both). **Next:** live-create a profile on the tailnet gateway; decide whether to stamp a bot-managed ui_meta marker. |
+| Configure / edit profile | Edit Profile loads profiles.describe editor snapshot, saves via profiles.configure | profiles.configure (describeProfile wrapper built, never called) | 🔶 | "Edit look & soul" sheet saves description/soul/model/skills/ui_meta, but never fetches profiles.describe: soul prefills from profile description (SOUL.md clobber risk on save), and skills/model chips have no live data source. **Next:** call profiles.describe on sheet open to prefill soul, disabled skills, model, toolsets. |
+| Duplicate profile | Duplicate = profiles.create clone (config.yaml/.env/SOUL.md/memory/skills) | profiles.create {clone_from, clone_all:true} | 🚧 | BotSheet action clones to first free "&lt;id&gt;-2" with optimistic roster row. Sends clone_all:true (full copytree minus history) — heavier than desktop's config-files clone; fine but not identical semantics. |
+| SOUL.md persona | Soul editor with real file read/write (GET/PUT /api/profiles/&lt;name&gt;/soul) | profiles.create {soul} / profiles.configure {soul} (full replacement) | 🔶 | Write-only: soul set at create, replaced on edit. Existing SOUL.md is never read, and the edit field prefills from description text — saving an untouched edit can overwrite the real SOUL.md. bot_mode_protocol capability flag implicitly honored (client never appends the protocol). **Next:** read soul via profiles.describe (or REST soul GET) before allowing edit save. |
+| Avatar image assets | Custom avatar portraits set/fetched and rendered in roster + chat | profiles.set_asset / profiles.get_asset (wrappers in GatewayClient, unused) | 🔶 | Client wrappers match the contract (dataURL, PNG/JPEG/WebP ≤2MB) but no UI calls them; AvatarView renders geometric shape-x-hue only; profiles.list has_avatar is parsed then ignored. **Next:** fetch avatar when has_avatar and add image rendering to AvatarView with shape/hue fallback. |
+| image.generate portraits | Generate avatar portrait via image.generate, save with profiles.set_asset | image.generate {prompt, aspect_ratio} (wrapper built, unused) | 🔶 | generateImage() handles 300 s timeout and image_data→image fallback correctly; no portrait-generation UI exists anywhere in the app. **Next:** add generate-portrait flow to Create/Edit sheets once avatar image rendering lands. |
+| ui_meta cosmetics (shape/hue) | Avatar accents + pinned order + hermes-bots block in profile.yaml ui_meta, merged key-wise | profiles.configure {ui_meta} merge; profiles.list ui_meta | 🚧 | Writes ui_meta.talaria {shape,hue} on create/edit; roster reads same keys back, stable-hash fallback otherwise. Fallback path live-verified via today's roster; write→read round trip not live-exercised. Desktop's hermes-bots ui_meta keys neither read nor written. **Next:** verify ui_meta round trip on a live-created profile. |
+| Model pin per profile | Per-profile model+provider pin via profiles.configure; picker fed by model.options | profiles.configure {model}; model.options (wrapper unused) | 🔶 | Landing today (shares the model-switching gap): pin chips on Bot sheet + Create sheet call configureProfile(model:), and profiles.list model round-trips into the roster (live-verified), but AppModel.models is demo-only — chips render empty against a real gateway. Provider never sent. **Next:** populate models from model.options on connect (shared with the in-flight chat model switcher). |
+| Skills enable/disable per profile | Skill toggles in profile editor; disabled_skills full-replace | profiles.configure {disabled_skills} | 🔶 | Strike-through chips send a full replacement list (nil when untouched, so no accidental clobber), but the skills catalog is demo-only (empty chips live) and the current disabled set is never prefetched. **Next:** source chips from profiles.describe skills[] with enabled state prefilled. (See also §10.) |
+| Profile delete / rename | Profiles overlay: rename + delete (PATCH/DELETE /api/profiles/&lt;name&gt;); Bot Mode roster itself defers delete to CLI | none wired | ⭕ | Deliberate: Bot sheet shows the CLI-only deletion footnote and the profile id field is disabled in edit (immutable), matching the Bot Mode roster stance; REST delete/rename not ported. **Next:** confirm CLI-only stance, or wire DELETE /api/profiles/{name} behind a confirmation. |
+| Default profile semantics | default = root profile, handle @hermes, owns un-namespaced cron; dedicated switch keybind | profiles.list is_default | 🚧 | Default profile appears as an ordinary roster bot (live-verified); is_default → defaultBotID owns un-namespaced cron jobs and unattributable approvals — both fallbacks untested since approvals/cron aren't live-tested. @hermes alias not surfaced. |
+| Bot sheet stats / recent sessions / context / memory | Profile card backed by live data: session list, skill/memory counts, star map | session.list {profile} + session.context_breakdown wrappers built, unused | 🔶 | BotSheetView renders stat cards, recent sessions, context meter and star map from demo dictionaries only — empty/zero in live mode. profiles.list skill_count is parsed but not used for the stat card; star map is decorative. **Next:** back the sheet with session.list {profile}, skill_count, and session.context_breakdown. |
+| Bot-to-bot @mentions / A2A feed | Mention middleware: roster handle resolution, CLI handoff for local bots, gateway-RPC delivery + reply poll for remote bots, "Message from robot" detection | none wired (desktop uses profiles.list + cli.exec + session.resume/prompt.submit) | ⭕ | AgentInboxView is a demo-only watch feed; Bot.mentionsYou is never set in live mode (no A2A prefix detection on incoming messages), no mention autocomplete or delivery path. **Next:** detect the "Message from 🤖" A2A prefix in live messages; add roster-mention delivery via session.resume+prompt.submit. (Inbox surface details in §6.) |
+| Routines [bot:] attribution (Bot Mode tile) | Per-bot routines via cron.manage {profile} (modern) or [bot:name] tag filter (legacy) | cron.manage list / toggle | 🚧 | refreshRoutines parses "[bot:&lt;name&gt;]" to attribute jobs, un-namespaced jobs fall to the default bot; only the legacy global list is used (profile param never passed). Suspect bug: toggle sends action "enable"/"disable" with "id" — gateway actions are pause/resume keyed by "name" — likely a silent no-op. Full cron CRUD is §6's audit. **Next:** fix toggle to cron.manage pause/resume {name:&lt;job_id&gt;} and scope lists with the profile param. |
+
+## 5. Approvals & YOLO
+
+The approvals core loop is coded but not live-tested: approval.request →
+Approvals-tab swipe card → approval.respond works in code, with resume replay
+of the oldest pending approval, request_id-matched push actions, and turn-end
+pruning. Biggest gaps: the UI collapses the 4-way choice set to binary
+approve(once)/deny; inline chat cards and in-app banners are demo-wired only;
+clarify has protocol support but no UI; sudo/secret prompts, the approval-mode
+picker, and global YOLO are entirely missing.
+
+| Feature | Desktop | Gateway surface | Talaria | Notes |
+|---|---|---|---|---|
+| approval.request card | Inline tool card in chat: redacted command, description, pattern key, derived choices | event approval.request | 🔶 | Parsed (TalariaKit/GatewayEvents.swift:216) and ingested into Approvals-tab swipe cards w/ badge + bot status (AppModelLive.swift:475, ApprovalsView.swift). InlineApprovalCard component exists (ChatView.swift:474) but live ingest never appends an .approvalRef chat message — inline card renders only from DemoData. Flow not yet exercised live. **Next:** append .approvalRef message in AppModelLive.ingest and live-test an approval end-to-end. |
+| once/session/always/deny choices + allow_permanent + smart_denied | Renders server-derived choices incl. permanent-allow; smart-denied shows reduced once/deny set | approval.respond {choice, request_id, session_id} | 🔶 | Kit models all 4 choices (ApprovalChoice, GatewayClient.respondToApproval:339) and parses choices/allow_permanent/allow_session; UI is binary — approve sends "once", deny "deny" (AppModelLive.swift:547). choices never reach UI; smart_denied flag not parsed at all. **Next:** drive buttons from request.choices (add "this session"/"always"), parse smart_denied for messaging. |
+| approval.pending replay on reconnect/resume | Reconnect fetches pending list (approval.pending) + ack via approval.received; resume carries pending_approval | approval.pending / approval.received; session.resume pending_approval | 🔶 | session.resume pending_approval is parsed and ingested (GatewayClient.swift:83, AppModelLive.swift:261,711) — oldest only. pendingApprovals() RPC built (GatewayClient.swift:347) but never called from UI; approval.received not implemented. **Next:** call approval.pending after reconnect/foreground to recover beyond the oldest entry. |
+| Per-session YOLO toggle | Statusbar zap toggles config.set {key:yolo, scope:session}; effective state read back from session.info.yolo | config.set yolo scope=session; session.info.yolo | 🚧 | BotSheet toggle (BotSheetView.swift:268-294) → client.setYolo scope:'session' (GatewayClient.swift:360); chat.yolo synced from session.info (AppModelLive.swift:418). RPC silently skipped when the bot has no live session yet — toggle is local-only until a session exists. **Next:** live-verify; mint or defer the set when toggled pre-session. |
+| Global YOLO | Shift+click zap / palette → config.set {key:yolo, scope:global} (writes approvals.mode off\|manual) | config.set yolo scope=global | ⭕ | setYolo hardcodes scope "session"; no global toggle anywhere in TalariaUI. **Next:** add scope:'global' variant plus a toggle in connection/settings surface. |
+| Approval mode menu (manual/smart/off) | Shell menu picker synced via config.get/config.set approvals.mode | config.get/set approvals.mode | ⭕ | session.info.approval_mode is parsed (GatewayEvents.swift:159,173) but unused; GatewayClient has no config.get and no approvals.mode setter; no picker UI. **Next:** add config.get/set approvals.mode + a mode picker (BotSheet or Connections). |
+| clarify.request bridge | Clarify question card w/ choices + multi-select, answered via clarify.respond; pending_clarify replayed on resume | clarify.request / clarify.respond; session.resume pending_clarify | 🔶 | ClarifyRequest parsed (GatewayEvents.swift:245) and respondToClarify built (GatewayClient.swift:352), but AppModelLive's event switch has no .clarifyRequest case — events are dropped; zero UI; pending_clarify not parsed in ResumeResult (GatewayClient.swift:82-95). Agent blocks 300 s then times out. **Next:** render clarify card in chat (choices/multi-select) + parse pending_clarify on resume. |
+| sudo/secret prompts | Modal password/secret dialogs; empty value = refusal | sudo.request→sudo.respond, secret.request→secret.respond | ⭕ | No parsing, no responder, no UI anywhere in TalariaKit/TalariaUI; requests would time out (300 s) with the agent blocked. **Next:** parse both events, add secure-entry sheet, send empty respond as refusal. |
+| terminal/preview/window read bridges | Agent reads the desktop app's terminal pane, preview tile, or window-below via read.request→respond responders | terminal.read.request/respond, preview.read.request/respond, window.read.request/respond | ➖ | Desktop client-capabilities gated by session.create source; Talaria correctly sends source:'talaria' (GatewayClient.swift:282,293) so the gateway won't route these requests to iOS. No terminal/preview pane exists to read; correct behavior is to not advertise, which the source tag achieves. |
+| Approve from notification / banner | Native notification with approve action → approval.respond (no request_id = oldest FIFO) | approval.respond; APNs via talaria-push relay | 🚧 | APNs category TALARIA_APPROVAL with Approve (authenticationRequired) + Later actions (PushCoordinator.swift:79-96); resolves by request_id with oldest-pending-for-bot fallback (:208-243). Relay emits approval pushes (app/relay/talaria-push events.py) but is not deployed. In-app PushBanner has approve/later actions yet only fires from the demo banner cycle (RootView.swift:248-296) — live approvals raise no in-app banner. **Next:** deploy relay; enqueue a live in-app banner from ingest(ApprovalRequest). |
+| Approval lifecycle: dedupe, timeout, interrupt-deny | Identical approvals coalesce; 300 s timeout denies; session.interrupt denies all pending | server-side + session.interrupt | 🔶 | Dedupe by request_id on ingest (AppModelLive.swift:476); stale cards pruned when the turn completes (pruneApprovals, AppModelLive.swift:499) covering timeout/answered-elsewhere/interrupt. No local countdown or expiry while a turn is still running; interruptSession exists in Kit (GatewayClient.swift:303) but no UI stop control invokes it. **Next:** live-verify prune on timeout; wire a stop control to session.interrupt. |
+| Pending-approval indicators | Composer YOLO indicator + statusbar zap + approval state in session list | local state from approval.request/session.info | 🚧 | Approvals tab badge (RootView.swift:148), bot status dot flips to .approval (AppModelLive.swift:492, recomputeStatus:615), Live Activity carries pendingApprovals count (LiveActivityController.swift:113). YOLO state visible only inside BotSheet — no chat-level indicator like desktop's composer zap. **Next:** Live Activity count needs on-device verification. |
+
+## 6. Routines, Inbox & Artifacts
+
+Routines are the only live-wired piece of this area: cron.manage list with
+[bot:name] namespacing, enable/disable toggles, and cron.changed refresh are
+code-complete but not exercised against a real gateway (and the toggle action
+names need live confirmation); all job CRUD beyond toggling is missing, with
+the "+ new routine" row a dead affordance. Agent Inbox, Activity, and
+Artifacts are finished, fully themed UI shells that render only demo data —
+all three tabs are empty against a real gateway. The common next step is
+building live data pipelines onto the already-working REST/WS client.
+
+| Feature | Desktop | Gateway surface | Talaria | Notes |
+|---|---|---|---|---|
+| Routines/cron job list with [bot:name] namespacing | /cron overlay + Bot Mode Routines tile list per-profile cron jobs (REST /api/cron/jobs; bot-mode via cron.manage) | cron.manage {action:list} over WS | 🚧 | RoutinesView + AppModelLive.refreshRoutines (AppModelLive.swift:568) map jobs to bots by parsing the "[bot:&lt;name&gt;] title" prefix, fallback to gateway default profile; refreshed on connect and reconnect; "Other bots" ledger section included. Cron not exercised live yet. **Next:** run against the real gateway with actual jobs; confirm CronJob field mapping (id/name/schedule/enabled/next_run/last_run) matches server payload. |
+| Routine enable/disable toggle | Per-job pause/resume (POST /api/cron/jobs/&lt;id&gt;/pause\|resume) | cron.manage {action:enable\|disable, id} | 🚧 | Themed toggle is optimistic and fire-and-forget (try? in liveToggleRoutine, AppModelLive.swift:554); action names "enable"/"disable" are unverified against the gateway's cron.manage vocabulary (desktop uses REST pause/resume). **Next:** verify accepted action names live; reconcile the toggle state on RPC failure. |
+| Create routine (schedule builder + prompt) | Create-job dialog: schedule builder, prompt, model override, delivery targets | POST /api/cron/jobs or cron.manage add — not wired | ⭕ | The dashed "+ new routine" row in RoutinesView.swift:136 is a static Text with .contentShape but no tap handler — pure affordance, no form, no RPC. **Next:** wire a create sheet to cron.manage add with a [bot:name]-namespaced title. |
+| Edit routine (schedule/prompt/model override w/ drift warnings) | Edit dialog incl. model-override drift impact warnings (store/cron-model-impact.ts) | PUT /api/cron/jobs/&lt;id&gt; — not wired | ⭕ | Rows only toggle; no edit UI anywhere. **Next:** add an edit sheet; drift warnings can be dropped for v1. |
+| Trigger routine now | Per-job trigger-now button (24 h request timeout) | POST /api/cron/jobs/&lt;id&gt;/trigger — not wired | ⭕ | No affordance in RoutinesView. **Next:** add a row action; needs a long per-call timeout like desktop's 24 h override. |
+| Delete routine | Per-job delete | DELETE /api/cron/jobs/&lt;id&gt; — not wired | ⭕ | No swipe/long-press delete on routine rows. **Next:** add swipe-to-delete calling cron.manage remove. |
+| Routine run history (runs → sessions) | Job run history opens run sessions; cron-runs section in sessions sidebar | GET /api/cron/jobs/&lt;id&gt;/runs — not wired | ⭕ | Rows show only a last-run timestamp (last_run field); no drill-in to run transcripts. **Next:** fetch runs and open them via the existing session hydration path. |
+| Delivery targets | Per-job delivery-target checkboxes from GET /api/cron/delivery-targets | GET /api/cron/delivery-targets — not wired | ⭕ | No concept of output delivery to messaging platforms in the app. **Next:** surface targets in the future create/edit sheet. |
+| Automation blueprints gallery + instantiate | Blueprints gallery, instantiate per profile (blueprints.tsx) | GET /api/cron/blueprints, POST .../instantiate — not wired | ⭕ | No blueprint surface at all. |
+| Live cron refresh on cron.changed | /cron overlay refreshes on cron.changed broadcast | cron.changed event (typed in GatewayEvents.swift:101) | 🚧 | Event router calls refreshRoutines() on cron.changed (AppModelLive.swift:451). **Next:** toggle a job from desktop while the phone is connected and watch the list update. |
+| Routine-run completion delivery to phone (push) | Native notifications on the desktop side; Talaria adds a push relay | Relay sidecar maps platform=="cron" session end → routine push (relay/talaria-push/.../events.py:166); PushCoordinator routes taps | 🚧 | Relay code complete but not deployed; hook surface lacks the job name (relay README gap), so pushes say only success/failure. Landing depends on relay deployment. **Next:** deploy relay, run a cron job, verify the routine push and its tap routing. |
+| Agent Inbox feed (bot-to-bot A2A traffic) | Bot Mode @-mention delivery over session.create+prompt.submit; bot-initiated cli.exec `hermes -p <bot> chat -c "Agent Inbox"` with attribution | Would need cross-profile session list + transcripts of "Agent Inbox" sessions — not wired | 🔶 | AgentInboxView is a complete themed UI (from→to rows, "all" broadcasts, attribution footer) over model.agentInbox — populated only by DemoData; live mode flushes it and nothing repopulates (zero references in AppModelLive.swift). **Next:** hydrate from /api/profiles/sessions filtered to Agent-Inbox-titled sessions, refreshed on sessions.changed. |
+| @mention steering (user hands off to another bot from chat) | Bot Mode parses @-mentions in composer and delivers to the target profile via session.create+prompt.submit | session.create + prompt.submit (both already implemented for normal chat) | ⭕ | liveSend submits raw text to the open bot's session only — no mention parsing, autocomplete, or cross-profile delivery, despite the inbox lead copy promising "@mention in a bot's chat to steer". **Next:** parse leading @botname in send(), route to that bot's session with attribution prefix; add composer autocomplete. |
+| Mentions-you badges on roster | Bot Mode unread/mention badges via roster poll watermark | No live source sets it | 🔶 | Bot.mentionsYou renders in RosterView rows and the .mention push kind routes to the bot's chat, but only demo data ever sets mentionsYou; live roster refresh carries it over as false. **Next:** set mentionsYou when an incoming A2A/inbox message targets the user, or from mention-kind pushes. |
+| Subagent monitor (desktop /agents overlay) | Tree of delegated subagent runs per session: status glyphs, live stream tail, duration, open child session (subagent.* events) | subagent.* events — not handled anywhere in GatewayEvents/AppModelLive | ⭕ | No subagent surface; TypedGatewayEvent has no subagent cases. Distinct from the Agent Inbox tab despite desktop calling /agents the "agent inbox". **Next:** decide if mobile needs it; minimum is a per-bot "delegating" status line from subagent events. |
+| Activity feed | No single desktop feed page — closest: native notifications, agent notices, cron-runs sidebar section, Command Center logs | Would be fed by events already received (approval.request, message.complete, cron.changed, connection state) — not wired | 🔶 | ActivityView is a finished day-grouped ledger (approvals w/ pending chip, mentions, routine runs, tasks, gateway events) with tap routing (approval→Approvals tab, gateway→Connections, else bot chat); model.activity is demo-only, live mode never appends. Push default-tap falls back to the Activity tab, which is empty when live. **Next:** append ActivityItems from the live event router; persist a rolling window across launches. |
+| Artifacts gallery (outputs indexing) | /artifacts cross-profile gallery of files/images/links extracted client-side from transcripts (artifact-utils.ts over getAllSessionMessages) | GET /api/sessions/&lt;id&gt;/messages (client.fetchSessionMessages exists) — extraction not wired | 🔶 | ArtifactsView two-column grid is complete (image stripe thumbs, file ext chips, link cards, owner attribution); model.artifacts is demo-only and live mode never populates it, so the tab is empty against a real gateway. **Next:** port desktop's artifact extraction over the transcript REST across roster sessions; refresh on sessions.changed. |
+| Artifact filters, pagination, search | Type/profile filters + pagination on /artifacts; ⌘K search | Client-side over the (unpopulated) artifacts array | 🔶 | SearchPalette filters model.artifacts by title/meta (SearchPalette.swift:62) — inherits the empty live dataset; no kind filters or pagination in ArtifactsView. **Next:** add kind filter chips once live extraction lands; paginate the transcript sweep. |
+| Artifact jump-to-session | Card opens the exact owning session | openBotID navigation only | 🔶 | Card tap sets selectedTab=.home + openBotID (ArtifactsView.swift:82), which resumes the bot's latest session — not the artifact's specific session; Artifact model carries no session id. **Next:** store sessionID on Artifact during extraction and open that session directly. |
+| Artifact media thumbnails / download | Real media fetched/downloaded via gateway (src/lib/media.ts) | No media fetch path in TalariaKit | ⭕ | Image cards render a striped placeholder pattern by design-port; no bytes fetched, no share/save. **Next:** add authenticated media GET + AsyncImage thumbs and a share sheet. |
+
+## 7. Models & Providers
+
+Talaria's model/provider surface splits three ways. (1) Gateway model
+controls: the model+effort sheet landed today but is untested live and drops
+the config.set result — deferred switches, warnings, and the expensive-model
+confirm handshake are silently lost, and session.info.model never resyncs the
+strip. (2) Provider onboarding is entirely missing. (3) BYO inference is the
+inverse: NousPortalClient and the TalariaLocal MLX package are essentially
+complete libraries with zero UI wiring, zero tests, and (for TalariaLocal) no
+linkage into the app target.
+
+| Feature | Desktop | Gateway surface | Talaria | Notes |
+|---|---|---|---|---|
+| Model picker (model.options) | Composer model pill + ⌘⇧M picker with provider grouping, configured/unconfigured state, per-session + profile-global cache | WS model.options; GET /api/model/options | 🔶 | Landing today: ModelEffortSheet (ChatView model strip tap) + AppModel.availableModels() harvest the model.options payload into a flat id list, demo fallback. No provider grouping, no configured/unconfigured badges, no refresh param. Not live-tested. **Next:** exercise live against real gateway; render provider sections + auth state from the payload instead of flat ids. |
+| Model switch mid-session (deferred) | config.set {key:model} with deferred/scope:'pending' handling while turn is busy; timeline event; strip resyncs from session.info | WS config.set key=model; session.info event | 🔶 | Landing today: AppModelLive.setModel → GatewayClient.setSessionModel + local pin update. RPC result is discarded — deferred:true/warning never surfaced (only static copy in the sheet); session.info.model is parsed (SessionInfo) but the handler only syncs yolo/storedSessionID, so a gateway-side switch never updates the strip. Not live-tested. **Next:** parse config.set result (deferred/warning) and sync chat strip from session.info.model. |
+| Expensive-model confirm | config.set returns confirm_required+confirm_message; dialog then resubmit with confirm_expensive_model:true | WS config.set key=model (confirm_required branch) | ⭕ | setSessionModel ignores the result dict; picking an expensive model silently no-ops with no dialog and no resubmit path. **Next:** return the config.set result to the sheet, show confirm alert, resubmit with confirm_expensive_model:true. |
+| Fast tier pin | Fast-mode selector on the model pill; session-scoped tier pin; fast flag on session.create | WS config.set key=fast; session.create {fast} | ⭕ | No config.set key=fast anywhere; GatewayClient.createSession takes model but not fast/provider/reasoning_effort. **Next:** add a fast toggle to ModelEffortSheet wired to config.set key=fast. |
+| Reasoning effort control | Effort selector on the model pill; per-session config.set reasoning; reasoning_effort on session.create | WS config.set key=reasoning; config.get reasoning | 🔶 | Landing today: none/low/medium/high chips in ModelEffortSheet → GatewayClient.setReasoningEffort (config.set key=reasoning). Initial value defaults to "" — never read back via config.get or session.info, so the sheet can show no selection on a fresh open. Not live-tested. **Next:** seed selection from config.get {key:'reasoning'} on sheet open; live-test. |
+| Per-profile model pin (bot default) | Profile default model via profiles.configure; shown in roster/profile switcher | WS profiles.create/configure {model}; profiles.list model field | 🔶 | Pin write wired (BotSheetView.pinModel, CreateBotView → profiles.create/configure model) and roster reads profile.model→pinnedModel (roster live-verified). BUT both chip pickers iterate AppModel.models, which is only populated with DemoData in demo mode — in live mode the chip rows render empty, so the pin is unreachable live. **Next:** feed the bot-sheet/create-bot chips from availableModels() instead of the demo-only models array. |
+| Provider onboarding (OAuth + runtime probe) | Onboarding flows pkce/device_code/external via REST providers/oauth start/submit/poll/cancel; setup.status + setup.runtime_check; recommended-default confirm via /api/model/recommended-default + /api/model/set; skip persisted | REST /api/providers/oauth/*; WS setup.status, setup.runtime_check, reload.env | ⭕ | No provider-onboarding surface at all in TalariaKit/UI; Talaria assumes the remote gateway already has inference credentials. Reasonable for remote-first mobile but a real desktop capability gap. **Next:** minimal path: setup.status probe on connect + a "configure on your gateway" notice; full path adds the OAuth REST flows. |
+| Provider API keys (model.save_key) | API-key entry per provider group, validate, env vault with reveal, disconnect | WS model.save_key, model.disconnect; PUT /api/env + POST /api/providers/validate + reload.env | ⭕ | No model.save_key/model.disconnect helpers in GatewayClient, no key-entry UI. NB: entering API keys inside the iOS app is a product decision (keys land on the gateway host, not the phone). **Next:** add model.save_key/model.disconnect to GatewayClient + a key sheet reachable from an unconfigured provider row in the model picker. |
+| Nous Portal device-code sign-in | hermes auth add nous device-code flow (client_id hermes-cli, scope inference:invoke), auth.json + shared mirror | Portal POST /api/oauth/device/code + /api/oauth/token (device grant + header-RT refresh) | 🔶 | NousPortalClient is a faithful, complete port: poll caps (1 s/slow_down+1 cap 30 s), single-use RT rotation with concurrent-refresh dedupe, Keychain write-through, host allowlists for portal/inference URLs, network-blip tolerance during polling. But zero UI wiring (no TalariaUI reference), zero tests (ProtocolChecks has no portal checks), never exercised live. **Next:** add a Portal sign-in screen (user_code + open verification_uri_complete) and cover the poll/refresh state machine in ProtocolChecks. |
+| Portal billing & entitlements | Billing settings page (tiers, usage bars, payment, auto-reload, cap) via gateway billing.*/subscription.* RPCs; billing:manage scope step-up device flow | WS billing.state/usage.bars/subscription.*; Portal GET /api/oauth/account | 🔶 | Client-side only: NousPortalClient.account() (GET /api/oauth/account, Bearer) + NousTokens.hasScope for the step-up check. No step-up device flow, no gateway billing.* RPC helpers, no billing UI anywhere. **Next:** decide scope: read-only entitlement badge from account() is cheap; full billing UI needs the gateway billing RPC set. |
+| Portal recommended models | Tier-aware aux/vision model picks from public endpoint, cached 5 min + disk LKG | Portal GET /api/nous/recommended-models (no auth) | ⭕ | No reference in the codebase; ModelCatalog.recommended is the unrelated local-MLX default pick. **Next:** fetch on Portal sign-in to preselect a chat model in the BYO path. |
+| Portal direct inference (BYO chat) | n/a — desktop always runs inference through the gateway provider chain | Inference API GET /models + POST /chat/completions (SSE) | 🚧 | NousPortalClient implements the InferenceProvider seam: model list, SSE streaming with reasoning_content routing, 401→forced-refresh retry, sticky session_id for provider prompt caches. Compiles; no UI consumes InferenceProvider, never hit the real inference API. **Next:** wire a gateway-less "pocket chat" surface consuming InferenceProvider, then live-test. |
+| Local MLX inference (TalariaLocal) | n/a mobile-only capability — desktop has no in-app LLM; local models run gateway-side | TalariaLocal package: LocalModelProvider (MLXLLM), ModelCatalog (Qwen3 1.7B/4B, Llama 3.2 3B 4-bit), ModelDownloadManager (HF Hub, progress/cancel/delete/disk) | 🔶 | Package is code-complete and thoughtful (single-resident-model memory policy, streaming &lt;think&gt; splitter → reasoningDelta, load dedupe, RAM gating per device). But it is NOT linked into the app: ios/project.yml only links TalariaKit/Theme/UI, no UI references it, MLX dep pinned to branch main, and the splitter/download code has no tests. **Next:** link TalariaLocal into the app target behind an opt-in, add a local-models screen (catalog+download+chat), pin mlx-swift-examples to a tag, test ReasoningTagSplitter. |
+| Model settings extras (aux/MoA/defaults/presets) | Settings→Model (default model, context length, fallbacks), GET/PUT /api/model/auxiliary + /api/model/moa, model presets store, model visibility overlay, custom endpoints CRUD, provider groups page, MoA runtime display | REST /api/model/{info,auxiliary,moa,set}; /api/providers/custom-endpoints; moa.* events | ⭕ | None of this exists in Talaria; moa.* events are not parsed in GatewayEvents. Low mobile priority — gateway-admin territory — but listed for completeness. |
+
+## 8. Voice & Wake
+
+A polished shell over almost no substance. VoiceView is fully built and
+reachable from the chat composer mic, with live wiring to voice.toggle and
+the voice.transcript/voice.status events — but its rings and waveform animate
+on fixed timers, and the app contains **zero on-device audio**: no mic
+capture, no TTS playback, no /api/audio/* REST calls, no wake.* code.
+Architecturally it is wired to the wrong surface for parity: desktop voice is
+client-side capture + audio REST, whereas Talaria's voice.toggle drives the
+mic/speakers of the gateway HOST machine. Nothing here was live-tested today.
+
+| Feature | Desktop | Gateway surface | Talaria | Notes |
+|---|---|---|---|---|
+| Push/press-to-talk voice input | Composer mic records client-side, POSTs /api/audio/transcribe, inserts transcript (voice-activity.tsx, use-composer-voice.ts) | POST /api/audio/transcribe {data_url,mime_type} (alt: voice.record RPC) | ⭕ | No mic capture anywhere in Talaria: no AVAudioSession/AVAudioEngine, no NSMicrophoneUsageDescription in app/ios/Talaria/Support/Info.plist, no transcribe call in GatewayClient.swift. **Next:** add mic usage string + AVAudioEngine capture, POST /api/audio/transcribe, feed composer draft. |
+| Voice conversation mode (voice turn loop) | Full duplex: record → transcribe → submit → spoken reply, looped, all client-side audio | /api/audio/transcribe + /api/audio/speak; Talaria instead calls voice.toggle {on\|off} | 🔶 | VoiceView overlay (TalariaUI/Screens/VoiceView.swift) is built and reachable from the chat mic button, but rides the backend-voice surface: voice.toggle on entry/off on exit turns on the gateway HOST's mic/speakers, not the phone's. Rings/orb/12-bar waveform animate on fixed timers, not audio levels — visual-only. Not live-tested. **Next:** decide model: on-device audio (REST transcribe/speak, matches desktop) vs. host-side voice; today's wiring is effectively a remote control for host voice. |
+| Live voice transcript display | Desktop has no voice.transcript handler (client-side STT shows its own text) | voice.transcript event {text, stop_phrase, typed, no_speech_limit} | 🚧 | GatewayEvents.swift:94 parses text+stop_phrase into VoiceView quote line; ignores typed/no_speech_limit. Never exercised live (voice not in today's test pass). **Next:** exercise against a gateway with HERMES_VOICE enabled. |
+| Voice state line (listening/thinking) | n/a on desktop (client-side state machine in use-composer-voice.ts) | voice.status event {state} | 🚧 | GatewayEvents.swift:97 → VoiceView stateLabel fallback when no transcript. Untested live. **Next:** same live pass as transcript. |
+| Auto-TTS spoken replies | Replies spoken via POST /api/audio/speak, mirrors voice.auto_tts config | POST /api/audio/speak {text} (alt: voice.tts RPC) | ⭕ | No audio playback code at all (no AVPlayer/AVSpeechSynthesizer, no speak call). VoiceView shows text only. **Next:** AVAudioSession playback + /api/audio/speak; honor voice.auto_tts. |
+| Streaming TTS | /api/audio/speak-stream streams audio as it generates | GET/POST /api/audio/speak-stream | ⭕ | Depends on TTS playback existing first. **Next:** after basic TTS lands, stream via AVAudioEngine buffer scheduling. |
+| Barge-in (interrupt TTS by speaking) | voice-barge-in.ts halts playback on user speech; session.interrupt also stops TTS | voice.interrupted event; session.interrupt RPC | ⭕ | voice.interrupted is not parsed (falls to .other in GatewayEvents.swift); no playback to interrupt anyway. **Next:** parse voice.interrupted once playback exists. |
+| Stop-word ("stop", voice.stop_phrases) | voice-stop-word.ts ends the voice turn on stop phrase | voice.transcript {stop_phrase:true} | 🔶 | VoiceView.swift:349-351 reads stop_phrase but only clears the state label — does not end voice mode or dismiss the overlay. **Next:** on stop_phrase, call voiceSet(off) and dismiss VoiceView. |
+| Mute control | Composer mute pauses client mic capture | Talaria maps hush → voice.toggle off/on | 🔶 | VoiceView hush button (VoiceLinkController.toggleMute) disables the entire host voice mode rather than muting a mic, and pins the waveform low — semantically wrong but plausible-looking. Untested live. **Next:** rework once audio model is decided. |
+| Thinking sounds + playback stall recovery | Audible thinking cues; voice-playback.ts recovers stalled TTS | client-side audio | ⭕ | No audio pipeline to attach to. |
+| Wake word "Hey Hermes" (backend listener) | wake.start/stop/pause/resume/status manage backend-owned listener; composer pauses it while recording | wake.start {surface,persist,client_capture}, wake.stop {persist}, wake.pause/resume/status | ⭕ | Zero wake.* references in Talaria code (grep across TalariaKit/TalariaUI/ios/relay). Low priority for a phone; iOS background mic listening is effectively impossible outside foreground anyway. |
+| Client-mic wake capture (PCM feed) | GUI streams mic PCM frames to the backend detector via wake.feed (wake-client-capture.ts) | wake.feed (PCM frames) | ⭕ | Blocked on mic capture; also iOS backgrounding makes always-listening a foreground-only feature at best. |
+| wake.detected → open voice turn + wake sound | wake.detected event opens a voice turn and plays the wake sound (wiring.tsx:701) | wake.detected event | ⭕ | Event unhandled (falls to .other). Could plausibly present VoiceView when received even without local wake capture (host-side detection). **Next:** handle wake.detected → present VoiceView, as a cheap partial win. |
+| Wake indicator window | Tiny always-on-top "listening" indicator window (?win=wake) | Electron window + hermes:wake-indicator:* IPC | ➖ | iOS has no floating windows; nearest analog is a Live Activity/Dynamic Island state, which Talaria's LiveActivityController does not model for wake. |
+| Voice settings (provider matrix, voices, record key, auto-TTS) | Settings → Voice: full TTS/STT provider matrix (ElevenLabs/OpenAI/Edge/xAI/MiniMax/Gemini/local), voice picker, voice.record_key, auto-TTS toggle | /api/config record; GET /api/audio/elevenlabs/voices | ⭕ | Talaria has no voice settings surface and never fetches the ElevenLabs voices endpoint. **Next:** fold minimal auto-TTS + voice picker into whatever settings screen lands. |
+| Voice availability probe | n/a (desktop keys off local config) | voice.toggle {action:"status"} → {enabled,tts,available,audio_available,stt_available} | 🔶 | GatewayClient.voiceStatus() exists (GatewayClient.swift:404) but has no callers — the chat mic button is never gated on availability, so VoiceView opens even when the gateway host has no audio. **Next:** call voiceStatus() before presenting VoiceView; hide/disable mic when unavailable. |
+
+## 9. Notifications & Live Activity
+
+Architecturally complete but almost entirely unexercised: a real APNs relay
+plugin (hook mode + sidecar), an NSE, an actionable TALARIA_APPROVAL
+category, a strict talaria:// deep-link router, and a well-behaved Live
+Activity controller + widget bundle. The one hard blocker: **the app never
+registers its APNs token with the relay's /devices endpoint**, so no push can
+be delivered even after relay deployment. Desktop's HUD, quick entry, pet
+overlay, and tray-less residency are n/a mobile, with the Live
+Activity/Dynamic Island as the built analogue.
+
+| Feature | Desktop | Gateway surface | Talaria | Notes |
+|---|---|---|---|---|
+| OS notifications for agent events (approval / long-task / routine / mention) | Native OS notifications with reply/approve actions via hermes:notify (store/native-notifications.ts) | Plugin hooks pre_approval_request, pre_llm_call+on_session_end, pre_gateway_dispatch → APNs HTTP/2 (relay/talaria-push/talaria_push_relay/events.py, push.py, apns.py) | 🚧 | Full relay plugin: JWT-auth APNs client, bounded queue+worker, per-kind categories, interruption levels, truncation, collapse ids. Relay not deployed yet, so no live push has been exercised. **Next:** deploy plugin into the gateway hermes, configure TALARIA_APNS_* env, send /test push to the physical device. |
+| Gateway offline/recovered notification | Reconnect banner in-app; no offline push (app is the client) | Sidecar mode: GET /api/health heartbeat + WS polls (relay sidecar.py); kind=gateway push → talaria://connections | 🚧 | Requires a separate long-running sidecar process, ideally on another host; loopback/static-token gateways only (scrapes __HERMES_SESSION_TOKEN__). Hook mode structurally cannot cover this. **Next:** stand up sidecar under launchd/systemd on a second tailnet host and verify offline→recovered pair. |
+| Device token registration handshake (app → relay) | n/a (no push infra needed) | POST/GET/DELETE /api/plugins/talaria-push/devices + /status + /test (relay dashboard/plugin_api.py); devices.json store | 🔶 | Server REST is complete and the app captures the APNs token (PushCoordinator.deviceToken awaitable, wired from AppDelegate), but NO Swift code ever POSTs the token to the relay — the handshake consumer is absent, so pushes can never reach the phone even once the relay deploys. **Next:** add a registration call (post token + environment + profile_filter with the dashboard session auth) after gateway sign-in, and DELETE on sign-out. |
+| Actionable approval from notification (approve on lock screen) | Approve action on native notification sends approval.respond (native-notifications.ts:236) | TALARIA_APPROVAL category, APPROVE_ACTION (.authenticationRequired) / LATER_ACTION → ApprovalOutcomes.resolve → approval.respond | 🚧 | PushCoordinator registers the category with theme-pack copy and re-registers on theme change. Hook-mode pushes ship empty approval_request_id (hook lacks it); client falls back to the bot's oldest pending approval. Time-sensitive level requested but the Time Sensitive capability/entitlement is not on the app id, so it silently downgrades. **Next:** live-test approve-from-lock-screen once relay is deployed; add Time Sensitive Notifications capability. |
+| Notification tap routing + talaria:// deep links | hermes:// scheme, hermes:deep-link IPC (main.ts:14885) | CFBundleURLTypes scheme talaria; DeepLinks.swift parser + DeepLinkRouter; PushCoordinator.handle(response:) mirrors it | 🚧 | talaria://approvals, talaria://connections, talaria://bot/&lt;id&gt; all route into AppModel; strict parse rejects junk. Gap: relay appends ?session_id=... to bot deeplinks but the parser drops it — tap opens the bot's chat, not the specific session. **Next:** honor the session_id query param when opening a bot chat. |
+| Notification decoration (rich push service extension) | n/a (Electron renders its own notifications) | TalariaNotificationService NSE: mutable-content=1, data strings win over aps alert, per-bot thread-id, approval category stamp, INSendMessageIntent communication styling for mentions | 🚧 | Target exists in project.yml and builds. Communication-notifications capability is not in the entitlements, so mention styling falls back to plain content (coded for graceful failure). **Next:** send a real mention push through APNs sandbox to confirm NSE runs under Lockdown Mode. |
+| In-app notification banner (toast center) | In-app toast center (store/notifications.ts) fed by live events | PushBanner.swift card with inline Approve/Later; RootView owns presentation | 🔶 | The banner UI is complete (avatar, meta line, approval actions, routing identical to notification taps) but is only driven by the demo cycle (RootView.runDemoPushCycle, "only runs against demo data"). Live foreground pushes surface via the system banner (willPresent returns .banner/.list/.sound) rather than the in-app card. **Next:** feed BannerPush from live gateway events (approval.request, background.complete) when the app is foreground. |
+| Agent notices (notification.show / notification.clear) | AgentNotice pills: sticky/ttl notices, credits warnings (store/agent-notices.ts) | WS events notification.show / notification.clear | 🔶 | GatewayEvents.swift parses both into .notificationShow/.notificationClear, but nothing in TalariaUI consumes them — no notice surface exists, so gateway-pushed notices are dropped on the floor. **Next:** render notices as a dismissible strip (sticky vs ttl_ms) above the roster/chat. |
+| Notification preferences + test notification | Settings → Notifications page: per-event prefs + test button | Relay: TALARIA_PUSH_EVENTS / TALARIA_PUSH_* env, POST /api/plugins/talaria-push/test; app: Connections "Notify me when" rows | 🔶 | Onboarding "Allow" card does real UNUserNotificationCenter authorization + APNs registration. But the Connections notify-prefs toggles mutate demo-local model state only (DemoData.notificationPrefs) — not persisted, not wired to the relay's kind filter or per-device profile_filter; no in-app test-push button (scheduleDemoPush exists but is demo-mode). **Next:** bind prefs to the device record's profile_filter / relay event kinds and surface the /test endpoint. |
+| Duplicate suppression / reconnect baseline | Dedup across windows + baseline suppression on reconnect (store/notify-baseline.ts) | Relay-side: per-event dedupe keys + windows, APNs collapse_id, post_approval_response hook clears approval dedupe | 🚧 | Suppression lives server-side in Talaria's model (correct place for push), incl. 120 s gateway-flap window and shed-oldest queue. Hook+sidecar double-push risk is documented and mitigated by splitting TALARIA_PUSH_EVENTS. |
+| Unread / pending badges | Unread dots, profile-rail badges, unread tracking (store/session-unread*.ts) | model.pendingApprovalCount() → tab bar badge; RosterView per-bot badges | 🔶 | Approvals tab badge and roster badges render (roster itself live-verified). No app icon badge: .badge permission is requested but setBadgeCount is never called anywhere, and there is no server-watermark unread sync (that is §3's gap too). **Next:** set the app icon badge to pending approvals on background/push. |
+| Live Activity / Dynamic Island (bot-at-work ambient) | No direct equivalent — HUD window + pet fill the ambient-presence role on desktop | LiveActivityController observing AppModel.workingBots/approvals; BotWorkAttributes (TalariaKit/LiveActivityModel.swift); TalariaWidgets BotWorkLiveActivity (lock card + island expanded/compact/minimal, widgetURL talaria://bot/&lt;id&gt;) | 🚧 | Cap 1 concurrent, most-recent working bot featured, orphan adoption at launch, pending-approvals chip, phosphor elapsed clock, NSSupportsLiveActivities set. pushType nil: activity only updates while the app process is alive — no push-updated activity, so it freezes/ends when iOS suspends the app. Dev entitlements drop the app group, so widget theme falls back gracefully. Not yet exercised on device. **Next:** live-test on device; consider ActivityKit push tokens via the relay for background updates. |
+| HUD window (floating always-on-top chat) | Chrome-free translucent floating ChatView with own socket (?win=hud, global snap shortcut) | n/a | ➖ | iOS has no floating windows. Mobile analogue is the Live Activity / Dynamic Island pill (built) plus notification quick actions; both exist. |
+| Quick Entry (global-hotkey mini composer) | Global shortcut mini composer submitting into the normal prompt path (?win=quick) | n/a | ➖ | No global hotkeys on iOS. The natural analogues — home-screen/lock-screen widget with a compose intent, App Intents/Siri shortcut, or a notification text-input reply action — are NOT built (widget bundle carries only the Live Activity; no reply action on any category). **Next (optional):** add an App Intent + lock-screen widget for one-tap prompt capture. |
+| Pet overlay window (desktop mascot) | Floating pet sprite on the desktop (?win=overlay) with drag/ignore-mouse IPC | n/a | ➖ | No desktop surface on iOS. The avatar language (shapes/hues/eyes) already lives in the roster and the Live Activity's StaticAvatarView, which is the mobile ambient-mascot analogue. |
+| Tray-less model / ambient residency | Deliberately no system tray; presence via HUD/pet/notifications | n/a | ➖ | iOS has no tray concept either; ambient residency maps to APNs pushes + Live Activity, both covered above. |
+| Completion sound + keep-awake (grouped) | Completion/thinking sounds (Settings→Appearance) and keep-awake toggle (store/keep-awake.ts) | n/a in app; push payloads carry sound:'default' | ⭕ | No in-app completion sound, haptics on turn completion, or UIApplication.isIdleTimerDisabled keep-awake anywhere in Talaria sources. Small polish items. **Next:** add a turn-complete haptic/sound option and an optional keep-awake while a bot streams. |
+
+## 10. Skills, MCP & Commands
+
+Talaria's largest parity hole: of the entire desktop Capabilities surface
+(slash commands, skills, MCP, toolsets, plugins, learning, insights,
+checkpoints, projects) nothing is built except a partial per-profile
+skill-exclusion chip row. ChatView sends "/"-prefixed text verbatim to
+prompt.submit, and GatewayEvents does not decode mcp.setup.request — an
+agent-initiated MCP setup silently stalls a turn for up to 600 s, the one
+correctness (not just parity) bug found. The gap is cheaper to close than
+desktop's implementation suggests: Talaria is WS-only and the gateway exposes
+WS twins for nearly everything here, so no REST plumbing is required.
+
+| Feature | Desktop | Gateway surface | Talaria | Notes |
+|---|---|---|---|---|
+| Commands catalog (slash popover) | Composer "/" popover lists categorized commands + skill commands with aliases from the backend catalog | WS commands.catalog (+command.resolve) | ⭕ | No slash handling anywhere in ChatView; nothing calls commands.catalog. High value on mobile — expose as a composer sheet. **Next:** fetch commands.catalog on chat open; show sheet when composer text starts with "/". |
+| Slash execution + dispatch | "/x ..." routed through slash.exec (worker, {output}) with structured command.dispatch for quick-commands/skills/bundles/pending-input; /browser via browser.manage | WS slash.exec, command.dispatch, browser.manage | ⭕ | Typed "/status" etc. is sent verbatim via prompt.submit and reaches the LLM as chat text. Expose — /status,/save,/retry,/undo,/compress come free. **Next:** route "/"-prefixed submits through slash.exec; render {output} as a system row. |
+| Slash + @ completions | Live completion drawer: complete.slash (commands+skills, replace_from) and complete.path (@diff/@file:/@url:, @profile mentions) | WS complete.slash, complete.path | ⭕ | complete.slash is cheap once the catalog sheet exists; @path completion low value on phone except @profile mentions. **Next:** add complete.slash filtering to the slash sheet; defer complete.path. |
+| Skills list + toggle + detail | Capabilities→Skills tab: installed list, enable toggles, detail pane with full SKILL.md | REST /api/skills, /api/skills/content, PUT /api/skills/toggle; WS equivalent skills.manage | ⭕ | No skills screen at all. Talaria is WS-only (no authenticated REST client), so build on skills.manage. Expose read-only list + toggles. **Next:** Capabilities sheet backed by WS skills.manage list/toggle. |
+| Skills hub (search/preview/install/uninstall/update) | Embedded hub browser inside Skills tab with scan/install/update | REST /api/skills/hub/sources\|search\|preview\|scan, POST install/uninstall/update (no WS twin) | ⭕ | Install flows are desktop-class and REST-only; skip v1, revisit as read-only browse. |
+| Skills reload/rescan | Rescan after hub/file changes | WS skills.reload | ⭕ | One RPC; belongs on the future skills sheet. **Next:** add rescan button alongside skills list. |
+| Per-profile skill exclusion (bot create/edit) | Bot-mode New Agent advanced disclosure embeds full SkillsView; persists via profiles.configure disabled_skills | WS profiles.configure {disabled_skills}; read side profiles.describe skills[] | 🔶 | CreateBotView chips write disabled_skills live (CreateBotView.swift:399-431) but candidate list is DemoData.skills — empty in live mode — and edit never prefills from profiles.describe (client method exists, unused). Bot sheet "skills" stat reads demo-only memory map, shows 0 live despite skill_count arriving in profiles.list. **Next:** populate chips + stat from profiles.describe/skill_count in live mode. |
+| MCP server list + enable + health | Capabilities→MCP tab: server rows with health store, enable/disable | REST /api/mcp/servers, PUT .../enabled; WS mcp.servers.list; profiles.describe mcp_servers[] | ⭕ | Zero MCP code in Talaria. Expose read-only list first — profiles.describe already returns mcp_servers[{name,enabled,transport}] for the bot sheet. **Next:** show mcp_servers from profiles.describe in bot sheet; then WS mcp.servers.list screen. |
+| MCP add/edit/remove + raw mcp.json editor | Add/edit/remove forms plus raw JSON editor with replace-map PUT | REST POST/DELETE /api/mcp/servers, PUT replace; WS mcp.servers.add/remove/set_api_key | ⭕ | Minimal add/remove via WS is reasonable later; raw JSON editor should be skipped on mobile. |
+| MCP server test | Test button: connect + tool list + client-side token cost estimate (60 s) | WS mcp.servers.test; REST POST .../test | ⭕ | Expose test with tool list; skip the token-cost estimate (desktop-local lib). **Next:** add test action to future MCP list rows. |
+| MCP OAuth connect | Start OAuth flow per server, poll flow status | WS mcp.servers.oauth.start/poll; REST POST .../auth + /api/mcp/oauth/flows | ⭕ | Good mobile fit — Talaria already has WKWebView auth sheet + loopback listener from gateway PKCE; reuse for MCP OAuth. **Next:** wire oauth.start/poll to the existing AuthWebSheet. |
+| MCP bundled catalog install | Catalog browser with per-profile install/enable state | WS mcp.catalog; REST /api/mcp/catalog(+/install) | ⭕ | Tap-to-enable bundled servers is the most mobile-appropriate MCP add path. **Next:** mcp.catalog list with enable action. |
+| MCP reload | Reload MCP button (full shutdown + rediscovery) | WS reload.mcp {confirm} | ⭕ | One RPC; pair with future MCP sheet. |
+| mcp.setup chat bridge | Inline MCP-setup prompt card in transcript; respond via mcp.setup.respond (600 s window) | WS event mcp.setup.request → mcp.setup.respond | ⭕ | GatewayEvents.swift decodes approval/clarify but not mcp.setup.request — an agent-initiated MCP setup silently stalls the turn until timeout. **Correctness gap, not just parity.** **Next:** decode event + minimal respond card (or explicit auto-decline with notice). |
+| MCP install deep links | hermes://mcp/install?... protocol handler + confirm dialog | OS protocol handler → REST catalog install | ⭕ | Talaria has a talaria:// scheme but only routes push/connections (RootView.swift:92). Skip v1; map talaria://mcp/install later. |
+| Toolsets browse/enable + per-toolset config | Capabilities→Toolsets: enable/disable, per-toolset config, provider/model pick, post-setup actions, usage badges | REST /api/tools/toolsets*; WS toolsets.list, tools.list/show/configure; profiles.configure {enabled_toolsets} | ⭕ | profiles.describe already returns toolsets[] and gateway accepts enabled_toolsets, but GatewayClient.configureProfile lacks the param. Expose per-profile toggles; skip deep config v1. **Next:** add enabledToolsets to configureProfile; toggles in bot sheet from profiles.describe. |
+| Terminal backend + computer-use config | Terminal backend picker (local/docker/modal/ssh...), computer-use status/permission grant | REST /api/tools/terminal/backends, /api/tools/computer-use/* | ➖ | Host-machine admin of the gateway box; not meaningful to configure from a phone. |
+| Desktop renderer plugin system | @hermes/plugin-sdk: plugin-contributed routes/panes/palette (kanban /boards, hermes-bots), runtime-fetched plugins | Electron renderer contribution registry + /api/plugins/&lt;id&gt; doors | ➖ | Electron renderer architecture; a native plugin UI system is out of scope. Individual plugin features (bot mode) are audited as first-class Talaria screens instead. |
+| Agent/gateway plugins manage | Settings→Plugins list/toggle of gateway-side plugins (agent-plugins store, contract v6) | WS plugins.manage (also plugins.list) | ⭕ | Ironic gap: Talaria depends on the talaria-push gateway plugin installed by hand server-side; a read-only plugins.manage list would let users verify the relay is present/enabled. **Next:** read-only plugins.manage list in Connections diagnostics. |
+| Learning star map + curator | /starmap d3-force graph of learned skills + memory chunks, node view/edit/delete, curator status/pause/run | REST /api/learning/graph, /api/learning/node, /api/curator* | ⭕ | Graph viz is desktop-class; skip on phone. The TUI-shaped WS learning.frames/detail/edit/delete is the mobile-friendly list path if a "journey" view is ever wanted. |
+| Insights | Not surfaced on desktop either (insights.get is TUI-only; desktop shows /api/analytics usage in Command Center instead) | WS insights.get | ⭕ | One RPC returning a stats payload — easy future win as a profile stats card, but no desktop-parity obligation. Skip v1. |
+| Rollback / checkpoints | Settings→Safety checkpoints toggle; REST checkpoint list + prune; file rollback itself is TUI-only (rollback.list/restore/diff); /undo rides slash | WS rollback.list/restore/diff; REST /api/ops/checkpoints(+/prune); config checkpoints key | ⭕ | No checkpoint concept in Talaria. /undo comes free once slash.exec lands; WS rollback.* could power a nice mobile safety feature later. Skip v1. |
+| Projects/repos browse + session grouping | Sidebar Projects section: CRUD family, tree, record_repos, project_sessions, set_active, session.workspace.move | WS projects.list/create/update/delete/tree/project_sessions/set_active, projects.record_repos | ⭕ | Talaria lists sessions flat per bot with no project grouping. Read-only projects.tree grouping is a plausible later add; full CRUD skip. **Next (optional):** group bot session lists by projects.tree. |
+| Worktrees + repo git ops | Worktree creation dialog, git review ops, repo discovery roots — all Electron-native git on the desktop host | Electron hermes:git:* (no gateway twin except projects.discover_repos) | ➖ | Requires local git on the client host; nothing for a phone to run. |
+| Capabilities shortcuts + palette rows | Cmd-K palette rows for Capabilities/YOLO/settings, keybinds into skills page | Renderer command registry | ➖ | Hardware-keyboard concept; Talaria's SearchPalette covers bots/sessions/artifacts and could gain capability actions once those screens exist. |
+
+---
+
+## Roadmap — next 10
+
+Ranked by daily-driver impact for a solo power user driving bots from a
+phone, then by contributor appeal. Each item names its concrete first step
+from the audit rows above.
+
+1. **Stop button for a running turn** (§2) — GatewayClient.interruptSession is already wrapped; morph the send button into a stop control while chat.isTyping/working. Today there is no way to halt a runaway bot from the phone. Hours of work, immediate daily payoff.
+2. **Push delivery end-to-end** (§9) — the single hard blocker is that the app never POSTs its APNs token to the relay's /api/plugins/talaria-push/devices endpoint. Add the registration call after gateway sign-in (+ DELETE on sign-out), deploy the relay plugin with TALARIA_APNS_* env, and live-test approve-from-lock-screen. Pushes are the reason a phone client exists.
+3. **Approvals live pass + full choice set** (§5) — drive buttons from request.choices (once / this session / always / deny) instead of binary approve/deny, append the .approvalRef inline chat card from live ingest, raise the in-app banner from ingest(ApprovalRequest), call approval.pending after reconnect, and live-test the whole loop.
+4. **Wire live data into the built shells** (§3, §4) — one pass calling listSessions(profile:), /api/sessions/search, session.context_breakdown, and handling the session.title event flips the bot sheet, search palette, and context card from demo-empty to live. All wrappers already exist unused.
+5. **Fix the SOUL.md clobber + empty live pickers** (§4) — call profiles.describe on edit-sheet open to prefill soul, disabled skills, model, and toolsets. Today an untouched edit save can overwrite a bot's real SOUL.md with description text — the audit's one data-loss risk.
+6. **Attachments** (§2) — PhotosPicker/file importer + image.attach_bytes / pdf.attach wrappers, with a pending-attachment badge on the composer. The gateway surface is complete and phone-friendly (base64); sending a photo to a bot is the most phone-native missing feature.
+7. **Finish model/effort switching** (§7) — parse the config.set result (deferred / warning / confirm_required + expensive-model resubmit), resync the strip from session.info.model, seed effort from config.get, and feed the bot-sheet/create-bot chips from availableModels() instead of the demo-only array.
+8. **Transcript richness: tool chips + block markdown** (§2) — render collapsible inline tool cards from tool.start/tool.complete (payloads already parsed then dropped), and do the block-level markdown pass (lists, headings, fenced code) on top of today's inline-only renderer.
+9. **Slash commands + the mcp.setup correctness fix** (§10) — route "/"-prefixed submits through slash.exec with a commands.catalog sheet (/status, /undo, /compress come free), and decode mcp.setup.request so an agent-initiated MCP setup no longer silently stalls a turn for 600 s.
+10. **Reconnect grace live-test + re-auth prompt** (§1, §3) — kill the socket mid-turn on device to verify the ~20 s park/reattach path, inflight replay, and offline-queue flush; and surface a re-sign-in banner when reconnect aborts on sessionExpired instead of staying silently offline.
