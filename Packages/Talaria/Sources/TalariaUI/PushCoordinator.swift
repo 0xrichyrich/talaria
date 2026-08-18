@@ -156,6 +156,18 @@ public final class PushCoordinator: NSObject {
         let waiters = tokenWaiters
         tokenWaiters.removeAll()
         for waiter in waiters { waiter.resume(returning: hex) }
+        registerWithRelayIfConnected()
+    }
+
+    /// Hand the token to the gateway's talaria-push relay plugin. Safe to call
+    /// repeatedly (idempotent upsert server-side); silently skips when the
+    /// gateway is absent or the plugin isn't installed.
+    public func registerWithRelayIfConnected() {
+        guard let hex = deviceTokenHex, let client = model?.client else { return }
+        Task {
+            // Dev builds sign with the development aps-environment.
+            try? await client.registerPushDevice(tokenHex: hex, environment: "dev")
+        }
     }
 
     /// Forwarded from `application(_:didFailToRegisterForRemoteNotificationsWithError:)`.

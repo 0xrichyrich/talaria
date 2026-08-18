@@ -107,6 +107,11 @@ extension AppModel {
 
         startDisconnectMonitor(for: client)
 
+        #if os(iOS)
+        // Hand the APNs token to this gateway's push relay (if installed).
+        PushCoordinator.shared.registerWithRelayIfConnected()
+        #endif
+
         try await refreshRoster()
         try? await refreshRoutines()
         connections = registry.rows
@@ -242,7 +247,10 @@ extension AppModel {
             var resumed = false
             if let stored {
                 do {
-                    live = try await client.resumeSession(stored, profile: botID, deferHistory: true)
+                    // Full projection in the resume ack (deferHistory returns a
+                    // bounded stub and leaves history to a REST shape that has
+                    // proven flaky) — one round trip, authoritative rows.
+                    live = try await client.resumeSession(stored, profile: botID, deferHistory: false)
                     resumed = true
                 } catch let error as GatewayError where error.code == GatewayError.sessionNotFound {
                     live = try await client.createSession(profile: botID)
@@ -281,14 +289,12 @@ extension AppModel {
     /// (defer_history contract), falling back to the projection rows the
     /// resume ack carried.
     private func hydrateTranscript(_ live: LiveSession, botID: String) async {
-        guard !live.storedSessionID.isEmpty else { return }
-        var history: [ChatMessage] = []
-        if let client,
+        // The resume ack's projection is the known-good shape; REST is only a
+        // fallback for resumes that omitted messages.
+        var history = Self.chatMessages(fromTranscript: .array(live.messages))
+        if history.isEmpty, !live.storedSessionID.isEmpty, let client,
            let payload = try? await client.fetchSessionMessages(storedID: live.storedSessionID) {
             history = Self.chatMessages(fromTranscript: payload)
-        }
-        if history.isEmpty {
-            history = Self.chatMessages(fromTranscript: .array(live.messages))
         }
         guard !history.isEmpty else { return }
         chat(for: botID).messages = history
@@ -311,9 +317,12 @@ extension AppModel {
             let text = row["text"]?.stringValue ?? ""
             guard !text.isEmpty else { return nil }
             let time = row["timestamp"]?.doubleValue.map { shortTime($0) }
+            let reasoning = row["reasoning"]?.stringValue
+                ?? row["reasoning_content"]?.stringValue
             switch row["role"]?.stringValue {
             case "user": return ChatMessage(author: .user, time: time, text: text)
-            case "assistant": return ChatMessage(author: .bot, time: time, text: text)
+            case "assistant": return ChatMessage(author: .bot, time: time, text: text,
+                                                 reasoning: reasoning)
             case "system": return ChatMessage(author: .system, time: time, text: text)
             default: return nil
             }
@@ -372,6 +381,20 @@ extension AppModel {
                                                  text: text, isStreaming: true))
             }
 
+        case .thinkingDelta(let text), .reasoningDelta(let text):
+            // Reasoning usually precedes the first visible token — open the
+            // streaming bubble early so the "Thought" block has a home.
+            guard let botID, !text.isEmpty else { return }
+            let chat = chat(for: botID)
+            chat.isTyping = false
+            if let last = chat.messages.last, last.isStreaming {
+                chat.messages[chat.messages.count - 1].reasoning =
+                    (last.reasoning ?? "") + text
+            } else {
+                chat.messages.append(ChatMessage(author: .bot, time: AppModel.clock(),
+                                                 text: "", isStreaming: true, reasoning: text))
+            }
+
         case .messageInterim(let text, let alreadyStreamed):
             // Complete assistant segment between tool calls: finalize the
             // streaming bubble, or append when it never streamed.
@@ -392,6 +415,10 @@ extension AppModel {
             if let last = chat.messages.last, last.isStreaming {
                 if !payload.text.isEmpty { chat.messages[chat.messages.count - 1].text = payload.text }
                 chat.messages[chat.messages.count - 1].isStreaming = false
+                if let reasoning = payload.reasoning, !reasoning.isEmpty,
+                   chat.messages[chat.messages.count - 1].reasoning == nil {
+                    chat.messages[chat.messages.count - 1].reasoning = reasoning
+                }
             } else if !payload.text.isEmpty, chat.messages.last?.text != payload.text {
                 chat.messages.append(ChatMessage(author: .bot, time: AppModel.clock(), text: payload.text))
             }
@@ -716,6 +743,72 @@ extension AppModel {
         try? await refreshRoutines()
         connections = ConnectionRegistry.shared.rows
         await flushComposeQueue()
+    }
+
+    // MARK: - Model / reasoning / YOLO controls (chat model strip)
+
+    /// Switch the session model (live: config.set model, may defer mid-turn)
+    /// and remember it as the bot's pin.
+    public func setModel(botID: String, to modelID: String) {
+        if let idx = bots.firstIndex(where: { $0.id == botID }) {
+            bots[idx].pinnedModel = modelID
+        }
+        guard mode == .live else { return }
+        Task { @MainActor in
+            guard let client else { return }
+            let sid = try? await ensureSession(botID: botID, hydrate: false)
+            guard let sid else { return }
+            try? await client.setSessionModel(sessionID: sid, model: modelID)
+        }
+    }
+
+    /// Session reasoning effort ("none"/"low"/"medium"/"high").
+    public func setReasoningEffort(botID: String, to effort: String) {
+        chat(for: botID).reasoningEffort = effort
+        guard mode == .live else { return }
+        Task { @MainActor in
+            guard let client else { return }
+            let sid = try? await ensureSession(botID: botID, hydrate: false)
+            guard let sid else { return }
+            try? await client.setReasoningEffort(sessionID: sid, value: effort)
+        }
+    }
+
+    /// Per-session YOLO toggle, wired through to the gateway when live.
+    public func setYolo(botID: String, enabled: Bool) {
+        chat(for: botID).yolo = enabled
+        guard mode == .live else { return }
+        Task { @MainActor in
+            guard let client else { return }
+            let sid = try? await ensureSession(botID: botID, hydrate: false)
+            guard let sid else { return }
+            try? await client.setYolo(sessionID: sid, enabled: enabled)
+        }
+    }
+
+    /// Model ids offered by the gateway (model.options), demo list otherwise.
+    /// Defensive parse: the picker payload nests models under providers.
+    public func availableModels() async -> [String] {
+        guard mode == .live, let client else { return DemoData.models }
+        guard let payload = try? await client.modelOptions() else { return DemoData.models }
+        var ids: [String] = []
+        func harvest(_ value: JSONValue) {
+            if let arr = value.arrayValue {
+                for item in arr { harvest(item) }
+            } else if let obj = value.objectValue {
+                if let id = (obj["id"] ?? obj["model"] ?? obj["name"])?.stringValue,
+                   obj["models"] == nil, ids.count < 200 {
+                    ids.append(id)
+                }
+                for key in ["providers", "models", "groups", "items"] {
+                    if let nested = obj[key] { harvest(nested) }
+                }
+            }
+        }
+        harvest(payload)
+        var seen = Set<String>()
+        let unique = ids.filter { seen.insert($0).inserted }
+        return unique.isEmpty ? DemoData.models : unique
     }
 
     // MARK: - Offline queue

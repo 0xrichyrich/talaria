@@ -59,6 +59,7 @@ public struct ChatView: View {
     private let onVoice: () -> Void
 
     @State private var draft = ""
+    @State private var showModelSheet = false
     @FocusState private var composerFocused: Bool
 
     public init(model: AppModel, botID: String,
@@ -299,6 +300,11 @@ public struct ChatView: View {
                         .foregroundStyle(theme.ink.opacity(0.45))
                         .padding(.bottom, 4)
                 }
+                if let reasoning = message.reasoning, !reasoning.isEmpty {
+                    ThoughtBlock(reasoning: reasoning, theme: theme,
+                                 isLive: message.isStreaming && message.text.isEmpty)
+                        .padding(.bottom, message.text.isEmpty ? 0 : 5)
+                }
                 if !message.text.isEmpty {
                     botBubble(message.text)
                 }
@@ -316,7 +322,7 @@ public struct ChatView: View {
     @ViewBuilder private func botBubble(_ text: String) -> some View {
         switch theme.id {
         case .soft:
-            Text(text)
+            Text(chatMarkdown(text))
                 .font(theme.body(14.5))
                 .lineSpacing(3)
                 .foregroundStyle(theme.ink.opacity(0.94))
@@ -330,7 +336,7 @@ public struct ChatView: View {
                     .strokeBorder(theme.ink.opacity(0.06), lineWidth: 1))
                 .shadow(color: theme.ink.opacity(0.04), radius: 1, y: 1)
         case .control:
-            Text(text)
+            Text(chatMarkdown(text))
                 .font(theme.body(14))
                 .lineSpacing(3.5)
                 .foregroundStyle(theme.ink.opacity(0.88))
@@ -344,7 +350,7 @@ public struct ChatView: View {
                     .strokeBorder(theme.line, lineWidth: 1))
         case .ink:
             // Flat manuscript text with a colored left rule — no bubble.
-            Text(text)
+            Text(chatMarkdown(text))
                 .font(theme.body(16.5))
                 .lineSpacing(4)
                 .foregroundStyle(theme.ink)
@@ -529,7 +535,7 @@ public struct ChatView: View {
                                                        bottomTrailingRadius: 6, topTrailingRadius: 20))
                 .shadow(color: theme.accent.opacity(0.24), radius: 6, y: 4)
         case .control:
-            Text(text)
+            Text(chatMarkdown(text))
                 .font(theme.body(14))
                 .lineSpacing(3.5)
                 .foregroundStyle(theme.ink)
@@ -572,13 +578,19 @@ public struct ChatView: View {
 
     private var modelStrip: some View {
         HStack(spacing: 8) {
-            Button(action: onOpenProfile) {
+            Button {
+                showModelSheet = true
+            } label: {
                 Text(verbatim: "⌘ \(modelShort)")
                     .font(chipStripFont)
                     .foregroundStyle(theme.id == .ink ? theme.ink.opacity(0.6) : theme.ink)
                     .lineLimit(1)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .sheet(isPresented: $showModelSheet) {
+                ModelEffortSheet(model: model, botID: botID)
+            }
             Spacer(minLength: 8)
             Capsule()
                 .fill(theme.line)
@@ -592,7 +604,7 @@ public struct ChatView: View {
                 .foregroundStyle(theme.id == .soft ? theme.ink.opacity(0.4) : theme.faint)
                 .monospacedDigit()
             Button {
-                model.chat(for: botID).yolo.toggle()
+                model.setYolo(botID: botID, enabled: !yoloOn)
             } label: {
                 Text(verbatim: "YOLO")
                     .font(chipStripFont)
@@ -1042,5 +1054,71 @@ private struct ChatEntrance: ViewModifier {
             .onAppear {
                 withAnimation(.easeOut(duration: 0.35)) { shown = true }
             }
+    }
+}
+
+
+// MARK: - Markdown + Thought (desktop chat parity)
+
+/// Inline markdown (bold/italic/code) with whitespace preserved; falls back
+/// to the raw text on parse failure. Block syntax (lists, headings) stays as
+/// typed — full block rendering is a later pass.
+func chatMarkdown(_ text: String) -> AttributedString {
+    var options = AttributedString.MarkdownParsingOptions()
+    options.interpretedSyntax = .inlineOnlyPreservingWhitespace
+    options.failurePolicy = .returnPartiallyParsedIfPossible
+    return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+}
+
+/// The collapsible reasoning block above a bot message — desktop's "Thought ›"
+/// row. While reasoning is streaming ahead of the first visible token it shows
+/// a live tail instead of a chevron.
+struct ThoughtBlock: View {
+    var reasoning: String
+    var theme: ThemePack
+    var isLive: Bool
+
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.easeOut(duration: 0.18)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(isLive ? "thinking" : "Thought")
+                        .font(theme.mono(10, weight: .semibold))
+                        .foregroundStyle(theme.faint)
+                    if isLive {
+                        Circle().fill(theme.accent)
+                            .frame(width: 5, height: 5)
+                            .shadow(color: theme.accent.opacity(0.6), radius: 3)
+                    } else {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(theme.faint)
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded || isLive {
+                Text(isLive ? String(reasoning.suffix(280)) : reasoning)
+                    .font(theme.mono(11))
+                    .lineSpacing(3)
+                    .foregroundStyle(theme.sub)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(theme.inset.opacity(theme.id == .ink ? 0 : 1),
+                                in: RoundedRectangle(cornerRadius: theme.cardRadius == 0 ? 0 : 10))
+                    .overlay(alignment: .leading) {
+                        if theme.id == .ink {
+                            Rectangle().fill(theme.line).frame(width: 2)
+                        }
+                    }
+            }
+        }
     }
 }

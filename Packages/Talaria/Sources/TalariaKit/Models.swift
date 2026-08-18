@@ -92,11 +92,17 @@ public struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     public var card: MessageCard?
     /// Set while tokens are still streaming in.
     public var isStreaming: Bool
+    /// Model reasoning/thinking that preceded this message (reasoning.delta /
+    /// thinking.delta accumulation, or the stored transcript's reasoning
+    /// fields). Rendered as a collapsible "Thought" block, desktop parity.
+    public var reasoning: String?
 
     public init(id: UUID = UUID(), author: MessageAuthor, time: String? = nil,
-                text: String, card: MessageCard? = nil, isStreaming: Bool = false) {
+                text: String, card: MessageCard? = nil, isStreaming: Bool = false,
+                reasoning: String? = nil) {
         self.id = id; self.author = author; self.time = time
         self.text = text; self.card = card; self.isStreaming = isStreaming
+        self.reasoning = reasoning
     }
 }
 

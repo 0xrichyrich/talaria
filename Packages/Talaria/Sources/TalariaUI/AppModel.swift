@@ -25,6 +25,8 @@ public final class ChatState {
     public var storedSessionID: String?
     public var usage: Usage?
     public var yolo: Bool = false
+    /// Session reasoning effort ("" = gateway default).
+    public var reasoningEffort: String = ""
 
     public init(messages: [ChatMessage] = []) {
         self.messages = messages
