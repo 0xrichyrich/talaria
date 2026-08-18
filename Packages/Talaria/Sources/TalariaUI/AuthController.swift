@@ -86,8 +86,13 @@ public final class AuthController {
     /// when gated) are populated and phase returns to `.idle` — unless a
     /// stored Keychain credential still works, in which case we jump straight
     /// to `.done`. Returns whether the probe succeeded.
+    ///
+    /// Re-authentication passes `allowStoredCredential: false`: that flow only
+    /// runs because the stored credential was rejected on the wire, and an
+    /// access token that still answers /api/auth/me would short-circuit the
+    /// user straight back into the same failing reconnect.
     @discardableResult
-    public func probe(_ urlString: String) async -> Bool {
+    public func probe(_ urlString: String, allowStoredCredential: Bool = true) async -> Bool {
         cancelSignIn()
         status = nil
         providers = []
@@ -112,7 +117,8 @@ public final class AuthController {
                 }
             }
             // A credential from an earlier sign-in may still be good.
-            if let stored = keychain.load(for: base), await works(stored, base: base) {
+            if allowStoredCredential,
+               let stored = keychain.load(for: base), await works(stored, base: base) {
                 credential = stored
                 phase = .done
                 return true

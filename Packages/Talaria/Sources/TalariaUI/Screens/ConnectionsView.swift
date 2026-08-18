@@ -2,14 +2,19 @@ import SwiftUI
 import TalariaKit
 import TalariaTheme
 
-// Connections — pushed from the Roster's net chip. Three sections, ported
+// Connections — pushed from the Roster's net chip. Four sections, ported
 // from Talaria.dc.html `data-screen-label="Connections"`:
 //   Appearance — the three theme swatch cards, switching + persisting live.
-//   Gateways   — saved connections with state dot, themed state word, ping
-//                and bot count; a dashed "+ add gateway" row → sheet that
-//                reuses the AuthController sign-in flow.
-//   Notify me when — push prefs with the CRITICAL/CRIT/GRAVE tag, and the
-//                APNs push-relay footnote.
+//   Gateways   — saved connections with state dot, themed state word, and a
+//                health line (version · auth mode · ping · bots) from the
+//                status probe, plus the last probe error. Tapping a row makes
+//                that gateway the live one; the ⋯ menu renames, signs out, or
+//                removes it (Keychain credential included). A dashed
+//                "+ add gateway" row opens a sheet that reuses the
+//                AuthController sign-in flow, and offers Hermes Cloud agent
+//                discovery when a Nous Portal token is on the device.
+//   Notify me when — push prefs with the CRITICAL/CRIT/GRAVE tag, the
+//                notifications control card, and the APNs relay footnote.
 
 public struct ConnectionsView: View {
     private let model: AppModel
@@ -17,6 +22,9 @@ public struct ConnectionsView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var showAddSheet = false
+    /// The row whose ⋯ menu is open.
+    @State private var actionTarget: SavedGateway?
+    @State private var renameTarget: SavedGateway?
 
     public init(model: AppModel, onBack: (() -> Void)? = nil) {
         self.model = model
@@ -87,7 +95,13 @@ public struct ConnectionsView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // The rename sheet hangs off the header rather than the container:
+            // two `.sheet` modifiers on one view compete for the same
+            // presentation slot, and the add-gateway sheet owns that one.
             header
+                .sheet(item: $renameTarget) { gateway in
+                    RenameGatewaySheet(model: model, gateway: gateway)
+                }
             ScrollView {
                 VStack(alignment: .leading, spacing: listGap) {
                     if model.demoDataLoaded {
@@ -114,8 +128,7 @@ public struct ConnectionsView: View {
                         .padding(.horizontal, 2)
 
                     ForEach(Array(model.connections.enumerated()), id: \.element.id) { index, conn in
-                        ConnectionRow(connection: conn, theme: theme)
-                            .modifier(ConnRowEntrance(delay: Double(index) * 0.055))
+                        gatewayRow(conn, index: index)
                     }
 
                     addGatewayRow
@@ -123,6 +136,9 @@ public struct ConnectionsView: View {
                     GatewaySectionLabel(theme: theme, text: copy.notifySec)
                         .padding(.top, 12)
                         .padding(.horizontal, 2)
+
+                    NotificationsCard(model: model)
+                        .padding(.bottom, 8)
 
                     prefsGroup
 
@@ -139,12 +155,23 @@ public struct ConnectionsView: View {
         .sheet(isPresented: $showAddSheet) {
             AddGatewaySheet(model: model)
         }
+        .confirmationDialog(actionTarget?.name ?? copy.gatewaysSec,
+                            isPresented: Binding(get: { actionTarget != nil },
+                                                 set: { if !$0 { actionTarget = nil } }),
+                            titleVisibility: .visible) {
+            if let gateway = actionTarget { rowActions(for: gateway) }
+        } message: {
+            Text(copy.connRemoveNote(theme.id))
+        }
         .task {
-            // Saved gateways get a fresh health probe whenever the screen
-            // appears; in live mode the rows come straight from the registry.
-            guard model.mode == .live, !ConnectionRegistry.shared.saved.isEmpty else { return }
-            await ConnectionRegistry.shared.probeAll()
-            model.connections = ConnectionRegistry.shared.rows
+            // Saved gateways get a fresh health probe whenever the screen is
+            // up, then every 20 s while it stays up; in live mode the rows come
+            // straight from the registry.
+            guard model.mode == .live else { return }
+            while !Task.isCancelled {
+                await model.refreshConnectionHealth()
+                try? await Task.sleep(for: .seconds(20))
+            }
         }
     }
 
@@ -194,6 +221,68 @@ public struct ConnectionsView: View {
         case .control: theme.display(18)
         case .ink: theme.display(22, weight: .bold).smallCaps()
         }
+    }
+
+    // MARK: Gateway rows
+
+    /// Demo rows have no registry entry behind them, so they stay display-only.
+    private func savedGateway(for connection: GatewayConnection) -> SavedGateway? {
+        ConnectionRegistry.shared.saved.first { $0.id == connection.id }
+    }
+
+    @ViewBuilder
+    private func gatewayRow(_ connection: GatewayConnection, index: Int) -> some View {
+        let saved = savedGateway(for: connection)
+        ConnectionRow(
+            connection: connection,
+            diagnostics: saved.flatMap { model.diagnostics(forGatewayID: $0.id) },
+            isActive: saved.map { model.isActiveGateway($0) } ?? false,
+            isBusy: model.isReconnecting,
+            theme: theme,
+            copy: copy,
+            onTap: saved == nil ? nil : { tapped(saved!) },
+            onActions: saved == nil ? nil : { actionTarget = saved })
+            .modifier(ConnRowEntrance(delay: Double(index) * 0.055))
+    }
+
+    /// A tap connects: switching gateways flushes the previous world, and the
+    /// active-but-offline row retries instead of re-dialing from scratch.
+    private func tapped(_ gateway: SavedGateway) {
+        if model.isActiveGateway(gateway) {
+            if model.isOffline {
+                model.reconnectNow()
+            } else {
+                actionTarget = gateway
+            }
+            return
+        }
+        Task { @MainActor in await model.switchGateway(to: gateway) }
+    }
+
+    @ViewBuilder
+    private func rowActions(for gateway: SavedGateway) -> some View {
+        let isActive = model.isActiveGateway(gateway)
+        if isActive {
+            if model.isOffline {
+                Button(copy.reconnectCTA(theme.id)) { model.reconnectNow() }
+            } else {
+                Button(copy.connDisconnect(theme.id)) {
+                    Task { @MainActor in await model.disconnectGateway() }
+                }
+            }
+        } else {
+            Button(copy.connConnect(theme.id)) {
+                Task { @MainActor in await model.switchGateway(to: gateway) }
+            }
+        }
+        Button(copy.connRename(theme.id)) { renameTarget = gateway }
+        Button(copy.connSignOut(theme.id)) {
+            Task { @MainActor in await model.signOutGateway(gateway) }
+        }
+        Button(copy.connRemove(theme.id), role: .destructive) {
+            Task { @MainActor in await model.removeGateway(gateway) }
+        }
+        Button(copy.cancel, role: .cancel) {}
     }
 
     // MARK: + Add gateway
@@ -260,37 +349,86 @@ public struct ConnectionsView: View {
 
 private struct ConnectionRow: View {
     let connection: GatewayConnection
+    let diagnostics: GatewayDiagnostics?
+    let isActive: Bool
+    let isBusy: Bool
     let theme: ThemePack
+    let copy: CopyPack
+    let onTap: (() -> Void)?
+    let onActions: (() -> Void)?
 
     @State private var pulse = false
 
     private var isUp: Bool { connection.state == .connected }
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            stateDot
-            VStack(alignment: .leading, spacing: 2) {
-                Text(connection.name)
-                    .font(nameFont)
-                    .foregroundStyle(theme.ink)
-                    .lineLimit(1)
-                Text(verbatim: "\(connection.kind.rawValue) · \(connection.address)")
-                    .font(metaFont)
-                    .foregroundStyle(theme.id == .ink ? theme.ink.opacity(0.5) : theme.faint)
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+        HStack(alignment: .center, spacing: 10) {
+            Button { onTap?() } label: {
+                HStack(alignment: .center, spacing: 12) {
+                    stateDot
+                    VStack(alignment: .leading, spacing: 2) {
+                        nameLine
+                        Text(verbatim: "\(connection.kind.rawValue) · \(connection.address)")
+                            .font(metaFont)
+                            .foregroundStyle(theme.id == .ink ? theme.ink.opacity(0.5) : theme.faint)
+                            .lineLimit(1)
+                        Text(healthLine)
+                            .font(healthFont)
+                            .foregroundStyle(theme.faint)
+                            .lineLimit(1)
+                        if let error = diagnostics?.lastError, !error.isEmpty, !isUp {
+                            Text(error)
+                                .font(healthFont)
+                                .foregroundStyle(theme.danger.opacity(0.85))
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(stateWord)
-                    .font(stateFont)
-                    .foregroundStyle(stateColor)
-                Text(metaLine)
-                    .font(theme.id == .soft ? theme.body(11, weight: .medium) : theme.mono(theme.id == .ink ? 9 : 10))
-                    .foregroundStyle(theme.faint)
+                    Text(stateWord)
+                        .font(stateFont)
+                        .foregroundStyle(stateColor)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(onTap == nil || isBusy)
+
+            if let onActions {
+                Button(action: onActions) {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(theme.id == .ink ? theme.ink.opacity(0.55) : theme.sub)
+                        .frame(width: 28, height: 30)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text(copy.connActions(theme.id)))
             }
         }
         .modifier(ConnRowChrome(theme: theme))
+    }
+
+    private var nameLine: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(connection.name)
+                .font(nameFont)
+                .foregroundStyle(theme.ink)
+                .lineLimit(1)
+            if isActive {
+                Text(copy.connActive(theme.id))
+                    .font(activeFont)
+                    .tracking(theme.id == .soft ? 0.5 : 1)
+                    .foregroundStyle(theme.accent)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1.5)
+                    .background(theme.accent.opacity(theme.id == .ink ? 0 : 0.1),
+                                in: RoundedRectangle(cornerRadius: theme.chipIsCapsule ? 999 : 3))
+                    .overlay(RoundedRectangle(cornerRadius: theme.chipIsCapsule ? 999 : 3)
+                        .strokeBorder(theme.accent.opacity(theme.id == .ink ? 0.6 : 0), lineWidth: 1))
+            }
+        }
     }
 
     private var stateDot: some View {
@@ -324,13 +462,20 @@ private struct ConnectionRow: View {
         return connection.state.rawValue
     }
 
-    /// "12ms · 6 bots" when up (ink: "familiars"); "2 bots · retrying" when not.
-    private var metaLine: String {
-        if isUp {
-            let noun = theme.id == .ink ? "familiars" : "bots"
-            return "\(connection.ping) · \(connection.botCount) \(noun)"
+    /// "v0.9.3 · oauth · 12ms · 6 bots" from the status probe. Without a probe
+    /// (demo rows, or a screen opened before the first round trip) it falls
+    /// back to the prototype's ping/bots line.
+    private var healthLine: String {
+        guard let diagnostics, diagnostics.checkedAt != nil else {
+            return isUp ? "\(connection.ping) · \(connection.botCount) \(copy.botsNoun(theme.id))"
+                        : "\(connection.botCount) \(copy.botsNoun(theme.id)) · \(copy.connRetrying(theme.id))"
         }
-        return "\(connection.botCount) bots · retrying"
+        var parts: [String] = []
+        if let version = diagnostics.version, !version.isEmpty { parts.append("v\(version)") }
+        parts.append(copy.authModeLabel(diagnostics.authMode, theme.id))
+        if let ping = diagnostics.pingMS { parts.append("\(ping)ms") }
+        parts.append("\(connection.botCount) \(copy.botsNoun(theme.id))")
+        return parts.joined(separator: " · ")
     }
 
     private var nameFont: Font {
@@ -349,11 +494,27 @@ private struct ConnectionRow: View {
         }
     }
 
+    private var healthFont: Font {
+        switch theme.id {
+        case .soft: theme.body(10.5, weight: .medium)
+        case .control: theme.mono(9)
+        case .ink: theme.mono(8)
+        }
+    }
+
     private var stateFont: Font {
         switch theme.id {
         case .soft: theme.body(12.5, weight: .bold)
         case .control: theme.mono(10.5, weight: .bold)
         case .ink: theme.body(14, weight: .bold).smallCaps()
+        }
+    }
+
+    private var activeFont: Font {
+        switch theme.id {
+        case .soft: theme.body(8.5, weight: .heavy)
+        case .control: theme.mono(7.5, weight: .bold)
+        case .ink: theme.mono(7)
         }
     }
 }
@@ -546,6 +707,63 @@ private struct PrefToggle: View {
     }
 }
 
+// MARK: - Rename sheet
+
+/// Metadata-only rename: the Keychain credential is keyed by URL, so the name
+/// is free to change.
+private struct RenameGatewaySheet: View {
+    let model: AppModel
+    let gateway: SavedGateway
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+
+    private var theme: ThemePack { model.theme.pack }
+    private var copy: CopyPack { model.theme.copy }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            HStack {
+                Button { dismiss() } label: {
+                    Text(copy.cancel)
+                        .font(theme.id == .control ? theme.mono(11, weight: .semibold)
+                                                   : theme.body(14, weight: .semibold))
+                        .foregroundStyle(theme.id == .ink ? theme.ink.opacity(0.55) : theme.accent)
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                Text(copy.connRenameTitle(theme.id))
+                    .font(theme.id == .ink ? theme.display(20, weight: .bold).smallCaps()
+                                           : theme.body(16, weight: .heavy))
+                    .foregroundStyle(theme.ink)
+                Spacer()
+                Text(copy.cancel)
+                    .font(theme.id == .control ? theme.mono(11, weight: .semibold)
+                                               : theme.body(14, weight: .semibold))
+                    .hidden()
+            }
+            .padding(.top, 16)
+
+            TextField(gateway.name, text: $name)
+                .gatewayFieldTraits()
+                .modifier(GatewayFlowInputChrome(theme: theme))
+
+            GatewayFootnote(theme: theme, text: ConnectionRegistry.address(for: gateway))
+
+            GatewayFlowButton(theme: theme, label: copy.connSave(theme.id), role: .primary) {
+                model.renameGateway(gateway, to: name)
+                dismiss()
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 18)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(theme.bg)
+        .onAppear { if name.isEmpty { name = gateway.name } }
+    }
+}
+
 // MARK: - Add-gateway sheet (reuses the AuthController flow)
 
 private struct AddGatewaySheet: View {
@@ -553,6 +771,7 @@ private struct AddGatewaySheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var auth = AuthController()
+    @State private var directory = CloudDirectory()
     @State private var name = ""
     @State private var gatewayMode: GatewayModeChoice = .tailscale
     @State private var urlString = ""
@@ -578,11 +797,21 @@ private struct AddGatewaySheet: View {
                         }
                     }
 
-                    TextField(OnboardingView.placeholderURL, text: $urlString)
+                    if gatewayMode == .cloud {
+                        CloudAgentPanel(theme: theme, copy: copy, directory: directory) { agent in
+                            pick(agent)
+                        }
+                    }
+
+                    TextField(gatewayMode == .cloud ? copy.cloudURLPlaceholder
+                                                    : OnboardingView.placeholderURL,
+                              text: $urlString)
                         .gatewayFieldTraits()
                         .modifier(GatewayFlowInputChrome(theme: theme))
 
-                    GatewayFootnote(theme: theme, text: copy.obNote1)
+                    GatewayFootnote(theme: theme,
+                                    text: gatewayMode == .cloud ? copy.cloudManualNote(theme.id)
+                                                                : copy.obNote1)
 
                     if auth.phase == .idle, auth.status == nil {
                         GatewayFlowButton(theme: theme, label: copy.obCta1, role: .primary) {
@@ -609,7 +838,13 @@ private struct AddGatewaySheet: View {
             // the Continue button (an in-flight browser round trip survives).
             if auth.phase == .idle, auth.status != nil { auth.reset() }
         }
-        .onDisappear { auth.cancelSignIn() }
+        .onChange(of: gatewayMode) { _, mode in
+            if mode == .cloud { directory.start() }
+        }
+        .onDisappear {
+            auth.cancelSignIn()
+            directory.cancel()
+        }
     }
 
     private var sheetHeader: some View {
@@ -670,6 +905,16 @@ private struct AddGatewaySheet: View {
         }
     }
 
+    /// A discovered cloud agent is an ordinary gated gateway at its dashboard
+    /// URL — fill the field and run the same probe → PKCE sign-in.
+    private func pick(_ agent: CloudAgent) {
+        guard let url = agent.dashboardURL else { return }
+        if name.trimmingCharacters(in: .whitespaces).isEmpty { name = agent.name }
+        urlString = url.absoluteString
+        auth.reset()
+        Task { await auth.probe(url.absoluteString) }
+    }
+
     private func probe() {
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -700,13 +945,178 @@ private struct AddGatewaySheet: View {
 
         if let saved {
             Task { @MainActor in
-                await ConnectionRegistry.shared.probe(saved)
+                await model.refreshConnectionHealth()
+                // First gateway on the device, or the user is still in the demo
+                // world: adopt it as the live link rather than saving a row
+                // nothing is connected to.
+                if model.client == nil { await model.switchGateway(to: saved) }
                 if model.mode == .live {
                     model.connections = ConnectionRegistry.shared.rows
                 }
             }
         }
         dismiss()
+    }
+}
+
+// MARK: - Hermes Cloud panel
+
+/// Portal-backed agent discovery. Every state is honest about what Talaria can
+/// actually see: without a portal token there is no list to show, and a portal
+/// that refuses the device-code credential for `/api/agents` says so instead of
+/// pretending the org is empty. The manual dashboard-URL field below stays
+/// usable throughout.
+private struct CloudAgentPanel: View {
+    let theme: ThemePack
+    let copy: CopyPack
+    var directory: CloudDirectory
+    var onPick: (CloudAgent) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            GatewaySectionLabel(theme: theme, text: copy.cloudSection(theme.id))
+
+            switch directory.phase {
+            case .signedOut:
+                GatewayFootnote(theme: theme, text: copy.cloudSignedOutNote(theme.id))
+                GatewayFlowButton(theme: theme, label: copy.cloudSignIn(theme.id),
+                                  role: .primary) {
+                    directory.signIn()
+                }
+
+            case .requestingCode:
+                progress(copy.cloudRequesting(theme.id))
+
+            case .awaitingApproval(let code):
+                progress(copy.cloudApproveNote(theme.id, code: code))
+                GatewayFlowButton(theme: theme, label: copy.cancel, role: .secondary) {
+                    directory.cancel()
+                }
+
+            case .discovering:
+                progress(copy.cloudDiscovering(theme.id))
+
+            case .chooseOrg:
+                GatewayFootnote(theme: theme, text: copy.cloudOrgPrompt(theme.id))
+                ForEach(directory.orgs) { org in
+                    Button { directory.selectOrg(org) } label: {
+                        pickRow(title: org.name,
+                                detail: org.isPersonal ? org.role.lowercased()
+                                                       : "\(org.queryValue) · \(org.role.lowercased())",
+                                enabled: true)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+            case .ready:
+                if directory.agents.isEmpty {
+                    GatewayFootnote(theme: theme, text: copy.cloudEmpty(theme.id))
+                } else {
+                    ForEach(directory.agents) { agent in
+                        Button { onPick(agent) } label: {
+                            pickRow(title: agent.name,
+                                    detail: agent.isReachable
+                                        ? "\(agent.status) · \(agent.gatewayState)"
+                                        : copy.cloudProvisioning(theme.id),
+                                    enabled: agent.isReachable)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!agent.isReachable)
+                    }
+                }
+                signOutLink
+
+            case .discoveryRefused:
+                GatewayFootnote(theme: theme, text: copy.cloudRefusedNote(theme.id))
+                signOutLink
+
+            case .failed(let detail):
+                Text(detail)
+                    .font(theme.id == .control ? theme.mono(10) : theme.body(12.5))
+                    .foregroundStyle(theme.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                GatewayFlowButton(theme: theme, label: copy.cloudRetry(theme.id),
+                                  role: .secondary) {
+                    directory.retry()
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(CloudApprovalPresenter(directory: directory, theme: theme))
+    }
+
+    private var signOutLink: some View {
+        Button { directory.signOut() } label: {
+            Text(copy.cloudSignOut(theme.id))
+                .font(theme.id == .control ? theme.mono(9.5, weight: .semibold)
+                                           : theme.body(11.5, weight: .semibold))
+                .foregroundStyle(theme.faint)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func progress(_ label: String) -> some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(theme.accent)
+            Text(label)
+                .font(theme.id == .soft ? theme.body(12.5) : theme.mono(10))
+                .foregroundStyle(theme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func pickRow(title: String, detail: String, enabled: Bool) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(theme.id == .ink ? theme.body(15, weight: .bold)
+                                           : theme.body(13.5, weight: .bold))
+                    .foregroundStyle(enabled ? theme.ink : theme.faint)
+                    .lineLimit(1)
+                Text(detail)
+                    .font(theme.id == .control ? theme.mono(9) : theme.body(10.5))
+                    .foregroundStyle(theme.faint)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if enabled {
+                Text(verbatim: "›")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(theme.accent)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(theme.inset)
+        .clipShape(RoundedRectangle(cornerRadius: theme.id == .ink ? 0 : 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: theme.id == .ink ? 0 : 10, style: .continuous)
+            .strokeBorder(theme.line, lineWidth: 1))
+        .contentShape(Rectangle())
+    }
+}
+
+/// The portal's approval page, in-app on iOS: the device-code poll has to keep
+/// running while the user approves, and a hop out to Safari suspends it.
+private struct CloudApprovalPresenter: ViewModifier {
+    var directory: CloudDirectory
+    var theme: ThemePack
+
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        content.sheet(item: Binding(
+            get: { directory.approvalRequest },
+            set: { if $0 == nil { directory.approvalSheetDismissed() } }
+        )) { request in
+            AuthWebSheet(request: request, theme: theme,
+                         onCallback: { _ in },
+                         onCancel: { directory.cancel() })
+        }
+        #else
+        content
+        #endif
     }
 }
 
@@ -723,5 +1133,246 @@ private struct ConnRowEntrance: ViewModifier {
             .onAppear {
                 withAnimation(.easeOut(duration: 0.38).delay(delay)) { shown = true }
             }
+    }
+}
+
+// MARK: - Copy (gateway rows, actions, Hermes Cloud)
+
+extension CopyPack {
+
+    /// What a gateway's agents are called in this voice.
+    func botsNoun(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "bots"
+        case .control: "agents"
+        case .ink: "familiars"
+        }
+    }
+
+    func connRetrying(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "retrying"
+        case .control: "RETRYING"
+        case .ink: "seeking"
+        }
+    }
+
+    func authModeLabel(_ mode: GatewayDiagnostics.AuthMode, _ t: ThemeID) -> String {
+        switch mode {
+        case .open:
+            switch t {
+            case .soft: return "open"
+            case .control: return "OPEN"
+            case .ink: return "unbarred"
+            }
+        case .oauth:
+            switch t {
+            case .soft: return "oauth"
+            case .control: return "OAUTH"
+            case .ink: return "sealed"
+            }
+        case .gated:
+            switch t {
+            case .soft: return "gated"
+            case .control: return "GATED"
+            case .ink: return "barred"
+            }
+        case .unknown:
+            switch t {
+            case .soft: return "unreached"
+            case .control: return "NO PROBE"
+            case .ink: return "unsounded"
+            }
+        }
+    }
+
+    func connActive(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "LIVE"
+        case .control: "LINKED"
+        case .ink: "IN USE"
+        }
+    }
+
+    func connActions(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Gateway actions"
+        case .control: "UPLINK ACTIONS"
+        case .ink: "acts upon this way"
+        }
+    }
+
+    func connConnect(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Connect"
+        case .control: "SWITCH LINK"
+        case .ink: "travel this way"
+        }
+    }
+
+    func connDisconnect(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Disconnect"
+        case .control: "DROP LINK"
+        case .ink: "close the way"
+        }
+    }
+
+    func connRename(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Rename"
+        case .control: "RENAME"
+        case .ink: "rename this way"
+        }
+    }
+
+    func connRenameTitle(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Rename gateway"
+        case .control: "RENAME UPLINK"
+        case .ink: "a new name"
+        }
+    }
+
+    func connSave(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Save"
+        case .control: "COMMIT"
+        case .ink: "inscribe"
+        }
+    }
+
+    func connSignOut(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Sign out"
+        case .control: "SIGN OUT"
+        case .ink: "surrender the seal"
+        }
+    }
+
+    func connRemove(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Remove gateway"
+        case .control: "DELETE UPLINK"
+        case .ink: "strike this way out"
+        }
+    }
+
+    func connRemoveNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Signing out or removing deletes this gateway's credential from the Keychain. Your bots keep running."
+        case .control: "SIGN OUT / DELETE PURGES THE KEYCHAIN CREDENTIAL. AGENTS CONTINUE SERVER-SIDE."
+        case .ink: "To surrender the seal, or strike the way out, unmakes the token kept in the Keychain. The familiars work on regardless."
+        }
+    }
+
+    // MARK: Hermes Cloud
+
+    func cloudSection(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Your cloud agents"
+        case .control: "CLOUD INVENTORY"
+        case .ink: "THE HOSTED FAMILIARS"
+        }
+    }
+
+    func cloudSignedOutNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Sign in to Nous Portal to list the agents on your account — the same device-code sign-in the hermes CLI uses."
+        case .control: "NOUS PORTAL SIGN-IN REQUIRED TO ENUMERATE HOSTED AGENTS (DEVICE-CODE GRANT, SAME AS THE CLI)."
+        case .ink: "Present yourself at the Nous Portal and your hosted familiars will be named — the same rite the hermes CLI performs."
+        }
+    }
+
+    func cloudSignIn(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Sign in to Nous Portal"
+        case .control: "PORTAL SIGN-IN"
+        case .ink: "present yourself"
+        }
+    }
+
+    func cloudRequesting(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Asking the portal for a code…"
+        case .control: "REQUESTING DEVICE CODE…"
+        case .ink: "asking the portal for a token…"
+        }
+    }
+
+    func cloudApproveNote(_ t: ThemeID, code: String) -> String {
+        switch t {
+        case .soft: "Approve code \(code) in the portal window."
+        case .control: "APPROVE CODE \(code) IN THE PORTAL WINDOW."
+        case .ink: "Grant the code \(code) at the portal."
+        }
+    }
+
+    func cloudDiscovering(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Looking for your agents…"
+        case .control: "ENUMERATING AGENTS…"
+        case .ink: "counting the familiars…"
+        }
+    }
+
+    func cloudOrgPrompt(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "You belong to more than one organisation — pick one."
+        case .control: "MULTIPLE ORGS — SELECT SCOPE."
+        case .ink: "You keep more than one house. Choose."
+        }
+    }
+
+    func cloudEmpty(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "No agents on this account yet — create one at portal.nousresearch.com."
+        case .control: "NO HOSTED AGENTS ON THIS ACCOUNT."
+        case .ink: "No hosted familiars answer to this name yet."
+        }
+    }
+
+    func cloudProvisioning(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "provisioning — no dashboard yet"
+        case .control: "PROVISIONING — NO DASHBOARD"
+        case .ink: "still being made"
+        }
+    }
+
+    /// The honest degrade: signed in, but the portal will not enumerate for
+    /// this credential (desktop's discovery rides a browser Privy session).
+    func cloudRefusedNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The portal would not list agents for this sign-in — it may only answer browser sessions. Paste the agent's dashboard URL below instead."
+        case .control: "PORTAL REFUSED THE DEVICE CREDENTIAL FOR /API/AGENTS — BROWSER SESSION MAY BE REQUIRED. USE THE DASHBOARD URL BELOW."
+        case .ink: "The portal will not name your familiars to this token; it may hear only browser sessions. Give the dashboard's address below instead."
+        }
+    }
+
+    func cloudSignOut(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Forget this portal sign-in"
+        case .control: "DROP PORTAL TOKEN"
+        case .ink: "forget the portal"
+        }
+    }
+
+    func cloudRetry(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Try again"
+        case .control: "RETRY"
+        case .ink: "try once more"
+        }
+    }
+
+    /// Replaces the pre-discovery `cloudURLHint` for this panel: discovery now
+    /// exists, so the manual path is the fallback, not the only route.
+    func cloudManualNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Or paste an agent's dashboard URL from portal.nousresearch.com — it signs in with the same Nous OAuth flow."
+        case .control: "OR PASTE AN AGENT DASHBOARD URL — SAME NOUS OAUTH FLOW."
+        case .ink: "Or set down the dashboard's address from the portal — the same Nous rite opens it."
+        }
     }
 }

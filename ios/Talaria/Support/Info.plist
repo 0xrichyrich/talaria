@@ -44,6 +44,10 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Talaria talks to your Hermes gateway (hermes serve) over your LAN or tailnet to reach your bots.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Talaria uses the microphone for voice mode — speech is sent to your own Hermes gateway for transcription.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Attach photos from your library to a message for your agents.</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>UIAppFonts</key>

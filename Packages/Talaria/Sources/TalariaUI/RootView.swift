@@ -3,20 +3,30 @@ import SwiftUI
 import TalariaKit
 import TalariaTheme
 
-// The screen graph, ported from the prototype's flat `state.screen` switch:
+// The screen graph, ported from the prototype's flat `state.screen` switch and
+// extended with the surfaces the live gateway needs:
 //
-//   onboarding (z35)
+//   reauth/offline banner (displaces content, zero-height when healthy)
 //   ── roster ⇄ chat (push) ── bot sheet / routines (push) / voice (z20)
 //   ── activity / approvals / agent inbox / artifacts (tabs)
-//   ── connections, new-bot sheet, search palette (z48)
-//   push banner (z40) · control-theme scanlines (z60) · theme-swap animation
+//   ── connections, capabilities (push z12), new-bot + sessions sheets
+//   ── search palette (z48) · push banner (z40) · onboarding (z50)
+//   blocking prompts + mcp setup (above everything) · control scanlines
 //
 // TalariaRootView(model:) is the app target's single mount point: it applies
-// the theme background, hosts every overlay and sheet, runs the demo push
-// cycle, and wires the push/live-activity controllers to the model.
+// the theme background, hosts every overlay and sheet, registers the live
+// event routers once per connection, runs the demo push cycle, and wires the
+// push/live-activity controllers to the model.
+//
+// Cross-screen navigation that doesn't fit a callback goes through
+// NotificationCenter — `.talariaOpenConnections`, `.talariaOpenCapabilities`
+// (AppModel.requestCapabilities) and `.talariaOpenSessions` — so a screen this
+// view doesn't own can ask for a push without a binding threaded through it.
 
 public struct TalariaRootView: View {
     private let model: AppModel
+
+    @Environment(\.scenePhase) private var scenePhase
 
     // Presentation state the model doesn't own (the model keeps routing state
     // other screens drive: selectedTab, openBotID, showOnboarding).
@@ -26,6 +36,26 @@ public struct TalariaRootView: View {
     @State private var showVoice = false
     @State private var showConnections = false
     @State private var routinesBotID: String?
+
+    // Screens reached from the palette, the chat header and cross-screen
+    // notifications rather than from a tab.
+    @State private var capabilitiesRequest: CapabilitiesRequest?
+    @State private var sessionsRequest: SessionsRequest?
+
+    /// Capabilities opens on a profile, and `nil` means "the gateway's launch
+    /// profile" — a real value — so presentation can't key off the profile
+    /// alone.
+    private struct CapabilitiesRequest: Identifiable, Equatable {
+        let id = UUID()
+        let profile: String?
+    }
+
+    /// Keyed by bot so a second request for the same bot is a no-op rather
+    /// than a re-present.
+    private struct SessionsRequest: Identifiable, Equatable {
+        var id: String { botID }
+        let botID: String
+    }
 
     // Demo push banner cycle.
     @State private var activeBanner: BannerPush?
@@ -43,7 +73,7 @@ public struct TalariaRootView: View {
     /// The tab bar lives only on the five tab screens.
     private var showsTabBar: Bool {
         model.openBotID == nil && routinesBotID == nil && !showConnections
-            && !showVoice && !model.showOnboarding
+            && capabilitiesRequest == nil && !showVoice && !model.showOnboarding
     }
 
     /// The prototype suppresses banner pushes on voice / onboarding / search.
@@ -51,6 +81,18 @@ public struct TalariaRootView: View {
     /// real state gets no fake pushes.
     private var bannersAllowed: Bool {
         model.demoDataLoaded && !model.showOnboarding && !showSearch && !showVoice
+    }
+
+    /// Per-tab counts. Approvals shows blocked work; Bots carries the unread
+    /// total so traffic is visible from the other four tabs (openChat clears
+    /// a bot's count, so the badge drains as you read).
+    private var tabBadges: [CopyPack.Tab: Int] {
+        var badges: [CopyPack.Tab: Int] = [:]
+        let pending = model.pendingApprovalCount()
+        if pending > 0 { badges[.approvals] = pending }
+        let unread = model.bots.reduce(0) { $0 + $1.unread }
+        if unread > 0 { badges[.home] = unread }
+        return badges
     }
 
     // MARK: - Body
@@ -61,9 +103,24 @@ public struct TalariaRootView: View {
                 .ignoresSafeArea()
                 .animation(.easeInOut(duration: 0.45), value: theme.id)
 
-            screenGraph
-                .opacity(themeSwapDim ? 0.3 : 1)
-                .scaleEffect(themeSwapDim ? 0.982 : 1)
+            // The re-auth / offline banner is zero-height while the link is
+            // healthy, so stacking it above the graph costs nothing and means
+            // it displaces content instead of covering a header. It also owns
+            // the connection-supervision loop, so it must be mounted once for
+            // the life of the app.
+            VStack(spacing: 0) {
+                ReauthBanner(model: model)
+                screenGraph
+            }
+            .opacity(themeSwapDim ? 0.3 : 1)
+            .scaleEffect(themeSwapDim ? 0.982 : 1)
+
+            // Parked-agent prompts (z55). Mounted unconditionally — each
+            // renders nothing until its request arrives, and each outranks
+            // every other surface, banner included, because a tool thread is
+            // blocked on the answer.
+            BlockingPromptOverlay(model: model)
+            MCPSetupPrompt(model: model)
 
             if theme.id == .control {
                 ScanlineOverlay()
@@ -79,14 +136,32 @@ public struct TalariaRootView: View {
         .sheet(isPresented: $showCreate) {
             CreateBotView(model: model)
         }
+        .sheet(item: $sessionsRequest) { request in
+            // onOpen fires after the sheet has already rebound the chat, so
+            // this only has to clear the way to it.
+            SessionsSheet(model: model, botID: request.botID) { _ in
+                sessionsRequest = nil
+                revealChat()
+            }
+        }
         .onChange(of: model.theme.themeID) { runThemeSwapAnimation() }
         .onChange(of: model.openBotID) {
-            // Leaving chat tears down everything stacked on it.
             if model.openBotID == nil {
+                // Leaving chat tears down everything stacked on it.
                 routinesBotID = nil
                 showVoice = false
                 showProfile = false
+            } else {
+                // One rule for every route into a chat — palette, banner,
+                // deep link, activity row: entering pops what covered it.
+                revealChat()
             }
+        }
+        .onChange(of: clientToken) { attachEventRouters() }
+        .onChange(of: scenePhase) {
+            // Foregrounding is when a parked socket has to be re-established
+            // and any approval resolved from a notification has to be caught up.
+            if scenePhase == .active { model.applicationDidBecomeActive() }
         }
         .onAppear { wireUp() }
         .onOpenURL { url in
@@ -97,6 +172,18 @@ public struct TalariaRootView: View {
             // owns the Connections navigation push.
             guard !showConnections else { return }
             withAnimation(pushAnimation) { showConnections = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .talariaOpenCapabilities)) { note in
+            withAnimation(pushAnimation) {
+                capabilitiesRequest = CapabilitiesRequest(
+                    profile: note.userInfo?["profile"] as? String)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .talariaOpenSessions)) { note in
+            // object carries the bot id; fall back to whatever chat is open.
+            if let botID = (note.object as? String) ?? model.openBotID {
+                sessionsRequest = SessionsRequest(botID: botID)
+            }
         }
         .task { await runDemoPushCycle() }
     }
@@ -139,13 +226,26 @@ public struct TalariaRootView: View {
                 .transition(pushTransition)
             }
 
+            // Capabilities, pushed over whatever asked for it (palette,
+            // Connections, bot sheet) — above chat so the bot sheet's row
+            // lands on top of the chat it was opened from.
+            if let request = capabilitiesRequest {
+                ZStack {
+                    theme.bg.ignoresSafeArea()
+                    CapabilitiesView(model: model, profileID: request.profile,
+                                     onBack: { closeCapabilities() })
+                }
+                .transition(pushTransition)
+                .zIndex(12)
+            }
+
             // Tab bar (z15).
             if showsTabBar {
                 VStack(spacing: 0) {
                     Spacer()
                     TalariaTabBar(theme: theme, copy: copy,
                                   selected: model.selectedTab,
-                                  badgeCount: model.pendingApprovalCount()) { tab in
+                                  badges: tabBadges) { tab in
                         withAnimation(.easeOut(duration: 0.3)) {
                             model.selectedTab = tab
                         }
@@ -157,10 +257,7 @@ public struct TalariaRootView: View {
             // Search palette (z48–49).
             if showSearch {
                 SearchPalette(model: model, isPresented: $showSearch) { action in
-                    switch action {
-                    case .newBot: showCreate = true
-                    case .addGateway: withAnimation(pushAnimation) { showConnections = true }
-                    }
+                    route(action)
                 }
                 .transition(.opacity)
                 .zIndex(48)
@@ -183,7 +280,7 @@ public struct TalariaRootView: View {
                 .zIndex(40)
             }
 
-            // Onboarding cover (z35, above tabs/banner-free zone).
+            // Onboarding cover (z50).
             if model.showOnboarding {
                 OnboardingView(model: model)
                     .transition(.opacity)
@@ -217,6 +314,70 @@ public struct TalariaRootView: View {
         .transition(.opacity)
     }
 
+    // MARK: - Palette routing
+
+    private func route(_ action: SearchPaletteAction) {
+        switch action {
+        case .newBot:
+            showCreate = true
+        case .addGateway:
+            withAnimation(pushAnimation) { showConnections = true }
+        case .tab(let tab):
+            goToTab(tab)
+        case .capabilities:
+            openCapabilities()
+        case .sessions(let botID):
+            openSessions(for: botID)
+        case .openSession(let botID, let sessionID):
+            openStoredSession(botID: botID, sessionID: sessionID)
+        }
+    }
+
+    /// Capabilities (skills / toolsets / MCP) deliberately has no tab of its
+    /// own — five is the prototype's tab budget. It is reached from the search
+    /// palette, from Connections and from the bot sheet; all three go through
+    /// `requestCapabilities`, whose notification lands back here.
+    private func openCapabilities() {
+        model.requestCapabilities(profile: model.openBotID ?? model.defaultCapabilityProfile)
+    }
+
+    private func closeCapabilities() {
+        withAnimation(pushAnimation) { capabilitiesRequest = nil }
+    }
+
+    /// A tab is only reachable once everything pushed over it is gone.
+    private func goToTab(_ tab: CopyPack.Tab) {
+        withAnimation(pushAnimation) {
+            model.openBotID = nil
+            showConnections = false
+            capabilitiesRequest = nil
+            routinesBotID = nil
+            model.selectedTab = tab
+        }
+    }
+
+    private func openSessions(for botID: String) {
+        sessionsRequest = SessionsRequest(botID: botID)
+    }
+
+    /// A cross-session search hit: rebind that bot's chat onto the picked
+    /// session (openStoredSession also selects the bot and the home tab) and
+    /// clear the way to it.
+    private func openStoredSession(botID: String, sessionID: String) {
+        model.openStoredSession(sessionID, botID: botID)
+        revealChat()
+    }
+
+    /// Pop whatever is stacked over the chat so a freshly bound session is
+    /// actually what the user sees.
+    private func revealChat() {
+        withAnimation(pushAnimation) {
+            showConnections = false
+            capabilitiesRequest = nil
+            routinesBotID = nil
+        }
+    }
+
     // MARK: - Transitions
 
     private var pushTransition: AnyTransition {
@@ -243,6 +404,28 @@ public struct TalariaRootView: View {
         Task { await model.restoreWorldAtLaunch() }
         PushCoordinator.shared.configure(model: model)
         LiveActivityController.shared.attach(to: model)
+        // Covers a remount onto an already-connected client; the usual path is
+        // the clientToken change below.
+        attachEventRouters()
+    }
+
+    /// Identity of the live client, so the routers re-register when a
+    /// connection is made, swapped or torn down. Each router is idempotent and
+    /// no-ops without a client, so calling them all on every change is safe.
+    private var clientToken: ObjectIdentifier? {
+        model.client.map(ObjectIdentifier.init)
+    }
+
+    /// Every feature that needs its own gateway-event subscription registers
+    /// here, once per connection. The main pump in AppModelLive ignores the
+    /// events these own.
+    private func attachEventRouters() {
+        model.attachChatEventRouter()
+        model.attachApprovalBridges()
+        model.attachSessionEventRouter()
+        model.attachActivityRouter()
+        model.attachVoiceRouter()
+        model.attachCommandsEventRouter()
     }
 
     // MARK: - Demo push banners
@@ -316,6 +499,17 @@ public struct TalariaRootView: View {
             }
         }
     }
+}
+
+// MARK: - Cross-screen navigation requests
+
+public extension Notification.Name {
+    /// Browse a bot's stored sessions. `object` is the bot id (String);
+    /// nil falls back to the open chat. Posted by the chat header and the bot
+    /// sheet so neither has to thread a callback through RootView.
+    /// (Capabilities has the same shape — `.talariaOpenCapabilities`, declared
+    /// with `AppModel.requestCapabilities(profile:)` in AppModelLive+Capabilities.)
+    static let talariaOpenSessions = Notification.Name("bot.talaria.openSessions")
 }
 
 // MARK: - Scanline overlay (control)

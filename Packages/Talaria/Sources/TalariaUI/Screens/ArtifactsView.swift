@@ -5,11 +5,21 @@ import TalariaTheme
 // The Artifacts tab — Artifacts / Vault / The Relics. A two-column grid of
 // everything the roster produced: images get a striped placeholder thumb,
 // files an extension chip in the owner bot's color, links an accented URL.
-// Tapping a card jumps to the owning bot's chat.
 // Ported from Talaria.dc.html `data-screen-label="Artifacts"`.
+//
+// Live derivation (AppModelLive+Feeds.swift): there is NO artifacts endpoint on
+// the gateway. Desktop builds its /artifacts gallery client-side by scanning
+// session transcripts (artifact-utils.ts), and so does this: recent sessions
+// per profile → GET /api/sessions/<id>/messages → produced files, images and
+// links pulled out of assistant prose and producer-tool results, plus anything
+// a tool.complete announces while the app is open. The footnote says so out
+// loud, because "6 artifacts" that came from a regex over transcripts is a
+// different claim from "6 artifacts the server has on file".
 
 public struct ArtifactsView: View {
     private let model: AppModel
+
+    @State private var filter: ArtifactKind?
 
     public init(model: AppModel) {
         self.model = model
@@ -17,6 +27,12 @@ public struct ArtifactsView: View {
 
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
+    private var feeds: FeedsRuntime { FeedsRuntime.shared }
+
+    private var shown: [Artifact] {
+        guard let filter else { return model.artifacts }
+        return model.artifacts.filter { $0.kind == filter }
+    }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -25,46 +41,133 @@ public struct ArtifactsView: View {
                 LazyVGrid(columns: [GridItem(.flexible(), spacing: 10),
                                     GridItem(.flexible(), spacing: 10)],
                           alignment: .leading, spacing: 10) {
-                    ForEach(Array(model.artifacts.enumerated()), id: \.element.id) { index, artifact in
+                    ForEach(Array(shown.enumerated()), id: \.element.id) { index, artifact in
                         ArtifactCard(artifact: artifact,
                                      owner: model.bot(artifact.botID),
                                      theme: theme) {
-                            openOwnerChat(of: artifact)
+                            model.openArtifact(artifact)
                         }
-                        .modifier(RowEntrance(delay: Double(index) * 0.045))
+                        .modifier(RowEntrance(delay: Double(min(index, 12)) * 0.045))
                     }
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
-                .padding(.bottom, 120) // clear the tab bar
+
+                if shown.isEmpty { emptyState }
+                footnote
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(theme.bg)
+        .task {
+            model.attachActivityRouter()
+            await model.refreshArtifacts()
+        }
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if theme.showsKicker {
-                Text(verbatim: "\(copy.kickerArtifacts) · \(model.artifacts.count)")
-                    .font(theme.mono(9.5, weight: .semibold))
-                    .tracking(2)
-                    .foregroundStyle(theme.id == .ink ? theme.sub : theme.accent)
-                    .padding(.bottom, theme.id == .control ? 3 : 1)
+            HStack(alignment: .bottom, spacing: 8) {
+                VStack(alignment: .leading, spacing: 0) {
+                    if theme.showsKicker {
+                        Text(verbatim: "\(copy.kickerArtifacts) · \(model.artifacts.count)")
+                            .font(theme.mono(9.5, weight: .semibold))
+                            .tracking(2)
+                            .foregroundStyle(theme.id == .ink ? theme.sub : theme.accent)
+                            .padding(.bottom, theme.id == .control ? 3 : 1)
+                    }
+                    Text(copy.titleArtifacts)
+                        .font(titleFont)
+                        .tracking(theme.smallCapsTitles ? 0.5 : -0.5)
+                        .foregroundStyle(theme.ink)
+                }
+                Spacer(minLength: 6)
+                if model.mode == .live {
+                    HeaderIconButton(theme: theme, size: 32) {
+                        Task { await model.refreshArtifacts(force: true) }
+                    } glyph: {
+                        Text(verbatim: "↻")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
+                            .opacity(feeds.artifactsScanning ? 0.4 : 1)
+                    }
+                    .disabled(feeds.artifactsScanning)
+                }
             }
-            Text(copy.titleArtifacts)
-                .font(titleFont)
-                .tracking(theme.smallCapsTitles ? 0.5 : -0.5)
-                .foregroundStyle(theme.ink)
             Text(copy.artifactsLead)
                 .font(leadFont)
                 .italic(theme.id == .ink)
                 .foregroundStyle(theme.id == .ink ? theme.sub : theme.faint)
                 .padding(.top, 4)
+            filterRow
+                .padding(.top, 9)
         }
         .padding(.horizontal, 20)
         .padding(.top, 12)
         .padding(.bottom, 6)
+    }
+
+    /// Type filters, desktop's /artifacts chips. Hidden while there is nothing
+    /// to filter so an empty tab stays quiet.
+    @ViewBuilder private var filterRow: some View {
+        if !model.artifacts.isEmpty {
+            HStack(spacing: 7) {
+                ForEach(Array([nil, ArtifactKind.image, .file, .link].enumerated()), id: \.offset) { _, kind in
+                    let count = kind.map { k in model.artifacts.filter { $0.kind == k }.count }
+                        ?? model.artifacts.count
+                    Button {
+                        withAnimation(.easeOut(duration: 0.2)) { filter = kind }
+                    } label: {
+                        Text(verbatim: "\(copy.artifactFilter(theme.id, kind: kind)) \(count)")
+                            .font(theme.id == .control ? theme.mono(9.5, weight: .semibold)
+                                                       : theme.body(11.5, weight: .semibold))
+                            .foregroundStyle(filter == kind ? theme.accent : theme.sub)
+                            .padding(.vertical, 5)
+                            .padding(.horizontal, 10)
+                            .chipShell(theme)
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(feeds.artifactsScanning ? copy.scanningLabel(theme.id)
+                                         : copy.artifactsEmptyTitle(theme.id))
+                .font(theme.id == .control ? theme.mono(12, weight: .bold)
+                                           : theme.body(15, weight: .bold))
+                .foregroundStyle(theme.ink)
+            Text(copy.artifactsEmptyBody(theme.id))
+                .font(footFont)
+                .italic(theme.id == .ink)
+                .foregroundStyle(theme.faint)
+                .lineSpacing(3)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 20)
+        .padding(.top, 26)
+    }
+
+    /// Honest provenance: this index is derived on-device, not served. Only
+    /// shown once a live sweep has actually run — the empty state carries the
+    /// explanation before that, and demo content makes no such claim.
+    @ViewBuilder private var footnote: some View {
+        if model.mode == .live, !feeds.artifactsNote.isEmpty {
+            Text(feeds.artifactsNote)
+                .font(footFont)
+                .italic(theme.id == .ink)
+                .foregroundStyle(theme.faint)
+                .lineSpacing(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20)
+                .padding(.top, 18)
+                .padding(.bottom, 120) // clear the tab bar
+        } else {
+            Color.clear.frame(height: 120)
+        }
     }
 
     private var titleFont: Font {
@@ -79,9 +182,12 @@ public struct ArtifactsView: View {
         theme.body(theme.id == .ink ? 14 : 12.5)
     }
 
-    private func openOwnerChat(of artifact: Artifact) {
-        model.selectedTab = .home
-        model.openBotID = artifact.botID
+    private var footFont: Font {
+        switch theme.id {
+        case .soft: theme.body(11.5)
+        case .control: theme.mono(9.5)
+        case .ink: theme.body(13)
+        }
     }
 }
 
@@ -125,7 +231,8 @@ private struct ArtifactCard: View {
     private var figure: some View {
         switch artifact.kind {
         case .image:
-            // Striped placeholder thumb (the design's artStripe token).
+            // Striped placeholder thumb (the design's artStripe token). The
+            // bytes live on the gateway host; nothing is fetched here.
             ZStack {
                 DiagonalStripes(stripeWidth: 8)
                     .fill(theme.artStripeStrong)
@@ -162,7 +269,7 @@ private struct ArtifactCard: View {
                 .font(titleFont)
                 .foregroundStyle(theme.ink)
                 .lineLimit(1)
-                .truncationMode(.tail)
+                .truncationMode(.middle)
             Text(artifact.meta)
                 .font(theme.id == .control ? theme.mono(10) : theme.body(theme.id == .ink ? 13 : 12))
                 .italic(theme.id == .ink)

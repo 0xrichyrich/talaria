@@ -81,6 +81,11 @@ public struct LiveSession: Sendable {
     public var inflight: JSONValue?
     /// Oldest unresolved approval, replayed on resume.
     public var pendingApproval: ApprovalRequest?
+    /// Clarify question still blocking this session, replayed on resume
+    /// (server.py `_pending_clarify_request_payload`). Unlike approvals there
+    /// is no `clarify.pending` RPC, so this block is the only way to recover a
+    /// question raised while the transport was detached.
+    public var pendingClarify: JSONValue?
 
     init(_ v: JSONValue) {
         sessionID = v["session_id"]?.stringValue ?? ""
@@ -92,6 +97,7 @@ public struct LiveSession: Sendable {
         running = v["running"]?.boolValue ?? false
         inflight = v["inflight"]
         pendingApproval = v["pending_approval"].map { ApprovalRequest($0, sessionID: v["session_id"]?.stringValue ?? "") }
+        pendingClarify = v["pending_clarify"]
     }
 }
 
@@ -437,6 +443,54 @@ public actor GatewayClient {
     }
 
     // MARK: - REST helpers
+
+    // MARK: - Authenticated REST
+
+    /// Perform an authenticated REST call against this gateway and return the
+    /// raw body. The public seam cross-module extensions need: `auth` and
+    /// `credential` are file-private, so TalariaUI extensions cannot build
+    /// their own authorized requests.
+    ///
+    /// `path` is relative to the gateway root ("api/sessions/search"), and any
+    /// reverse-proxy path prefix in `baseURL` is preserved.
+    @discardableResult
+    public func restData(path: String, method: String = "GET",
+                         query: [URLQueryItem] = [], body: Data? = nil,
+                         contentType: String = "application/json",
+                         timeout: TimeInterval = 30) async throws -> Data {
+        var comps = URLComponents(url: baseURL.appending(path: path),
+                                  resolvingAgainstBaseURL: false)
+        if !query.isEmpty { comps?.queryItems = query }
+        guard let url = comps?.url else {
+            throw GatewayError(code: -11, message: "bad REST path: \(path)")
+        }
+        var req = URLRequest(url: url, timeoutInterval: timeout)
+        req.httpMethod = method
+        if let body {
+            req.httpBody = body
+            req.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        }
+        auth.apply(credential: credential, to: &req)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(code) else {
+            let detail = (try? JSONDecoder().decode(JSONValue.self, from: data))?["detail"]?.stringValue
+            throw GatewayError(code: code, message: detail ?? "HTTP \(code) for \(path)")
+        }
+        return data
+    }
+
+    /// `restData` decoded as JSON.
+    @discardableResult
+    public func restJSON(path: String, method: String = "GET",
+                         query: [URLQueryItem] = [], body: JSONValue? = nil,
+                         timeout: TimeInterval = 30) async throws -> JSONValue {
+        let payload = try body.map { try JSONEncoder().encode($0) }
+        let data = try await restData(path: path, method: method, query: query,
+                                      body: payload, timeout: timeout)
+        guard !data.isEmpty else { return .null }
+        return try JSONDecoder().decode(JSONValue.self, from: data)
+    }
 
     /// Paginated transcript hydration (GET /api/sessions/{id}/messages).
     public func fetchSessionMessages(storedID: String, limit: Int = 200, offset: Int = 0) async throws -> JSONValue {

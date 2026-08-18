@@ -84,6 +84,51 @@ public enum MessageCard: Codable, Sendable, Equatable {
     }
 }
 
+/// One tool invocation inside a turn, rendered as a collapsible chip in the
+/// transcript (desktop shows these inline under the assistant message).
+public struct ToolCall: Identifiable, Codable, Sendable, Equatable {
+    public enum State: String, Codable, Sendable { case running, done, failed }
+
+    /// The gateway's tool_id.
+    public var id: String
+    public var name: String
+    /// ≤80-char argument preview from tool.start.
+    public var context: String
+    public var state: State
+    /// One-line result summary from tool.complete.
+    public var summary: String?
+    /// Full result text, shown when the chip is expanded.
+    public var resultText: String?
+    public var durationSeconds: Double?
+
+    public init(id: String, name: String, context: String, state: State = .running,
+                summary: String? = nil, resultText: String? = nil,
+                durationSeconds: Double? = nil) {
+        self.id = id; self.name = name; self.context = context; self.state = state
+        self.summary = summary; self.resultText = resultText
+        self.durationSeconds = durationSeconds
+    }
+}
+
+/// A file/image staged on the composer, consumed by the next prompt.submit.
+public struct PendingAttachment: Identifiable, Codable, Sendable, Equatable {
+    public enum Kind: String, Codable, Sendable { case image, pdf, file }
+
+    public var id: String
+    public var kind: Kind
+    public var name: String
+    /// Gateway-side path returned by the attach RPC.
+    public var path: String?
+    /// Local thumbnail data for images (never sent again).
+    public var thumbnail: Data?
+
+    public init(id: String = UUID().uuidString, kind: Kind, name: String,
+                path: String? = nil, thumbnail: Data? = nil) {
+        self.id = id; self.kind = kind; self.name = name
+        self.path = path; self.thumbnail = thumbnail
+    }
+}
+
 public struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     public var id: UUID
     public var author: MessageAuthor
@@ -96,13 +141,17 @@ public struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     /// thinking.delta accumulation, or the stored transcript's reasoning
     /// fields). Rendered as a collapsible "Thought" block, desktop parity.
     public var reasoning: String?
+    /// Tools this turn ran, in call order (tool.start / tool.complete).
+    public var toolCalls: [ToolCall]
+    /// Durable transcript row id — needed for reactions and rewind.
+    public var rowID: Int?
 
     public init(id: UUID = UUID(), author: MessageAuthor, time: String? = nil,
                 text: String, card: MessageCard? = nil, isStreaming: Bool = false,
-                reasoning: String? = nil) {
+                reasoning: String? = nil, toolCalls: [ToolCall] = [], rowID: Int? = nil) {
         self.id = id; self.author = author; self.time = time
         self.text = text; self.card = card; self.isStreaming = isStreaming
-        self.reasoning = reasoning
+        self.reasoning = reasoning; self.toolCalls = toolCalls; self.rowID = rowID
     }
 }
 

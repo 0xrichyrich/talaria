@@ -27,6 +27,14 @@ public final class ChatState {
     public var yolo: Bool = false
     /// Session reasoning effort ("" = gateway default).
     public var reasoningEffort: String = ""
+    /// A turn is in flight — the composer's send button becomes stop.
+    public var isRunning: Bool = false
+    /// Files staged on the composer, consumed by the next submit.
+    public var attachments: [PendingAttachment] = []
+    /// Stored sessions for this bot (session.list), for the sessions sheet.
+    public var storedSessions: [SessionSummary] = []
+    /// Live context-window breakdown (session.context_breakdown).
+    public var contextSegments: [ContextSegment] = []
 
     public init(messages: [ChatMessage] = []) {
         self.messages = messages

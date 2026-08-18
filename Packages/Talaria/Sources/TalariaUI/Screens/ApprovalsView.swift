@@ -5,12 +5,18 @@ import TalariaTheme
 // Approvals — Approvals / Holds / The Seals. The kicker counts pending items
 // in the theme's voice ("2 pending" / "2 HOLDS PENDING" / "TWO AWAIT YOUR
 // HAND", empty "all clear" / "ALL CLEAR" / "ALL IS SEALED"). Cards swipe:
-// drag right to approve, left to deny — the card translates and slightly
+// drag right to approve once, left to deny — the card translates and slightly
 // rotates, the matching affordance fades in past 24pt, and ≥90pt commits.
-// Explicit Approve/Deny buttons remain. Decided cards linger dimmed with the
-// themed done-word ("Approved — sent" / "RELEASED — RAN CLEAN" / "sealed —
-// done cleanly") before animating out.
+// Decided cards linger dimmed with the themed done-word ("Approved — sent" /
+// "RELEASED — RAN CLEAN" / "sealed — done cleanly") before animating out.
 // Ported from Talaria.dc.html `data-screen-label="Approvals"`.
+//
+// The buttons are driven by the request's own `choices` array
+// (ws-protocol.md §8), not a hardcoded approve/deny: the gateway derives
+// once / session / always / deny per request, drops "always" when the pattern
+// cannot be permanently allowed, and reduces to once/deny for a pattern it has
+// already refused (smart_denied). Swipe stays the fast path for the two
+// choices that are always present; the broader grants are explicit taps.
 
 public struct ApprovalsView: View {
     private let model: AppModel
@@ -20,8 +26,9 @@ public struct ApprovalsView: View {
     /// model itself resolves immediately so badges, chats and live RPCs stay
     /// in sync.
     @State private var rows: [Approval] = []
-    /// id → approved. Present while a decided card is still lingering.
-    @State private var decisions: [String: Bool] = [:]
+    /// id → the choice it was answered with. Present while a decided card is
+    /// still lingering.
+    @State private var decisions: [String: ApprovalChoice] = [:]
 
     public init(model: AppModel) {
         self.model = model
@@ -42,9 +49,11 @@ public struct ApprovalsView: View {
                     ForEach(Array(rows.enumerated()), id: \.element.id) { index, approval in
                         ApprovalCard(approval: approval,
                                      bot: model.bot(approval.botID),
+                                     choices: model.approvalChoices(for: approval.id),
+                                     smartDenied: model.approvalDetail(approval.id)?.smartDenied ?? false,
                                      decision: decisions[approval.id],
                                      theme: theme, copy: copy,
-                                     decide: { approve in decide(approval, approve: approve) })
+                                     decide: { choice in decide(approval, choice: choice) })
                             // sealMargin — breathing room for ink's double rule.
                             .padding(theme.id == .ink ? 4 : 0)
                             .modifier(RowEntrance(delay: Double(index) * 0.06))
@@ -58,7 +67,14 @@ public struct ApprovalsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(theme.bg)
-        .onAppear(perform: syncRows)
+        .onAppear {
+            syncRows()
+            // Approvals raised while the app was backgrounded never re-emit
+            // their event; approval.pending is the only way to see them. Opening
+            // this tab is a direct request to be up to date.
+            model.attachApprovalBridges()
+            Task { await model.replayPendingApprovals(force: true) }
+        }
         .onChange(of: model.approvals) { syncRows() }
     }
 
@@ -77,7 +93,7 @@ public struct ApprovalsView: View {
                 .font(titleFont)
                 .tracking(theme.smallCapsTitles ? 0.5 : -0.5)
                 .foregroundStyle(theme.ink)
-            Text(verbatim: "\(copy.approvalsLead) \(Self.swipeHint)")
+            Text(verbatim: "\(copy.approvalsLead) \(copy.approvalsSwipeHint(theme.id))")
                 .font(theme.body(theme.id == .ink ? 14 : 12.5))
                 .italic(theme.id == .ink)
                 .foregroundStyle(theme.id == .ink ? theme.sub : theme.faint)
@@ -87,10 +103,6 @@ public struct ApprovalsView: View {
         .padding(.top, 12)
         .padding(.bottom, 6)
     }
-
-    /// The swipe hint reads the same in all three theme voices (prototype
-    /// hardcodes it beside `approvalsLead`).
-    private static let swipeHint = "Swipe → approve, ← deny."
 
     private var titleFont: Font {
         switch theme.id {
@@ -119,22 +131,26 @@ public struct ApprovalsView: View {
 
     // MARK: Decide / sync
 
-    private func decide(_ approval: Approval, approve: Bool) {
+    private func decide(_ approval: Approval, choice: ApprovalChoice) {
         guard decisions[approval.id] == nil else { return }
         withAnimation(.easeOut(duration: 0.22)) {
-            decisions[approval.id] = approve
+            decisions[approval.id] = choice
         }
         // Resolve in the model immediately (tab badge, chat follow-up, live
         // RPC); the local row lingers so the done-word can land first. Going
         // through ApprovalOutcomes shares the exact outcome with the inline
         // chat card and push banner.
-        ApprovalOutcomes.shared.resolve(approval, approve: approve, in: model)
+        ApprovalOutcomes.shared.resolve(approval, choice: choice, in: model)
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(1.8))
             withAnimation(.easeInOut(duration: 0.35)) {
                 rows.removeAll { $0.id == approval.id }
                 decisions.removeValue(forKey: approval.id)
             }
+            // A failed approval.respond puts the card back in the model — the
+            // agent is still parked and the user must be able to retry. Resync
+            // rather than trust the local removal.
+            syncRows()
         }
     }
 
@@ -155,15 +171,20 @@ public struct ApprovalsView: View {
 private struct ApprovalCard: View {
     let approval: Approval
     let bot: Bot?
-    /// nil = pending; true/false = approved/denied (lingering).
-    let decision: Bool?
+    /// The gateway's derived choice set for this request.
+    let choices: [ApprovalChoice]
+    /// This pattern was refused before, so only once/deny is on offer.
+    let smartDenied: Bool
+    /// nil = pending; otherwise the choice it was answered with (lingering).
+    let decision: ApprovalChoice?
     let theme: ThemePack
     let copy: CopyPack
-    let decide: (Bool) -> Void
+    let decide: (ApprovalChoice) -> Void
 
     @State private var dragX: CGFloat = 0
 
     private var pending: Bool { decision == nil }
+    private var approved: Bool { decision != nil && decision != .deny }
     private var botColor: Color { theme.color(for: bot?.hue ?? .teal) }
 
     private var tagColor: Color {
@@ -179,7 +200,7 @@ private struct ApprovalCard: View {
         }
     }
 
-    private var doneColor: Color { decision == true ? theme.ok : theme.danger }
+    private var doneColor: Color { approved ? theme.ok : theme.danger }
 
     // Affordances fade in past 24pt of drag, saturating at 90pt.
     private var approveOpacity: Double {
@@ -243,8 +264,18 @@ private struct ApprovalCard: View {
                 .padding(.top, 6)
             whyAndAge
                 .padding(.top, 7)
+            if pending && smartDenied {
+                Text(copy.approvalSmartDenied(theme.id))
+                    .font(theme.mono(theme.id == .ink ? 8 : 9))
+                    .tracking(theme.id == .soft ? 0.5 : 1.2)
+                    .foregroundStyle(theme.danger.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 7)
+            }
             if pending {
-                buttons.padding(.top, 11)
+                ApprovalChoiceButtons(theme: theme, copy: copy, choices: choices,
+                                      decide: decide)
+                    .padding(.top, 11)
             } else {
                 doneRow.padding(.top, 11)
             }
@@ -337,7 +368,8 @@ private struct ApprovalCard: View {
         }
     }
 
-    /// Why line, with the age trailing ("12m ago" / "12m past" in ink).
+    /// Why line, with the age trailing ("12m ago" / "12m past" in ink, or the
+    /// themed "waiting" for a request recovered by the reconnect replay).
     private var whyAndAge: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(theme.id == .soft ? approval.why : approval.why.uppercased())
@@ -345,48 +377,24 @@ private struct ApprovalCard: View {
                 .tracking(theme.id == .soft ? 0 : (theme.id == .ink ? 1.5 : 0.5))
                 .foregroundStyle(theme.faint)
             Spacer(minLength: 6)
-            Text(verbatim: approval.age + (theme.id == .ink ? " past" : " ago"))
+            Text(copy.approvalAge(approval.age, theme.id))
                 .font(timeFont)
                 .foregroundStyle(theme.faint)
                 .lineLimit(1)
         }
     }
 
-    // MARK: Buttons / done
-
-    private var buttons: some View {
-        HStack(spacing: 8) {
-            Button { decide(true) } label: {
-                primaryLabel(copy.approve)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(primaryBackground)
-                    .clipShape(buttonShape)
-                    .shadow(color: primaryShadow, radius: theme.id == .control ? 8 : 5, y: theme.id == .soft ? 3 : 0)
-                    .contentShape(buttonShape)
-            }
-            .buttonStyle(.plain)
-            Button { decide(false) } label: {
-                secondaryLabel(copy.deny)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(secondaryBackground)
-                    .clipShape(buttonShape)
-                    .overlay(buttonShape.strokeBorder(secondaryBorder, lineWidth: 1))
-                    .contentShape(buttonShape)
-            }
-            .buttonStyle(.plain)
-        }
-    }
+    // MARK: Done
 
     private var doneRow: some View {
         HStack(spacing: 9) {
             if theme.id == .ink {
                 WaxSealDot(color: doneColor, ring: theme.panel, size: 14, pulsing: false)
             }
-            Text(TalariaVoice.doneWord(kind: approval.kind,
-                                       approved: decision == true, theme.id))
+            Text(copy.approvalDone(kind: approval.kind, choice: decision ?? .once, theme.id))
                 .tracking(theme.id == .soft ? 0 : 1)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
         }
         .font(doneFont)
         .foregroundStyle(doneColor)
@@ -439,6 +447,9 @@ private struct ApprovalCard: View {
 
     // MARK: Swipe
 
+    /// The fast path covers the two choices every request offers. Session and
+    /// always are deliberately tap-only — a gesture should not hand a bot a
+    /// standing permission.
     private var swipe: some Gesture {
         DragGesture(minimumDistance: 14)
             .onChanged { value in
@@ -452,7 +463,7 @@ private struct ApprovalCard: View {
             .onEnded { _ in
                 guard pending else { return }
                 if abs(dragX) >= 90 {
-                    decide(dragX > 0)
+                    decide(dragX > 0 ? .once : .deny)
                 }
                 withAnimation(.spring(response: 0.32, dampingFraction: 0.8)) {
                     dragX = 0
@@ -478,14 +489,6 @@ private struct ApprovalCard: View {
 
     private var primaryBackground: Color {
         theme.id == .ink ? theme.ink : theme.accent
-    }
-
-    private var primaryShadow: Color {
-        switch theme.id {
-        case .soft: theme.accent.opacity(0.28)
-        case .control: theme.accent.opacity(0.22)
-        case .ink: .clear
-        }
     }
 
     private var secondaryBackground: Color {
@@ -613,8 +616,8 @@ private struct ApprovalCard: View {
 
     private var doneBackground: Color {
         switch theme.id {
-        case .soft: decision == true ? theme.ok.opacity(0.1) : theme.danger.opacity(0.08)
-        case .control: decision == true ? theme.ok.opacity(0.08) : theme.danger.opacity(0.08)
+        case .soft: approved ? theme.ok.opacity(0.1) : theme.danger.opacity(0.08)
+        case .control: approved ? theme.ok.opacity(0.08) : theme.danger.opacity(0.08)
         case .ink: .clear
         }
     }

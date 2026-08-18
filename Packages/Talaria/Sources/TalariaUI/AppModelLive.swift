@@ -133,6 +133,15 @@ extension AppModel {
         runtime.baseURL = nil
         client = nil
         isOffline = false
+        // Each area's router owns state belonging to *that* gateway. Without
+        // this they survive the disconnect: cached session titles from a store
+        // that is gone, and — the visible one — a parked clarify/sudo/secret
+        // prompt left modal over an empty world with no socket to answer on.
+        // The attach* calls all early-return once `client` is nil, so this is
+        // the only chance to tear them down.
+        detachApprovalBridges()
+        detachSessionEventRouter()
+        detachVoiceRouter()
         connections = ConnectionRegistry.shared.rows
     }
 
@@ -266,7 +275,7 @@ extension AppModel {
                 await self.hydrateTranscript(live, botID: botID)
             }
             self.replayInflight(live, botID: botID)
-            if let pending = live.pendingApproval { self.ingest(pending) }
+            self.replayPendingPrompts(live)
             return live.sessionID
         }
         runtime.attachTasks[botID] = task
@@ -319,10 +328,15 @@ extension AppModel {
             let time = row["timestamp"]?.doubleValue.map { shortTime($0) }
             let reasoning = row["reasoning"]?.stringValue
                 ?? row["reasoning_content"]?.stringValue
+            // Durable row identity (_history_to_messages stamps `row_id` from
+            // _rows_to_conversation). Without it only the newest assistant row
+            // is addressable by `message.react`, which names rows by id.
+            let rowID = row["row_id"]?.intValue
             switch row["role"]?.stringValue {
-            case "user": return ChatMessage(author: .user, time: time, text: text)
+            case "user": return ChatMessage(author: .user, time: time, text: text,
+                                            rowID: rowID)
             case "assistant": return ChatMessage(author: .bot, time: time, text: text,
-                                                 reasoning: reasoning)
+                                                 reasoning: reasoning, rowID: rowID)
             case "system": return ChatMessage(author: .system, time: time, text: text)
             default: return nil
             }
@@ -352,6 +366,19 @@ extension AppModel {
         }
         if let error = inflight["error"]?.stringValue, !error.isEmpty {
             chat.messages.append(ChatMessage(author: .system, text: error))
+        }
+    }
+
+    /// Replay the blocking prompts `session.resume` carries. Both park a real
+    /// agent thread, and neither is re-emitted as an event after a reconnect:
+    /// the approval sweep would find the approval a round trip later, but a
+    /// clarify has no `*.pending` RPC at all, so this block is its only
+    /// recovery channel. Routed through the approvals surface so a replayed
+    /// approval arrives with its real choice set rather than once/deny.
+    func replayPendingPrompts(_ live: LiveSession) {
+        if let pending = live.pendingApproval { ingestPendingApproval(pending) }
+        if let clarify = live.pendingClarify, clarify != .null {
+            ingestPendingClarify(clarify, sessionID: live.sessionID)
         }
     }
 
@@ -735,7 +762,7 @@ extension AppModel {
             if let live = try? await client.resumeSession(stored, profile: botID, deferHistory: true) {
                 bindSession(live, botID: botID)
                 replayInflight(live, botID: botID)
-                if let pending = live.pendingApproval { ingest(pending) }
+                replayPendingPrompts(live)
             }
         }
 

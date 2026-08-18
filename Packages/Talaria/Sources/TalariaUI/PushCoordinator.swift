@@ -162,9 +162,27 @@ public final class PushCoordinator: NSObject {
     /// Hand the token to the gateway's talaria-push relay plugin. Safe to call
     /// repeatedly (idempotent upsert server-side); silently skips when the
     /// gateway is absent or the plugin isn't installed.
+    ///
+    /// Connecting a gateway is the in-context moment to ask for notification
+    /// permission — approvals are the whole point of the relay — so an
+    /// undetermined status prompts once here rather than only in onboarding.
     public func registerWithRelayIfConnected() {
-        guard let hex = deviceTokenHex, let client = model?.client else { return }
-        Task {
+        guard let client = model?.client else { return }
+        Task { @MainActor in
+            if deviceTokenHex == nil {
+                let status = await authorizationStatus()
+                switch status {
+                case .notDetermined:
+                    guard await requestAuthorization() else { return }
+                case .authorized, .provisional, .ephemeral:
+                    registerForRemoteNotifications()
+                default:
+                    return  // denied — respect it
+                }
+            }
+            // Wait for the APNs token (already resolved when registration
+            // happened earlier in this launch).
+            let hex = await deviceToken
             // Dev builds sign with the development aps-environment.
             try? await client.registerPushDevice(tokenHex: hex, environment: "dev")
         }
