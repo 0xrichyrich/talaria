@@ -111,7 +111,12 @@ public struct CronJob: Sendable, Identifiable {
     public var raw: JSONValue
 
     init(_ v: JSONValue) {
-        id = v["id"]?.stringValue ?? v["name"]?.stringValue ?? UUID().uuidString
+        // `_format_job` (cronjob_tools.py:620) emits `job_id`, never `id`, and
+        // every mutation addresses a job by it. Falling through to `name` — as
+        // this did — meant enable/disable/delete targeted a title, so a
+        // renamed or duplicate-titled job hit the wrong row or nothing at all.
+        // Verified against a live gateway 2026-08-18: rows carry job_id.
+        id = v["job_id"]?.stringValue ?? v["id"]?.stringValue ?? v["name"]?.stringValue ?? UUID().uuidString
         name = v["name"]?.stringValue ?? ""
         schedule = v["schedule"]?.stringValue ?? v["cron"]?.stringValue ?? ""
         enabled = v["enabled"]?.boolValue ?? true
