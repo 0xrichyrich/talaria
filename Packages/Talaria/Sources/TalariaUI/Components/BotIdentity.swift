@@ -24,11 +24,19 @@ import TalariaTheme
 public extension Bot {
     /// Stand-in for a profile with no roster row — a cron entry naming a bot
     /// that lives on another gateway, an approval that arrived before the
-    /// roster did. It carries no cosmetics, but `displayTitle` / `handle`
-    /// still apply their rules, so `default` reads Hermes/@hermes here
-    /// exactly as it does on a real row.
+    /// roster did. `displayTitle` / `handle` still apply their rules, so
+    /// `default` reads Hermes/@hermes here exactly as it does on a real row.
+    ///
+    /// The face is the name hash, which is `BotCosmetics`' own last resort for
+    /// a profile carrying no stored cosmetics — not a fixed circle/teal. A
+    /// stand-in is by definition the paint that comes BEFORE the roster row,
+    /// and a constant here is a face guaranteed to change the moment the row
+    /// arrives: an approval landing ahead of the roster drew a teal circle and
+    /// then became a different bot a second later.
     static func unlisted(id: String) -> Bot {
-        Bot(id: id, job: "", shape: .circle, hue: .teal)
+        Bot(id: id, job: "",
+            shape: BotCosmetics.derivedShape(forName: id),
+            hue: BotCosmetics.derivedHue(forName: id))
     }
 }
 

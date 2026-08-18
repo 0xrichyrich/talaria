@@ -178,13 +178,9 @@ public struct ActiveNowStrip: View {
     /// Desktop hardcodes `mood: 'work'` on these chips (plugin.js:6934): being
     /// on the rail *is* the statement that this bot is working, so the face
     /// must not contradict it while the row's own pose is still catching up.
-    @ViewBuilder private func face(for bot: Bot) -> some View {
-        if model.hasStoredAvatar(bot.id) {
-            BotPortraitView(model: model, bot: bot, size: faceSize, theme: theme)
-        } else {
-            AvatarView(shape: bot.shape, hue: bot.hue, size: faceSize,
-                       isWorking: true, theme: theme)
-        }
+    private func face(for bot: Bot) -> some View {
+        BotPortraitView(model: model, bot: bot, size: faceSize, theme: theme,
+                        isWorking: true)
     }
 
     // MARK: - Pack voices
