@@ -1,0 +1,1046 @@
+import SwiftUI
+import TalariaKit
+import TalariaTheme
+
+// Per-bot chat, pushed from the roster. Header with back / avatar / themed
+// state line / routines button (header tap opens the bot sheet); the message
+// list (sys rows, bot bubbles with papers-digest and inline-approval cards,
+// user bubbles with offline queued notes, typing dots); quick replies; the
+// model/context/YOLO strip; and the composer with mic → voice and send.
+// Ported from Talaria.dc.html `data-screen-label="Chat"`.
+//
+// The inline approval card is wired to the same state as the Approvals tab:
+// pending == the ref is still in model.approvals; deciding here removes it
+// there (and vice versa), with the outcome word remembered in ApprovalOutcomes.
+
+// MARK: - Approval outcome ledger
+
+/// AppModel removes an approval on resolve, but decided cards keep rendering
+/// with their themed done-word ("Approved — sent" / "RELEASED — RAN CLEAN" /
+/// "sealed — done cleanly"). This ledger keeps the card data + outcome for
+/// every approval this process has seen, shared by the inline chat card and
+/// the push banner.
+@MainActor
+@Observable
+public final class ApprovalOutcomes {
+    public static let shared = ApprovalOutcomes()
+
+    public private(set) var snapshots: [String: Approval] = [:]
+    public private(set) var outcomes: [String: Bool] = [:]
+
+    public init() {}
+
+    /// Cache the card data while the approval is still pending.
+    public func remember(_ approval: Approval) {
+        if snapshots[approval.id] == nil { snapshots[approval.id] = approval }
+    }
+
+    /// Record a decision made anywhere in the app.
+    public func record(_ approval: Approval, approved: Bool) {
+        snapshots[approval.id] = approval
+        outcomes[approval.id] = approved
+    }
+
+    /// Record + resolve in one step — the path every approve/deny control
+    /// in this module should take.
+    public func resolve(_ approval: Approval, approve: Bool, in model: AppModel) {
+        record(approval, approved: approve)
+        model.resolveApproval(approval, approve: approve)
+    }
+}
+
+// MARK: - ChatView
+
+public struct ChatView: View {
+    private let model: AppModel
+    private let botID: String
+    private let onOpenProfile: () -> Void
+    private let onRoutines: () -> Void
+    private let onVoice: () -> Void
+
+    @State private var draft = ""
+    @FocusState private var composerFocused: Bool
+
+    public init(model: AppModel, botID: String,
+                onOpenProfile: @escaping () -> Void = {},
+                onRoutines: @escaping () -> Void = {},
+                onVoice: @escaping () -> Void = {}) {
+        self.model = model
+        self.botID = botID
+        self.onOpenProfile = onOpenProfile
+        self.onRoutines = onRoutines
+        self.onVoice = onVoice
+    }
+
+    private var theme: ThemePack { model.theme.pack }
+    private var copy: CopyPack { model.theme.copy }
+
+    private var bot: Bot {
+        model.bot(botID) ?? Bot(id: botID, job: "", shape: .circle, hue: .teal)
+    }
+
+    private var botColor: Color { theme.color(for: bot.hue) }
+    private var chat: ChatState? { model.chats[botID] }
+    private var messages: [ChatMessage] { chat?.messages ?? [] }
+
+    private var quickReplies: [String] {
+        model.mode == .demo ? (DemoData.quickReplies[botID] ?? []) : []
+    }
+
+    public var body: some View {
+        VStack(spacing: 0) {
+            header
+            messageList
+            modelStrip
+            if !quickReplies.isEmpty {
+                quickReplyRow
+            }
+            composer
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(theme.bg)
+        .onAppear { seedChatIfNeeded() }
+    }
+
+    /// Bots without history open on their roster preview, like the prototype's
+    /// `[{ from:'bot', text: preview }]` fallback.
+    private func seedChatIfNeeded() {
+        guard model.chats[botID] == nil else { return }
+        let chat = model.chat(for: botID)
+        if chat.messages.isEmpty, !bot.preview.isEmpty {
+            chat.messages.append(ChatMessage(author: .bot, time: bot.previewTime,
+                                             text: bot.preview))
+        }
+    }
+
+    // MARK: - Header
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            HeaderIconButton(theme: theme, size: 31, action: { model.openBotID = nil }) {
+                Text(verbatim: "‹")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
+                    .padding(.bottom, 2)
+            }
+            AvatarView(bot: bot, size: 36, theme: theme)
+            Button(action: onOpenProfile) {
+                VStack(alignment: .leading, spacing: 1) {
+                    nameLine
+                    stateLine
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            routinesButton
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(theme.line).frame(height: 1)
+        }
+    }
+
+    private var nameLine: some View {
+        let name = TalariaVoice.displayName(botID, theme.id)
+        return Group {
+            switch theme.id {
+            case .soft: Text(verbatim: "\(name) ›").font(theme.body(16, weight: .bold))
+            case .control: Text(verbatim: "\(name) ›").font(theme.body(15, weight: .bold))
+            case .ink: Text(verbatim: "\(name) ›").font(theme.body(19, weight: .bold).smallCaps()).tracking(0.5)
+            }
+        }
+        .foregroundStyle(theme.ink)
+        .lineLimit(1)
+    }
+
+    private var stateLine: some View {
+        let line = TalariaVoice.chatStateLine(for: bot, theme.id)
+        let color: Color = switch bot.status {
+        case .working: theme.ok
+        case .approval: theme.id == .control ? theme.warn : theme.danger
+        case .idle: theme.faint
+        }
+        return Group {
+            switch theme.id {
+            case .soft: Text(line).font(theme.body(11.5, weight: .medium))
+            case .control: Text(line.uppercased()).font(theme.mono(9.5)).tracking(0.8)
+            case .ink: Text(line.uppercased()).font(theme.mono(8.5)).tracking(1.5)
+            }
+        }
+        .foregroundStyle(color)
+        .lineLimit(1)
+    }
+
+    private var routinesButton: some View {
+        Button(action: onRoutines) {
+            Group {
+                switch theme.id {
+                case .soft:
+                    Text(copy.routinesBtn).font(theme.body(12, weight: .semibold))
+                        .foregroundStyle(theme.ink)
+                case .control:
+                    Text(copy.routinesBtn).font(theme.mono(10, weight: .semibold))
+                        .tracking(1).foregroundStyle(theme.ink)
+                case .ink:
+                    Text(copy.routinesBtn).font(theme.body(13, weight: .semibold).smallCaps())
+                        .tracking(1).foregroundStyle(theme.ink)
+                }
+            }
+            .padding(.vertical, 7)
+            .padding(.horizontal, 11)
+            .chipShell(theme)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Message list
+
+    private var messageList: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 11) {
+                    ForEach(messages) { message in
+                        messageRow(message)
+                    }
+                    if chat?.isTyping == true {
+                        TypingDots(theme: theme, color: botColor)
+                            .modifier(ChatEntrance())
+                    }
+                    Color.clear.frame(height: 1).id("chat-bottom")
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 8)
+            }
+            .defaultScrollAnchor(.bottom)
+            .onChange(of: messages.count) {
+                withAnimation(.easeOut(duration: 0.25)) {
+                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                }
+            }
+            .onChange(of: chat?.isTyping ?? false) {
+                withAnimation(.easeOut(duration: 0.25)) {
+                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func messageRow(_ message: ChatMessage) -> some View {
+        switch message.author {
+        case .system: systemRow(message)
+        case .bot: botRow(message)
+        case .user: userRow(message)
+        }
+    }
+
+    // MARK: System rows
+
+    private func systemRow(_ message: ChatMessage) -> some View {
+        HStack(spacing: 8) {
+            if theme.id == .ink {
+                Rectangle().fill(theme.line).frame(height: 1)
+            } else {
+                Spacer(minLength: 0)
+            }
+            sysPill(message.text)
+            if theme.id == .ink {
+                Rectangle().fill(theme.line).frame(height: 1)
+            } else {
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.vertical, 3)
+    }
+
+    @ViewBuilder private func sysPill(_ text: String) -> some View {
+        switch theme.id {
+        case .soft:
+            Text(text)
+                .font(theme.body(11, weight: .semibold))
+                .foregroundStyle(theme.ink.opacity(0.4))
+                .padding(.vertical, 5)
+                .padding(.horizontal, 12)
+                .background(theme.ink.opacity(0.05), in: Capsule())
+                .lineLimit(1)
+        case .control:
+            Text(text.uppercased())
+                .font(theme.mono(9.5))
+                .tracking(1)
+                .foregroundStyle(theme.ink.opacity(0.4))
+                .padding(.vertical, 4)
+                .padding(.horizontal, 10)
+                .overlay(RoundedRectangle(cornerRadius: 4)
+                    .strokeBorder(theme.lineStrong.opacity(0.6), lineWidth: 1))
+                .lineLimit(1)
+        case .ink:
+            Text(text.uppercased())
+                .font(theme.mono(8))
+                .tracking(1.5)
+                .foregroundStyle(theme.ink.opacity(0.45))
+                .lineLimit(1)
+                .fixedSize()
+        }
+    }
+
+    // MARK: Bot rows
+
+    private func botRow(_ message: ChatMessage) -> some View {
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
+                if theme.id == .ink {
+                    Text(verbatim: "\(TalariaVoice.plainUpper(botID)) · \(message.time ?? "now")")
+                        .font(theme.mono(8))
+                        .tracking(1.5)
+                        .foregroundStyle(theme.ink.opacity(0.45))
+                        .padding(.bottom, 4)
+                }
+                if !message.text.isEmpty {
+                    botBubble(message.text)
+                }
+                if let card = message.card {
+                    cardView(card)
+                        .padding(.top, 8)
+                        .padding(.leading, theme.id == .ink ? 14 : 0)
+                }
+            }
+            Spacer(minLength: 44) // ≈ the prototype's 86% max width
+        }
+        .modifier(ChatEntrance())
+    }
+
+    @ViewBuilder private func botBubble(_ text: String) -> some View {
+        switch theme.id {
+        case .soft:
+            Text(text)
+                .font(theme.body(14.5))
+                .lineSpacing(3)
+                .foregroundStyle(theme.ink.opacity(0.94))
+                .padding(.vertical, 11)
+                .padding(.horizontal, 14)
+                .background(theme.panel,
+                            in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 6,
+                                                       bottomTrailingRadius: 20, topTrailingRadius: 20))
+                .overlay(UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 6,
+                                                bottomTrailingRadius: 20, topTrailingRadius: 20)
+                    .strokeBorder(theme.ink.opacity(0.06), lineWidth: 1))
+                .shadow(color: theme.ink.opacity(0.04), radius: 1, y: 1)
+        case .control:
+            Text(text)
+                .font(theme.body(14))
+                .lineSpacing(3.5)
+                .foregroundStyle(theme.ink.opacity(0.88))
+                .padding(.vertical, 11)
+                .padding(.horizontal, 13)
+                .background(theme.panel,
+                            in: UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 3,
+                                                       bottomTrailingRadius: 10, topTrailingRadius: 10))
+                .overlay(UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 3,
+                                                bottomTrailingRadius: 10, topTrailingRadius: 10)
+                    .strokeBorder(theme.line, lineWidth: 1))
+        case .ink:
+            // Flat manuscript text with a colored left rule — no bubble.
+            Text(text)
+                .font(theme.body(16.5))
+                .lineSpacing(4)
+                .foregroundStyle(theme.ink)
+                .padding(.vertical, 2)
+                .padding(.leading, 12)
+                .overlay(alignment: .leading) {
+                    Rectangle().fill(botColor).frame(width: 2)
+                }
+        }
+    }
+
+    @ViewBuilder private func cardView(_ card: MessageCard) -> some View {
+        switch card {
+        case .papers(let papers): papersCard(papers)
+        case .approvalRef(let ref): approvalCard(ref: ref)
+        }
+    }
+
+    // MARK: Papers digest card
+
+    private static let inkFigures = ["fig. i", "fig. ii", "fig. iii"]
+
+    private func papersCard(_ papers: [MessageCard.Paper]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(copy.digestHead)
+                .font(theme.mono(theme.id == .ink ? 8 : 9, weight: .bold))
+                .tracking(theme.id == .ink ? 2 : 1.5)
+                .foregroundStyle(theme.id == .control ? theme.accent
+                    : theme.ink.opacity(theme.id == .ink ? 0.55 : 0.45))
+                .padding(.vertical, 8)
+                .padding(.horizontal, 13)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .overlay(alignment: .bottom) {
+                    Rectangle().fill(theme.line).frame(height: 1)
+                }
+            ForEach(Array(papers.enumerated()), id: \.offset) { index, paper in
+                paperRow(paper, index: index)
+                    .overlay(alignment: .bottom) {
+                        Rectangle().fill(theme.line).frame(height: 1)
+                    }
+            }
+            Button {
+                // Full digest lives with the artifact — jump to the vault.
+                model.selectedTab = .artifacts
+                model.openBotID = nil
+            } label: {
+                Group {
+                    switch theme.id {
+                    case .soft:
+                        Text(copy.digestLink).font(theme.body(12.5, weight: .bold))
+                    case .control:
+                        Text(copy.digestLink).font(theme.mono(10, weight: .bold)).tracking(1)
+                    case .ink:
+                        Text(copy.digestLink).font(theme.body(14, weight: .bold).smallCaps()).tracking(1)
+                    }
+                }
+                .foregroundStyle(theme.accent)
+                .padding(.vertical, 9)
+                .padding(.horizontal, 13)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .background(cardChrome)
+    }
+
+    private func paperRow(_ paper: MessageCard.Paper, index: Int) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(theme.id == .ink
+                 ? (index < Self.inkFigures.count ? Self.inkFigures[index] : "fig.")
+                 : "▪")
+                .font(theme.mono(9))
+                .foregroundStyle(botColor)
+                .padding(.top, 4)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(paper.title)
+                    .font(theme.body(theme.id == .ink ? 15.5 : 13.5,
+                                     weight: theme.id == .control ? .semibold : .bold))
+                    .foregroundStyle(theme.ink)
+                Text(paper.meta)
+                    .font(theme.id == .soft ? theme.body(11) : theme.mono(theme.id == .ink ? 8.5 : 9.5))
+                    .tracking(theme.id == .ink ? 0.5 : 0)
+                    .foregroundStyle(theme.id == .soft ? theme.ink.opacity(0.45)
+                        : theme.id == .control ? theme.ink.opacity(0.42) : theme.ink.opacity(0.5))
+                    .padding(.top, 2)
+                Text(paper.summary)
+                    .font(theme.body(theme.id == .ink ? 14 : 12.5))
+                    .italic(theme.id == .ink)
+                    .lineSpacing(2.5)
+                    .foregroundStyle(theme.ink.opacity(theme.id == .ink ? 0.75 : 0.65))
+                    .padding(.top, 3)
+            }
+        }
+        .padding(.vertical, 11)
+        .padding(.horizontal, 13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder private var cardChrome: some View {
+        switch theme.id {
+        case .soft:
+            RoundedRectangle(cornerRadius: 18)
+                .fill(theme.panel)
+                .overlay(RoundedRectangle(cornerRadius: 18)
+                    .strokeBorder(theme.ink.opacity(0.06), lineWidth: 1))
+                .shadow(color: theme.ink.opacity(0.04), radius: 1, y: 1)
+        case .control:
+            RoundedRectangle(cornerRadius: 10)
+                .fill(theme.panel)
+                .overlay(RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(theme.lineStrong.opacity(0.7), lineWidth: 1))
+        case .ink:
+            Rectangle()
+                .fill(theme.panel)
+                .overlay(Rectangle().strokeBorder(theme.ink.opacity(0.35), lineWidth: 1))
+        }
+    }
+
+    // MARK: Inline approval card
+
+    private func approvalCard(ref: String) -> some View {
+        let live = model.approvals.first { $0.id == ref }
+        let approval = live ?? ApprovalOutcomes.shared.snapshots[ref]
+        return Group {
+            if let approval {
+                InlineApprovalCard(
+                    model: model, theme: theme, copy: copy,
+                    approval: approval, pending: live != nil,
+                    approved: resolvedOutcome(for: approval, pending: live != nil))
+                .onAppear {
+                    if let live { ApprovalOutcomes.shared.remember(live) }
+                }
+            }
+        }
+    }
+
+    /// Decided outcome for a no-longer-pending approval. Prefers the shared
+    /// ledger; falls back to the system line AppModel appended on resolve.
+    private func resolvedOutcome(for approval: Approval, pending: Bool) -> Bool {
+        guard !pending else { return true }
+        if let recorded = ApprovalOutcomes.shared.outcomes[approval.id] { return recorded }
+        let denied = messages.contains {
+            $0.author == .system && $0.text.hasPrefix("Denied") && $0.text.contains(approval.title)
+        }
+        return !denied
+    }
+
+    // MARK: User rows
+
+    private func userRow(_ message: ChatMessage) -> some View {
+        let queued = model.composeQueue.contains {
+            $0.botID == botID && $0.text == message.text
+        }
+        return HStack(spacing: 0) {
+            Spacer(minLength: 70) // ≈ the prototype's 78% max width
+            VStack(alignment: .trailing, spacing: 3) {
+                userBubble(message.text)
+                if queued {
+                    Text(copy.queued)
+                        .font(theme.id == .soft ? theme.body(11, weight: .medium) : theme.mono(9))
+                        .foregroundStyle(theme.faint)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .modifier(ChatEntrance())
+    }
+
+    @ViewBuilder private func userBubble(_ text: String) -> some View {
+        switch theme.id {
+        case .soft:
+            Text(text)
+                .font(theme.body(14.5))
+                .lineSpacing(3)
+                .foregroundStyle(theme.accentFg)
+                .padding(.vertical, 11)
+                .padding(.horizontal, 14)
+                .background(LinearGradient(colors: [theme.color(for: .violet), theme.accent],
+                                           startPoint: .topLeading, endPoint: .bottomTrailing),
+                            in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 20,
+                                                       bottomTrailingRadius: 6, topTrailingRadius: 20))
+                .shadow(color: theme.accent.opacity(0.24), radius: 6, y: 4)
+        case .control:
+            Text(text)
+                .font(theme.body(14))
+                .lineSpacing(3.5)
+                .foregroundStyle(theme.ink)
+                .padding(.vertical, 11)
+                .padding(.horizontal, 13)
+                .background(theme.accent.opacity(0.12),
+                            in: UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 10,
+                                                       bottomTrailingRadius: 3, topTrailingRadius: 10))
+                .overlay(UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 10,
+                                                bottomTrailingRadius: 3, topTrailingRadius: 10)
+                    .strokeBorder(theme.accent.opacity(0.25), lineWidth: 1))
+        case .ink:
+            Text(text)
+                .font(theme.body(15.5))
+                .lineSpacing(3)
+                .foregroundStyle(theme.bg)
+                .padding(.vertical, 11)
+                .padding(.horizontal, 15)
+                .background(theme.ink,
+                            in: UnevenRoundedRectangle(topLeadingRadius: 16, bottomLeadingRadius: 16,
+                                                       bottomTrailingRadius: 3, topTrailingRadius: 16))
+        }
+    }
+
+    // MARK: - Model / context / YOLO strip
+
+    private var contextPercent: Int {
+        if let live = chat?.usage?.contextPercent { return live }
+        let seeded = DemoData.chats[botID]?.count ?? (bot.preview.isEmpty ? 0 : 1)
+        let extra = max(0, messages.count - seeded)
+        return min(92, 34 + extra * 3)
+    }
+
+    private var modelShort: String {
+        let pinned = bot.pinnedModel ?? model.models.first ?? ""
+        return pinned.components(separatedBy: " ").first ?? pinned
+    }
+
+    private var yoloOn: Bool { chat?.yolo ?? false }
+
+    private var modelStrip: some View {
+        HStack(spacing: 8) {
+            Button(action: onOpenProfile) {
+                Text(verbatim: "⌘ \(modelShort)")
+                    .font(chipStripFont)
+                    .foregroundStyle(theme.id == .ink ? theme.ink.opacity(0.6) : theme.ink)
+                    .lineLimit(1)
+            }
+            .buttonStyle(.plain)
+            Spacer(minLength: 8)
+            Capsule()
+                .fill(theme.line)
+                .frame(width: 52, height: 4)
+                .overlay(alignment: .leading) {
+                    Capsule().fill(theme.accent)
+                        .frame(width: 52 * CGFloat(contextPercent) / 100)
+                }
+            Text(verbatim: "\(contextPercent)%")
+                .font(chipStripFont)
+                .foregroundStyle(theme.id == .soft ? theme.ink.opacity(0.4) : theme.faint)
+                .monospacedDigit()
+            Button {
+                model.chat(for: botID).yolo.toggle()
+            } label: {
+                Text(verbatim: "YOLO")
+                    .font(chipStripFont)
+                    .foregroundStyle(yoloOn ? theme.warn : theme.faint)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 7)
+        .padding(.horizontal, 11)
+        .chipShell(theme)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 7)
+    }
+
+    private var chipStripFont: Font {
+        switch theme.id {
+        case .soft: theme.body(12, weight: .semibold)
+        case .control: theme.mono(10.5, weight: .semibold)
+        case .ink: theme.mono(9)
+        }
+    }
+
+    // MARK: - Quick replies
+
+    private var quickReplyRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 7) {
+                ForEach(quickReplies, id: \.self) { reply in
+                    Button {
+                        model.send(text: reply, to: botID)
+                    } label: {
+                        quickChip(reply)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+        .padding(.bottom, 6)
+    }
+
+    @ViewBuilder private func quickChip(_ text: String) -> some View {
+        switch theme.id {
+        case .soft:
+            Text(text)
+                .font(theme.body(13, weight: .semibold))
+                .foregroundStyle(theme.accent)
+                .padding(.vertical, 8)
+                .padding(.horizontal, 13)
+                .background(theme.accent.opacity(0.06), in: Capsule())
+                .overlay(Capsule().strokeBorder(theme.accent.opacity(0.35), lineWidth: 1.5))
+        case .control:
+            Text(text)
+                .font(theme.mono(10.5, weight: .semibold))
+                .foregroundStyle(theme.accent)
+                .padding(.vertical, 8)
+                .padding(.horizontal, 13)
+                .background(theme.accent.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(theme.accent.opacity(0.3), lineWidth: 1))
+        case .ink:
+            Text(text)
+                .font(theme.body(14, weight: .semibold).smallCaps())
+                .tracking(0.5)
+                .foregroundStyle(theme.ink)
+                .padding(.vertical, 8)
+                .padding(.horizontal, 13)
+                .background(theme.ink.opacity(0.03))
+                .overlay(Rectangle().strokeBorder(theme.ink.opacity(0.4), lineWidth: 1))
+        }
+    }
+
+    // MARK: - Composer
+
+    private var composer: some View {
+        HStack(spacing: 8) {
+            HeaderIconButton(theme: theme, size: 40, action: onVoice) {
+                HStack(spacing: 3) {
+                    micBar(height: 14, color: theme.accent)
+                    micBar(height: 8, color: theme.accentFaint)
+                }
+            }
+            TextField("", text: $draft,
+                      prompt: Text(copy.composer(botID)).foregroundStyle(theme.faint))
+                .textFieldStyle(.plain)
+                .font(composerFont)
+                .foregroundStyle(theme.ink)
+                .tint(theme.accent)
+                .focused($composerFocused)
+                .frame(height: 42)
+                .padding(.horizontal, 15)
+                .background(composerFieldChrome)
+                .onSubmit { send() }
+            Button(action: send) {
+                Text(verbatim: "↑")
+                    .font(.system(size: 18, weight: .heavy))
+                    .foregroundStyle(theme.accentFg)
+                    .frame(width: 40, height: 40)
+                    .background(sendBackground, in: sendShape)
+                    .contentShape(sendShape)
+            }
+            .buttonStyle(.plain)
+            .animation(.easeOut(duration: 0.2), value: draft.isEmpty)
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+    }
+
+    private func micBar(height: CGFloat, color: Color) -> some View {
+        RoundedRectangle(cornerRadius: theme.id == .soft ? 2.25 : theme.id == .control ? 1 : 2)
+            .fill(color)
+            .frame(width: 4.5, height: height)
+    }
+
+    private var composerFont: Font {
+        switch theme.id {
+        case .soft: theme.body(14.5)
+        case .control: theme.mono(13)
+        case .ink: theme.body(15)
+        }
+    }
+
+    @ViewBuilder private var composerFieldChrome: some View {
+        switch theme.id {
+        case .soft:
+            Capsule().fill(theme.panel)
+                .overlay(Capsule().strokeBorder(theme.ink.opacity(0.09), lineWidth: 1))
+        case .control:
+            RoundedRectangle(cornerRadius: 8).fill(theme.panel)
+                .overlay(RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(theme.lineStrong.opacity(0.8), lineWidth: 1))
+        case .ink:
+            RoundedRectangle(cornerRadius: 2).fill(theme.panel)
+                .overlay(RoundedRectangle(cornerRadius: 2)
+                    .strokeBorder(theme.ink.opacity(0.4), lineWidth: 1))
+        }
+    }
+
+    private var sendShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: theme.id == .control ? 8 : 20, style: .continuous)
+    }
+
+    private var sendBackground: Color {
+        if draft.trimmingCharacters(in: .whitespaces).isEmpty {
+            return switch theme.id {
+            case .soft: theme.ink.opacity(0.18)
+            case .control: theme.ink.opacity(0.14)
+            case .ink: theme.ink.opacity(0.3)
+            }
+        }
+        return theme.accent
+    }
+
+    private func send() {
+        let text = draft.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return }
+        draft = ""
+        model.send(text: text, to: botID)
+    }
+}
+
+// MARK: - Inline approval card
+
+/// The seal card inside a bot message. Same approval as the Approvals tab —
+/// deciding here resolves it everywhere; a decided card dims and shows the
+/// themed done-word (with the wax seal-dot in ink).
+private struct InlineApprovalCard: View {
+    var model: AppModel
+    var theme: ThemePack
+    var copy: CopyPack
+    var approval: Approval
+    var pending: Bool
+    var approved: Bool
+
+    private var accentState: Color {
+        pending ? (theme.id == .control ? theme.warn : theme.danger) : theme.faint
+    }
+
+    private var borderColor: Color {
+        if pending {
+            return theme.id == .control ? theme.warn.opacity(0.35)
+                : theme.id == .ink ? theme.accent.opacity(0.65)
+                : theme.danger.opacity(0.35)
+        }
+        return theme.id == .control ? theme.line
+            : theme.id == .ink ? theme.ink.opacity(0.3)
+            : theme.ink.opacity(0.08)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if theme.id == .control && pending {
+                HazardStripes(color: theme.warn, background: theme.panel)
+                    .frame(height: 5)
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(accentState)
+                        .frame(width: 8, height: 8)
+                        .glowPulse(period: 1.7)
+                    Text(copy.tag)
+                        .font(theme.mono(theme.id == .ink ? 8.5 : 9.5,
+                                         weight: theme.id == .ink ? .semibold : .bold))
+                        .tracking(theme.id == .control ? 1.8 : theme.id == .ink ? 2 : 1)
+                        .foregroundStyle(accentState)
+                }
+                subjectLine
+                    .padding(.top, 7)
+                Text(verbatim: "\(copy.unto) \(approval.target)")
+                    .font(theme.id == .soft ? theme.body(11) : theme.mono(theme.id == .ink ? 8.5 : 9.5))
+                    .foregroundStyle(theme.ink.opacity(theme.id == .ink ? 0.5 : 0.45))
+                    .padding(.top, 2)
+                quote
+                    .padding(.top, 8)
+                if pending {
+                    HStack(spacing: 8) {
+                        ThemedPrimaryButton(theme: theme, title: copy.approveSend) {
+                            ApprovalOutcomes.shared.resolve(approval, approve: true, in: model)
+                        }
+                        ThemedSecondaryButton(theme: theme, title: copy.deny) {
+                            ApprovalOutcomes.shared.resolve(approval, approve: false, in: model)
+                        }
+                    }
+                    .padding(.top, 11)
+                } else {
+                    doneRow
+                        .padding(.top, 11)
+                }
+            }
+            .padding(.vertical, 12)
+            .padding(.horizontal, 14)
+        }
+        .background(sealChrome)
+        .padding(theme.id == .ink ? 4 : 0) // room for the ink double rule
+        .opacity(pending ? 1 : 0.68)
+    }
+
+    private var subjectLine: some View {
+        Group {
+            if approval.kind == .command {
+                Text(approval.subject)
+                    .font(theme.mono(theme.id == .soft ? 12.5 : 12, weight: .semibold))
+            } else {
+                Text(approval.subject)
+                    .font(theme.body(theme.id == .ink ? 17 : theme.id == .control ? 13 : 14,
+                                     weight: theme.id == .soft ? .bold : .semibold))
+            }
+        }
+        .foregroundStyle(theme.id == .control ? theme.warn : theme.ink)
+    }
+
+    private var quote: some View {
+        Group {
+            switch theme.id {
+            case .soft:
+                Text(approval.body)
+                    .font(theme.body(13))
+                    .lineSpacing(3)
+                    .foregroundStyle(theme.ink.opacity(0.7))
+                    .padding(.vertical, 9)
+                    .padding(.horizontal, 11)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(theme.inset, in: RoundedRectangle(cornerRadius: 12))
+            case .control:
+                Text(approval.body)
+                    .font(theme.body(12.5))
+                    .lineSpacing(3.5)
+                    .foregroundStyle(theme.ink.opacity(0.7))
+                    .padding(.vertical, 9)
+                    .padding(.horizontal, 11)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(theme.inset, in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(theme.line, lineWidth: 1))
+            case .ink:
+                Text(approval.body)
+                    .font(theme.body(14.5))
+                    .italic()
+                    .lineSpacing(3.5)
+                    .foregroundStyle(theme.ink.opacity(0.8))
+                    .padding(.leading, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlay(alignment: .leading) {
+                        Rectangle().fill(theme.ink.opacity(0.25)).frame(width: 2)
+                    }
+            }
+        }
+    }
+
+    private var doneRow: some View {
+        let color = approved ? theme.ok : theme.danger
+        let text = TalariaVoice.doneWord(kind: approval.kind, approved: approved, theme.id)
+        return HStack(spacing: 9) {
+            if theme.id == .ink {
+                // The wax seal-dot.
+                Circle()
+                    .fill(color)
+                    .frame(width: 14, height: 14)
+                    .overlay(Circle().inset(by: 2).stroke(theme.panel, lineWidth: 1))
+            }
+            Group {
+                switch theme.id {
+                case .soft: Text(text).font(theme.body(13, weight: .bold))
+                case .control: Text(text).font(theme.mono(10.5, weight: .bold)).tracking(1)
+                case .ink: Text(text).font(theme.body(14.5, weight: .bold).smallCaps()).tracking(1)
+                }
+            }
+            .foregroundStyle(color)
+        }
+        .padding(.vertical, 9)
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity)
+        .background(doneBackground(color))
+    }
+
+    @ViewBuilder private func doneBackground(_ color: Color) -> some View {
+        switch theme.id {
+        case .soft:
+            RoundedRectangle(cornerRadius: 12).fill(color.opacity(approved ? 0.1 : 0.08))
+        case .control:
+            RoundedRectangle(cornerRadius: 6).fill(color.opacity(0.08))
+        case .ink:
+            Rectangle().strokeBorder(color, lineWidth: 1)
+        }
+    }
+
+    @ViewBuilder private var sealChrome: some View {
+        switch theme.id {
+        case .soft:
+            RoundedRectangle(cornerRadius: 18)
+                .fill(theme.panel)
+                .overlay(RoundedRectangle(cornerRadius: 18)
+                    .strokeBorder(borderColor, lineWidth: 1))
+                .shadow(color: theme.ink.opacity(0.06), radius: 7, y: 4)
+        case .control:
+            RoundedRectangle(cornerRadius: 10)
+                .fill(theme.panel)
+                .overlay(RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(borderColor, lineWidth: 1))
+        case .ink:
+            // sealCardCss: card border plus the offset second rule.
+            Rectangle()
+                .fill(theme.panel)
+                .overlay(Rectangle().strokeBorder(borderColor, lineWidth: 1))
+                .background(Rectangle().fill(theme.bg).padding(-3))
+                .overlay(Rectangle().strokeBorder(theme.ink.opacity(0.45), lineWidth: 1).padding(-4))
+        }
+    }
+}
+
+// MARK: - Hazard stripes (control's pending HOLD banner)
+
+/// `repeating-linear-gradient(45deg, warn 0 8px, panel 8px 16px)`.
+private struct HazardStripes: View {
+    var color: Color
+    var background: Color
+
+    var body: some View {
+        Canvas { context, size in
+            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(background))
+            let step: CGFloat = 8
+            var x: CGFloat = -size.height
+            while x < size.width + size.height {
+                var stripe = Path()
+                stripe.move(to: CGPoint(x: x, y: size.height))
+                stripe.addLine(to: CGPoint(x: x + size.height, y: 0))
+                stripe.addLine(to: CGPoint(x: x + size.height + step, y: 0))
+                stripe.addLine(to: CGPoint(x: x + step, y: size.height))
+                stripe.closeSubpath()
+                context.fill(stripe, with: .color(color))
+                x += step * 2
+            }
+        }
+        .clipped()
+    }
+}
+
+// MARK: - Typing indicator
+
+private struct TypingDots: View {
+    var theme: ThemePack
+    var color: Color
+
+    @State private var bouncing = false
+
+    private var dotShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: theme.id == .soft ? 3.5 : theme.id == .control ? 1 : 2)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(0..<3, id: \.self) { index in
+                dotShape
+                    .fill(color)
+                    .frame(width: 7, height: 7)
+                    .offset(y: bouncing ? -4 : 0)
+                    .opacity(bouncing ? 1 : 0.32)
+                    .animation(.easeInOut(duration: 0.6)
+                        .repeatForever(autoreverses: true)
+                        .delay(Double(index) * 0.15),
+                               value: bouncing)
+            }
+        }
+        .padding(chrome: theme)
+        .onAppear { bouncing = true }
+    }
+}
+
+private extension View {
+    /// typingCss — a bot bubble in soft/control, flat indented text in ink.
+    @ViewBuilder func padding(chrome theme: ThemePack) -> some View {
+        switch theme.id {
+        case .soft:
+            padding(.vertical, 14).padding(.horizontal, 16)
+                .background(theme.panel,
+                            in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 6,
+                                                       bottomTrailingRadius: 20, topTrailingRadius: 20))
+                .overlay(UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 6,
+                                                bottomTrailingRadius: 20, topTrailingRadius: 20)
+                    .strokeBorder(theme.ink.opacity(0.06), lineWidth: 1))
+        case .control:
+            padding(.vertical, 13).padding(.horizontal, 15)
+                .background(theme.panel,
+                            in: UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 3,
+                                                       bottomTrailingRadius: 10, topTrailingRadius: 10))
+                .overlay(UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 3,
+                                                bottomTrailingRadius: 10, topTrailingRadius: 10)
+                    .strokeBorder(theme.line, lineWidth: 1))
+        case .ink:
+            padding(.top, 8).padding(.bottom, 4).padding(.leading, 14)
+        }
+    }
+}
+
+// MARK: - Entrance
+
+/// rowU for chat messages — quick fade + rise.
+private struct ChatEntrance: ViewModifier {
+    @State private var shown = false
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(shown ? 1 : 0)
+            .offset(y: shown ? 0 : 12)
+            .onAppear {
+                withAnimation(.easeOut(duration: 0.35)) { shown = true }
+            }
+    }
+}

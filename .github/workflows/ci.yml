@@ -1,0 +1,67 @@
+# CI for the GitHub mirror. (Cursor Origin CI: TBD.)
+#
+# Two jobs:
+#   package — SwiftPM build + protocol checks (no Xcode project needed;
+#             the package compiles for macOS by design, see docs/ARCHITECTURE.md)
+#   ios-app — xcodegen-generated project, simulator build, no code signing.
+#             Currently continue-on-error: the app shell has no entry point yet
+#             (ios/Talaria/App/ is empty and the widgets target's Live Activity
+#             view is pending), so this job documents the target state rather
+#             than gating merges. Make it required in the PR that lands the
+#             app entry point.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Swift package (build + talaria-verify)
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: Packages/Talaria
+    steps:
+      - uses: actions/checkout@v4
+
+      # macos-15 runners default to Xcode 16.x, which is all we need.
+      - name: Toolchain info
+        run: xcodebuild -version && swift --version
+
+      - name: swift build
+        run: swift build
+
+      - name: Protocol checks
+        run: swift run talaria-verify
+
+  ios-app:
+    name: iOS app (xcodegen + simulator build)
+    runs-on: macos-15
+    # See header comment — flip this off when ios/Talaria/App lands.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build for iOS Simulator (unsigned)
+        working-directory: ios
+        run: |
+          xcodebuild build \
+            -project Talaria.xcodeproj \
+            -scheme Talaria \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO

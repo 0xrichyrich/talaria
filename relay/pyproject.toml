@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "talaria-push-relay"
+version = "0.1.0"
+description = "APNs push relay for the Talaria iOS client — hermes-agent gateway plugin + standalone sidecar watcher"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Talaria contributors" }]
+keywords = ["hermes-agent", "apns", "push", "ios", "talaria"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Communications",
+]
+# hermes-agent already ships httpx and cryptography; these pins are for the
+# pip-installed standalone sidecar. httpx[http2] pulls in h2, the one wheel
+# hermes does NOT ship (needed for the HTTP/2 connection to APNs).
+dependencies = [
+  "httpx[http2]>=0.27,<1.0",
+  "cryptography>=42",
+  "websockets>=12",
+]
+
+[project.scripts]
+talaria-push-sidecar = "talaria_push_relay.sidecar:main"
+
+[project.urls]
+Homepage = "https://cursor.com/codebase/richyrich/talaria"
+
+[tool.setuptools]
+# The importable package lives inside the hermes plugin directory so the
+# plugin dir can be copied to ~/.hermes/plugins/talaria-push as one unit.
+package-dir = { "" = "talaria-push" }
+packages = [
+  "talaria_push_relay",
+]

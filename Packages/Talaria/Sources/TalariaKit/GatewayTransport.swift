@@ -1,0 +1,205 @@
+import Foundation
+
+// JSON-RPC 2.0 over WebSocket against `hermes serve` at /api/ws.
+//
+// Wire facts (tui_gateway/ws.py, hermes_cli/web_server.py):
+// - One JSON object per WS text frame, both directions.
+// - Client requests: {"jsonrpc":"2.0","id":…,"method":…,"params":{…}}.
+// - Server: responses ({id, result|error}) and events
+//   ({"method":"event","params":{type, session_id, payload}}).
+// - Pooled handlers respond OUT OF ORDER — correlate strictly by id.
+// - Streaming deltas are coalesced server-side (~30 fps); expect bursts.
+// - No application-level heartbeat is required; on public binds the server
+//   pings at the protocol level every 20 s.
+// - On disconnect, live sessions are parked for ~20 s; reconnect and
+//   session.resume within the grace window reattaches in-flight state.
+
+public struct GatewayError: Error, Sendable {
+    public var code: Int
+    public var message: String
+    public var data: JSONValue?
+
+    public init(code: Int, message: String, data: JSONValue? = nil) {
+        self.code = code; self.message = message; self.data = data
+    }
+
+    // Application error codes the client special-cases.
+    public static let sessionNotFound = 4001
+    public static let sessionBusy = 4009
+    public static let resumeTooLarge = 4130
+}
+
+public enum TransportState: Sendable, Equatable {
+    case idle
+    case connecting
+    /// Connected and past the gateway.ready frame.
+    case ready
+    case disconnected(reason: String?)
+}
+
+/// Low-level JSON-RPC WebSocket transport. One instance per live socket;
+/// `GatewayClient` owns reconnect policy and re-creates transports.
+public actor GatewayTransport {
+    private let url: URL
+    private let session: URLSession
+    private var task: URLSessionWebSocketTask?
+    private var nextID = 1
+    private var pending: [String: CheckedContinuation<JSONValue, Error>] = [:]
+    private var eventContinuation: AsyncStream<GatewayEvent>.Continuation?
+    private(set) public var state: TransportState = .idle
+
+    /// All server events, in arrival order. Single consumer.
+    public nonisolated let events: AsyncStream<GatewayEvent>
+    private nonisolated let eventsCont: AsyncStream<GatewayEvent>.Continuation
+
+    public init(url: URL, session: URLSession = .shared) {
+        self.url = url
+        self.session = session
+        var cont: AsyncStream<GatewayEvent>.Continuation!
+        self.events = AsyncStream(bufferingPolicy: .unbounded) { cont = $0 }
+        self.eventsCont = cont
+    }
+
+    /// Open the socket and wait for the `gateway.ready` event.
+    /// The ready frame is the first thing the server sends after accept.
+    public func connect(timeout: TimeInterval = 15) async throws {
+        guard task == nil else { return }
+        state = .connecting
+        let task = session.webSocketTask(with: url)
+        task.maximumMessageSize = 64 * 1024 * 1024
+        self.task = task
+        task.resume()
+        Task { await self.receiveLoop(task) }
+
+        // The server sends gateway.ready immediately on accept; treat its
+        // arrival as connection success.
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                for await event in self.events where event.type == "gateway.ready" {
+                    return
+                }
+                throw GatewayError(code: -1, message: "socket closed before gateway.ready")
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(timeout))
+                throw GatewayError(code: -2, message: "timed out waiting for gateway.ready")
+            }
+            try await group.next()
+            group.cancelAll()
+        }
+        state = .ready
+    }
+
+    public func close() {
+        task?.cancel(with: .normalClosure, reason: nil)
+        finish(reason: "closed")
+    }
+
+    /// Send a JSON-RPC request and await its response (correlated by id;
+    /// responses may arrive out of order relative to other requests).
+    public func request(_ method: String, params: JSONValue? = nil,
+                        timeout: TimeInterval = 120) async throws -> JSONValue {
+        guard let task else {
+            throw GatewayError(code: -3, message: "not connected")
+        }
+        let id = String(nextID)
+        nextID += 1
+
+        var frame: [String: JSONValue] = [
+            "jsonrpc": "2.0",
+            "id": .string(id),
+            "method": .string(method),
+        ]
+        if let params { frame["params"] = params }
+        let data = try JSONEncoder().encode(JSONValue.object(frame))
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw GatewayError(code: -4, message: "encode failure")
+        }
+
+        try await task.send(.string(text))
+
+        return try await withThrowingTaskGroup(of: JSONValue.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { cont in
+                    Task { await self.registerPending(id: id, cont) }
+                }
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(timeout))
+                await self.failPending(id: id, error: GatewayError(code: -5, message: "request timed out: \(method)"))
+                throw GatewayError(code: -5, message: "request timed out: \(method)")
+            }
+            guard let first = try await group.next() else {
+                throw GatewayError(code: -6, message: "request cancelled")
+            }
+            group.cancelAll()
+            return first
+        }
+    }
+
+    // MARK: - Internals
+
+    private func registerPending(id: String, _ cont: CheckedContinuation<JSONValue, Error>) {
+        pending[id] = cont
+    }
+
+    private func failPending(id: String, error: Error) {
+        pending.removeValue(forKey: id)?.resume(throwing: error)
+    }
+
+    private func receiveLoop(_ task: URLSessionWebSocketTask) async {
+        while true {
+            do {
+                let message = try await task.receive()
+                switch message {
+                case .string(let text):
+                    handleFrame(text)
+                case .data(let data):
+                    if let text = String(data: data, encoding: .utf8) { handleFrame(text) }
+                @unknown default:
+                    break
+                }
+            } catch {
+                finish(reason: (error as NSError).localizedDescription)
+                return
+            }
+        }
+    }
+
+    private func handleFrame(_ text: String) {
+        guard let data = text.data(using: .utf8),
+              let value = try? JSONDecoder().decode(JSONValue.self, from: data),
+              let obj = value.objectValue else { return }
+
+        // Event notification: {"method":"event","params":{type,session_id,payload}}
+        if obj["method"]?.stringValue == "event", let params = obj["params"] {
+            let event = GatewayEvent(type: params["type"]?.stringValue ?? "",
+                                     sessionID: params["session_id"]?.stringValue ?? "",
+                                     payload: params["payload"])
+            eventsCont.yield(event)
+            return
+        }
+
+        // Response: correlate by id. id may be encoded as string or number.
+        let id: String? = obj["id"]?.stringValue ?? obj["id"]?.intValue.map(String.init)
+        guard let id, let cont = pending.removeValue(forKey: id) else { return }
+
+        if let error = obj["error"] {
+            cont.resume(throwing: GatewayError(code: error["code"]?.intValue ?? -32603,
+                                               message: error["message"]?.stringValue ?? "error",
+                                               data: error["data"]))
+        } else {
+            cont.resume(returning: obj["result"] ?? .null)
+        }
+    }
+
+    private func finish(reason: String?) {
+        state = .disconnected(reason: reason)
+        task = nil
+        for (_, cont) in pending {
+            cont.resume(throwing: GatewayError(code: -7, message: "connection lost"))
+        }
+        pending.removeAll()
+        eventsCont.finish()
+    }
+}

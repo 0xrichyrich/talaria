@@ -1,0 +1,12 @@
+{
+  "name": "talaria-push",
+  "label": "Talaria Push",
+  "description": "Device registration API for the Talaria iOS push relay (no dashboard tab; REST only)",
+  "icon": "Bell",
+  "version": "0.1.0",
+  "tab": {
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

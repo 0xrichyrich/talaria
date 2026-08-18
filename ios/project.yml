@@ -1,0 +1,126 @@
+# Talaria — XcodeGen project spec.
+#
+# The .xcodeproj is generated, never committed:
+#     cd app/ios && xcodegen generate        (or: make ios from app/)
+#
+# Signing: DEVELOPMENT_TEAM is intentionally NOT set here. Provide it via an
+# xcconfig or on the command line, e.g.
+#     xcodebuild ... DEVELOPMENT_TEAM=AB12CD34EF
+# or drop a `Local.xcconfig` next to this file and uncomment `configFiles`
+# below. The bundle id is overridable the same way:
+#     xcodebuild ... TALARIA_BUNDLE_ID=com.example.talaria
+name: Talaria
+options:
+  minimumXcodeGenVersion: 2.38.0
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+packages:
+  TalariaPackage:
+    path: ../Packages/Talaria
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    # DEVELOPMENT_TEAM: supplied by xcconfig / CLI — see header comment.
+
+targets:
+  Talaria:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Talaria
+        excludes:
+          - "Support/**" # Info.plist + entitlements are referenced by build settings, not bundled.
+    dependencies:
+      - package: TalariaPackage
+        products:
+          - TalariaKit
+          - TalariaTheme
+          - TalariaUI
+      - target: TalariaWidgets
+        embed: true
+      - target: TalariaNotificationService
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(TALARIA_BUNDLE_ID:default=bot.talaria.ios)"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Talaria/Support/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Talaria/Support/Talaria.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: NO
+        ENABLE_PREVIEWS: YES
+
+  # Widget + Live Activity extension. Sources are owned by the widgets
+  # build-out; its generated Info.plist lives under the app's Support/ dir so
+  # regeneration never collides with extension source files.
+  TalariaWidgets:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: TalariaWidgets
+        excludes:
+          - ".gitkeep"
+    dependencies:
+      - package: TalariaPackage
+        products:
+          - TalariaKit
+          - TalariaTheme
+    info:
+      path: Talaria/Support/TalariaWidgets-Info.plist
+      properties:
+        CFBundleDisplayName: Talaria Widgets
+        NSSupportsLiveActivities: true
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(TALARIA_BUNDLE_ID:default=bot.talaria.ios).widgets"
+        TARGETED_DEVICE_FAMILY: "1"
+        SKIP_INSTALL: YES
+
+  # Notification service extension (decrypts/enriches APNs pushes from the
+  # gateway relay). Principal class must be named NotificationService.
+  TalariaNotificationService:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: TalariaNotificationService
+        excludes:
+          - ".gitkeep"
+    dependencies:
+      - package: TalariaPackage
+        products:
+          - TalariaKit
+    info:
+      path: Talaria/Support/TalariaNotificationService-Info.plist
+      properties:
+        CFBundleDisplayName: Talaria Notification Service
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).NotificationService"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(TALARIA_BUNDLE_ID:default=bot.talaria.ios).nse"
+        TARGETED_DEVICE_FAMILY: "1"
+        SKIP_INSTALL: YES
+
+schemes:
+  Talaria:
+    build:
+      targets:
+        Talaria: all
+    run:
+      config: Debug
+    archive:
+      config: Release

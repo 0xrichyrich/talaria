@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Generated Xcode project — recreate with `xcodegen generate` (or `make ios`).
+*.xcodeproj
+
+# Build state
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcresult
+
+# Per-developer signing overrides (see ios/project.yml header).
+ios/Local.xcconfig
