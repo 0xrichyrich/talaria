@@ -124,9 +124,16 @@ public struct ConnectionBadge: View {
 /// on a screen too narrow for a per-row context menu.
 public struct MultiGatewayRosterSection: View {
     private let model: AppModel
+    /// The roster search needle (already trimmed, lowercased and '@'-stripped
+    /// by `RosterSearch.needle`). Foreign rows are part of the same array
+    /// desktop filters (plugin.js:2345-2357, 7668), so one query narrows this
+    /// block too — and the device label is a match field, which is what makes
+    /// typing a machine's name list everything on it (plugin.js:2974-2976).
+    private let needle: String
 
-    public init(model: AppModel) {
+    public init(model: AppModel, needle: String = "") {
         self.model = model
+        self.needle = needle
     }
 
     private var theme: ThemePack { model.theme.pack }
@@ -139,14 +146,20 @@ public struct MultiGatewayRosterSection: View {
         // it. The refresh that FEEDS these rows deliberately does not live
         // here — this view sits in a lazy list and may never be built on a
         // long roster; the roster screen owns the task instead.
+        let entries = model.foreignRosterEntries(matching: needle)
+        // Gateways that listed NOTHING are a footnote about the fleet, not
+        // roster rows, so a live query has nothing of theirs to narrow —
+        // answering "homelab" with a machine that has no bots on it would be
+        // the search inventing a result. They come back when the field clears.
+        let problems = needle.isEmpty ? model.foreignRosterProblems : []
         VStack(alignment: .leading, spacing: rowGap) {
-            if model.rosterSpansGateways {
+            if !entries.isEmpty || !problems.isEmpty {
                 header
                     .padding(.top, 18)
-                ForEach(model.foreignRosterEntries) { entry in
+                ForEach(entries) { entry in
                     row(for: entry)
                 }
-                ForEach(model.foreignRosterProblems) { problem in
+                ForEach(problems) { problem in
                     problemRow(problem.gateway, problem.freshness)
                 }
             }

@@ -541,20 +541,8 @@ public final class ConnectionRegistry {
     public func foreignRoster(activeProfiles: [String],
                               activeGatewayID: String?) -> [ForeignRosterEntry] {
         let liveID = activeGatewayID
-
-        // Bare-name occurrences across all sources. Deduplicated per source
-        // first, exactly like the upstream `identities` map, so a gateway that
-        // transiently repeats a profile cannot invent a collision.
-        var counts: [String: Int] = [:]
-        for name in Set(activeProfiles.map { Self.profileName($0) }) {
-            counts[name, default: 0] += 1
-        }
-        for gateway in saved where gateway.id != liveID {
-            guard let roster = secondaryRosters[gateway.id] else { continue }
-            for name in Set(roster.profiles.map { Self.profileName($0.name) }) {
-                counts[name, default: 0] += 1
-            }
-        }
+        let duplicated = duplicatedProfileNames(activeProfiles: activeProfiles,
+                                                activeGatewayID: liveID)
 
         var entries: [ForeignRosterEntry] = []
         for gateway in saved where gateway.id != liveID {
@@ -563,16 +551,16 @@ public final class ConnectionRegistry {
             let needsSignIn = roster.freshness == .needsSignIn
             var seen = Set<String>()
             for profile in roster.profiles {
-                let name = Self.profileName(profile.name)
+                let name = AgentHandle.profileName(profile.name)
                 guard seen.insert(name).inserted else { continue }
                 entries.append(ForeignRosterEntry(
                     gatewayID: gateway.id,
                     connectionLabel: gateway.name,
                     connectionKind: gateway.kind,
                     profile: name,
-                    handle: Self.agentHandle(profile: name,
+                    handle: AgentHandle.mint(profile: name,
                                              connectionLabel: gateway.name,
-                                             duplicated: (counts[name] ?? 0) > 1),
+                                             duplicated: duplicated.contains(name)),
                     title: profile.title,
                     job: profile.job,
                     shape: profile.shape,
@@ -595,6 +583,31 @@ public final class ConnectionRegistry {
         }
     }
 
+    /// Profile names that exist on more than one registered source — the input
+    /// to the `@name-device` rule, computed ONCE across every source.
+    ///
+    /// The counting itself is `AgentHandle.duplicatedNames` (a port of
+    /// connection-registry.ts:341-358, and the only place the per-source
+    /// dedupe lives); the registry's job is to say what the sources ARE. The
+    /// live gateway is one of them — upstream counts every identity including
+    /// the active connection's, and stamps the suffix on every colliding one
+    /// (:362-370) — which is why the phone's OWN `default` becomes
+    /// `default-macbook` the moment a saved gateway also carries `default`,
+    /// rather than only the far side being renamed.
+    ///
+    /// `activeGatewayID` nil means nothing is connected: every saved gateway
+    /// is then a secondary source, and `activeProfiles` is whatever the roster
+    /// last held.
+    public func duplicatedProfileNames(activeProfiles: [String],
+                                       activeGatewayID: String?) -> Set<String> {
+        var sources: [[String]] = [activeProfiles]
+        for gateway in saved where gateway.id != activeGatewayID {
+            guard let roster = secondaryRosters[gateway.id] else { continue }
+            sources.append(roster.profiles.map(\.name))
+        }
+        return AgentHandle.duplicatedNames(across: sources)
+    }
+
     /// Saved gateways that could not be listed and why — for the roster
     /// section's footnote. Only gateways the user could act on are reported.
     public func secondaryRosterProblems(activeGatewayID: String?) -> [SecondaryRosterProblem] {
@@ -608,29 +621,11 @@ public final class ConnectionRegistry {
         }
     }
 
-    /// `labelSlug` (connection-registry.ts:121) — lowercase, non-alphanumerics
-    /// to single hyphens, trimmed, capped at 48 chars.
-    static func labelSlug(_ label: String) -> String {
-        let lowered = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let hyphenated = lowered.replacingOccurrences(of: "[^a-z0-9]+", with: "-",
-                                                      options: .regularExpression)
-        let slug = hyphenated.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        return slug.isEmpty ? "connection" : String(slug.prefix(48))
-    }
-
-    /// `agentHandle` (connection-registry.ts:137) — the one place the
-    /// `@name-device` rule lives. Ambiguity must refuse rather than guess:
-    /// silently picking one of two bots named `default` would deliver a real
-    /// message to the wrong machine (plugin.js:2434-2470).
-    static func agentHandle(profile: String, connectionLabel: String, duplicated: Bool) -> String {
-        let name = profileName(profile)
-        return duplicated ? "\(name)-\(labelSlug(connectionLabel))" : name
-    }
-
-    static func profileName(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "default" : trimmed
-    }
+    // `labelSlug`, `agentHandle` and the profile-name normalisation used to
+    // live here. They moved to TalariaKit/AgentHandle.swift so `talaria-verify`
+    // — which links TalariaKit alone — can pin them: the slug has to be
+    // reproduced byte-for-byte on both machines or `@name-device` stops
+    // round-tripping, and that is not a thing to hold by memory.
 
     // MARK: - Rows for the Connections screen
 

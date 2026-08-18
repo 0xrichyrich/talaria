@@ -86,9 +86,27 @@ public struct SearchPalette: View {
         return text.lowercased().contains(trimmedQuery)
     }
 
+    /// Bots search on desktop's needle, not the palette's: trimmed, lowercased
+    /// and with one leading '@' stripped (plugin.js:2964), so a half-typed
+    /// mention finds the bot it was reaching for. Sessions, artifacts and
+    /// actions keep `trimmedQuery` — they have no handle and therefore no '@'
+    /// rule to obey (desktop applies the same split at plugin.js:7673-7675,
+    /// where group rows re-derive the raw needle rather than reuse this one).
+    private var botNeedle: String { RosterSearch.needle(query) }
+
     private var resultBots: [Bot] {
+        // Palette-only zero state. Desktop's `filterBots` returns the whole
+        // roster for an empty needle (plugin.js:2966-2968), which is right for
+        // its Bots pane — that pane IS the roster. This palette opens FROM the
+        // roster, so repeating it here would be a wall of rows between the
+        // caret and the actions; "Live now" is the prototype's answer and is
+        // kept deliberately (Talaria.dc.html `sc-if searchOpen`).
         if trimmedQuery.isEmpty { return model.workingBots }
-        return model.bots.filter { matches($0.id) || matches($0.job) || matches($0.preview) }
+        // `rankedBots`, never `bots`: search narrows the roster's own
+        // pinned-then-recency order, it never re-ranks and never reveals the
+        // gateway's directory order (plugin.js:2961-2962, 7657-7668).
+        return model.rankedBots.filterBots(needle: botNeedle,
+                                           connectionLabel: model.activeConnectionLabel)
     }
 
     /// Demo mode has no search endpoint — filter the canned per-bot index so

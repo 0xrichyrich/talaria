@@ -2,18 +2,23 @@ import SwiftUI
 import TalariaKit
 import TalariaTheme
 
-// The composer field that knows about @handles.
+// The composer field that knows about @handles, and the suggestion strip it
+// wears — the strip is a type of its own because desktop's provider is
+// registered into EVERY composer (plugin.js:7996-7997), and the phone's other
+// composer (Screens/ChatView.swift) is a bare `TextField` inside a row of
+// buttons that cannot be swapped for this whole control.
 //
-// Desktop registers an `atCompletions` provider into EVERY composer
-// (plugin.js:7998-8043): typing "@rese…" opens a popover of roster handles,
-// answered synchronously from the ≤5 s-stale roster cache, prefix-matched on
-// the HANDLE only, capped at 8, excluding the bot doing the talking.
+// Desktop's registration (plugin.js:7998-8043): typing "@rese…" opens a
+// popover of roster handles, answered synchronously from the ≤5 s-stale roster
+// cache, prefix-matched on the HANDLE only, capped at 8, excluding the bot
+// doing the talking.
 //
 // The mobile shape is a suggestion strip ABOVE the field rather than a
 // floating popover — the keyboard owns the bottom of the screen, so a popover
 // under the caret would be behind it. Everything else is the port: same
 // source (`AppModel.mentionSuggestions`, which is the same synchronous roster
-// read), same prefix-on-handle rule, same cap, same self-exclusion.
+// read), same prefix-on-handle rule, same cap, same self-exclusion, same
+// `Bot · <display name>` meta line.
 //
 // The field publishes text, not selection, so the token being completed is the
 // trailing one (`BotMention.activeToken`). That matches how the strip is used
@@ -51,7 +56,9 @@ public struct MentionField: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             let items = suggestions
-            if !items.isEmpty { strip(items) }
+            if !items.isEmpty {
+                MentionSuggestionStrip(theme: theme, items: items, pick: complete)
+            }
             field
         }
         // The strip appears and disappears per keystroke; without a transition
@@ -78,45 +85,6 @@ public struct MentionField: View {
 
     // MARK: Suggestions
 
-    private func strip(_ items: [MentionSuggestion]) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(items) { item in
-                Button {
-                    complete(with: item)
-                } label: {
-                    HStack(spacing: 9) {
-                        AvatarView(shape: item.shape, hue: item.hue, size: 20, theme: theme)
-                        Text(verbatim: "@" + item.handle)
-                            .font(handleFont)
-                            .foregroundStyle(theme.accent)
-                            .lineLimit(1)
-                            .layoutPriority(1)
-                        Text(item.meta)
-                            .font(metaFont)
-                            .foregroundStyle(theme.faint)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(Text(verbatim: "@\(item.handle) — \(item.meta)"))
-
-                if item.id != items.last?.id {
-                    theme.line.frame(height: 1).padding(.leading, 40)
-                }
-            }
-        }
-        .background(theme.id == .ink ? theme.bg : theme.panel)
-        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous)
-            .strokeBorder(theme.id == .soft ? theme.line : theme.lineStrong, lineWidth: 1))
-        .shadow(color: theme.id == .soft ? theme.ink.opacity(0.06) : .clear, radius: 6, y: 2)
-    }
-
     /// Replace the token being typed and hand the keyboard straight back —
     /// picking a handle is the middle of a sentence, not the end of one.
     private func complete(with item: MentionSuggestion) {
@@ -136,6 +104,77 @@ public struct MentionField: View {
         case .ink: theme.body(15.5)
         }
     }
+}
+
+// MARK: - The completion surface
+
+/// The @-completion rows, drawn above whichever composer is asking.
+///
+/// Desktop's popover renders `display` on the first line and `meta` on the
+/// second (composer/contrib.ts:53-71); a phone row is 20pt of avatar, the
+/// `@handle` in the accent, and the meta line trailing it — one line, because
+/// the strip sits between a transcript and a keyboard and there is no room to
+/// spend two.
+///
+/// Empty in, nothing out: an empty roster (or a query nothing starts with)
+/// draws no chrome at all, which is upstream's `return []` (8010-8012) — the
+/// popover simply stays closed.
+public struct MentionSuggestionStrip: View {
+    private let theme: ThemePack
+    private let items: [MentionSuggestion]
+    private let pick: (MentionSuggestion) -> Void
+
+    public init(theme: ThemePack, items: [MentionSuggestion],
+                pick: @escaping (MentionSuggestion) -> Void) {
+        self.theme = theme
+        self.items = items
+        self.pick = pick
+    }
+
+    public var body: some View {
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(items) { item in
+                    Button { pick(item) } label: { row(item) }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(Text(verbatim: "@\(item.handle) — \(item.meta)"))
+
+                    if item.id != items.last?.id {
+                        theme.line.frame(height: 1).padding(.leading, 40)
+                    }
+                }
+            }
+            .background(theme.id == .ink ? theme.bg : theme.panel)
+            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .strokeBorder(theme.id == .soft ? theme.line : theme.lineStrong, lineWidth: 1))
+            .shadow(color: theme.id == .soft ? theme.ink.opacity(0.06) : .clear, radius: 6, y: 2)
+        }
+    }
+
+    /// The handle takes layout priority over the meta line: the token is what
+    /// gets inserted, so it is the half that must never be the one truncated.
+    private func row(_ item: MentionSuggestion) -> some View {
+        HStack(spacing: 9) {
+            AvatarView(shape: item.shape, hue: item.hue, size: 20, theme: theme)
+            Text(verbatim: "@" + item.handle)
+                .font(handleFont)
+                .foregroundStyle(theme.accent)
+                .lineLimit(1)
+                .layoutPriority(1)
+            Text(item.meta)
+                .font(metaFont)
+                .foregroundStyle(theme.faint)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .contentShape(Rectangle())
+    }
+
+    private var radius: CGFloat { theme.inputRadius > 100 ? 14 : theme.inputRadius }
 
     private var handleFont: Font {
         switch theme.id {
@@ -174,9 +213,16 @@ public struct MentionRecipients: View {
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
 
+    /// Chips are the DELIVERABLE half only (desktop's `localMentions`,
+    /// plugin.js:8289). A bot on another gateway resolved — that is what the
+    /// `@name-device` form is for — but this app holds one socket and cannot
+    /// carry to it, so it appears as a notice below rather than as a recipient
+    /// the send is about to include.
+    private var chips: [Bot] { resolution.deliverable }
+
     public var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if !resolution.bots.isEmpty {
+            if !chips.isEmpty {
                 Text(copy.mentionRecipients(theme.id))
                     .font(labelFont)
                     .tracking(theme.id == .soft ? 0.5 : 1.5)
@@ -184,7 +230,7 @@ public struct MentionRecipients: View {
                     .foregroundStyle(theme.faint)
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 7) {
-                        ForEach(resolution.bots) { bot in
+                        ForEach(chips) { bot in
                             Button { remove(bot) } label: {
                                 HStack(spacing: 6) {
                                     AvatarView(shape: bot.shape, hue: bot.hue, size: 16,
@@ -210,6 +256,11 @@ public struct MentionRecipients: View {
             }
             ForEach(resolution.ambiguous, id: \.self) { token in
                 notice(copy.mentionAmbiguous(theme.id, token: token), tone: theme.warn)
+            }
+            ForEach(resolution.unreachable) { bot in
+                notice(copy.mentionElsewhere(theme.id, handle: bot.handle,
+                                             label: bot.remoteSource?.connectionLabel ?? ""),
+                       tone: theme.warn)
             }
             ForEach(resolution.unknown, id: \.self) { token in
                 notice(copy.mentionUnknown(theme.id, token: token), tone: theme.faint)
