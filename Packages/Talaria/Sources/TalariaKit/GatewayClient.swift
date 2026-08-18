@@ -14,12 +14,31 @@ public struct HermesProfile: Sendable, Identifiable {
     public var provider: String?
     public var description: String?
     public var skillCount: Int
+    /// The row summary a roster paints. Identity and stamps stay
+    /// `last_session`'s — liveness, ranking and the row timestamp are
+    /// last_session semantics by design (plugin.js:3852-3858: *any* recent
+    /// activity, from any client, means the bot is alive) — while the preview
+    /// text comes from the resolved canonical-chat pin when the gateway
+    /// answered one. See `foldingCanonicalPreview()`; `rawLastSession` keeps
+    /// the untouched wire value.
     public var lastSession: ProfileSessionRef?
+    /// `last_session` exactly as the gateway sent it, before any preview fold.
+    public var rawLastSession: ProfileSessionRef?
+    /// `preferred_session` — the gateway's precise answer about the ONE
+    /// session this client asked about (its canonical-chat pin), as opposed to
+    /// `last_session`'s "whatever is newest".
+    public var preferredSession: PreferredSession
     public var uiMeta: JSONValue?
     public var hasAvatar: Bool
 
     public struct ProfileSessionRef: Sendable {
         public var id: String
+        /// `resolved_id` — the live compression tip for `id`, equal to `id`
+        /// when the lineage was never compressed. Only `preferred_session`
+        /// carries it (methods_profiles.py:104-112); `last_session` leaves it
+        /// nil. `id` stays the caller's durable pin, which is why a compaction
+        /// on the laptop does not orphan a phone's pin.
+        public var resolvedID: String?
         public var title: String?
         public var preview: String?
         public var startedAt: Double?
@@ -29,11 +48,46 @@ public struct HermesProfile: Sendable, Identifiable {
         init?(_ v: JSONValue?) {
             guard let id = v?["id"]?.stringValue else { return nil }
             self.id = id
+            resolvedID = v?["resolved_id"]?.stringValue
             title = v?["title"]?.stringValue
             preview = v?["preview"]?.stringValue
             startedAt = v?["started_at"]?.doubleValue
             lastActive = v?["last_active"]?.doubleValue
             messageCount = v?["message_count"]?.intValue ?? 0
+        }
+    }
+
+    /// The three answers `profiles.list` can give about a pin, and the reason
+    /// the difference is load-bearing rather than pedantic
+    /// (methods_profiles.py:63-130, plugin.js:2857-2880):
+    ///
+    /// - **absent** — this client sent no pin for the profile, *or* the
+    ///   gateway predates `preferred_session_ids` and ignored the parameter.
+    ///   Verified against a live 0.20.3 gateway on 2026-08-18: the row keys
+    ///   come back `name, path, is_default, model, provider, description,
+    ///   skill_count, last_session, ui_meta, has_avatar` — no
+    ///   `preferred_session` at all. The pin is innocent.
+    /// - **null** — a gateway that *does* speak the contract saying the row is
+    ///   definitively gone (missing, archived, or a denied internal source).
+    ///   This is the only signal that may re-anchor a canonical chat.
+    /// - **a summary** — the pin resolved, hidden sessions included and
+    ///   compression lineages followed to their live tip.
+    public enum PreferredSession: Sendable {
+        case notRequested
+        case gone
+        case resolved(ProfileSessionRef)
+
+        public var session: ProfileSessionRef? {
+            if case .resolved(let session) = self { return session }
+            return nil
+        }
+
+        /// True only when a gateway that speaks the contract said so. An older
+        /// gateway can never produce this, which is what keeps a pin alive
+        /// across a downgrade.
+        public var isDefinitivelyGone: Bool {
+            if case .gone = self { return true }
+            return false
         }
     }
 
@@ -46,8 +100,41 @@ public struct HermesProfile: Sendable, Identifiable {
         description = v["description"]?.stringValue
         skillCount = v["skill_count"]?.intValue ?? 0
         lastSession = ProfileSessionRef(v["last_session"])
+        rawLastSession = lastSession
+        switch v["preferred_session"] {
+        case .none: preferredSession = .notRequested
+        case .some(.null): preferredSession = .gone
+        case .some(let node): preferredSession = ProfileSessionRef(node).map(
+            PreferredSession.resolved) ?? .gone
+        }
         uiMeta = v["ui_meta"]
         hasAvatar = v["has_avatar"]?.boolValue ?? false
+    }
+
+    /// Desktop's `previewSession = bot.preferred_session || last`
+    /// (plugin.js:3867), applied at the one door every roster caller comes
+    /// through so the preview and the tap describe the same conversation
+    /// (hermes-agent#88200).
+    ///
+    /// Only the *text* moves. The row keeps `last_session`'s id, stamps and
+    /// message count because that is what the 90 s liveness window, the
+    /// recency ranking and the relative timestamp are built on — a bot that
+    /// just spoke in a scratch session is still awake. The one exception is a
+    /// profile with no `last_session` at all (a locked state.db, or a bot
+    /// whose only conversation is its hidden forever chat, which
+    /// `_latest_profile_session_row` cannot see): there the pin is the only
+    /// conversation the row knows about, and previewing it beats an empty row.
+    func foldingCanonicalPreview() -> HermesProfile {
+        guard let pinned = preferredSession.session else { return self }
+        var folded = self
+        guard var row = lastSession else {
+            folded.lastSession = pinned
+            return folded
+        }
+        if let preview = pinned.preview, !preview.isEmpty { row.preview = preview }
+        if let title = pinned.title, !title.isEmpty { row.title = title }
+        folded.lastSession = row
+        return folded
     }
 }
 
@@ -230,9 +317,94 @@ public actor GatewayClient {
 
     // MARK: - Profiles (the bot roster)
 
-    public func listProfiles(includeSessions: Bool = true) async throws -> [HermesProfile] {
-        let result = try await rpc("profiles.list", ["include_sessions": .bool(includeSessions)])
-        return result["profiles"]?.arrayValue?.map(HermesProfile.init) ?? []
+    /// The roster, with each row's canonical-chat pin resolved precisely.
+    ///
+    /// `preferred_session_ids` — `{profile: stored_session_id}` — is the
+    /// enabling call for the whole roster region: it lets the *gateway* answer
+    /// "what about THIS conversation" per row (hidden sessions included,
+    /// compression lineages followed) instead of the client inferring the
+    /// canonical chat from `last_session` and previewing a conversation the
+    /// tap will not open (hermes-agent#88200). Deliberately not `session.list`
+    /// — a paginated, hidden-excluding window once misjudged live hidden pins
+    /// as gone.
+    ///
+    /// Server side: `methods_profiles.py` `_preferred_session_row` +
+    /// `profiles.list` (`preferred_ids = params.get("preferred_session_ids")`,
+    /// resolved only when `include_sessions` is on). Client side this mirrors
+    /// `preferredSessionIds(allMeta)` (plugin.js:2208-2231).
+    ///
+    /// Pins default to the ones harvested from the previous answer's own
+    /// `ui_meta["hermes-bots"].chat` — the same store desktop reads them from
+    /// — so every existing caller gets the round trip without threading pins
+    /// through. A gateway that predates the parameter ignores it and simply
+    /// omits `preferred_session`; verified live 2026-08-18 against 0.20.3,
+    /// where the roster came back identical with and without the field.
+    public func listProfiles(includeSessions: Bool = true,
+                             preferredSessionIDs: [String: String]? = nil) async throws -> [HermesProfile] {
+        var params: JSONValue = ["include_sessions": .bool(includeSessions)]
+        let pins = preferredSessionIDs ?? preferredSessionPins
+        // Sending an empty map would be a no-op the gateway still has to
+        // parse; desktop omits the key entirely for the same reason.
+        if includeSessions, !pins.isEmpty,
+           case .object(var fields) = params {
+            fields["preferred_session_ids"] = .object(pins.mapValues(JSONValue.string))
+            params = .object(fields)
+        }
+        let result = try await rpc("profiles.list", params)
+        let rows = result["profiles"]?.arrayValue?.map(HermesProfile.init) ?? []
+        if !rows.isEmpty {
+            rememberPins(from: rows)
+            // Only a call that asked for sessions can carry a verdict: the
+            // gateway skips preferred resolution entirely when
+            // `include_sessions` is off (methods_profiles.py:128-133), so
+            // recording those answers would erase a real `.gone` with a
+            // meaningless "not requested" from an unrelated ui_meta read.
+            if includeSessions {
+                lastPreferredSessions = Dictionary(rows.map { ($0.name, $0.preferredSession) },
+                                                   uniquingKeysWith: { _, last in last })
+            }
+        }
+        return rows.map { $0.foldingCanonicalPreview() }
+    }
+
+    /// The last answer about each profile's pin. Kept because the *shape* of
+    /// the answer outlives the roster row: only a gateway that speaks the
+    /// contract can say `.gone`, and that is the one signal allowed to
+    /// re-anchor a canonical chat.
+    private var lastPreferredSessions: [String: HermesProfile.PreferredSession] = [:]
+
+    public func preferredSessionOutcome(_ profile: String) -> HermesProfile.PreferredSession {
+        lastPreferredSessions[profile] ?? .notRequested
+    }
+
+    /// Canonical-chat pins to resolve on the NEXT roster call. Self-priming
+    /// from the block every answer already carries, which is where desktop's
+    /// `$botMeta` gets them too.
+    private var preferredSessionPins: [String: String] = [:]
+
+    private func rememberPins(from rows: [HermesProfile]) {
+        var harvested: [String: String] = [:]
+        for row in rows {
+            if let pin = row.uiMeta?["hermes-bots"]?["chat"]?.stringValue, !pin.isEmpty {
+                harvested[row.name] = pin
+            } else if row.uiMeta?["hermes-bots"]?.objectValue == nil,
+                      let kept = preferredSessionPins[row.name] {
+                // No server block at all — an older gateway, or one that
+                // cannot persist ui_meta. Desktop's rule (plugin.js:441-470)
+                // is that only an EXISTING block is authoritative, so a pin
+                // this client learned locally survives; a block that exists
+                // and omits `chat` really is a deletion and drops through.
+                harvested[row.name] = kept
+            }
+        }
+        preferredSessionPins = harvested
+    }
+
+    /// Tell the client about a pin before the gateway can: a canonical chat
+    /// minted seconds ago is not in `ui_meta` until its write lands, and the
+    /// poll in between would otherwise preview the wrong session once.
+    public func notePreferredSessions(_ pins: [String: String]) {
+        for (name, id) in pins where !id.isEmpty { preferredSessionPins[name] = id }
     }
 
     public func describeProfile(_ name: String) async throws -> JSONValue {

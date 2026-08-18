@@ -105,6 +105,11 @@ public struct RosterView: View {
                     .padding(.horizontal, 20)
                     .padding(.bottom, 6)
             }
+            // Who is working right now — above the list, never inside it, and
+            // zero height when nobody is (Components/ActiveNowStrip.swift,
+            // plugin.js:6888-6937). A separate view by construction, so
+            // presence can never reorder the rows beneath it.
+            ActiveNowStrip(model: model)
             ScrollView {
                 LazyVStack(spacing: listGap) {
                     if model.bots.isEmpty {
@@ -150,6 +155,11 @@ public struct RosterView: View {
         .task {
             RosterSignals.shared.rosterVisible = true
             model.startRosterSignals()
+            // The approval-answer haptic watches a process-wide ledger rather
+            // than any one screen, so it is armed from the first screen shown
+            // and then covers the chat card, the Approvals tab and the push
+            // banner alike (AppModelLive+Preview.swift).
+            model.startFeelObservers()
             // Coming back from another tab, the numbers can be up to a slow
             // tick old; ask once on arrival rather than showing stale ranking.
             await model.refreshRosterSignalsNow()
@@ -314,6 +324,13 @@ public struct RosterView: View {
 
     private func row(for bot: Bot, index: Int) -> some View {
         Button {
+            // First statement, before any state write and before the async
+            // resume — desktop's rule (plugin.js:3900), and the reason for it
+            // is sharper on a phone: the feedback has to land under the thumb
+            // that is still on the glass, however slow the open turns out to
+            // be. It marks leaving this surface; nothing else on the roster
+            // buzzes except the pin below.
+            model.feedback(.open)
             // openChat, never a raw openBotID write: it is what resumes the
             // bot's canonical forever-chat and hydrates the transcript. A bare
             // navigation write opens an empty chat whose first send forks a
@@ -358,6 +375,9 @@ public struct RosterView: View {
     @ViewBuilder private func rowMenu(for bot: Bot) -> some View {
         let pinned = model.isPinned(bot.id)
         Button {
+            // Pinning re-ranks the list under the thumb; the buzz is the
+            // acknowledgement that the tap took, before the write round-trips.
+            model.feedback(pinned ? .unpin : .pin)
             Task { await model.setBotPinned(botID: bot.id, pinned: !pinned) }
         } label: {
             Label(pinned ? CopyPack.rosterUnpin(theme.id) : CopyPack.rosterPin(theme.id),
@@ -461,30 +481,43 @@ public struct RosterView: View {
                 // Per-row second offset so timers don't tick in lockstep
                 // (prototype: `(secs + i * 17) % 60`).
                 let tick = Int(context.date.timeIntervalSinceReferenceDate)
-                statusText(for: bot, seconds: (tick + index * 17) % 60)
+                workingText(for: bot, seconds: (tick + index * 17) % 60)
             }
         } else {
-            statusText(for: bot, seconds: 0)
+            previewText(for: bot)
         }
     }
 
-    private func statusText(for bot: Bot, seconds: Int) -> some View {
-        let line = TalariaVoice.rosterLine(for: bot, seconds: seconds, theme.id)
-        let working = bot.status == .working
-        let hot = bot.mentionsYou || bot.status == .approval || working
-
-        return HStack(spacing: 6) {
-            Text(line)
-                .font(previewFont(hot: hot))
-                .italic(theme.id == .ink && (working || bot.mentionsYou))
+    /// A working row says what it is doing, not what it last said.
+    private func workingText(for bot: Bot, seconds: Int) -> some View {
+        HStack(spacing: 6) {
+            Text(TalariaVoice.rosterLine(for: bot, seconds: seconds, theme.id))
+                .font(previewFont(hot: true))
+                .italic(theme.id == .ink)
                 .foregroundStyle(previewColor(for: bot))
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .monospacedDigit()
-            if working && theme.id == .control {
+            if theme.id == .control {
                 BlinkingCursor(color: theme.color(for: bot.hue))
             }
         }
+    }
+
+    /// An idle row says what was last said — flattened out of markdown, with
+    /// the delivery prefix moved into a `🤖 @sender` chip when another bot was
+    /// the one talking (Components/RosterPreview.swift).
+    private func previewText(for bot: Bot) -> some View {
+        let preview = model.rosterPreview(for: bot)
+        let hot = bot.mentionsYou || bot.status == .approval
+        // Weight stays desktop's: a delivery is marked by the chip, the accent
+        // and the italic, not by shouting. Only a mention or a held approval
+        // earns the heavier face.
+        return RosterPreviewLine(preview: preview,
+                                 theme: theme,
+                                 tint: previewColor(for: bot),
+                                 font: previewFont(hot: hot),
+                                 italic: theme.id == .ink && bot.mentionsYou)
     }
 
     /// Relative time — "4m", "2h" — reads better on a chat roster than a wall
