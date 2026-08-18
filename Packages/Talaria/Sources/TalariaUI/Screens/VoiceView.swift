@@ -98,7 +98,7 @@ public struct VoiceView: View {
     // MARK: Header
 
     private var header: some View {
-        Text(verbatim: "\(copy.voiceHead) \(plainUpper(botID))")
+        Text(verbatim: "\(copy.voiceHead) \(TalariaVoice.plainUpper(for: model.identity(botID)))")
             .font(headFont)
             .tracking(theme.id == .soft ? 0 : 2.5)
             .foregroundStyle(headColor)
@@ -345,10 +345,6 @@ public struct VoiceView: View {
     private func dismissToChat() {
         session.end()
         isPresented = false
-    }
-
-    private func plainUpper(_ id: String) -> String {
-        (id.prefix(1).uppercased() + id.dropFirst()).uppercased()
     }
 }
 

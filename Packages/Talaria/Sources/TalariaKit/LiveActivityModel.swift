@@ -36,14 +36,26 @@ public struct BotWorkAttributes: ActivityAttributes, Sendable {
 
     // The fixed half: bot identity + avatar language (shape × hue), so the
     // extension can redraw the silhouette without talking to the gateway.
+    //
+    // Identity travels as the two resolved strings `Bot` exposes, never as the
+    // profile id: the extension picks its theme at RENDER time, so it has to
+    // apply the same title-or-@handle rule the app does rather than receive a
+    // string already committed to one theme's voice.
     public var botID: String
+    /// The @handle without its "@" — `Bot.handle` (default → "hermes").
     public var botName: String
+    /// `Bot.displayTitle`. Optional so an activity encoded by a build that
+    /// predates this field still decodes (synthesized `decodeIfPresent`);
+    /// nil falls back to the handle, which is what the widget used to show.
+    public var botTitle: String?
     public var shape: AvatarShape
     public var hue: AvatarHue
 
-    public init(botID: String, botName: String, shape: AvatarShape, hue: AvatarHue) {
+    public init(botID: String, botName: String, botTitle: String? = nil,
+                shape: AvatarShape, hue: AvatarHue) {
         self.botID = botID
         self.botName = botName
+        self.botTitle = botTitle
         self.shape = shape
         self.hue = hue
     }

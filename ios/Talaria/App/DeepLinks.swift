@@ -66,8 +66,10 @@ struct DeepLinkRouter {
             // Not validated against the roster on purpose: on a cold start in
             // live mode the roster may still be loading when the island tap
             // arrives; the root view resolves the id once bots land.
-            model.selectedTab = .home
-            model.openBotID = id
+            //
+            // openChat, not a raw openBotID write: it resumes the bot's
+            // canonical forever-chat and hydrates the transcript.
+            model.openChat(botID: id)
 
         case .connections:
             // Connections is pushed off the roster, not a tab; surface the

@@ -276,19 +276,32 @@ public actor GatewayClient {
 
     // MARK: - Sessions
 
-    public func listSessions(limit: Int = 200, profile: String? = nil) async throws -> [StoredSession] {
+    /// `includeHidden` is for the surfaces that OWN hidden sessions — the
+    /// per-bot browser and the canonical-chat resolver. The flag stays off for
+    /// every shared/global list, which is what `hidden` means upstream
+    /// (methods_session.py:180-186). An older gateway ignores the unknown
+    /// param and simply keeps hidden rows out.
+    public func listSessions(limit: Int = 200, profile: String? = nil,
+                             includeHidden: Bool = false) async throws -> [StoredSession] {
         var params: [String: JSONValue] = ["limit": .number(Double(limit))]
         if let profile { params["profile"] = .string(profile) }
+        if includeHidden { params["include_hidden"] = .bool(true) }
         let result = try await rpc("session.list", .object(params))
         return result["sessions"]?.arrayValue?.map(StoredSession.init) ?? []
     }
 
+    /// `hidden` marks a session plugin-owned: it stays out of shared lists
+    /// (recents, the resume picker) and is browsed only by the surface that
+    /// owns it. Bot Mode's canonical chats are always born this way
+    /// (plugin.js:2758-2763). Applied as `pending_hidden` until the row exists
+    /// (methods_session.py:100, server.py:3014-3021); older gateways ignore it.
     public func createSession(profile: String? = nil, title: String? = nil,
-                              model: String? = nil) async throws -> LiveSession {
+                              model: String? = nil, hidden: Bool = false) async throws -> LiveSession {
         var params: [String: JSONValue] = ["source": "talaria", "cols": 100]
         if let profile { params["profile"] = .string(profile) }
         if let title { params["title"] = .string(title) }
         if let model { params["model"] = .string(model) }
+        if hidden { params["hidden"] = .bool(true) }
         return LiveSession(try await rpc("session.create", .object(params)))
     }
 
@@ -492,15 +505,11 @@ public actor GatewayClient {
         return try JSONDecoder().decode(JSONValue.self, from: data)
     }
 
-    /// Paginated transcript hydration (GET /api/sessions/{id}/messages).
-    public func fetchSessionMessages(storedID: String, limit: Int = 200, offset: Int = 0) async throws -> JSONValue {
-        var comps = URLComponents(url: baseURL.appending(path: "api/sessions/\(storedID)/messages"),
-                                  resolvingAgainstBaseURL: false)!
-        comps.queryItems = [URLQueryItem(name: "limit", value: String(limit)),
-                            URLQueryItem(name: "offset", value: String(offset))]
-        var req = URLRequest(url: comps.url!)
-        auth.apply(credential: credential, to: &req)
-        let (data, _) = try await URLSession.shared.data(for: req)
-        return try JSONDecoder().decode(JSONValue.self, from: data)
-    }
+    // Transcript hydration lives in `latestSessionMessages`
+    // (TalariaUI/AppModelLive+CanonicalChat.swift). The wrapper that used to
+    // sit here sent only limit+offset, and the endpoint pages from the OLDEST
+    // message whenever a `limit` arrives without `order`
+    // (hermes_cli/web_routers/sessions.py:601-640) — so it opened a long chat
+    // at its beginning — while omitting `profile` made it read the DEFAULT
+    // profile's state.db and 404 for every other bot.
 }

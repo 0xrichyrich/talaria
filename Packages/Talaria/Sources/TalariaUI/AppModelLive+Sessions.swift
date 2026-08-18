@@ -66,9 +66,16 @@ extension AppModel {
 
     // MARK: - Listing
 
-    /// Load this bot's stored sessions (session.list {limit:200, profile})
-    /// into `ChatState.storedSessions`. Demo mode serves the canned index so
-    /// the sheet is never empty in the App Review walkthrough.
+    /// Load this bot's stored sessions (session.list {limit:200, profile,
+    /// include_hidden}) into `ChatState.storedSessions`. Demo mode serves the
+    /// canned index so the sheet is never empty in the App Review walkthrough.
+    ///
+    /// `include_hidden` because this is the per-bot browser — the one surface
+    /// that OWNS hidden sessions, which is exactly the case upstream carves
+    /// the flag out for (methods_session.py:180-186; desktop's Bots pane does
+    /// the same). Bot Mode sessions, the canonical forever-chat among them,
+    /// are always hidden; without the flag a bot's own chat is missing from
+    /// its own session list.
     public func refreshSessions(botID: String) async {
         let runtime = SessionsRuntime.shared
         guard mode == .live else {
@@ -81,7 +88,8 @@ extension AppModel {
             return
         }
         do {
-            let rows = try await client.listSessions(limit: 200, profile: botID)
+            let rows = try await client.listSessions(limit: 200, profile: botID,
+                                                     includeHidden: true)
             var summaries: [SessionSummary] = []
             summaries.reserveCapacity(rows.count)
             for row in rows where !row.id.isEmpty {
@@ -193,7 +201,8 @@ extension AppModel {
 
                 var history = AppModel.chatMessages(fromTranscript: .array(live.messages))
                 if history.isEmpty, let stored = chat.storedSessionID,
-                   let payload = try? await client.fetchSessionMessages(storedID: stored) {
+                   let payload = try? await client.latestSessionMessages(storedID: stored,
+                                                                         profile: botID) {
                     history = AppModel.chatMessages(fromTranscript: payload)
                 }
                 chat.messages = history

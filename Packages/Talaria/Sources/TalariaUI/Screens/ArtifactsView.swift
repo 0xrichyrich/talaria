@@ -279,7 +279,9 @@ private struct ArtifactCard: View {
                 if let owner {
                     AvatarView(shape: owner.shape, hue: owner.hue, size: 14, theme: theme)
                 }
-                Text(themedBotName(artifact.botID, theme: theme))
+                // `owner` is the roster row when the bot is still listed; the
+                // id alone still resolves through the one identity path.
+                Text(TalariaVoice.displayName(owner, id: artifact.botID, theme.id))
                     .font(ownerNameFont)
                     .foregroundStyle(ownerColor)
                     .lineLimit(1)
@@ -366,10 +368,6 @@ private extension ThemePack {
 }
 
 // MARK: - Shared row helpers (file-scoped copies; each screen file keeps its own)
-
-private func themedBotName(_ id: String, theme: ThemePack) -> String {
-    theme.id == .ink ? id.prefix(1).uppercased() + id.dropFirst() : "@" + id
-}
 
 private struct RowEntrance: ViewModifier {
     let delay: Double

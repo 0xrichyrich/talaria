@@ -660,7 +660,11 @@ public extension AppModel {
         // One transcript resident at a time: recent sessions run to thousands
         // of rows and the phone pays for every one of them.
         for bot in bots.prefix(8) {
-            guard let sessions = try? await client.listSessions(limit: 6, profile: bot.id) else {
+            // The forever chat is where a bot does most of its work, and it is
+            // hidden — scanning without the flag indexes artifacts from every
+            // session EXCEPT the one that matters (methods_session.py:180-186).
+            guard let sessions = try? await client.listSessions(limit: 6, profile: bot.id,
+                                                                includeHidden: true) else {
                 failures += 1
                 continue
             }
@@ -718,22 +722,22 @@ public extension AppModel {
     func openArtifact(_ artifact: Artifact) {
         selectedTab = .home
         guard mode == .live, let ref = FeedsRuntime.shared.artifactSessions[artifact.id] else {
-            openBotID = artifact.botID
+            // No owning session recorded — fall back to the bot's canonical
+            // chat through openChat, never a raw openBotID write (which leaves
+            // the transcript empty and forks on the first send).
+            openChat(botID: artifact.botID)
             return
         }
         open(ref)
     }
 
     /// Rebind a bot's chat to a specific stored session and push into it.
+    /// `openStoredSession` is the one path that rebinds AND resumes AND
+    /// hydrates; `openChat` deliberately re-resolves the canonical forever-chat
+    /// instead, so routing an artifact/inbox jump through it would land the
+    /// user somewhere other than the session the row describes.
     internal func open(_ ref: SessionRef) {
-        let chat = chat(for: ref.botID)
-        if chat.storedSessionID != ref.storedID {
-            chat.sessionID = nil
-            chat.storedSessionID = ref.storedID
-            chat.messages = []
-        }
-        selectedTab = .home
-        openChat(botID: ref.botID)
+        openStoredSession(ref.storedID, botID: ref.botID)
     }
 
     /// tool.complete → artifact rows, for files produced while you watch. Same
@@ -845,7 +849,11 @@ public extension AppModel {
         var sessionCount = 0
 
         for bot in bots.prefix(10) {
-            guard let sessions = try? await client.listSessions(limit: 40, profile: bot.id) else { continue }
+            // `isInboxSession` matches "Bot Chat" too, and Bot Mode sessions —
+            // canonical chats included — are hidden, which session.list drops
+            // unless asked (methods_session.py:180-186).
+            guard let sessions = try? await client.listSessions(limit: 40, profile: bot.id,
+                                                                includeHidden: true) else { continue }
             let inboxes = sessions.filter { Self.isInboxSession($0.title) }.prefix(2)
             for session in inboxes {
                 guard !Task.isCancelled else { return }
@@ -908,8 +916,21 @@ public extension AppModel {
         guard mode == .live, let client else {
             throw GatewayError(code: -3, message: "connect a gateway to hand off")
         }
-        let attributed = "Message from 🤖 \(from) (@\(from)): \(body)"
-        let sessions = try await client.listSessions(limit: 40, profile: to)
+        // The attribution prefix is a wire contract, and both halves are the
+        // sender's IDENTITY, not its profile id: desktop sends
+        // `Message from 🤖 ${senderName} (@${senderHandle})` where senderName
+        // is the display title and senderHandle the @handle (plugin.js:2635,
+        // and the same shape in the CLI recipe at 3654). Sending the raw
+        // profile name put "Message from 🤖 default (@default)" into the other
+        // bot's permanent transcript for the profile that presents as
+        // Hermes/@hermes.
+        let sender = identity(from)
+        let attributed = "Message from 🤖 \(sender.displayTitle) (@\(sender.handle)): \(body)"
+        // Inbox and canonical ("Bot Chat") sessions are hidden, and session.list
+        // omits hidden rows unless asked (methods_session.py:180-186) — without
+        // the flag an existing inbox is invisible and every handoff mints a
+        // second one.
+        let sessions = try await client.listSessions(limit: 40, profile: to, includeHidden: true)
         let existing = sessions.first { Self.isInboxSession($0.title) }
         let live: LiveSession
         if let existing {
@@ -939,8 +960,9 @@ public extension AppModel {
     /// Inbox row tap → the owning bot's inbox session.
     func openInboxMessage(_ message: A2AMessage) {
         guard mode == .live, let ref = FeedsRuntime.shared.inboxSessions[message.id] else {
-            selectedTab = .home
-            openBotID = message.toBotID == "all" ? message.fromBotID : message.toBotID
+            // Same rule as the artifact fallback: openChat, so the bot's
+            // canonical conversation is resumed rather than opened empty.
+            openChat(botID: message.toBotID == "all" ? message.fromBotID : message.toBotID)
             return
         }
         open(ref)

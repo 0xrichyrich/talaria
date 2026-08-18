@@ -256,8 +256,11 @@ public struct RosterView: View {
 
     private func row(for bot: Bot, index: Int) -> some View {
         Button {
-            model.selectedTab = .home
-            model.openBotID = bot.id
+            // openChat, never a raw openBotID write: it is what resumes the
+            // bot's canonical forever-chat and hydrates the transcript. A bare
+            // navigation write opens an empty chat whose first send forks a
+            // brand-new session away from the bot's real history.
+            model.openChat(botID: bot.id)
         } label: {
             HStack(alignment: .center, spacing: 13) {
                 avatar(for: bot)
@@ -311,30 +314,11 @@ public struct RosterView: View {
         }
     }
 
+    /// Title + @handle, from the one identity path
+    /// (Components/BotIdentity.swift) — the same pair the profile sheet
+    /// renders, so a bot never reads two different names in two places.
     private func nameText(for bot: Bot) -> some View {
-        let name = TalariaVoice.displayName(for: bot, theme.id)
-        return HStack(spacing: 5) {
-            Group {
-                switch theme.id {
-                case .soft: Text(name).font(theme.body(16, weight: .bold))
-                case .control: Text(name).font(theme.body(15, weight: .bold))
-                case .ink: Text(name).font(theme.body(19, weight: .bold).smallCaps()).tracking(0.5)
-                }
-            }
-            .foregroundStyle(theme.ink)
-            .lineLimit(1)
-            .layoutPriority(1)
-
-            // Desktop shows the @handle beside a titled bot so you always know
-            // what to tag it (plugin.js `showsHandle`).
-            if bot.showsHandle {
-                Text(TalariaVoice.handle(for: bot))
-                    .font(theme.mono(theme.id == .ink ? 8.5 : 10))
-                    .foregroundStyle(theme.faint)
-                    .lineLimit(1)
-                    .layoutPriority(0.5)
-            }
-        }
+        BotIdentityLabel(bot: bot, theme: theme, scale: .row)
     }
 
     private func jobText(for bot: Bot) -> some View {

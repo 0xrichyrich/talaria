@@ -48,16 +48,12 @@ public struct BotSheetView: View {
     private var copy: CopyPack { model.theme.copy }
     private var style: DetailStyle { DetailStyle(t: theme) }
 
-    private var bot: Bot {
-        model.bot(botID) ?? Bot(id: botID, job: "", shape: .circle, hue: .teal)
-    }
+    /// The one identity path (Components/BotIdentity.swift): the roster row
+    /// when there is one, else an unlisted stand-in that still applies
+    /// displayTitle/handle's rules.
+    private var bot: Bot { model.identity(botID) }
 
     private var isLive: Bool { model.mode == .live }
-
-    /// Ink names its familiars ("Researcher"); the others use handles ("@researcher").
-    private var displayName: String {
-        theme.id == .ink ? botID.prefix(1).uppercased() + botID.dropFirst() : "@" + botID
-    }
 
     /// session.list rows when live; the demo dictionary otherwise.
     private var sessions: [SessionSummary] {
@@ -198,16 +194,21 @@ public struct BotSheetView: View {
             }
             .buttonStyle(.plain)
 
-            Text(displayName)
-                .font(style.subTitleFont)
-                .foregroundStyle(theme.ink)
+            // Same pair the roster row renders — title plus the @handle when
+            // it adds anything (desktop's `showsHandle`).
+            BotIdentityLabel(bot: bot, theme: theme, scale: .sheet)
+                .layoutPriority(1)
 
             Spacer(minLength: 8)
 
+            // The job yields first: a long title with its handle must not push
+            // the identity into a truncation the job could have absorbed.
             Text(theme.id == .soft ? bot.job : bot.job.uppercased())
                 .font(style.jobFont)
                 .tracking(style.jobTracking)
                 .foregroundStyle(theme.faint)
+                .lineLimit(1)
+                .truncationMode(.tail)
         }
         .padding(.horizontal, 18)
         .padding(.top, 18)
@@ -651,13 +652,8 @@ fileprivate struct DetailStyle {
 
     var backFg: Color { t.id == .ink ? t.ink : t.accent }
 
-    var subTitleFont: Font {
-        switch t.id {
-        case .soft: t.body(20, weight: .heavy)
-        case .control: t.body(18, weight: .heavy)
-        case .ink: t.display(22, weight: .bold).smallCaps()
-        }
-    }
+    // The header's name type scale lives in BotIdentityLabel(.sheet) — one
+    // owner for the identity pair, here and on the roster.
 
     var jobFont: Font {
         switch t.id {

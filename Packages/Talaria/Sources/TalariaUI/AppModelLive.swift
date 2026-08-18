@@ -79,6 +79,9 @@ extension AppModel {
         runtime.monitorTask?.cancel(); runtime.monitorTask = nil
         runtime.eventPump?.cancel(); runtime.eventPump = nil
         runtime.resetSessionState()
+        // Session ids are per-gateway; a pin from the previous one resolves to
+        // nothing (or worse, something else) here.
+        CanonicalChatRuntime.shared.reset()
         if let old = client { await old.disconnect() }
 
         let client = GatewayClient(baseURL: baseURL, credential: credential)
@@ -142,6 +145,10 @@ extension AppModel {
         detachApprovalBridges()
         detachSessionEventRouter()
         detachVoiceRouter()
+        // Canonical-chat pins name sessions in THIS gateway's per-profile
+        // state.db; carrying them to the next gateway would resume ids that
+        // mean nothing there.
+        CanonicalChatRuntime.shared.reset()
         // ~11 MB of decoded spritesheets and a per-profile pet cache belong to
         // the gateway that served them, not to the next one.
         detachPetEventRouter()
@@ -162,6 +169,10 @@ extension AppModel {
     /// task lines survive the refresh.
     public func refreshRoster() async throws {
         guard let client else { return }
+        // Sampled BEFORE the await: any pin written while this poll was in
+        // flight makes the block it returns stale, and the merge below reads a
+        // missing `chat` key as an authoritative deletion.
+        let pinWrites = CanonicalChatRuntime.shared.writeCount
         let profiles = try await client.listProfiles()
         let runtime = LiveRuntime.shared
         runtime.defaultBotID = profiles.first(where: \.isDefault)?.name ?? profiles.first?.name
@@ -174,6 +185,20 @@ extension AppModel {
             // Desktop Bot Mode's own metadata block wins over Talaria's, so a
             // bot titled/recolored on desktop reads identically here.
             let deskMeta = BotModeMeta(uiMeta: profile.uiMeta)
+            // The canonical-chat pin travels in that same block, and desktop's
+            // mergeServerMeta is precise about it (plugin.js:441-470): when the
+            // server block EXISTS it is authoritative and an omitted `chat` key
+            // is a deletion — so this assignment, nil included, is the whole
+            // merge. When there is no block at all (a gateway that cannot store
+            // ui_meta) the locally resolved pin survives instead. A bot whose
+            // own pin write is still in flight — or landed while this poll was
+            // out — is skipped: that answer predates the write, and reading it
+            // as a deletion would drop the pin just made.
+            let canonical = CanonicalChatRuntime.shared
+            if profile.uiMeta?["hermes-bots"]?.objectValue != nil,
+               !canonical.hasLocalPinWrite(profile.name, since: pinWrites) {
+                canonical.pins[profile.name] = profile.uiMeta?["hermes-bots"]?["chat"]?.stringValue
+            }
             var bot = Bot(
                 id: profile.name,
                 job: profile.description ?? "",
@@ -230,67 +255,62 @@ extension AppModel {
         return f.string(from: date)
     }
 
-    // MARK: - Opening a chat (resume latest session + hydrate history)
+    // MARK: - Opening a chat (canonical forever-chat + hydration)
 
-    /// Navigate into a bot's chat. Live mode resumes the profile's most
-    /// recent stored session with deferred history, then hydrates the
-    /// transcript over REST (GET /api/sessions/{id}/messages).
+    /// Navigate into a bot's chat. THE entry point: every route into a bot —
+    /// roster row, deep link, notification tap, search result, activity row,
+    /// banner — goes through here, because this is what resumes the bot's
+    /// conversation instead of leaving the chat empty and letting the first
+    /// send fork a brand-new session.
+    ///
+    /// Live mode lands in the bot's canonical forever-chat, resolved in
+    /// AppModelLive+CanonicalChat.swift (plugin.js:2802-2896). Never "the most
+    /// recent session": a cron delivery or a CLI run would otherwise hijack
+    /// what a tap opens.
     public func openChat(botID: String) {
+        // Some routes in carry a @handle rather than a profile id — an A2A
+        // attribution prefix names the sender `@hermes`, and a deep link or
+        // push payload can quote whatever the desktop displayed. Every
+        // gateway call below wants the profile id, so resolve once, here, at
+        // the single entry point (Components/BotIdentity.swift).
+        let botID = resolvedBotID(botID)
         openBotID = botID
+        selectedTab = .home
         if let idx = bots.firstIndex(where: { $0.id == botID }) {
             bots[idx].unread = 0
             bots[idx].mentionsYou = false
         }
         guard mode == .live, !isOffline else { return }
-        guard chat(for: botID).sessionID == nil else { return }
-        Task { @MainActor in
-            _ = try? await self.ensureSession(botID: botID, hydrate: true)
-        }
+        Task { @MainActor in await self.enterCanonicalChat(botID: botID) }
     }
 
     /// Create-or-resume the bot's session and bind it to the chat. Coalesces
     /// concurrent callers (openChat racing a send) onto one attach.
+    ///
+    /// The resolution itself lives in `attachCanonicalSession`: an explicit
+    /// binding wins, otherwise the canonical chat. That is what keeps a send
+    /// typed before the chat finished opening out of a fresh forked session.
     func ensureSession(botID: String, hydrate: Bool) async throws -> String {
         let runtime = LiveRuntime.shared
-        let chat = chat(for: botID)
-        if let sid = chat.sessionID { return sid }
+        if let sid = chat(for: botID).sessionID { return sid }
         if let pending = runtime.attachTasks[botID] { return try await pending.value }
-        guard let client else { throw GatewayError(code: -3, message: "not connected") }
+        guard client != nil else { throw GatewayError(code: -3, message: "not connected") }
 
-        let stored = chat.storedSessionID ?? runtime.lastSessionByBot[botID]
         let task = Task<String, Error> { @MainActor in
-            var live: LiveSession
-            var resumed = false
-            if let stored {
-                do {
-                    // Full projection in the resume ack (deferHistory returns a
-                    // bounded stub and leaves history to a REST shape that has
-                    // proven flaky) — one round trip, authoritative rows.
-                    live = try await client.resumeSession(stored, profile: botID, deferHistory: false)
-                    resumed = true
-                } catch let error as GatewayError where error.code == GatewayError.sessionNotFound {
-                    live = try await client.createSession(profile: botID)
-                }
-            } else {
-                live = try await client.createSession(profile: botID)
-            }
-            guard !live.sessionID.isEmpty else {
-                throw GatewayError(code: -8, message: "session create/resume returned no id")
-            }
-            self.bindSession(live, botID: botID)
-            if hydrate, resumed {
-                await self.hydrateTranscript(live, botID: botID)
-            }
-            self.replayInflight(live, botID: botID)
-            self.replayPendingPrompts(live)
-            return live.sessionID
+            try await self.attachCanonicalSession(botID: botID, hydrate: hydrate)
         }
         runtime.attachTasks[botID] = task
-        defer { runtime.attachTasks[botID] = nil }
+        // Clear only OUR entry. `openStoredSession` cancels the in-flight
+        // attach and drops the slot, so by the time this frame resumes the
+        // slot may already hold a newer task; blanking it unconditionally
+        // un-coalesces that one, and two concurrent resolutions of the same
+        // bot can mint two canonical chats — the fork this phase exists to
+        // prevent. Task is Equatable, so identity is exact.
+        defer { if runtime.attachTasks[botID] == task { runtime.attachTasks[botID] = nil } }
         return try await task.value
     }
 
-    private func bindSession(_ live: LiveSession, botID: String) {
+    func bindSession(_ live: LiveSession, botID: String) {
         let chat = chat(for: botID)
         chat.sessionID = live.sessionID
         if !live.storedSessionID.isEmpty { chat.storedSessionID = live.storedSessionID }
@@ -301,24 +321,17 @@ extension AppModel {
         }
     }
 
-    /// Replace local history with the stored transcript. REST hydration first
-    /// (defer_history contract), falling back to the projection rows the
-    /// resume ack carried.
-    private func hydrateTranscript(_ live: LiveSession, botID: String) async {
-        // The resume ack's projection is the known-good shape; REST is only a
-        // fallback for resumes that omitted messages.
-        var history = Self.chatMessages(fromTranscript: .array(live.messages))
-        if history.isEmpty, !live.storedSessionID.isEmpty, let client,
-           let payload = try? await client.fetchSessionMessages(storedID: live.storedSessionID) {
-            history = Self.chatMessages(fromTranscript: payload)
-        }
-        guard !history.isEmpty else { return }
-        chat(for: botID).messages = history
-    }
-
-    /// Map transcript projection rows (server.py:_history_to_messages shape:
-    /// {role, text, timestamp?, display_kind?} + tool rows {role:"tool",…})
-    /// to chat messages. Hidden scaffolding and tool rows are dropped.
+    /// Map transcript rows to chat messages. Two shapes reach here and both
+    /// have to work, because the REST route is the hydration fallback:
+    ///
+    /// - the WS display projection (server.py:_history_to_messages) —
+    ///   `{role, text, timestamp?, row_id?, reasoning?, display_kind?}`, tool
+    ///   rows carrying `{role:"tool", name, args}`;
+    /// - raw `messages` rows from GET /api/sessions/{id}/messages
+    ///   (hermes_state.py:get_messages returns `SELECT *`) — the same fields
+    ///   under their column names: `content` for the body, `id` for the row.
+    ///
+    /// Hidden scaffolding and tool rows are dropped either way.
     static func chatMessages(fromTranscript payload: JSONValue) -> [ChatMessage] {
         var rows = payload["messages"]?.arrayValue ?? payload.arrayValue ?? []
         // The REST page may serve newest-first; normalize to oldest-first.
@@ -330,16 +343,24 @@ extension AppModel {
         }
         return rows.compactMap { row in
             guard row["display_kind"]?.stringValue != "hidden" else { return nil }
-            let text = row["text"]?.stringValue ?? ""
+            let role = row["role"]?.stringValue
+            let text = transcriptText(row)
             guard !text.isEmpty else { return nil }
+            // Gateway bookkeeping (model switches, personality notices) is
+            // persisted as role=user "[System: …]" so strict providers accept
+            // it mid-history. The WS projection filters it
+            // (server.py:_is_display_hidden_marker); raw DB rows do not, so it
+            // has to be filtered here too or it renders as a user bubble.
+            guard !(role == "user" && text.hasPrefix("[System:")) else { return nil }
             let time = row["timestamp"]?.doubleValue.map { shortTime($0) }
             let reasoning = row["reasoning"]?.stringValue
                 ?? row["reasoning_content"]?.stringValue
             // Durable row identity (_history_to_messages stamps `row_id` from
-            // _rows_to_conversation). Without it only the newest assistant row
-            // is addressable by `message.react`, which names rows by id.
-            let rowID = row["row_id"]?.intValue
-            switch row["role"]?.stringValue {
+            // _rows_to_conversation; the DB column it comes from is `id`).
+            // Without it only the newest assistant row is addressable by
+            // `message.react`, which names rows by id.
+            let rowID = row["row_id"]?.intValue ?? row["id"]?.intValue
+            switch role {
             case "user": return ChatMessage(author: .user, time: time, text: text,
                                             rowID: rowID)
             case "assistant": return ChatMessage(author: .bot, time: time, text: text,
@@ -350,9 +371,23 @@ extension AppModel {
         }
     }
 
+    /// The body of a transcript row. `text` is the projection's field name and
+    /// `content` the column's; a multimodal `content` is a parts array
+    /// (`[{type:"text", text:…}, {type:"image_url", …}]`), whose text parts are
+    /// the only renderable half.
+    private static func transcriptText(_ row: JSONValue) -> String {
+        if let text = row["text"]?.stringValue { return text.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let content = row["content"] else { return "" }
+        if let text = content.stringValue { return text.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let parts = content.arrayValue else { return "" }
+        return parts.compactMap { $0["text"]?.stringValue }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Replay a reconnect/resume inflight snapshot ({user, assistant,
     /// streaming, error?}) into the chat so a dropped socket loses nothing.
-    private func replayInflight(_ live: LiveSession, botID: String) {
+    func replayInflight(_ live: LiveSession, botID: String) {
         guard let inflight = live.inflight, inflight != .null else { return }
         let chat = chat(for: botID)
         if let user = inflight["user"]?.stringValue, !user.isEmpty,

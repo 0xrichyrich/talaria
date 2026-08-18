@@ -495,8 +495,10 @@ public struct TalariaRootView: View {
         default:
             withAnimation(pushAnimation) {
                 showConnections = false
-                model.selectedTab = .home
-                model.openBotID = banner.botID
+                // openChat, not a raw openBotID write — the banner has to land
+                // in the bot's canonical chat with its history, like every
+                // other route in.
+                model.openChat(botID: banner.botID)
             }
         }
     }

@@ -177,7 +177,7 @@ public struct RoutinesView: View {
                         .tracking(2)
                         .foregroundStyle(theme.id == .ink ? theme.sub : theme.accent)
                 }
-                Text(verbatim: "\(copy.titleRoutines) \(themedBotName(botID, theme: theme))")
+                Text(verbatim: "\(copy.titleRoutines) \(model.botName(botID, theme.id))")
                     .font(subtitleFont)
                     .foregroundStyle(theme.ink)
             }
@@ -278,7 +278,7 @@ public struct RoutinesView: View {
 
     private func otherBotRow(_ routine: Routine) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 9) {
-            Text(themedBotName(routine.botID, theme: theme))
+            Text(model.botName(routine.botID, theme.id))
                 .font(otherNameFont)
                 .foregroundStyle(theme.color(for: model.bot(routine.botID)?.hue ?? .teal))
             Text(routine.name)
@@ -684,10 +684,6 @@ private extension ThemePack {
         case .ink: lineStrong
         }
     }
-}
-
-private func themedBotName(_ id: String, theme: ThemePack) -> String {
-    theme.id == .ink ? id.prefix(1).uppercased() + id.dropFirst() : "@" + id
 }
 
 private struct RowEntrance: ViewModifier {

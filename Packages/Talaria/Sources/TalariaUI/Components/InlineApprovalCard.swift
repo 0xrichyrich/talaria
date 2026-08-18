@@ -684,7 +684,7 @@ public struct BlockingPromptOverlay: View {
             VStack(alignment: .leading, spacing: 0) {
                 tagRow(prompt)
                 if let botID = prompt.botID {
-                    Text(TalariaVoice.displayName(botID, theme.id))
+                    Text(model.botName(botID, theme.id))
                         .font(botFont)
                         .foregroundStyle(theme.color(for: model.bot(botID)?.hue ?? .teal))
                         .padding(.top, 6)

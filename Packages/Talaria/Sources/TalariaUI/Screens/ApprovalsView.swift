@@ -289,7 +289,7 @@ private struct ApprovalCard: View {
                        size: 34, theme: theme)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(TalariaVoice.displayName(approval.botID, theme.id))
+                    Text(TalariaVoice.displayName(bot, id: approval.botID, theme.id))
                         .font(nameFont)
                         .foregroundStyle(botColor)
                         .lineLimit(1)

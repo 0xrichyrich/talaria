@@ -82,9 +82,8 @@ public struct ChatView: View {
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
 
-    private var bot: Bot {
-        model.bot(botID) ?? Bot(id: botID, job: "", shape: .circle, hue: .teal)
-    }
+    /// The one identity path (Components/BotIdentity.swift).
+    private var bot: Bot { model.identity(botID) }
 
     private var botColor: Color { theme.color(for: bot.hue) }
     private var chat: ChatState? { model.chats[botID] }
@@ -123,9 +122,14 @@ public struct ChatView: View {
         }
     }
 
-    /// Bots without history open on their roster preview, like the prototype's
-    /// `[{ from:'bot', text: preview }]` fallback.
+    /// Demo bots without history open on their roster preview, like the
+    /// prototype's `[{ from:'bot', text: preview }]` fallback.
+    ///
+    /// Demo only. In live mode `openChat` hydrates the real transcript, and
+    /// seeding here painted the roster preview as a message the bot never sent
+    /// — an empty forever-chat has to look empty, not fake.
     private func seedChatIfNeeded() {
+        guard model.mode == .demo else { return }
         guard model.chats[botID] == nil else { return }
         let chat = model.chat(for: botID)
         if chat.messages.isEmpty, !bot.preview.isEmpty {
@@ -314,7 +318,7 @@ public struct ChatView: View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 if theme.id == .ink {
-                    Text(verbatim: "\(TalariaVoice.plainUpper(botID)) · \(message.time ?? "now")")
+                    Text(verbatim: "\(TalariaVoice.plainUpper(for: bot)) · \(message.time ?? "now")")
                         .font(theme.mono(8))
                         .tracking(1.5)
                         .foregroundStyle(theme.ink.opacity(0.45))
@@ -722,7 +726,7 @@ public struct ChatView: View {
                 }
                 attachButton
                 TextField("", text: $draft,
-                          prompt: Text(copy.composer(botID)).foregroundStyle(theme.faint))
+                          prompt: Text(copy.composer(bot)).foregroundStyle(theme.faint))
                     .textFieldStyle(.plain)
                     .font(composerFont)
                     .foregroundStyle(theme.ink)

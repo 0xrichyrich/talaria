@@ -54,11 +54,23 @@ private func monoFont(size: CGFloat, weight: Font.Weight = .semibold) -> Font {
     return .system(size: size, weight: weight, design: .monospaced)
 }
 
-/// Themed bot display name, ported from the prototype:
-/// ink capitalizes ("Researcher"), soft/control prefix "@" ("@researcher").
-private func displayName(_ botName: String, themeID: ThemeID) -> String {
-    guard themeID == .ink else { return "@" + botName }
-    return botName.isEmpty ? botName : botName.prefix(1).uppercased() + botName.dropFirst()
+/// Themed bot display name — the extension's copy of the app's one identity
+/// rule (`TalariaVoice.displayName(for:)`): the title when it says something
+/// the handle doesn't, or when ink is speaking (ink names its familiars); the
+/// "@handle" otherwise. Kept as a function rather than a shared call because
+/// the widget holds attributes, not a `Bot`.
+///
+/// `title` is absent on an activity started by a build older than the field;
+/// the handle alone is then the best available identity.
+private func displayName(_ attributes: BotWorkAttributes, themeID: ThemeID) -> String {
+    let handle = attributes.botName
+    guard let title = attributes.botTitle?.trimmingCharacters(in: .whitespaces),
+          !title.isEmpty else {
+        return themeID == .ink
+            ? (handle.isEmpty ? handle : handle.prefix(1).uppercased() + handle.dropFirst())
+            : "@" + handle
+    }
+    return title.lowercased() != handle.lowercased() || themeID == .ink ? title : "@" + handle
 }
 
 // MARK: - Static avatar
@@ -156,7 +168,7 @@ private struct BotWorkLockScreenView: View {
                              hue: context.attributes.hue,
                              size: 42, theme: theme)
             VStack(alignment: .leading, spacing: 3) {
-                Text(displayName(context.attributes.botName, themeID: themeID))
+                Text(displayName(context.attributes, themeID: themeID))
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(terminal.ink)
                 Text(context.state.task)
@@ -208,7 +220,7 @@ struct BotWorkLiveActivity: Widget {
                 }
                 DynamicIslandExpandedRegion(.center) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(displayName(context.attributes.botName, themeID: themeID))
+                        Text(displayName(context.attributes, themeID: themeID))
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(ThemePack.control.ink)
                         Text(context.state.task)

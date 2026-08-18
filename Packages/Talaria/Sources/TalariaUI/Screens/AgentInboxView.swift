@@ -225,7 +225,7 @@ private struct A2ARow: View {
     /// "all bots" / "ALL" / "All" for broadcasts, else the themed bot name.
     private var toName: String {
         guard isBroadcast else {
-            return TalariaVoice.displayName(message.toBotID, theme.id)
+            return TalariaVoice.displayName(toBot, id: message.toBotID, theme.id)
         }
         switch theme.id {
         case .soft: return "all bots"
@@ -248,7 +248,7 @@ private struct A2ARow: View {
                     .padding(.top, 1)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(TalariaVoice.displayName(message.fromBotID, theme.id))
+                        Text(TalariaVoice.displayName(fromBot, id: message.fromBotID, theme.id))
                             .font(nameFont)
                             .foregroundStyle(fromColor)
                             .lineLimit(1)
@@ -428,7 +428,7 @@ private struct HandoffSheet: View {
                         } label: {
                             HStack(spacing: 6) {
                                 AvatarView(shape: bot.shape, hue: bot.hue, size: 16, theme: theme)
-                                Text(TalariaVoice.displayName(bot.id, theme.id))
+                                Text(TalariaVoice.displayName(for: bot, theme.id))
                                     .font(theme.id == .control ? theme.mono(10.5, weight: .semibold)
                                                                : theme.body(12.5, weight: .semibold))
                                     .foregroundStyle(selection.wrappedValue == bot.id

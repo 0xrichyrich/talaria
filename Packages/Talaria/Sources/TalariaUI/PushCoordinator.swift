@@ -205,8 +205,10 @@ public final class PushCoordinator: NSObject {
         case "bot":
             let id = url.pathComponents.count > 1 ? url.pathComponents[1] : url.lastPathComponent
             guard !id.isEmpty, id != "/" else { return false }
-            model.selectedTab = .home
-            model.openBotID = id
+            // openChat, not a raw openBotID write: it resumes the bot's
+            // canonical chat and hydrates it. A bare write lands in an empty
+            // transcript whose first send forks a new session.
+            model.openChat(botID: id)
             return true
         case "approvals":
             model.selectedTab = .approvals
@@ -252,8 +254,9 @@ public final class PushCoordinator: NSObject {
                 NotificationCenter.default.post(name: .talariaOpenConnections, object: nil)
             default:
                 if let botID, botID != "gateway" {
-                    model.selectedTab = .home
-                    model.openBotID = botID
+                    // Same rule as every other route into a chat: openChat
+                    // resumes the canonical conversation, a raw write does not.
+                    model.openChat(botID: botID)
                 } else {
                     model.selectedTab = .activity
                 }

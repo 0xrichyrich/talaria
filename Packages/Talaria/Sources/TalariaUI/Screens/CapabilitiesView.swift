@@ -181,7 +181,7 @@ public struct CapabilitiesView: View {
     /// "Capabilities · @researcher" — the bot the toggles actually write to.
     private var titleText: String {
         guard let profile, !profile.isEmpty else { return copy.capTitle(themeID) }
-        return copy.capTitle(themeID) + " · " + TalariaVoice.displayName(profile, themeID)
+        return copy.capTitle(themeID) + " · " + model.botName(profile, themeID)
     }
 
     private var iconButtonShape: RoundedRectangle {

@@ -250,7 +250,7 @@ public struct SearchPalette: View {
                     sectionHeader(copy.titleArtifacts)
                     ForEach(resultArtifacts) { artifact in
                         metaRow(title: artifact.title,
-                                trail: "\(themedBotName(artifact.botID, theme: theme)) · \(artifact.when)") {
+                                trail: "\(model.botName(artifact.botID, theme.id)) · \(artifact.when)") {
                             openBot(artifact.botID)
                         }
                     }
@@ -324,7 +324,7 @@ public struct SearchPalette: View {
         Button { openBot(bot.id) } label: {
             HStack(spacing: 10) {
                 AvatarView(bot: bot, size: 26, theme: theme)
-                Text(themedBotName(bot.id, theme: theme))
+                Text(TalariaVoice.displayName(for: bot, theme.id))
                     .font(nameFont)
                     .foregroundStyle(theme.ink)
                 Text(liveLine(for: bot))
@@ -352,7 +352,7 @@ public struct SearchPalette: View {
                         .foregroundStyle(theme.ink)
                         .lineLimit(1)
                     Spacer(minLength: 8)
-                    Text("\(themedBotName(hit.botID, theme: theme)) · \(hit.when)")
+                    Text("\(model.botName(hit.botID, theme.id)) · \(hit.when)")
                         .font(theme.id == .soft ? theme.body(11, weight: .medium) : theme.mono(theme.id == .ink ? 9 : 10))
                         .foregroundStyle(theme.faint)
                         .lineLimit(1)
@@ -697,8 +697,4 @@ private extension ThemePack {
     var scrimColor: Color {
         id == .control ? Color.black.opacity(0.62) : ink.opacity(0.4)
     }
-}
-
-private func themedBotName(_ id: String, theme: ThemePack) -> String {
-    theme.id == .ink ? id.prefix(1).uppercased() + id.dropFirst() : "@" + id
 }

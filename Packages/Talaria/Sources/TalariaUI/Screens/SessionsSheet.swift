@@ -44,11 +44,6 @@ public struct SessionsSheet: View {
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
 
-    /// Ink names its familiars; the others use handles.
-    private var displayName: String {
-        theme.id == .ink ? botID.prefix(1).uppercased() + botID.dropFirst() : "@" + botID
-    }
-
     // MARK: - Rows
 
     /// One list row, from either the loaded page or the full-text index.
