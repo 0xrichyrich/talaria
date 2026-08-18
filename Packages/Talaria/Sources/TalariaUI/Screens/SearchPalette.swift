@@ -26,6 +26,9 @@ public enum SearchPaletteAction: Sendable {
     /// Skills / toolsets / MCP — hosted as a sheet so it never crowds the
     /// five prototype tabs.
     case capabilities
+    /// Device settings. Tabless for the same reason Capabilities is, and
+    /// reached the same two ways: here, and from Connections.
+    case settings
     /// Browse stored sessions for a bot (the palette resolves which one).
     case sessions(botID: String)
     /// A cross-session search hit: open this bot on this stored session.
@@ -128,6 +131,7 @@ public struct SearchPalette: View {
             PaletteAction(id: "new-bot", label: copy.createTitle) { onAction?(.newBot) },
             PaletteAction(id: "add-gateway", label: copy.paletteAddGateway(theme.id)) { onAction?(.addGateway) },
             PaletteAction(id: "capabilities", label: copy.paletteCapabilities(theme.id)) { onAction?(.capabilities) },
+            PaletteAction(id: "settings", label: copy.paletteSettings(theme.id)) { onAction?(.settings) },
         ]
         if let botID = sessionsActionBot {
             all.append(PaletteAction(id: "sessions", label: copy.paletteSessionsAction(theme.id)) {
@@ -608,6 +612,14 @@ extension CopyPack {
         case .soft: "Capabilities"
         case .control: "CAPABILITIES"
         case .ink: "gifts & arts"
+        }
+    }
+
+    func paletteSettings(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Settings"
+        case .control: "SETTINGS"
+        case .ink: "the settings"
         }
     }
 

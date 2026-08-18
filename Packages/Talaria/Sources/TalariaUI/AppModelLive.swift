@@ -157,6 +157,12 @@ extension AppModel {
         // ~11 MB of decoded spritesheets and a per-profile pet cache belong to
         // the gateway that served them, not to the next one.
         detachPetEventRouter()
+        // Same rule for the About panel's facts: `desktop_contract`, the health
+        // probe and the runtime model all describe THIS gateway. Left standing,
+        // the next gateway's About page would report the departed one's
+        // contract version — which is precisely the number a client uses to
+        // decide which RPC shapes it may send.
+        detachSettingsDiagnostics()
         connections = ConnectionRegistry.shared.rows
     }
 

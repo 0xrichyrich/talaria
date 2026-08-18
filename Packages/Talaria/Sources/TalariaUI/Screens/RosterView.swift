@@ -495,13 +495,21 @@ private struct BlinkingCursor: View {
 private struct RosterEntrance: ViewModifier {
     var delay: Double
     @State private var shown = false
+    @Environment(\.talariaReducedMotion) private var reducedMotion
 
     func body(content: Content) -> some View {
         content
             .opacity(shown ? 1 : 0)
-            .offset(y: shown ? 0 : 12)
+            // Damped, the row still fades in — but it does not travel, and the
+            // stagger collapses so the whole roster is legible at once.
+            .offset(y: shown || reducedMotion ? 0 : 12)
             .onAppear {
-                withAnimation(.easeOut(duration: 0.45).delay(delay)) { shown = true }
+                guard !shown else { return }
+                if reducedMotion {
+                    withAnimation(.easeOut(duration: 0.2)) { shown = true }
+                } else {
+                    withAnimation(.easeOut(duration: 0.45).delay(delay)) { shown = true }
+                }
             }
     }
 }

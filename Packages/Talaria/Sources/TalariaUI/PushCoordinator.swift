@@ -183,8 +183,16 @@ public final class PushCoordinator: NSObject {
             // Wait for the APNs token (already resolved when registration
             // happened earlier in this launch).
             let hex = await deviceToken
-            // Dev builds sign with the development aps-environment.
-            try? await client.registerPushDevice(tokenHex: hex, environment: "dev")
+            // The relay's upsert REPLACES the stored record wholesale
+            // (talaria_push_relay/devices.py `upsert`), and an omitted
+            // `profile_filter` normalizes to [] — "every bot". Re-sending the
+            // existing filter is what stops this connect-time handshake from
+            // silently undoing the per-bot choice made in Settings.
+            // `environment` is deliberately NOT carried over: it describes this
+            // build's aps-environment, not a user preference.
+            let existing = await client.pushDevice(tokenHex: hex)
+            try? await client.registerPushDevice(tokenHex: hex, environment: "dev",
+                                                 profileFilter: existing?.profileFilter ?? [])
         }
     }
 

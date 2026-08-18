@@ -402,25 +402,12 @@ public actor GatewayClient {
                                      "key": "reasoning", "value": .string(value)])
     }
 
-    // MARK: - Push relay (talaria-push gateway plugin)
-
-    /// Register this device with the gateway-side APNs relay. No-op errors
-    /// surface to the caller (the plugin may simply not be installed).
-    public func registerPushDevice(tokenHex: String, environment: String) async throws {
-        var req = URLRequest(url: baseURL.appending(path: "api/plugins/talaria-push/devices"))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        auth.apply(credential: credential, to: &req)
-        req.httpBody = try JSONEncoder().encode(JSONValue.object([
-            "device_token": .string(tokenHex),
-            "platform": "ios",
-            "environment": .string(environment),
-        ]))
-        let (_, response) = try await URLSession.shared.data(for: req)
-        guard let code = (response as? HTTPURLResponse)?.statusCode, (200..<300).contains(code) else {
-            throw GatewayError(code: -9, message: "push relay registration failed")
-        }
-    }
+    // Device registration for the talaria-push relay lives in
+    // GatewayClient+Providers.swift. It is deliberately the ONLY spelling: the
+    // relay's upsert replaces the whole record, so a registration call that
+    // cannot express `profile_filter` erases the caller's per-bot push filter
+    // every time it runs. An earlier two-argument version here did exactly
+    // that on every gateway connect.
 
     // MARK: - Cron (Routines)
 

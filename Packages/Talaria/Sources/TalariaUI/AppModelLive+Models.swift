@@ -63,6 +63,14 @@ public final class ModelPresetStore {
         presets[Self.key(provider: provider, model: model)] ?? ModelPreset()
     }
 
+    /// Forget every per-model preset. Used by Settings → "delete local data",
+    /// which is about to remove the backing key: without dropping the in-memory
+    /// copy too, the next `merge` would write the whole lot straight back.
+    public func reset() {
+        presets = [:]
+        UserDefaults.standard.removeObject(forKey: Self.storageKey)
+    }
+
     /// Merge a partial preset for one model and persist.
     public func merge(provider: String, model: String, effort: String? = nil, fast: Bool? = nil) {
         let key = Self.key(provider: provider, model: model)

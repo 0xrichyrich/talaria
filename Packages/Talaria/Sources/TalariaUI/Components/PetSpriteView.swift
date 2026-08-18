@@ -73,6 +73,8 @@ public struct PetSpriteView: View {
     /// at different moments stay in step with each other.
     @State private var epoch = Date()
 
+    @Environment(\.talariaReducedMotion) private var reducedMotion
+
     public init(sheet: PetSpriteSheet, state: PetState = .idle,
                 scale: Double = Pet.defaultScale, size: Size = .companion,
                 paused: Bool = false) {
@@ -111,7 +113,10 @@ public struct PetSpriteView: View {
         let interval = sheet.frameInterval(for: state)
 
         Group {
-            if frames.count > 1, !paused {
+            // Reduced motion stops the loop on its first frame — the pet is
+            // still drawn, still the right pet, just not walking. This is the
+            // "sprite loops" Settings → Motion promises to still.
+            if frames.count > 1, !paused, !reducedMotion {
                 TimelineView(.periodic(from: epoch, by: interval)) { context in
                     canvas(frames, index: Self.frameIndex(at: context.date,
                                                           interval: interval,

@@ -110,7 +110,11 @@ public struct TalariaRootView: View {
             // the life of the app.
             VStack(spacing: 0) {
                 ReauthBanner(model: model)
+                // Settings pushes over the screen graph but under the parked-
+                // agent prompts below: a blocked tool thread outranks a
+                // preferences screen.
                 screenGraph
+                    .talariaSettings(model: model)
             }
             .opacity(themeSwapDim ? 0.3 : 1)
             .scaleEffect(themeSwapDim ? 0.982 : 1)
@@ -128,6 +132,13 @@ public struct TalariaRootView: View {
         }
         .preferredColorScheme(theme.statusBarDark ? .dark : .light)
         .tint(theme.accent)
+        // Appearance (Settings → Appearance) is app-wide, so it is adopted at
+        // the one mount point every screen hangs off. Text size overrides
+        // Dynamic Type for the whole tree; `talariaMotion` publishes the motion
+        // preference already merged with the device's own setting, so a view
+        // reads one bool and never has to know which switch asked for stillness.
+        .talariaTextSize(model)
+        .talariaMotion(model)
         .sheet(isPresented: $showProfile) {
             if let id = model.openBotID {
                 BotSheetView(model: model, botID: id)
@@ -333,6 +344,10 @@ public struct TalariaRootView: View {
             goToTab(tab)
         case .capabilities:
             openCapabilities()
+        case .settings:
+            // Same shape as capabilities: the request is a notification, so
+            // the presenter mounted on the screen graph does the push.
+            model.requestSettings()
         case .sessions(let botID):
             openSessions(for: botID)
         case .openSession(let botID, let sessionID):

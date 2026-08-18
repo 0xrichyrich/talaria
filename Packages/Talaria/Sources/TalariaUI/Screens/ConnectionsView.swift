@@ -204,6 +204,25 @@ public struct ConnectionsView: View {
                     .font(subtitleFont)
                     .foregroundStyle(theme.ink)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Settings has no tab of its own (five is the budget), so it is
+            // reached from here and from the search palette — the same pair
+            // Capabilities uses. Settings hands the add-gateway flow back to
+            // this screen, so the two need to be one step apart in both
+            // directions.
+            Button { model.requestSettings() } label: {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
+                    .frame(width: 31, height: 31)
+                    .background(theme.id == .ink ? Color.clear : theme.panel)
+                    .clipShape(iconButtonShape)
+                    .overlay(iconButtonShape.strokeBorder(
+                        theme.id == .ink ? theme.lineStrong : theme.line, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text(copy.settingsTitle(theme.id)))
         }
         .padding(.horizontal, 18)
         .padding(.top, 12)
