@@ -91,10 +91,11 @@ private struct AuthWebView: UIViewRepresentable {
                 DispatchQueue.main.async { callback(url) }
                 return
             }
-            // The gateway/IdP pages inside this dedicated sign-in sheet may
-            // opt out of Lockdown Mode's WebKit restrictions so login forms
-            // render; nothing else in the app hosts web content.
-            preferences.isLockdownModeEnabled = false
+            // Lockdown Mode's WebKit restrictions stay in force here — only
+            // apps with the browser-engine entitlement may disable them, and
+            // attempting it raises an exception. Login forms render fine
+            // under Lockdown; only the loopback-port redirect needed help,
+            // and that never reaches the network in this flow.
             decisionHandler(.allow, preferences)
         }
     }
