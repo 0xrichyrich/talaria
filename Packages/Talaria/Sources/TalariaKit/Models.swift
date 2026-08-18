@@ -29,6 +29,34 @@ public enum BotStatus: String, Codable, Sendable {
     case idle
 }
 
+/// Where a roster row was listed from, when that is not the live gateway.
+///
+/// Desktop's union roster keeps thin `remoteSource: true` rows in the SAME
+/// array as the live ones (plugin.js:2348-2356), each carrying its bare
+/// profile `name` beside a source-qualified key, plus the connection id and
+/// the device label. Talaria folds that key onto `Bot.id` — it has to, so two
+/// gateways' `default` rows can coexist in one `ForEach` (`botRosterKey`,
+/// plugin.js:2664-2670) — which is exactly why the bare name has to ride
+/// along here: `id` is `"<gatewayID>::<profile>"` and no @handle resolves to
+/// that.
+public struct BotSource: Codable, Sendable, Equatable {
+    /// The profile name as its own gateway knows it — desktop's `bot.name`,
+    /// the form `resolveRosterMentions` registers beside the handle (2445).
+    public var profile: String
+    /// Saved-gateway id of the source (`connectionId`).
+    public var gatewayID: String
+    /// Display label of the source (`connectionLabel`) — the device half of
+    /// the `@name-device` handle, the fourth `filterBots` match field (2976),
+    /// and the tail of the completion meta line (8034).
+    public var connectionLabel: String
+
+    public init(profile: String, gatewayID: String, connectionLabel: String) {
+        self.profile = profile
+        self.gatewayID = gatewayID
+        self.connectionLabel = connectionLabel
+    }
+}
+
 /// A bot is a Hermes profile (`~/.hermes/profiles/<name>/`) — isolated config,
 /// memory, skills, credentials and history. Talaria is a window onto the same
 /// roster as desktop Bot Mode; there is no separate store.
@@ -56,17 +84,24 @@ public struct Bot: Identifiable, Codable, Sendable, Equatable {
     /// Explicit @handle when the roster precomputed one (multi-gateway rosters
     /// disambiguate duplicates as `name-device`).
     public var handleOverride: String?
+    /// Set when this row was listed from a gateway other than the live one —
+    /// desktop's `remoteSource` flag and the three fields that travel with it
+    /// (plugin.js:2348-2356). Nil means the row is on the socket this app
+    /// holds, which is the only place a handoff can be delivered.
+    public var remoteSource: BotSource?
 
     public init(id: String, job: String, shape: AvatarShape, hue: AvatarHue,
                 status: BotStatus = .idle, task: String? = nil, minutesElapsed: Int = 0,
                 preview: String = "", previewTime: String = "", unread: Int = 0,
                 mentionsYou: Bool = false, description: String? = nil, pinnedModel: String? = nil,
-                title: String? = nil, handleOverride: String? = nil) {
+                title: String? = nil, handleOverride: String? = nil,
+                remoteSource: BotSource? = nil) {
         self.id = id; self.job = job; self.shape = shape; self.hue = hue
         self.status = status; self.task = task; self.minutesElapsed = minutesElapsed
         self.preview = preview; self.previewTime = previewTime; self.unread = unread
         self.mentionsYou = mentionsYou; self.description = description; self.pinnedModel = pinnedModel
         self.title = title; self.handleOverride = handleOverride
+        self.remoteSource = remoteSource
     }
 }
 
@@ -78,18 +113,53 @@ public struct Bot: Identifiable, Codable, Sendable, Equatable {
 // `botHandle()` (2406) so the same profile reads identically in both apps.
 public extension Bot {
 
-    /// The friendly name. A user title wins; the primary profile is literally
-    /// named "default", which "reads like nobody bothered", so it presents as
-    /// Hermes; everything else is de-slugged and title-cased.
+    /// The friendly name — `displayName()` (plugin.js:2935-2958), all FOUR of
+    /// its rules. A row on another gateway whose profile is `default` reads
+    /// its device label; a user title wins next; the primary profile is
+    /// literally named "default", which "reads like nobody bothered", so it
+    /// presents as Hermes; everything else is de-slugged and title-cased.
+    ///
+    /// RULE 1 IS THE ONE WITH A HISTORY (2941-2943). Without it the far
+    /// machine's primary agent and this one's are the same word on two rows —
+    /// `Hermes` above `Hermes` — and neither the roster, the search field nor
+    /// the @-completion meta line can tell them apart. Upstream keys it off
+    /// `remoteSource` and pointedly NOT off `sourceScoped`: an annotated
+    /// ACTIVE row carries `sourceScoped` too, and keying off that renamed
+    /// users' own main agent to an IP-derived label (community report,
+    /// Aug 17 2026). `remoteSource == nil` is the same guard, which is why the
+    /// live gateway's own `default` still reads Hermes here.
+    ///
+    /// THE LABEL WINS OVER A TITLE, because that is the order upstream wrote:
+    /// 2941 returns before the `meta.title` check at 2949. Upstream can never
+    /// reach the case where the two disagree — `botRosterMeta` returns null
+    /// for any remote row (2717-2719) and a thin row is pushed with no title
+    /// field at all (2349-2356) — but Talaria's foreign rows are richer, and
+    /// carry the far gateway's own `ui_meta` title. There is no upstream
+    /// behaviour to copy for a TITLED foreign `default`, so what upstream
+    /// actually wrote is kept rather than a precedence that exists nowhere in
+    /// the plugin.
+    ///
+    /// De-slugs `profileName`, not `id`: desktop reads `displayName(profile)`
+    /// off `profile.name` (plugin.js:8033), and a foreign row's `id` is the
+    /// source-qualified key, which would title-case to "Homelab::default".
     var displayTitle: String {
+        if let remoteSource,
+           profileName.trimmingCharacters(in: .whitespaces).lowercased() == "default" {
+            // `&& bot.connectionLabel` (2941): a source with no label has
+            // nothing to rename the row to, so it falls through to Hermes
+            // rather than to an empty title.
+            let label = remoteSource.connectionLabel.trimmingCharacters(in: .whitespaces)
+            if !label.isEmpty { return label }
+        }
         if let title, !title.trimmingCharacters(in: .whitespaces).isEmpty {
             return title.trimmingCharacters(in: .whitespaces)
         }
-        if id.trimmingCharacters(in: .whitespaces).lowercased() == "default" {
+        let name = profileName
+        if name.trimmingCharacters(in: .whitespaces).lowercased() == "default" {
             return "Hermes"
         }
-        let spaced = id.replacingOccurrences(of: "[-_]+", with: " ",
-                                             options: .regularExpression)
+        let spaced = name.replacingOccurrences(of: "[-_]+", with: " ",
+                                               options: .regularExpression)
             .trimmingCharacters(in: .whitespaces)
         return spaced.split(separator: " ")
             .map { $0.prefix(1).uppercased() + $0.dropFirst() }
@@ -98,14 +168,139 @@ public extension Bot {
 
     /// The @handle you tag the bot with — the profile name, except "default",
     /// which is tagged @hermes.
+    ///
+    /// The precomputed `@name-device` form WINS, and it wins over the
+    /// default→hermes rule on the next line (plugin.js:2407-2411). That is not
+    /// an accident of ordering: when `default` exists on two gateways the
+    /// handles are `@default-macbook` / `@default-homelab`, never
+    /// `@hermes-macbook`, and plain `@hermes` then addresses nobody. The
+    /// `handleOverride != id` guard is upstream's `bot.handle !== name` — it
+    /// is what lets a UNIQUE union row fall back to the bare-name path.
     var handle: String {
         if let handleOverride, handleOverride != id { return handleOverride }
-        return id.trimmingCharacters(in: .whitespaces).lowercased() == "default" ? "hermes" : id
+        return profileName.trimmingCharacters(in: .whitespaces).lowercased() == "default"
+            ? "hermes" : profileName
     }
 
+    /// The bare profile name this row answers to on its own gateway — the
+    /// second form `resolveRosterMentions` registers (plugin.js:2445), and the
+    /// string a gateway call will actually accept as a profile.
+    ///
+    /// Equal to `id` for every live row. It differs only for a foreign one,
+    /// whose `id` is the source-qualified `botRosterKey` (plugin.js:2669) and
+    /// therefore addresses nothing.
+    var profileName: String { remoteSource?.profile ?? id }
+
     /// Desktop only shows the handle alongside the title when they differ.
+    ///
+    /// Upstream computes the display half from a STRIPPED `{ name }` object
+    /// (plugin.js:2721-2723), which carries no `remoteSource` — so
+    /// `displayName`'s rule 1 cannot fire inside `showsHandle`, and a foreign
+    /// `default` reads its device label in the row while hiding its `@hermes`.
+    /// Talaria compares the REAL display name instead, and that is deliberate:
+    /// `TalariaVoice.displayName` collapses a row whose title and handle agree
+    /// down to "@handle" (Components/ScreenHeader.swift:318), so taking
+    /// upstream's stripped reading here would print `@hermes` INSTEAD of the
+    /// label — hiding, in two of the three themes, the very thing rule 1
+    /// exists to show. The extra handle a foreign row shows is one the row
+    /// really answers to.
     var showsHandle: Bool {
         displayTitle.lowercased() != handle.lowercased()
+    }
+}
+
+// MARK: - Roster search (desktop `filterBots`)
+
+// One needle, four fields, and no re-ranking. Ported from
+// plugin.js `filterBots()` (2963-2981) and kept here, in the module both the
+// roster and the palette import, so the phone cannot grow two different ideas
+// of what typing "hermes" finds.
+//
+// The asymmetry with @-mention completion is deliberate upstream and preserved
+// here: search is forgiving (substring, four fields, a leading '@' shrugged
+// off) because it is exploration; completion is strict (prefix, handle only,
+// capped at 8 — AppModelLive+A2A.swift) because it inserts a token that has to
+// resolve.
+public enum RosterSearch {
+
+    /// Desktop's needle (plugin.js:2964): trim, lowercase, then strip exactly
+    /// ONE leading '@'. `"@hermes"`, `"@Hermes"` and `" @hermes "` all narrow
+    /// to `hermes`; `"@@ops"` narrows to `"@ops"`, because only one '@' goes.
+    public static func needle(_ query: String) -> String {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmed.hasPrefix("@") ? String(trimmed.dropFirst()) : trimmed
+    }
+
+    /// The per-row predicate (plugin.js:2970-2980): case-insensitive
+    /// **substring** — not prefix — OR'd across four fields.
+    ///
+    ///  1. the display name, i.e. what the row actually reads (2971);
+    ///  2. the raw profile id (2972);
+    ///  3. the @handle (2973);
+    ///  4. the device label (2976), so "homelab" finds every bot living on the
+    ///     Homelab connection.
+    ///
+    /// The job/description and the preview line are deliberately NOT matched.
+    /// Desktop has only those four locals in the filter body, and preview
+    /// matching would make results move while you read them — the preview
+    /// changes every time the bot speaks.
+    ///
+    /// An empty needle matches everything, which is the identity that makes
+    /// `filterBots` a no-op rather than a blank list (2966-2968).
+    public static func matches(needle: String,
+                               displayName: String,
+                               profile: String,
+                               handle: String,
+                               connectionLabel: String? = nil) -> Bool {
+        guard !needle.isEmpty else { return true }
+        return displayName.lowercased().contains(needle)
+            || profile.lowercased().contains(needle)
+            || handle.lowercased().contains(needle)
+            || (connectionLabel?.lowercased().contains(needle) ?? false)
+    }
+}
+
+public extension Bot {
+
+    /// This row's side of `filterBots`. `connectionLabel` is the device the row
+    /// lives on: desktop annotates every union row with its source's label
+    /// (plugin.js:2337 for active rows, 2353 for thin remote ones) and searches
+    /// it, so the label is passed in rather than derived — a live profile does
+    /// not know which machine it was listed from.
+    ///
+    /// A row that DOES know wins: a foreign row carries its own
+    /// `remoteSource.connectionLabel`, and in a union array the caller has only
+    /// one label to hand down. Upstream reads the label off the row for the
+    /// same reason (2976 filters on `bot.connectionLabel`).
+    ///
+    /// The profile field is `profileName`, never `id` — matching the
+    /// source-qualified key would let a needle that fell inside a gateway id
+    /// silently match rows nothing on screen says it should.
+    func matchesRosterSearch(_ needle: String, connectionLabel: String? = nil) -> Bool {
+        RosterSearch.matches(needle: needle,
+                             displayName: displayTitle,
+                             profile: profileName,
+                             handle: handle,
+                             connectionLabel: remoteSource?.connectionLabel ?? connectionLabel)
+    }
+}
+
+public extension Array where Element == Bot {
+
+    /// `filterBots(roster, metaByName, query)` (plugin.js:2963).
+    ///
+    /// Narrowing ONLY. `Array.prototype.filter` preserves input order and the
+    /// upstream doc comment says it outright — "Keep the current activity
+    /// order — search narrows the roster, it never re-ranks it"
+    /// (plugin.js:2961-2962). So callers pass the roster in the order it is
+    /// already painted (`rankedBots`, pinned-then-recency), never a re-sorted
+    /// copy, and the surviving rows stay where the eye left them.
+    ///
+    /// An empty needle returns the roster untouched (plugin.js:2966-2968) —
+    /// which is also why a bare "@" lists everyone rather than nobody.
+    func filterBots(needle: String, connectionLabel: String? = nil) -> [Bot] {
+        guard !needle.isEmpty else { return self }
+        return filter { $0.matchesRosterSearch(needle, connectionLabel: connectionLabel) }
     }
 }
 

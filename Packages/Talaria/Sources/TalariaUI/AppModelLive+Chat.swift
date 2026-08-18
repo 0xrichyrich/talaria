@@ -264,14 +264,27 @@ extension AppModel {
             startDemoTurn(botID: botID, chat: chat)
         case .live:
             if chat.isRunning, !isOffline, !trimmed.isEmpty, let sessionID = chat.sessionID {
+                // Deliberately mention-free. Desktop has no steer path at all
+                // — its middleware only ever sees a fresh submit — so there is
+                // no upstream answer for "@ops" typed into a turn already
+                // running, and the conservative reading wins: steering is a
+                // correction aimed at THIS bot mid-thought, and firing a
+                // handoff out of one would send a half-sentence to a stranger.
+                // The handle rides along as literal text, as it does today.
                 steer(text: trimmed, botID: botID, sessionID: sessionID, chat: chat)
             } else {
                 ChatRuntime.shared.turnFloor[botID] = chat.messages.count + 1
                 chat.isRunning = !isOffline
+                // The composer middleware runs FIRST, on the raw draft, which
+                // is where desktop registers it (plugin.js:8214 reads
+                // `draft.text`). Order is not incidental: the attachment
+                // rewrite below prepends "@file:<path>" refs, and a mention
+                // scan downstream of it would read those as an @file handle.
+                let routed = routeMentions(in: trimmed, from: botID)
                 // Staged attachments only reach the agent if their "@file:"
                 // refs ride the prompt (images ride the session) — the
                 // attachments surface owns that rewrite.
-                let prompt = composedPrompt(trimmed, botID: botID)
+                let prompt = composedPrompt(routed, botID: botID)
                 // send() appends the user bubble and submits (or queues while
                 // offline) — going around it would duplicate the bubble.
                 send(text: prompt, to: botID)

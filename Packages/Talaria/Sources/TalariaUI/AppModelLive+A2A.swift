@@ -150,216 +150,54 @@ final class A2ARuntime {
     }
 }
 
-// MARK: - Mention grammar (plugin.js:2434-2493)
+// MARK: - Mention grammar (plugin.js:2434-2497)
 
-/// The @handle grammar, ported token for token. Strict on purpose: a false
-/// positive here sends a real message to a real agent, so an @ must start a
-/// word, the first character must be alphanumeric, dots are not part of a
-/// handle, and anything inside code never counts.
-public enum BotMention {
-    /// `[a-z0-9][a-z0-9_-]*` — the same namespace `NAME_RE` defines for a
-    /// profile name (plugin.js:78), which is why the profile name IS the
-    /// handle. Underscores are legal even though Talaria's creator does not
-    /// offer them: a bot named `code_review` on desktop must stay mentionable.
-    static func isHandleBody(_ c: Character) -> Bool {
-        c.isASCII && (c.isLetter || c.isNumber || c == "_" || c == "-")
-    }
-
-    /// Text with fenced and inline code replaced by a space, so a handle
-    /// inside a snippet never fires a handoff. Done FIRST, before any token
-    /// scan (plugin.js:2434).
-    public static func prose(_ text: String) -> String {
-        var out = replace(text, pattern: "```[\\s\\S]*?```", with: " ")
-        out = replace(out, pattern: "`[^`\\n]*`", with: " ")
-        return out
-    }
-
-    /// Every @token in prose order, lowercased. Duplicates are kept; the
-    /// resolver dedupes by bot, not by token.
-    public static func tokens(in text: String) -> [String] {
-        let prose = prose(text)
-        guard let regex = Self.tokenRegex else { return [] }
-        let ns = prose as NSString
-        return regex.matches(in: prose, range: NSRange(location: 0, length: ns.length))
-            .compactMap { match in
-                guard match.numberOfRanges > 2 else { return nil }
-                return ns.substring(with: match.range(at: 2)).lowercased()
-            }
-    }
-
-    /// The cheap gate the middleware runs on every keystroke's worth of draft
-    /// before doing any real work (plugin.js:8243).
-    public static func mentions(_ text: String) -> Bool {
-        guard let regex = Self.tokenRegex else { return false }
-        let ns = text as NSString
-        return regex.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) != nil
-    }
-
-    /// The @token the composer is mid-way through typing — the trailing one,
-    /// with the same word-boundary rule the resolver uses. `@` on its own
-    /// returns an empty token, which offers the whole roster.
-    ///
-    /// Anchored to the END of the string rather than to the caret: SwiftUI's
-    /// `TextField` publishes its text, never its selection.
-    public static func activeToken(in text: String) -> (range: Range<String.Index>, token: String)? {
-        guard let at = text.lastIndex(of: "@") else { return nil }
-        if at != text.startIndex {
-            guard text[text.index(before: at)].isWhitespace else { return nil }
-        }
-        let body = text[text.index(after: at)...]
-        guard body.allSatisfy(isHandleBody) else { return nil }
-        if let first = body.first, !(first.isLetter || first.isNumber) { return nil }
-        return (at..<text.endIndex, body.lowercased())
-    }
-
-    /// Replace the token being typed with a chosen handle, leaving one
-    /// trailing space so the next word is not swallowed into it.
-    public static func complete(_ text: String, range: Range<String.Index>,
-                                with handle: String) -> String {
-        text.replacingCharacters(in: range, with: "@" + handle + " ")
-    }
-
-    /// Append a handle as a new mention (the roster strip's tap).
-    public static func append(_ handle: String, to text: String) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "@\(handle) " : trimmed + " @\(handle) "
-    }
-
-    /// Drop every mention of `handle`, keeping the whitespace that introduced
-    /// it so the surrounding prose still reads.
-    public static func remove(_ handle: String, from text: String) -> String {
-        let escaped = NSRegularExpression.escapedPattern(for: handle)
-        let stripped = replace(text, pattern: "(^|\\s)@\(escaped)(?![a-z0-9_-])",
-                               with: "$1", options: [.caseInsensitive])
-        return replace(stripped, pattern: "[ \\t]{2,}", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    // plugin.js:2470 — the @ must start a word, so `user@host` and `a@b` are
-    // not mentions; no dots, unlike the group-room parser at 3104.
-    private static let tokenRegex = try? NSRegularExpression(
-        pattern: "(^|\\s)@([a-z0-9][a-z0-9_-]*)", options: [.caseInsensitive])
-
-    private static func replace(_ text: String, pattern: String, with template: String,
-                                options: NSRegularExpression.Options = []) -> String {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else {
-            return text
-        }
-        let ns = text as NSString
-        return regex.stringByReplacingMatches(in: text,
-                                              range: NSRange(location: 0, length: ns.length),
-                                              withTemplate: template)
-    }
-}
-
-/// What the roster made of the @tokens in a draft.
-public struct MentionResolution: Sendable, Equatable {
-    /// Resolved bots, first-mention order, deduped.
-    public var bots: [Bot] = []
-    /// Tokens whose bare form is shared by more than one bot. Upstream
-    /// resolves these to NOTHING rather than guessing, because guessing sends
-    /// a real message to the wrong machine (plugin.js:2455-2462).
-    public var ambiguous: [String] = []
-    /// Tokens no bot answers to. Silently skipped upstream; surfaced here,
-    /// quietly, because a phone gives no other feedback that a handle was
-    /// mistyped.
-    public var unknown: [String] = []
-
-    public var isEmpty: Bool { bots.isEmpty && ambiguous.isEmpty && unknown.isEmpty }
-}
-
-/// One row of the @-autocomplete popover.
-public struct MentionSuggestion: Identifiable, Sendable, Equatable {
-    public var id: String { botID }
-    public var botID: String
-    public var handle: String
-    /// `Bot · <display>` upstream (plugin.js:8035). On a phone the popover is
-    /// bots-only, so the slot carries the display name and the bot's job
-    /// instead — the parity note's suggested mobile reading.
-    public var meta: String
-    public var shape: AvatarShape
-    public var hue: AvatarHue
-}
+// `BotMention`, `MentionResolution`, `MentionResolver`, `MentionSuggestion`
+// and `MentionMiddleware` live in TalariaKit/BotMention.swift — they are pure,
+// three surfaces share them, and `talaria-verify` links TalariaKit alone, so
+// that is the only place their rules can be pinned by ProtocolChecks. What
+// stays here is everything that needs a socket: the roster the resolver and
+// the completion provider run against, the dispatch, and the reply watch.
 
 // MARK: - Resolving mentions against the roster
 
 public extension AppModel {
 
-    /// Resolve @handles in a draft against the live roster.
+    /// Resolve @handles in a draft against the union roster
+    /// (`MentionResolver`, plugin.js:2434-2497). The roster is the only thing
+    /// this side supplies; every rule is the shared one.
     ///
-    /// `speaker` is the bot doing the talking; it is excluded, because a bot
-    /// never @s itself (plugin.js:2414 `isActiveRosterBot` — the multi-source
-    /// half of that rule collapses to a name comparison while Talaria binds
-    /// one gateway at a time).
+    /// `unionRosterBots`, not `bots`: upstream resolves against the whole
+    /// merged roster (8252-8256 reads the cached `profiles`, which
+    /// `mergeMultiSourceRoster` has already unioned), and that is what makes
+    /// the duplicate-name rule fire. Two `default` rows from two gateways
+    /// poison the bare form between them, so `@default` refuses and only
+    /// `@default-macbook` / `@default-homelab` resolve.
     func resolveMentions(in text: String, speaking speaker: String?) -> MentionResolution {
-        guard BotMention.mentions(text) else { return MentionResolution() }
-
-        // The form map: every string that addresses this bot. A form claimed
-        // by two different bots is poisoned to nil and STAYS poisoned — a
-        // third bot cannot claim it — so the bare name of a duplicated profile
-        // stops resolving and the user must type the @name-device form.
-        var byForm: [String: Bot] = [:]
-        var poisoned: Set<String> = []
-        for bot in bots {
-            let name = bot.id.trimmingCharacters(in: .whitespaces)
-            guard !name.isEmpty, !isSpeaker(bot, speaker) else { continue }
-            var forms: Set<String> = [bot.handle.lowercased(), name.lowercased()]
-            if let override = bot.handleOverride, !override.isEmpty {
-                forms.insert(override.lowercased())
-            }
-            for form in forms where !form.isEmpty {
-                if poisoned.contains(form) { continue }
-                if let existing = byForm[form] {
-                    if existing.id != bot.id {
-                        byForm.removeValue(forKey: form)
-                        poisoned.insert(form)
-                    }
-                } else {
-                    byForm[form] = bot
-                }
-            }
-        }
-
-        var resolution = MentionResolution()
-        var seen: Set<String> = []
-        for token in BotMention.tokens(in: text) {
-            if poisoned.contains(token) {
-                if !resolution.ambiguous.contains(token) { resolution.ambiguous.append(token) }
-                continue
-            }
-            guard let bot = byForm[token] else {
-                // `hermes` addresses the primary profile, which is literally
-                // named `default` — `Bot.handle` already maps it, so reaching
-                // here means no such bot is on this gateway (plugin.js:2474
-                // keeps the same guard as a no-op for the same reason).
-                if !resolution.unknown.contains(token) { resolution.unknown.append(token) }
-                continue
-            }
-            guard seen.insert(bot.id).inserted else { continue }
-            resolution.bots.append(bot)
-        }
-        return resolution
+        MentionResolver.resolve(text, roster: unionRosterBots, speaking: speaker)
     }
 
-    /// The @-autocomplete provider (plugin.js:7998-8043): PREFIX match, on the
-    /// HANDLE only — never the title — because the token it inserts has to be
-    /// a legal handle. Deliberately asymmetric with roster search, which
-    /// matches four fields loosely. Capped at 8; never throws, never awaits.
+    /// The @-autocomplete provider (plugin.js:8006-8043). Every rule is the
+    /// shared one; the roster and the device it lives on are what this side
+    /// supplies.
+    ///
+    /// Same union roster as the resolver, for the same reason plus one more:
+    /// a `@name-device` handle that cannot be completed cannot be discovered,
+    /// and it is not a form anyone guesses. The meta line is what keeps the
+    /// two apart on screen — `Bot · Hermes · MacBook` above
+    /// `Bot · Homelab · Homelab`, the far row naming itself by the machine it
+    /// lives on in both slots (`displayName` rule 1, plugin.js:2941-2943).
+    ///
+    /// The label passed here is the live gateway's, because those rows all
+    /// came off it — desktop stamps `connectionLabel` onto each row it merges
+    /// from a source and reads it back out for the meta line (plugin.js:2337,
+    /// 8034); foreign rows carry their own and override it. It is nil until
+    /// the socket is bound to a saved Connection, and the meta line then reads
+    /// `Bot · <name>` with no tail, which is the no-label shape upstream
+    /// renders too.
     func mentionSuggestions(for query: String, speaking speaker: String?) -> [MentionSuggestion] {
-        let needle = query.lowercased()
-        var out: [MentionSuggestion] = []
-        for bot in bots {
-            guard !bot.id.trimmingCharacters(in: .whitespaces).isEmpty,
-                  !isSpeaker(bot, speaker) else { continue }
-            let handle = bot.handle
-            guard needle.isEmpty || handle.lowercased().hasPrefix(needle) else { continue }
-            let job = bot.job.trimmingCharacters(in: .whitespaces)
-            let meta = job.isEmpty ? bot.displayTitle : "\(bot.displayTitle) · \(job)"
-            out.append(MentionSuggestion(botID: bot.id, handle: handle, meta: meta,
-                                         shape: bot.shape, hue: bot.hue))
-            if out.count == 8 { break }
-        }
-        return out
+        unionRosterBots.mentionSuggestions(for: query, speaking: speaker,
+                                           connectionLabel: activeConnectionLabel)
     }
 
     /// The delivery note for an inbox row, when this app is the one that sent
@@ -554,11 +392,6 @@ private extension AppModel {
         startIdleInboxPoll()
     }
 
-    func isSpeaker(_ bot: Bot, _ speaker: String?) -> Bool {
-        guard let speaker, !speaker.isEmpty else { return false }
-        return bot.id.caseInsensitiveCompare(speaker) == .orderedSame
-    }
-
     func subscribeToA2AChanges(_ client: GatewayClient) {
         Task { @MainActor in
             let token = await client.addEventHandler { event in
@@ -589,6 +422,143 @@ private extension AppModel {
     }
 }
 
+// MARK: - The composer middleware (plugin.js:8206-8321)
+
+public extension AppModel {
+
+    /// Route the @handles in a chat draft, and return the text the submit
+    /// should actually carry.
+    ///
+    /// This is desktop's `mention-middleware` composer registration
+    /// (plugin.js:8206-8321) at Talaria's matching point in the pipeline:
+    /// `sendOrSteer` → here → `composedPrompt` → `send`. Upstream's handler
+    /// also carries the `/new` → `/compact` reroute (8218-8241), which shares
+    /// the handler and nothing else; Talaria's slash path never reaches this
+    /// function, because `ChatView.send()` hands a leading "/" to `runSlash`
+    /// first.
+    ///
+    /// Three things happen, in upstream's order:
+    ///
+    ///  1. the fast gate, on the RAW draft (8244) — an ordinary message does
+    ///     no work at all;
+    ///  2. resolution against the live roster (8252-8256 → 2434), which strips
+    ///     code FIRST, so an @handle inside a fence or `backticks` is literal
+    ///     text and never a handoff;
+    ///  3. delivery, and then the note (8319). The note is appended; the
+    ///     handles are never rewritten or stripped out of the message.
+    ///
+    /// An ambiguous handle is refused rather than guessed, and the refusal is
+    /// said out loud — see `refuse`.
+    ///
+    /// Runs only against a live, online gateway. Demo mode has nobody to hand
+    /// off to (`deliverHandoff` throws), and offline the draft is queued —
+    /// a note promising a delivery that never happened would be a lie the
+    /// agent acts on. Both return the draft untouched, which is upstream's own
+    /// rule for its failure path: a mention must never block a send
+    /// (8263-8265).
+    func routeMentions(in text: String, from botID: String) -> String {
+        guard mode == .live, !isOffline, BotMention.mentions(text) else { return text }
+        let routed = MentionMiddleware.route(text, roster: unionRosterBots, speaking: botID)
+        // Every dropped handle is named, whether or not something else in the
+        // draft routed — a silently swallowed @token is the one outcome a
+        // phone cannot afford. What changes with `delivered` is only the
+        // SUBJECT of the sentence: a draft mixing "@ops" (two machines) with
+        // "@ci" (one) is a handoff that happened, so "Nothing was handed off"
+        // would contradict the note this same function is about to append to
+        // the outgoing message — and send the user back to retype a mention
+        // @ci has already received.
+        let delivered = !routed.recipients.isEmpty
+        for collision in routed.refused { refuse(collision, in: botID, delivered: delivered) }
+        for bot in routed.unreachable { refuseElsewhere(bot, in: botID) }
+        guard delivered else { return text }
+
+        // Fire-and-forget, the way upstream fires `deliverRemoteRosterMentions`
+        // (`void`, 8295-8300): the user's own turn starts now, not after N
+        // canonical chats have been resolved over the radio. What the
+        // recipients receive is the RAW draft — handles and all, not
+        // fence-stripped and not the noted text (plugin.js:2599, 2635) — since
+        // the note is an instruction to the SENDING agent, not part of the
+        // message. Per-recipient failures are recorded on the delivery and in
+        // the activity ledger by `deliverHandoff`; only a total failure earns
+        // a line in this chat, because the note in the message above it has
+        // already told the agent the delivery happened.
+        let recipients = routed.recipients.map(\.id)
+        Task { @MainActor in
+            do {
+                try await deliverHandoff(from: botID, to: recipients, text: text)
+            } catch {
+                chat(for: botID).messages.append(ChatMessage(
+                    author: .system, time: Self.clock(),
+                    text: theme.copy.a2aFailedNote(theme.themeID, reason: Self.reason(error))))
+            }
+        }
+        return routed.text
+    }
+}
+
+private extension AppModel {
+
+    /// An ambiguous handle, said out loud in the chat it was typed in.
+    ///
+    /// Upstream refuses silently and totally: the form map holds `null`, the
+    /// token is skipped, and there is no notify anywhere in 2434-2497 or
+    /// 8206-8321 for it. Silence is affordable on desktop, where the roster
+    /// sits beside the composer and the two duplicate rows are visible. On a
+    /// phone the roster is a screen away, so the refusal costs one system
+    /// line naming the bots that collided — the same divergence, for the same
+    /// reason, as `MentionResolution.ambiguous` existing at all.
+    ///
+    /// The message itself still sends. Refusing the mention is not refusing
+    /// the turn (plugin.js:8285-8287 returns the draft untouched) — which is
+    /// also why the line is appended one hop later: the middleware runs BEFORE
+    /// `send()` has put the user's own bubble in the transcript, and a
+    /// refusal that appears above the message it is about reads as an answer
+    /// to the previous turn.
+    ///
+    /// `delivered` picks the SUBJECT, not whether to speak. A draft can carry
+    /// an ambiguous handle and a good one at once — `MentionMiddleware.route`
+    /// returns `refused` beside a non-empty `recipients` by design (2457-2466
+    /// poisons one form; the rest of the draft resolves normally) — and in
+    /// that case the whole-message wording ("Nothing was handed off") is
+    /// simply false: the note appended to the outgoing message names a
+    /// delivery that IS under way. The scoped wording says which handle was
+    /// dropped and leaves the rest alone.
+    func refuse(_ collision: MentionCollision, in botID: String, delivered: Bool) {
+        let copy = theme.copy
+        let line = delivered
+            ? copy.mentionRefusedOne(theme.themeID, token: collision.token,
+                                     options: collision.labels)
+            : copy.mentionRefused(theme.themeID, token: collision.token,
+                                  options: collision.labels)
+        Task { @MainActor in
+            chat(for: botID).messages.append(
+                ChatMessage(author: .system, time: Self.clock(), text: line))
+        }
+    }
+
+    /// A handle that resolved to a bot on another gateway.
+    ///
+    /// Desktop takes this branch and DELIVERS (plugin.js:8295-8300 fires
+    /// `deliverRemoteRosterMentions`, which routes each recipient through
+    /// `host.requestProfile` on its own connection). Talaria holds one socket,
+    /// so it cannot, and the honest answer is the same shape as the ambiguity
+    /// refusal: say it in the chat it was typed in, name the machine, and let
+    /// the message itself send unchanged. The alternative — submitting a
+    /// recipient whose id is `homelab::default` to the live gateway — is the
+    /// exact wrong-machine delivery the whole rule exists to prevent.
+    ///
+    /// Desktop's own remote note names the device in parentheses (8313); this
+    /// borrows that, because "switch to Homelab" is the only action there is.
+    func refuseElsewhere(_ bot: Bot, in botID: String) {
+        let label = bot.remoteSource?.connectionLabel ?? ""
+        let line = theme.copy.mentionElsewhere(theme.themeID, handle: bot.handle, label: label)
+        Task { @MainActor in
+            chat(for: botID).messages.append(
+                ChatMessage(author: .system, time: Self.clock(), text: line))
+        }
+    }
+}
+
 // MARK: - Composing a handoff
 
 public extension AppModel {
@@ -608,8 +578,16 @@ public extension AppModel {
                         text: String) async throws -> Int {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return 0 }
+        // Belt and braces on the one-socket rule. Every caller already splits
+        // recipients on `remoteSource` before getting here, but a foreign row's
+        // id is the source-qualified `botRosterKey` (plugin.js:2669) — passing
+        // one through would ask this gateway to open a profile literally named
+        // "homelab::default", and a gateway that happened to have such a
+        // profile would receive a message meant for another machine.
+        let elsewhere = Set(foreignRosterEntries.map(\.id))
         var targets: [String] = []
-        for id in recipients where !id.isEmpty && id != sender && !targets.contains(id) {
+        for id in recipients
+        where !id.isEmpty && id != sender && !elsewhere.contains(id) && !targets.contains(id) {
             targets.append(id)
         }
         guard !targets.isEmpty else { return 0 }
@@ -623,6 +601,15 @@ public extension AppModel {
         // raw profile name writes "Message from 🤖 default (@default)" into
         // another bot's permanent transcript for the profile that presents as
         // Hermes/@hermes.
+        //
+        // `identity(_:)` reads the UN-annotated roster on purpose, so the
+        // handle here is the bare/alias form even when the sender's name is
+        // duplicated across gateways. That is upstream's own choice, not an
+        // oversight: it builds the sender with `botHandle(live.name)` —  one
+        // argument, no row, so the `@name-device` branch at 2407 cannot fire
+        // (plugin.js:8298). The prefix says who spoke, and the recipient reads
+        // it back as a name; the device suffix belongs to addressing, which is
+        // the other direction.
         let identity = identity(sender)
         let attributed = "Message from 🤖 \(identity.displayTitle) (@\(identity.handle)): \(body)"
 
@@ -922,11 +909,67 @@ extension CopyPack {
         }
     }
 
+    /// The same refusal, said in a bot chat rather than under a composer, and
+    /// naming the bots that collided — the composer strip can show two rows,
+    /// a transcript has to say it in a sentence. Falls back to the composer
+    /// wording if the collision arrived without its cause.
+    ///
+    /// The subject is the WHOLE message ("nothing was handed off"), so this is
+    /// the line for a draft where nothing routed at all. When something did,
+    /// use `mentionRefusedOne`.
+    func mentionRefused(_ t: ThemeID, token: String, options: [String]) -> String {
+        guard !options.isEmpty else { return mentionAmbiguous(t, token: token) }
+        let list = options.joined(separator: " or ")
+        return switch t {
+        case .soft: "Nothing was handed off — @\(token) fits \(list). Name the one you mean."
+        case .control: "NO HANDOFF — @\(token) FITS \(list.uppercased()). NAME ONE."
+        case .ink: "@\(token) answers for \(list) alike, so nothing was carried. Name the one you mean."
+        }
+    }
+
+    /// One ambiguous handle in a draft that DID hand off to somebody else.
+    ///
+    /// Scoped to the token, because the message above it carries a note
+    /// promising a delivery to the handles that resolved: a line claiming
+    /// nothing was sent would contradict the transcript one bubble up, and
+    /// would send the user back to retype a mention the other bot has already
+    /// received. Same instruction, narrower subject.
+    func mentionRefusedOne(_ t: ThemeID, token: String, options: [String]) -> String {
+        guard !options.isEmpty else { return mentionAmbiguous(t, token: token) }
+        let list = options.joined(separator: " or ")
+        return switch t {
+        case .soft: "@\(token) was left out — it fits \(list). Name the one you mean."
+        case .control: "@\(token) DROPPED — FITS \(list.uppercased()). NAME ONE."
+        case .ink: "@\(token) answers for \(list) alike, so that one alone was not carried. "
+            + "Name the one you mean."
+        }
+    }
+
     func mentionUnknown(_ t: ThemeID, token: String) -> String {
         switch t {
         case .soft: "No bot answers to @\(token)."
         case .control: "@\(token) — NO SUCH HANDLE."
         case .ink: "None answers to @\(token)."
+        }
+    }
+
+    /// Addressed, but on another gateway. Desktop delivers this one over
+    /// Connections (plugin.js:8312-8317); a phone holds one socket, so it says
+    /// where the bot is instead — naming the device the way upstream's own
+    /// remote note does (8313, `@handle (label)`).
+    func mentionElsewhere(_ t: ThemeID, handle: String, label: String) -> String {
+        let where_ = label.trimmingCharacters(in: .whitespaces)
+        guard !where_.isEmpty else {
+            return switch t {
+            case .soft: "@\(handle) is on another gateway — switch to it to send this."
+            case .control: "@\(handle) — OTHER GATEWAY. SWITCH TO SEND."
+            case .ink: "@\(handle) keeps another house; go there to be heard."
+            }
+        }
+        return switch t {
+        case .soft: "@\(handle) lives on \(where_) — switch to that gateway to send this."
+        case .control: "@\(handle) — ON \(where_.uppercased()). SWITCH GATEWAY TO SEND."
+        case .ink: "@\(handle) keeps house on \(where_); go there to be heard."
         }
     }
 

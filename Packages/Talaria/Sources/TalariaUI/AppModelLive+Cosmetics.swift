@@ -387,9 +387,15 @@ extension AppModel {
     /// The roster, in desktop's order (plugin.js:7657-7666): pinned bots float
     /// to the top **as a group**, and inside each group recency rules. Presence
     /// never reorders — a bot waking up does not move the list under a thumb.
+    ///
+    /// Sorts `liveRosterBots` rather than `bots`, so a row whose profile name
+    /// also exists on a saved gateway paints the `@name-device` handle it is
+    /// actually addressable by (plugin.js:2334 annotates the active-source row
+    /// with exactly that). Same rows, same ids, same order — the annotation
+    /// only rewrites `handleOverride`.
     public var rankedBots: [Bot] {
         let signals = RosterSignals.shared
-        return bots.enumerated().sorted { left, right in
+        return liveRosterBots.enumerated().sorted { left, right in
             let lp = signals.isPinned(left.element.id)
             let rp = signals.isPinned(right.element.id)
             if lp != rp { return lp }

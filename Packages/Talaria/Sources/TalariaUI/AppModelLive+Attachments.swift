@@ -230,6 +230,11 @@ extension AppModel {
     /// staged file only exists for the agent if its "@file:" ref is in the
     /// prompt — and an image sent with no words gets desktop's implicit
     /// question rather than an empty turn.
+    ///
+    /// The @mention middleware has already run on `text` by the time it gets
+    /// here (`routeMentions`, AppModelLive+Chat.swift) — it has to, because
+    /// the refs prepended below would otherwise read as a mention of a bot
+    /// called `file`.
     public func composedPrompt(_ text: String, botID: String) -> String {
         let attachments = chats[botID]?.attachments ?? []
         guard !attachments.isEmpty else { return text }

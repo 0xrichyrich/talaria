@@ -730,6 +730,13 @@ public struct ChatView: View {
             if turnRunning, model.mode == .live {
                 steerHint
             }
+            // The @-completion rows, above the field because the keyboard owns
+            // everything below it. Kept out of the stack entirely when there
+            // is nothing to offer, so no gap opens over the composer.
+            let handles = mentionSuggestions
+            if !handles.isEmpty {
+                MentionSuggestionStrip(theme: theme, items: handles, pick: complete(with:))
+            }
             // Bottom-aligned: the field grows upward as it fills, and the
             // controls stay level with its last line rather than floating in
             // the middle of a tall box.
@@ -764,6 +771,9 @@ public struct ChatView: View {
         .padding(.horizontal, 14)
         .padding(.top, 8)
         .padding(.bottom, 10)
+        // The strip appears and disappears per keystroke; without a transition
+        // the field jumps under the thumb mid-word.
+        .animation(.easeOut(duration: 0.18), value: mentionSuggestions.map(\.botID))
         // "/" as the first character opens the command palette; Cancel just
         // dismisses it and leaves the draft (and the keyboard) where they were.
         .onChange(of: draft) { _, new in
@@ -780,6 +790,46 @@ public struct ChatView: View {
                 showCommands = false
             }
         }
+    }
+
+    // MARK: - @-mention completion (plugin.js:7996-8043)
+
+    /// The handles worth offering for the token being typed.
+    ///
+    /// Desktop registers its provider into EVERY composer (plugin.js:7996-7997
+    /// — "active in ANY composer", issue #88060), and this is the composer
+    /// that matters on a phone: the handoff sheet is a deliberate act, a chat
+    /// message is where an @handle actually gets typed. Everything about the
+    /// rows is the shared provider (`bots.mentionSuggestions`), which is
+    /// synchronous by contract because it answers per keystroke.
+    ///
+    /// The guards are Talaria's, and each names a path where picking a handle
+    /// would insert a token that does NOT route:
+    ///
+    ///  * demo mode and offline — `routeMentions` bails on both
+    ///    (AppModelLive+A2A.swift:444) and an offline draft is queued as
+    ///    written, so the mention would reach the model as literal text;
+    ///  * mid-turn — a send while a turn runs STEERS, and steering is
+    ///    deliberately mention-free (`sendOrSteer`, AppModelLive+Chat.swift:253);
+    ///  * a slash draft — `send()` hands anything starting with "/" to
+    ///    `runSlash`, which never reaches the middleware. This also keeps the
+    ///    strip out of the lone-"/" palette gesture's way.
+    ///
+    /// Upstream has no equivalent because it has no steer path, no offline
+    /// queue and no demo world; the honest reading is that a completion is an
+    /// offer to route, so it is only made where routing happens.
+    private var mentionSuggestions: [MentionSuggestion] {
+        guard model.mode == .live, !model.isOffline, !turnRunning,
+              !draft.hasPrefix("/"),
+              let active = BotMention.activeToken(in: draft) else { return [] }
+        return model.mentionSuggestions(for: active.token, speaking: botID)
+    }
+
+    /// Swap the half-typed token for the chosen handle and keep the keyboard.
+    private func complete(with item: MentionSuggestion) {
+        guard let active = BotMention.activeToken(in: draft) else { return }
+        draft = BotMention.complete(draft, range: active.range, with: item.handle)
+        composerFocused = true
     }
 
     /// Paperclip → the attachments agent's picker, badged with what is staged.

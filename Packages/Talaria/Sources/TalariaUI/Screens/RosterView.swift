@@ -37,6 +37,11 @@ public struct RosterView: View {
     /// roster is where desktop puts Edit Profile too (plugin.js:4051-4111);
     /// before this the only way in was to open the bot first.
     @State private var editing: Bot?
+    /// The in-place roster filter (plugin.js:7831-7842). Deliberately NOT the
+    /// palette's query: the palette is a cross-surface jump (bots, sessions,
+    /// artifacts, actions) and replaces the screen, where this narrows the list
+    /// under the thumb without leaving it. Desktop has only the second one.
+    @State private var search = ""
     @Environment(\.talariaReducedMotion) private var reducedMotion
 
     public init(model: AppModel,
@@ -95,6 +100,43 @@ public struct RosterView: View {
         }
     }
 
+    // MARK: - Search (desktop `filterBots`)
+
+    /// Desktop's needle: trimmed, lowercased, one leading '@' stripped
+    /// (plugin.js:2964, ported in `RosterSearch`). Empty means "not
+    /// searching", which is why a bare "@" lists the whole roster instead of
+    /// nothing — upstream's `if (!needle) return roster`.
+    private var needle: String { RosterSearch.needle(search) }
+
+    private var isSearching: Bool { !needle.isEmpty }
+
+    /// The rows the list draws: `rankedBots` narrowed, never re-sorted. The
+    /// filter is applied to the array in the order it is already painted, so
+    /// pinned-then-recency survives typing (plugin.js:2961-2962, 7657-7668).
+    private var visibleBots: [Bot] {
+        model.rankedBots.filterBots(needle: needle,
+                                    connectionLabel: model.activeConnectionLabel)
+    }
+
+    private var visibleForeign: [ForeignRosterEntry] {
+        model.foreignRosterEntries(matching: needle)
+    }
+
+    /// Desktop renders the field only when there is a roster to narrow
+    /// (plugin.js:7831 `roster.length ? … : null`) — an empty roster shows the
+    /// create-first empty state instead of a dead search box. Its `roster` is
+    /// the union, so a phone whose only rows live on other gateways still gets
+    /// a field.
+    private var showsSearchField: Bool {
+        !model.bots.isEmpty || !model.foreignRosterEntries.isEmpty
+    }
+
+    /// Both halves of the union came back empty for a live query — desktop's
+    /// `No bots match “…”` (plugin.js:7874-7885).
+    private var showsNoMatches: Bool {
+        isSearching && visibleBots.isEmpty && visibleForeign.isEmpty
+    }
+
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScreenHeader(theme: theme, kicker: copy.kickerHome, title: copy.titleHome) {
@@ -108,15 +150,24 @@ public struct RosterView: View {
             // Who is working right now — above the list, never inside it, and
             // zero height when nobody is (Components/ActiveNowStrip.swift,
             // plugin.js:6888-6937). A separate view by construction, so
-            // presence can never reorder the rows beneath it.
+            // presence can never reorder the rows beneath it — and, for the
+            // same reason, it sits ABOVE the search field and reads the
+            // unfiltered roster: desktop feeds the strip `roster` (7777) and
+            // only the list below it `query` (7831), because "who is working"
+            // is not a question about names.
             ActiveNowStrip(model: model)
+            if showsSearchField {
+                searchField
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+            }
             ScrollView {
                 LazyVStack(spacing: listGap) {
-                    if model.bots.isEmpty {
+                    if model.bots.isEmpty && !isSearching {
                         emptyState
                             .padding(.top, 60)
                     } else {
-                        let ranked = model.rankedBots
+                        let ranked = visibleBots
                         ForEach(Array(ranked.enumerated()), id: \.element.id) { index, bot in
                             row(for: bot, index: index)
                                 // Keyed by id, never by index: the entrance is
@@ -132,8 +183,16 @@ public struct RosterView: View {
                     // other gateways are the only roster there is, and an
                     // "add a gateway" empty state above rows this phone
                     // already knows about would be a lie.
-                    MultiGatewayRosterSection(model: model)
-                    if !model.bots.isEmpty {
+                    MultiGatewayRosterSection(model: model, needle: needle)
+                    if showsNoMatches {
+                        noMatchesRow
+                            .padding(.top, 40)
+                    }
+                    // The footer is a census of the roster ("6 bots across 2
+                    // gateways"), so it stands down while a query is narrowing
+                    // the list — a count that does not match what is on screen
+                    // reads as a bug, and desktop has no footer to consult.
+                    if !model.bots.isEmpty && !isSearching {
                         footer
                             .padding(.top, 10)
                     }
@@ -191,6 +250,13 @@ public struct RosterView: View {
         // conversation you are having with it.
         .onChange(of: model.openBotID) {
             if let botID = model.openBotID { model.noteChatOpened(botID) }
+        }
+        // The field only exists while there is a roster to narrow
+        // (plugin.js:7831), so a roster that empties under a live query — the
+        // gateway dropped, or the last bot was deleted — must not leave the
+        // query filtering from behind a field that is no longer on screen.
+        .onChange(of: showsSearchField) {
+            if !showsSearchField { search = "" }
         }
     }
 
@@ -292,6 +358,72 @@ public struct RosterView: View {
         case .control: theme.accent.opacity(0.35)
         case .ink: .clear
         }
+    }
+
+    // MARK: - Search field
+
+    /// Desktop's roster `SearchField` (plugin.js:7831-7842): full width, one
+    /// placeholder, aria-label 'Search bots'. It narrows the list in place —
+    /// the magnifier in the header still opens the palette, which is a
+    /// different verb (jump to anything, anywhere).
+    private var searchField: some View {
+        HStack(spacing: 9) {
+            searchGlyph
+                .opacity(0.5)
+            TextField(CopyPack.rosterSearchPlaceholder(theme.id), text: $search)
+                .font(searchFont)
+                .foregroundStyle(theme.ink)
+                .tint(theme.accent)
+                .autocorrectionDisabled()
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                .submitLabel(.done)
+                #endif
+                .textFieldStyle(.plain)
+                .accessibilityLabel(Text(CopyPack.rosterSearchLabel(theme.id)))
+            if !search.isEmpty {
+                Button { search = "" } label: {
+                    Text(verbatim: "✕")
+                        .font(.system(size: 12))
+                        .foregroundStyle(theme.faint)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text(CopyPack.rosterSearchClear(theme.id)))
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 38)
+        .background(theme.panel)
+        .clipShape(searchShape)
+        .overlay(searchShape.strokeBorder(
+            theme.id == .ink ? theme.lineStrong : theme.line, lineWidth: 1))
+    }
+
+    private var searchShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: min(theme.inputRadius, 19), style: .continuous)
+    }
+
+    private var searchFont: Font {
+        switch theme.id {
+        case .soft: theme.body(13.5)
+        case .control: theme.mono(11.5)
+        case .ink: theme.body(15)
+        }
+    }
+
+    /// Desktop's `No bots match “<query>”` (plugin.js:7874-7885), which is a
+    /// `role='status' aria-live='polite'` region — the SwiftUI equivalent is a
+    /// plain label the focus lands on when the rows vanish.
+    private var noMatchesRow: some View {
+        Text(CopyPack.rosterSearchNoMatch(search.trimmingCharacters(in: .whitespaces), theme.id))
+            .font(theme.id == .control ? theme.mono(11) : theme.body(theme.id == .ink ? 15 : 13))
+            .italic(theme.id == .ink)
+            .multilineTextAlignment(.center)
+            .foregroundStyle(theme.sub)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 20)
     }
 
     // MARK: - Offline banner
@@ -731,6 +863,45 @@ extension CopyPack {
         case .soft: "new"
         case .control: "NEW"
         case .ink: "unwritten"
+        }
+    }
+
+    /// Desktop's placeholder is 'Search bots…' with the single ellipsis
+    /// character, not three dots (plugin.js:7838).
+    static func rosterSearchPlaceholder(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Search bots…"
+        case .control: "FILTER ROSTER…"
+        case .ink: "Seek a name…"
+        }
+    }
+
+    /// Screen-reader name for the field — desktop's aria-label is
+    /// 'Search bots' (plugin.js:7835).
+    static func rosterSearchLabel(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Search bots"
+        case .control: "FILTER ROSTER"
+        case .ink: "seek a name"
+        }
+    }
+
+    static func rosterSearchClear(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Clear search"
+        case .control: "CLEAR FILTER"
+        case .ink: "let the roll stand whole"
+        }
+    }
+
+    /// Desktop: `No bots match “<query>”` (plugin.js:7884). The query is shown
+    /// as typed — the '@' strip is a matching rule, not a correction, so
+    /// quoting the stripped needle back would look like a typo the app made.
+    static func rosterSearchNoMatch(_ query: String, _ t: ThemeID) -> String {
+        switch t {
+        case .soft: "No bots match “\(query)”"
+        case .control: "NO MATCH: \(query.uppercased())"
+        case .ink: "None on the roll answer to “\(query)”"
         }
     }
 }

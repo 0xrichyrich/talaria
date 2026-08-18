@@ -23,6 +23,9 @@ public enum ProtocolChecks {
         try demoDataIntegrity()
         try liveSessionParsing()
         try preferredSessionParsing()
+        try rosterSearchSemantics()
+        try mentionRouting()
+        try agentHandleRules()
     }
 
     static func eventEnvelopeDecoding() throws {
