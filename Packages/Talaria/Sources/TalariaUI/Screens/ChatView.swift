@@ -730,7 +730,10 @@ public struct ChatView: View {
             if turnRunning, model.mode == .live {
                 steerHint
             }
-            HStack(spacing: 8) {
+            // Bottom-aligned: the field grows upward as it fills, and the
+            // controls stay level with its last line rather than floating in
+            // the middle of a tall box.
+            HStack(alignment: .bottom, spacing: 8) {
                 HeaderIconButton(theme: theme, size: 40, action: onVoice) {
                     HStack(spacing: 3) {
                         micBar(height: 14, color: theme.accent)
@@ -738,17 +741,23 @@ public struct ChatView: View {
                     }
                 }
                 attachButton
+                // Grows with the message instead of scrolling a one-line
+                // window: a long prompt is unreadable while you are still
+                // writing it. Caps at six lines, then scrolls internally so
+                // the transcript never loses the screen.
                 TextField("", text: $draft,
-                          prompt: Text(copy.composer(bot)).foregroundStyle(theme.faint))
+                          prompt: Text(copy.composer(bot)).foregroundStyle(theme.faint),
+                          axis: .vertical)
                     .textFieldStyle(.plain)
+                    .lineLimit(1...6)
                     .font(composerFont)
                     .foregroundStyle(theme.ink)
                     .tint(theme.accent)
                     .focused($composerFocused)
-                    .frame(height: 42)
                     .padding(.horizontal, 15)
+                    .padding(.vertical, 11)
+                    .frame(minHeight: 42)
                     .background(composerFieldChrome)
-                    .onSubmit { send() }
                 sendOrStopButton
             }
         }
@@ -879,16 +888,23 @@ public struct ChatView: View {
     /// The single highest-value control on this screen: while a turn runs the
     /// send button becomes stop (session.interrupt), so a runaway bot can be
     /// halted from the phone.
+    /// Stop is what the button means only when there is nothing to send.
+    /// With a draft in hand it is a send button even mid-turn — that send
+    /// steers or queues (the hint above the field says which), which is what
+    /// you wanted when you typed. Reaching for the return key to get past a
+    /// permanent stop button was the old behaviour.
+    private var showsStop: Bool { turnRunning && !canSend }
+
     private var sendOrStopButton: some View {
         Button {
-            if turnRunning {
+            if showsStop {
                 model.stopTurn(botID: botID)
             } else {
                 send()
             }
         } label: {
             Group {
-                if turnRunning {
+                if showsStop {
                     RoundedRectangle(cornerRadius: theme.id == .soft ? 3
                                         : theme.id == .control ? 1 : 2)
                         .fill(stopGlyphColor)
@@ -902,18 +918,19 @@ public struct ChatView: View {
             .frame(width: 40, height: 40)
             .background(sendBackground, in: sendShape)
             .overlay {
-                if turnRunning, theme.id != .soft {
+                if showsStop, theme.id != .soft {
                     sendShape.strokeBorder(theme.danger.opacity(0.55), lineWidth: 1)
                 }
             }
             .contentShape(sendShape)
         }
         .buttonStyle(.plain)
-        .shadow(color: turnRunning && theme.glowRadius > 0 ? theme.danger.opacity(0.45) : .clear,
+        .shadow(color: showsStop && theme.glowRadius > 0 ? theme.danger.opacity(0.45) : .clear,
                 radius: 8)
         .animation(.easeOut(duration: 0.2), value: canSend)
         .animation(.easeOut(duration: 0.2), value: turnRunning)
-        .accessibilityLabel(turnRunning ? copy.stopLabel(theme.id) : copy.sendLabel(theme.id))
+        .animation(.easeOut(duration: 0.2), value: showsStop)
+        .accessibilityLabel(showsStop ? copy.stopLabel(theme.id) : copy.sendLabel(theme.id))
     }
 
     private func send() {
