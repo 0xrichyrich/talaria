@@ -185,13 +185,18 @@ for automation, share sheet for export) it is named in
 - **5 last** — additive, and it deserves the explainer GUI done properly
   rather than rushed.
 
-## Open questions for review
+## Decisions (settled 2026-08-18)
 
-1. **Settings scope** — is the Phase 2 list right, or do you want raw
-   config/env editing on mobile too?
-2. **Phase 3 vs 4 order** — if you drive bot-to-bot handoffs more than cron,
-   these should swap.
-3. **Cosmetics round-trip** — should phone edits write `ui_meta["hermes-bots"]`
-   (desktop sees them) or stay phone-local?
-4. **Session verbs** — is pin/archive worth building on mobile, or is the
-   canonical forever-chat enough that session management is mostly desktop?
+1. **Settings scope — as proposed.** No raw config/env editing on device: you
+   can just *ask a bot* to make config changes, which is a better mobile
+   affordance than a text editor for YAML. Mobile settings stay the controls a
+   phone-first operator reaches for; everything else points at desktop.
+2. **Phase 3 before Phase 4 — unchanged.**
+3. **Cosmetics round-trip — yes, write back.** Phone edits write
+   `ui_meta["hermes-bots"]` so desktop sees them, matching desktop's own
+   merge semantics (server block authoritative, local-only fields preserved).
+   This moves into Phase 0 alongside reading the canonical-chat pin, since
+   both touch the same block.
+4. **Session verbs — mostly a desktop concern.** The canonical forever-chat is
+   the mobile model. Pin/archive/delete land as a tucked-away *power-user*
+   surface (long-press in the sessions sheet), never as primary navigation.
