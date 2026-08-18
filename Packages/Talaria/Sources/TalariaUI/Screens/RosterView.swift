@@ -302,17 +302,29 @@ public struct RosterView: View {
     }
 
     private func nameText(for bot: Bot) -> some View {
-        let name = TalariaVoice.displayName(bot.id, theme.id)
-        return Group {
-            switch theme.id {
-            case .soft: Text(name).font(theme.body(16, weight: .bold))
-            case .control: Text(name).font(theme.body(15, weight: .bold))
-            case .ink: Text(name).font(theme.body(19, weight: .bold).smallCaps()).tracking(0.5)
+        let name = TalariaVoice.displayName(for: bot, theme.id)
+        return HStack(spacing: 5) {
+            Group {
+                switch theme.id {
+                case .soft: Text(name).font(theme.body(16, weight: .bold))
+                case .control: Text(name).font(theme.body(15, weight: .bold))
+                case .ink: Text(name).font(theme.body(19, weight: .bold).smallCaps()).tracking(0.5)
+                }
+            }
+            .foregroundStyle(theme.ink)
+            .lineLimit(1)
+            .layoutPriority(1)
+
+            // Desktop shows the @handle beside a titled bot so you always know
+            // what to tag it (plugin.js `showsHandle`).
+            if bot.showsHandle {
+                Text(TalariaVoice.handle(for: bot))
+                    .font(theme.mono(theme.id == .ink ? 8.5 : 10))
+                    .foregroundStyle(theme.faint)
+                    .lineLimit(1)
+                    .layoutPriority(0.5)
             }
         }
-        .foregroundStyle(theme.ink)
-        .lineLimit(1)
-        .layoutPriority(1)
     }
 
     private func jobText(for bot: Bot) -> some View {

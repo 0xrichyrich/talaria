@@ -302,9 +302,26 @@ public enum TalariaVoice {
         return String(first).uppercased() + id.dropFirst()
     }
 
-    /// "@researcher" everywhere; "Researcher" in ink (rendered small-caps).
+    /// Fallback for call sites that only know a profile id (approval cards,
+    /// feed rows). Prefer the Bot overload — it carries the desktop title.
     public static func displayName(_ id: String, _ theme: ThemeID) -> String {
-        theme == .ink ? capitalized(id) : "@" + id
+        displayName(for: Bot(id: id, job: "", shape: .circle, hue: .teal), theme)
+    }
+
+    /// Desktop Bot Mode's title (plugin.js `displayName`): a user-set title,
+    /// "Hermes" for the primary "default" profile, else the de-slugged
+    /// profile name. Ink renders it small-caps, so it stays unprefixed there;
+    /// the other packs keep the prototype's @-prefix only when the bot has no
+    /// distinct title, so a titled bot reads "skynet" rather than "@skynet".
+    public static func displayName(for bot: Bot, _ theme: ThemeID) -> String {
+        bot.showsHandle || theme == .ink ? bot.displayTitle : "@" + bot.handle
+    }
+
+    /// The @handle you tag a bot with (plugin.js `botHandle`): the profile
+    /// name, except "default" → @hermes. Shown beside the title only when the
+    /// two differ, matching desktop's `showsHandle`.
+    public static func handle(for bot: Bot) -> String {
+        "@" + bot.handle
     }
 
     /// "RESEARCHER" — message meta lines and the voice screen header.

@@ -49,15 +49,63 @@ public struct Bot: Identifiable, Codable, Sendable, Equatable {
     public var description: String?
     /// Pinned model override for this profile (nil = gateway default).
     public var pinnedModel: String?
+    /// User-set display title from desktop Bot Mode
+    /// (`ui_meta["hermes-bots"].title`). Shared with desktop so a bot renamed
+    /// there reads the same here.
+    public var title: String?
+    /// Explicit @handle when the roster precomputed one (multi-gateway rosters
+    /// disambiguate duplicates as `name-device`).
+    public var handleOverride: String?
 
     public init(id: String, job: String, shape: AvatarShape, hue: AvatarHue,
                 status: BotStatus = .idle, task: String? = nil, minutesElapsed: Int = 0,
                 preview: String = "", previewTime: String = "", unread: Int = 0,
-                mentionsYou: Bool = false, description: String? = nil, pinnedModel: String? = nil) {
+                mentionsYou: Bool = false, description: String? = nil, pinnedModel: String? = nil,
+                title: String? = nil, handleOverride: String? = nil) {
         self.id = id; self.job = job; self.shape = shape; self.hue = hue
         self.status = status; self.task = task; self.minutesElapsed = minutesElapsed
         self.preview = preview; self.previewTime = previewTime; self.unread = unread
         self.mentionsYou = mentionsYou; self.description = description; self.pinnedModel = pinnedModel
+        self.title = title; self.handleOverride = handleOverride
+    }
+}
+
+// MARK: - Identity (desktop Bot Mode parity)
+
+// Desktop renders two stable identities per roster row: a customizable
+// display name and the profile's @handle. Ported verbatim from
+// apps/desktop/src/plugins/hermes-bots/plugin.js `displayName()` (2935) and
+// `botHandle()` (2406) so the same profile reads identically in both apps.
+public extension Bot {
+
+    /// The friendly name. A user title wins; the primary profile is literally
+    /// named "default", which "reads like nobody bothered", so it presents as
+    /// Hermes; everything else is de-slugged and title-cased.
+    var displayTitle: String {
+        if let title, !title.trimmingCharacters(in: .whitespaces).isEmpty {
+            return title.trimmingCharacters(in: .whitespaces)
+        }
+        if id.trimmingCharacters(in: .whitespaces).lowercased() == "default" {
+            return "Hermes"
+        }
+        let spaced = id.replacingOccurrences(of: "[-_]+", with: " ",
+                                             options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        return spaced.split(separator: " ")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
+    }
+
+    /// The @handle you tag the bot with — the profile name, except "default",
+    /// which is tagged @hermes.
+    var handle: String {
+        if let handleOverride, handleOverride != id { return handleOverride }
+        return id.trimmingCharacters(in: .whitespaces).lowercased() == "default" ? "hermes" : id
+    }
+
+    /// Desktop only shows the handle alongside the title when they differ.
+    var showsHandle: Bool {
+        displayTitle.lowercased() != handle.lowercased()
     }
 }
 

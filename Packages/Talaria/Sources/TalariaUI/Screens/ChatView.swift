@@ -165,7 +165,7 @@ public struct ChatView: View {
     }
 
     private var nameLine: some View {
-        let name = TalariaVoice.displayName(botID, theme.id)
+        let name = TalariaVoice.displayName(for: bot, theme.id)
         return Group {
             switch theme.id {
             case .soft: Text(verbatim: "\(name) ›").font(theme.body(16, weight: .bold))

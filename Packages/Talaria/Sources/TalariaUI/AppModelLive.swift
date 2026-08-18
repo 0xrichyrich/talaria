@@ -168,11 +168,14 @@ extension AppModel {
                 runtime.lastSessionByBot[profile.name] = last
             }
             let existing = bots.first { $0.id == profile.name }
+            // Desktop Bot Mode's own metadata block wins over Talaria's, so a
+            // bot titled/recolored on desktop reads identically here.
+            let deskMeta = BotModeMeta(uiMeta: profile.uiMeta)
             var bot = Bot(
                 id: profile.name,
                 job: profile.description ?? "",
-                shape: Self.derivedShape(for: profile),
-                hue: Self.derivedHue(for: profile),
+                shape: deskMeta?.talariaShape ?? Self.derivedShape(for: profile),
+                hue: deskMeta?.talariaHue ?? Self.derivedHue(for: profile),
                 status: .idle,
                 task: existing?.task,
                 minutesElapsed: existing?.minutesElapsed ?? 0,
@@ -181,7 +184,8 @@ extension AppModel {
                 unread: existing?.unread ?? 0,
                 mentionsYou: existing?.mentionsYou ?? false,
                 description: profile.description,
-                pinnedModel: profile.model)
+                pinnedModel: profile.model,
+                title: deskMeta?.title)
             if approvals.contains(where: { $0.botID == bot.id }) { bot.status = .approval }
             if runtime.workingBotIDs.contains(bot.id) { bot.status = .working }
             return bot
@@ -813,28 +817,9 @@ extension AppModel {
         }
     }
 
-    /// Model ids offered by the gateway. Payload shape
-    /// (hermes_cli/inventory.py build_models_payload):
-    /// {"providers":[{"slug","name","is_current","models":[<id strings>],…}],
-    ///  "model":<current>,"provider":<current>} — current model listed first.
-    public func availableModels() async -> [String] {
-        guard mode == .live, let client else { return DemoData.models }
-        guard let payload = try? await client.modelOptions() else { return DemoData.models }
-        var ids: [String] = []
-        if let current = payload["model"]?.stringValue, !current.isEmpty {
-            ids.append(current)
-        }
-        for provider in payload["providers"]?.arrayValue ?? [] {
-            for model in provider["models"]?.arrayValue ?? [] {
-                if let id = model.stringValue ?? (model["id"] ?? model["model"])?.stringValue {
-                    ids.append(id)
-                }
-            }
-        }
-        var seen = Set<String>()
-        let unique = ids.filter { seen.insert($0).inserted }
-        return unique.isEmpty ? DemoData.models : unique
-    }
+    // The flat `availableModels()` that used to live here is superseded by the
+    // typed catalog in AppModelLive+Models.swift, which keeps the same
+    // signature for the profile editor's fallback path.
 
     // MARK: - Offline queue
 
