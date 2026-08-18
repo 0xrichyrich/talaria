@@ -145,6 +145,11 @@ extension AppModel {
         detachApprovalBridges()
         detachSessionEventRouter()
         detachVoiceRouter()
+        // The liveness watches are not event subscriptions but they have the
+        // same lifetime: a reaper polling `session.active_list`, a foreground
+        // observer and an NWPathMonitor all outlive this call otherwise, and
+        // every conclusion they draw is scoped to the gateway that just left.
+        stopLivenessSupervision()
         // Canonical-chat pins name sessions in THIS gateway's per-profile
         // state.db; carrying them to the next gateway would resume ids that
         // mean nothing there.

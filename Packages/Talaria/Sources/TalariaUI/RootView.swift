@@ -158,6 +158,13 @@ public struct TalariaRootView: View {
             }
         }
         .onChange(of: clientToken) { attachEventRouters() }
+        // `connectGateway` assigns the client, awaits the dial, and only then
+        // sets `mode = .live` — so a render landing inside that await sees a
+        // client while every router's `mode == .live` guard is still false, and
+        // `clientToken` never changes again to give them a second chance.
+        // Every attach is idempotent, so re-running them on the mode edge costs
+        // nothing and closes that window.
+        .onChange(of: model.mode) { attachEventRouters() }
         .onChange(of: scenePhase) {
             // Foregrounding is when a parked socket has to be re-established
             // and any approval resolved from a notification has to be caught up.
@@ -427,6 +434,11 @@ public struct TalariaRootView: View {
         model.attachVoiceRouter()
         model.attachCommandsEventRouter()
         model.attachPetEventRouter()
+        // Not an event subscription but the same lifecycle: the liveness
+        // watches (foreground re-seed, network-restore nudge, phantom reaper)
+        // are per-gateway bookkeeping, so they arm here and re-scope when the
+        // client is swapped or torn down.
+        model.startLivenessSupervision()
     }
 
     // MARK: - Demo push banners

@@ -229,6 +229,14 @@ extension AppModel {
     /// roster of a healthy one.
     public func applicationDidBecomeActive() {
         startLinkSupervision()
+        // The socket that was supposed to deliver `message.complete` died when
+        // the process was parked, so the roster's "working" flags are beliefs
+        // and not facts until `session.active_list` says otherwise. Asked
+        // before the roster refresh below and independently of it: this runs
+        // even when the link is down (it records the debt and the reaper pays
+        // it once the link is back), and it is the only thing that clears a
+        // bot left spinning on a turn that finished while we were away.
+        foregroundReseed()
         Task { @MainActor in
             await refreshConnectionHealth()
             guard mode == .live, let client else { return }

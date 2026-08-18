@@ -201,7 +201,11 @@ extension AppModel {
 
     /// A finished turn can hold no running tools — a stop or an error leaves
     /// chips spinning forever otherwise.
-    private func finishRunningTools(in chat: ChatState, interrupted: Bool) {
+    /// Settle every tool chip still spinning in the recent tail. Internal
+    /// rather than private because the liveness reaper owes the same debt when
+    /// a turn ends off-socket (AppModelLive+Liveness.swift): one rule for what
+    /// a chip left running means, in one place.
+    func finishRunningTools(in chat: ChatState, interrupted: Bool) {
         for index in chat.messages.indices.suffix(12) {
             guard !chat.messages[index].toolCalls.isEmpty else { continue }
             for call in chat.messages[index].toolCalls.indices

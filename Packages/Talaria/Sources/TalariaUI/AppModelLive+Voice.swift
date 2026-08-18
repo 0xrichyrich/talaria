@@ -17,6 +17,26 @@ import TalariaKit
 // continuous PCM feed over `wake.feed`, which iOS cannot sustain outside the
 // foreground. `wake.detected` from a host-side listener is routed anyway (it is
 // free), so a shell can present voice on it.
+//
+// Verified wire shapes (hermes-agent-upstream, re-checked this pass):
+//   voice.toggle {action:"status"} → {enabled, record_key, tts, available,
+//     audio_available, stt_available, details}   tui_gateway/server.py:14757-14782
+//   voice.tts {text} → {status:"speaking"}; 4020 without text
+//                                              tui_gateway/server.py:15008-15021
+//   voice.record {action, session_id} — NOT used here: it drives the gateway
+//     HOST's microphone and errors 4015 ("voice mode is off") unless
+//     voice.toggle on flipped HERMES_VOICE on that machine
+//                                              tui_gateway/server.py:14854-14882
+//   POST /api/audio/transcribe {data_url, mime_type} [?profile=]
+//     → {ok, transcript, provider}              hermes_cli/web_server.py:4891-4979
+//   POST /api/audio/speak {text} [?profile=]
+//     → {ok, data_url, mime_type, provider}     hermes_cli/web_server.py:5098-5171
+//   voice.transcript payload keys are {text} | {stop_phrase, text} |
+//     {no_speech_limit} — the last one reports that the HOST's own 3-strikes
+//     silence detector gave up (server.py:14933-14947). It is deliberately not
+//     routed: Talaria's loop runs on this device and its own VAD already
+//     decides when to re-listen, so honoring a host timeout would end a phone
+//     conversation for something that happened on a desk machine.
 
 /// Shared voice state. `AppModel`'s stored properties live in a file another
 /// owner holds, and extensions cannot add storage — same pattern as
@@ -85,10 +105,52 @@ public final class VoiceRuntime {
     }
 }
 
+/// Whether the phone can reach its gateway right now, from voice's point of
+/// view.
+///
+/// Voice is the surface where being wrong about this is loudest: every other
+/// screen degrades to stale-but-readable, while voice keeps the microphone hot
+/// and the orb breathing over a socket that is gone. The distinction that
+/// matters to the conversation is not "connected / not connected" but "will it
+/// come back on its own?" — one state parks and resumes, the other has to say
+/// so and stop.
+public enum VoiceLinkState: Sendable, Equatable {
+    /// Socket up — or demo mode, which has no socket to lose.
+    case up
+    /// Dropped. AppModelLive's backoff loop, or ConnectionSupervisor, is
+    /// dialing; the conversation parks and picks up where it left off.
+    case reconnecting
+    /// Not coming back without the user: the refresh token was rejected (the
+    /// reconnect loop stops dead on `AuthError.sessionExpired`) or the gateway
+    /// was disconnected on purpose.
+    case needsSignIn
+}
+
 extension AppModel {
 
     /// Shared voice state, for views.
     public var voice: VoiceRuntime { VoiceRuntime.shared }
+
+    // MARK: - Liveness
+
+    /// Live-link state as the voice loop needs to see it. Observable: reading
+    /// it from a view body (or an `onChange`) subscribes to `isOffline`,
+    /// `client` and the supervisor's re-auth flag.
+    public var voiceLink: VoiceLinkState {
+        guard mode == .live else { return .up }
+        // A torn-down link (Settings → Disconnect) leaves mode == .live with no
+        // client; nothing is dialing for it.
+        guard client != nil else { return .needsSignIn }
+        guard isOffline else { return .up }
+        // `needsReauth` can name a *different* saved gateway — one tapped in
+        // Connections while signed out. Only the live one means nobody is
+        // dialing on our behalf.
+        if let stalled = needsReauth, let live = LiveRuntime.shared.baseURL,
+           stalled.absoluteString == live.absoluteString {
+            return .needsSignIn
+        }
+        return .reconnecting
+    }
 
     // MARK: - Event router
 
@@ -98,8 +160,11 @@ extension AppModel {
     public func attachVoiceRouter() {
         let runtime = VoiceRuntime.shared
         guard mode == .live, let client, !runtime.attaching else { return }
-        // Already listening on *this* link. After a reconnect the client is a
-        // new object, so the stale record is dropped and we re-register.
+        // Already listening on *this* client. A socket-level reconnect re-dials
+        // the same GatewayClient and its handler table survives the new
+        // transport (GatewayClient.connect rebuilds only `eventsTask`, which
+        // reads the live table), so nothing needs re-registering there. A new
+        // gateway builds a new client, and that stale record is dropped here.
         if runtime.handlerID != nil, runtime.handlerClient === client { return }
         runtime.handlerID = nil
         runtime.handlerClient = nil
@@ -164,9 +229,16 @@ extension AppModel {
     // MARK: - Speech ⇄ text (profile-scoped, like desktop)
 
     /// POST the clip for transcription. An empty return means "no speech" —
-    /// upstream reports that as success and expects a re-listen.
+    /// upstream reports that as success and expects a re-listen
+    /// (web_server.py:4966-4975).
     public func transcribe(_ clip: RecordedClip, for botID: String) async throws -> String {
-        guard mode == .live, let client else { return "" }
+        guard mode == .live else { return "" }
+        // Never answer "no speech" for "no gateway": the caller re-listens on
+        // an empty transcript, so returning "" here spins the microphone
+        // forever against a link that is gone.
+        guard let client else {
+            throw GatewayError(code: -3, message: "not connected")
+        }
         return try await client.transcribeAudio(dataURL: clip.dataURL,
                                                 mimeType: clip.mimeType,
                                                 profile: botID)
@@ -191,10 +263,28 @@ extension AppModel {
     // MARK: - One voice turn
 
     /// Submit a spoken prompt and wait out the reply. Returns the reply text,
-    /// or nil if the turn produced nothing (interrupted, error, timeout).
+    /// or nil if the turn produced nothing (interrupted, error, link lost).
+    ///
+    /// This deliberately takes the composer's own path rather than `send`.
+    /// `sendOrSteer` is what raises `chat.isRunning` — which is what puts the
+    /// stop control under the turn and lets the composer steer into it instead
+    /// of interrupting it — what raises the tool-chip turn floor so tool chips
+    /// land on this turn's bubble, what lets staged attachments ride the
+    /// prompt, and what arms the submit watchdog. Calling `send` directly (as
+    /// this did) produced a turn the rest of the app could not see: no stop
+    /// button, no steering, tool chips attaching to the previous bubble.
+    ///
+    /// Demo mode passes through the same door. `sendOrSteer`'s demo branch runs
+    /// its own cancellable turn (`ChatRuntime.demoTurns`) on the same
+    /// 0.9–1.8 s clock as `AppModel.demoReply`, and it clears `isTyping`,
+    /// `isRunning` and appends the reply in one synchronous MainActor block —
+    /// so the sampler below can never observe "idle with no reply yet" and cut
+    /// the pretend turn short.
     public func submitVoicePrompt(_ text: String, to botID: String) async -> String? {
         let chat = chat(for: botID)
-        send(text: text, to: botID)          // shared path: bubble, offline queue, live RPC
+        sendOrSteer(text: text, to: botID)
+        // Floor read AFTER the send: both of sendOrSteer's live branches append
+        // the user bubble, so the reply is the first row past this index.
         return await awaitReply(botID: botID, after: chat.messages.count)
     }
 
@@ -210,16 +300,26 @@ extension AppModel {
         let start = Date()
         var sawTurn = false
         while Date().timeIntervalSince(start) < timeout {
+            // A turn whose ending we cannot hear is not worth waiting on: with
+            // the socket down there is no message.complete coming, and the
+            // synthesis hop that would speak the answer cannot run either. The
+            // caller parks on the link instead and resumes when it returns —
+            // the reply itself is not lost, it arrives in the transcript when
+            // session.resume replays the turn.
+            guard voiceLink == .up else { return nil }
+
             let streaming = chat.messages.last?.isStreaming ?? false
             let busy = chat.isTyping || chat.isRunning || streaming
                 || LiveRuntime.shared.workingBotIDs.contains(botID)
             if busy { sawTurn = true }
 
             if !busy, chat.messages.count > index, let last = chat.messages.last {
-                // A system row (error, denial) ends the turn with no speech.
+                // A system row (error, denial, the stop note) ends the turn
+                // with no speech.
                 return last.author == .bot ? last.text : nil
             }
-            // The turn never started: the send failed, or the socket is down.
+            // The turn never started: the send failed, or the submit was
+            // steered into a turn that had already finished.
             if !busy, !sawTurn, Date().timeIntervalSince(start) > 20 { return nil }
 
             do {
