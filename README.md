@@ -59,9 +59,14 @@ Requirements: **Xcode 16+** on macOS, and [XcodeGen](https://github.com/yonaskol
 
 ```sh
 brew install xcodegen
-git clone <this repo> talaria && cd talaria
+git clone https://github.com/0xrichyrich/talaria.git && cd talaria
 make ios
 ```
+
+**Testing it on your own iPhone, or against your own gateway?**
+[TESTING.md](TESTING.md) is the guide — device signing with your own team and
+bundle id, the three ways to authenticate, wireless installs, push setup, and
+what to include in a bug report.
 
 `make ios` runs `xcodegen generate` in `ios/` and builds the `Talaria` scheme
 for the iOS Simulator. To work on the non-UI core without Xcode project

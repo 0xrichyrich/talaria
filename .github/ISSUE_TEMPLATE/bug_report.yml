@@ -1,0 +1,76 @@
+name: Bug report
+description: Something in Talaria behaves wrongly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. If this is a **security** issue — auth, Keychain,
+        the approval path, or the push relay — please close this and follow
+        [SECURITY.md](../blob/main/SECURITY.md) instead.
+
+        Please redact tokens, `.p8` contents, and any gateway URL you would
+        rather not publish.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got. A screenshot helps enormously.
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device and iOS version
+      placeholder: iPhone 17 Pro, iOS 26.5
+    validations:
+      required: true
+  - type: dropdown
+    id: lockdown
+    attributes:
+      label: Lockdown Mode
+      description: It changes networking and WebKit behaviour, and has caused real bugs here.
+      options: ["Off", "On", "Not sure"]
+    validations:
+      required: true
+  - type: input
+    id: gateway
+    attributes:
+      label: Gateway version
+      description: Output of `hermes --version` on the machine running `hermes serve`.
+    validations:
+      required: true
+  - type: dropdown
+    id: binding
+    attributes:
+      label: How is the gateway reachable
+      options:
+        - Loopback (127.0.0.1)
+        - LAN IP
+        - Tailscale / VPN
+        - Hermes Cloud
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: auth
+    attributes:
+      label: Auth mode
+      options:
+        - Session token
+        - Sign in with Nous Research (OAuth)
+        - Username & password
+        - Demo mode (no gateway)
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Gateway log
+      description: Anything from `~/.hermes/logs/serve.log` around the time it happened.
+      render: text
+  - type: input
+    id: build
+    attributes:
+      label: Talaria commit
+      description: "`git rev-parse --short HEAD` in your clone."
