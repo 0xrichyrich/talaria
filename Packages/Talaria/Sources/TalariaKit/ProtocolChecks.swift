@@ -22,6 +22,7 @@ public enum ProtocolChecks {
         try tokenSetRefreshWindow()
         try demoDataIntegrity()
         try liveSessionParsing()
+        try preferredSessionParsing()
     }
 
     static func eventEnvelopeDecoding() throws {
