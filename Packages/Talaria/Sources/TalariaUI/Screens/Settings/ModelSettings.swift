@@ -263,7 +263,7 @@ public struct ModelSettingsSection: View {
 
         return Button {
             guard !locked else { return }
-            Task { await selectDefault(family.id) }
+            Task { await selectDefault(family.id, provider: provider.slug) }
         } label: {
             HStack(spacing: 8) {
                 Text(parts.name)
@@ -581,7 +581,8 @@ public struct ModelSettingsSection: View {
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
                 Button {
-                    Task { await selectDefault(pending.model, confirmExpensive: true) }
+                    Task { await selectDefault(pending.model, provider: pending.provider,
+                                               confirmExpensive: true) }
                 } label: {
                     Text(copy.modelsConfirmGo(theme.id))
                         .font(theme.mono(10.5, weight: .bold))
@@ -641,7 +642,8 @@ public struct ModelSettingsSection: View {
         }
     }
 
-    private func selectDefault(_ modelID: String, confirmExpensive: Bool = false) async {
+    private func selectDefault(_ modelID: String, provider: String? = nil,
+                               confirmExpensive: Bool = false) async {
         notice = nil
         pendingConfirm = nil
         busyModel = modelID
@@ -654,7 +656,7 @@ public struct ModelSettingsSection: View {
         }
 
         do {
-            let outcome = try await client.applyDefaultModel(modelID,
+            let outcome = try await client.applyDefaultModel(modelID, provider: provider,
                                                              confirmExpensive: confirmExpensive)
             if outcome.confirmRequired {
                 let message = outcome.confirmMessage.isEmpty ? outcome.warning

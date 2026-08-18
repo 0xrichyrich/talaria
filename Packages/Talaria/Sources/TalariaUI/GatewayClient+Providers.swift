@@ -223,9 +223,20 @@ extension GatewayClient {
     /// session and an explicit `--global`, which is the only spelling that
     /// reaches `config.yaml` (see the file header). Same three answers as a
     /// session switch: `confirm_required` means NOTHING was applied.
-    func applyDefaultModel(_ model: String,
+    ///
+    /// The provider is NOT optional in practice. `parse_model_switch_args`
+    /// resolves a bare name *within the current aggregator first*
+    /// (model_switch.py:713-716), so setting a self-hosted model while a
+    /// subscription provider is active sends the gateway looking for it at the
+    /// wrong endpoint — the symptom is a "could not reach this custom
+    /// endpoint's model listing" warning naming the OTHER provider's URL.
+    /// `--provider <slug>` is the documented spelling (model_switch.py:515).
+    func applyDefaultModel(_ model: String, provider: String? = nil,
                            confirmExpensive: Bool = false) async throws -> ModelSwitchOutcome {
-        var params: [String: JSONValue] = ["key": "model", "value": .string("\(model) --global")]
+        let slug = (provider ?? "").trimmingCharacters(in: .whitespaces)
+        let value = slug.isEmpty ? "\(model) --global"
+                                 : "\(model) --provider \(slug) --global"
+        var params: [String: JSONValue] = ["key": "model", "value": .string(value)]
         if confirmExpensive { params["confirm_expensive_model"] = .bool(true) }
         return ModelSwitchOutcome(try await rpc("config.set", .object(params), timeout: 180))
     }

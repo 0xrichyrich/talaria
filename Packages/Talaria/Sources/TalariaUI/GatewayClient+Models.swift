@@ -549,9 +549,16 @@ extension GatewayClient {
     /// start), `confirm_required` (the expensive-model guard fired and NOTHING
     /// was applied — re-send with `confirmExpensive: true`), and a plain
     /// `warning` riding alongside a successful switch.
-    func applySessionModel(sessionID: String?, model: String,
+    ///
+    /// Pass the provider whenever the picker knows it: a bare name resolves
+    /// within the *current* aggregator first (model_switch.py:713-716), so
+    /// switching to a self-hosted model while a subscription provider is
+    /// active otherwise resolves against the wrong endpoint.
+    func applySessionModel(sessionID: String?, model: String, provider: String? = nil,
                            confirmExpensive: Bool = false) async throws -> ModelSwitchOutcome {
-        var params: [String: JSONValue] = ["key": "model", "value": .string(model)]
+        let slug = (provider ?? "").trimmingCharacters(in: .whitespaces)
+        let value = slug.isEmpty ? model : "\(model) --provider \(slug)"
+        var params: [String: JSONValue] = ["key": "model", "value": .string(value)]
         if let sessionID, !sessionID.isEmpty { params["session_id"] = .string(sessionID) }
         if confirmExpensive { params["confirm_expensive_model"] = .bool(true) }
         return ModelSwitchOutcome(try await rpc("config.set", .object(params), timeout: 180))

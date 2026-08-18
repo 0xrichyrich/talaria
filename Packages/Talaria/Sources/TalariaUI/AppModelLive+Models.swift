@@ -395,8 +395,12 @@ extension AppModel {
         }
 
         do {
+            // The provider travels with the id: a bare name resolves inside
+            // whatever aggregator is current, which is how a self-hosted model
+            // ends up being looked for on a subscription endpoint.
             let outcome = try await client.applySessionModel(
-                sessionID: sessionID, model: model, confirmExpensive: confirmExpensive)
+                sessionID: sessionID, model: model, provider: provider,
+                confirmExpensive: confirmExpensive)
 
             if outcome.confirmRequired {
                 // NOTHING was applied. Park the message; the caller re-sends

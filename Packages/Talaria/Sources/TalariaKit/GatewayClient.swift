@@ -395,9 +395,17 @@ public actor GatewayClient {
         return try await rpc("model.options", .object(params))
     }
 
-    public func setSessionModel(sessionID: String, model: String) async throws {
+    /// Pass `provider` whenever it is known: `parse_model_switch_args`
+    /// resolves a bare name within the CURRENT aggregator first
+    /// (model_switch.py:713-716), so a self-hosted model set while a
+    /// subscription provider is active gets looked up on the wrong endpoint.
+    /// `--provider <slug>` is the documented spelling (model_switch.py:515).
+    public func setSessionModel(sessionID: String, model: String,
+                                provider: String? = nil) async throws {
+        let slug = (provider ?? "").trimmingCharacters(in: .whitespaces)
+        let value = slug.isEmpty ? model : "\(model) --provider \(slug)"
         try await rpc("config.set", ["session_id": .string(sessionID),
-                                     "key": "model", "value": .string(model)])
+                                     "key": "model", "value": .string(value)])
     }
 
     /// Reasoning effort for the session ("none" | "low" | "medium" | "high" —
