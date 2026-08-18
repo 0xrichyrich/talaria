@@ -42,6 +42,15 @@
 	<array>
 		<string>_hermes._tcp</string>
 	</array>
+	<!-- Solo mode's calendar and reminder tools (docs/SOLO-MODE.md §"The Solo
+	     tool surface"). EventKit terminates the process if access is requested
+	     without these strings, so SoloEventKitGate refuses to ask when they are
+	     absent — which without them makes both families permanently dead while
+	     the explainer still lists them. -->
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Solo mode reads your events and adds new ones when you ask it to — on this device only, and only after you approve each request.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>Solo mode reads your reminders and adds new ones when you ask it to — on this device only, and only after you approve each request.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Talaria talks to your Hermes gateway (hermes serve) over your LAN or tailnet to reach your bots.</string>
 	<key>NSMicrophoneUsageDescription</key>

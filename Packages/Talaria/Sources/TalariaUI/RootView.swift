@@ -119,6 +119,15 @@ public struct TalariaRootView: View {
                     // one of the two places that opens it — pushing it under
                     // would hide it behind the screen that asked for it.
                     .talariaApprovalPolicy(model: model)
+                    // Solo (roadmap Phase 5) mounts the same way, in the order
+                    // it is opened: the chat, then its settings, then the
+                    // explainer that Solo settings pushes. Each renders nothing
+                    // until its notification arrives, so mounting all three
+                    // costs a modifier and buys every route in — the Settings
+                    // section, the chat header, the explainer's own footer.
+                    .talariaSolo(model: model)
+                    .talariaSoloSettings(model: model)
+                    .talariaSoloExplainer(model: model)
             }
             .opacity(themeSwapDim ? 0.3 : 1)
             .scaleEffect(themeSwapDim ? 0.982 : 1)

@@ -13,6 +13,7 @@
 // (onOpenURL), so both paths land in identical AppModel state.
 
 import Foundation
+import TalariaKit
 import TalariaUI
 
 /// A parsed talaria:// destination.
@@ -51,6 +52,11 @@ struct DeepLinkRouter {
     /// `onOpenURL` entry point. Returns whether the URL was recognized.
     @discardableResult
     func open(_ url: URL) -> Bool {
+        // talaria://solo/shortcut?token=… is the x-callback-url return leg of
+        // Solo's `shortcuts_run` (SoloShortcutsRunTool.callbackURL). It carries
+        // no navigation — a Solo turn is parked on it — so it is answered here
+        // and never reaches the navigation switch below.
+        if SoloToolHost.shared.deliver(url) { return true }
         guard let link = DeepLink(url: url) else { return false }
         route(link)
         return true

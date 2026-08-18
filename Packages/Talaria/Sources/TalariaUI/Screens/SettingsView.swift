@@ -67,14 +67,20 @@ public struct SettingsView: View {
                     VoiceSettingsSection(model: model)
                         .settingsEntrance(delay: 0.16, reduced: reducedMotion)
 
-                    PrivacySettingsSection(model: model)
+                    // Solo sits above Privacy on purpose: it is the one section
+                    // here that is *not* about the gateway, and a person looking
+                    // for "does this work without a server" looks in Settings.
+                    SoloSettingsSection(model: model)
                         .settingsEntrance(delay: 0.2, reduced: reducedMotion)
 
-                    AboutSettingsSection(model: model)
+                    PrivacySettingsSection(model: model)
                         .settingsEntrance(delay: 0.24, reduced: reducedMotion)
 
-                    DesktopPointerSection(theme: theme, copy: copy)
+                    AboutSettingsSection(model: model)
                         .settingsEntrance(delay: 0.28, reduced: reducedMotion)
+
+                    DesktopPointerSection(theme: theme, copy: copy)
+                        .settingsEntrance(delay: 0.32, reduced: reducedMotion)
                 }
                 .padding(.horizontal, 18)
                 .padding(.top, 4)

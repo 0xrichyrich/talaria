@@ -643,6 +643,10 @@ extension AppModel {
         voice.autoSpeak = true
         ModelPresetStore.shared.reset()
         ModelVisibilityStore.shared.reset()
+        // Solo's stores AND its directory tree: transcripts, the memory note and
+        // the images handed to it have no copy on any gateway, so this is the
+        // only thing that unmakes them (AppModelLive+Solo.swift).
+        soloForgetEverything()
         // The activity ledger is held in memory and written on every new row,
         // so dropping only the key would restore 200 entries on the next event.
         clearActivityJournal()
