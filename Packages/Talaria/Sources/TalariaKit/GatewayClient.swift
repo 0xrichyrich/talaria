@@ -81,6 +81,11 @@ public struct LiveSession: Sendable {
     public var inflight: JSONValue?
     /// Oldest unresolved approval, replayed on resume.
     public var pendingApproval: ApprovalRequest?
+    /// Clarify question still blocking this session, replayed on resume
+    /// (server.py `_pending_clarify_request_payload`). Unlike approvals there
+    /// is no `clarify.pending` RPC, so this block is the only way to recover a
+    /// question raised while the transport was detached.
+    public var pendingClarify: JSONValue?
 
     init(_ v: JSONValue) {
         sessionID = v["session_id"]?.stringValue ?? ""
@@ -92,6 +97,7 @@ public struct LiveSession: Sendable {
         running = v["running"]?.boolValue ?? false
         inflight = v["inflight"]
         pendingApproval = v["pending_approval"].map { ApprovalRequest($0, sessionID: v["session_id"]?.stringValue ?? "") }
+        pendingClarify = v["pending_clarify"]
     }
 }
 
@@ -105,7 +111,12 @@ public struct CronJob: Sendable, Identifiable {
     public var raw: JSONValue
 
     init(_ v: JSONValue) {
-        id = v["id"]?.stringValue ?? v["name"]?.stringValue ?? UUID().uuidString
+        // `_format_job` (cronjob_tools.py:620) emits `job_id`, never `id`, and
+        // every mutation addresses a job by it. Falling through to `name` — as
+        // this did — meant enable/disable/delete targeted a title, so a
+        // renamed or duplicate-titled job hit the wrong row or nothing at all.
+        // Verified against a live gateway 2026-08-18: rows carry job_id.
+        id = v["job_id"]?.stringValue ?? v["id"]?.stringValue ?? v["name"]?.stringValue ?? UUID().uuidString
         name = v["name"]?.stringValue ?? ""
         schedule = v["schedule"]?.stringValue ?? v["cron"]?.stringValue ?? ""
         enabled = v["enabled"]?.boolValue ?? true
@@ -270,19 +281,32 @@ public actor GatewayClient {
 
     // MARK: - Sessions
 
-    public func listSessions(limit: Int = 200, profile: String? = nil) async throws -> [StoredSession] {
+    /// `includeHidden` is for the surfaces that OWN hidden sessions — the
+    /// per-bot browser and the canonical-chat resolver. The flag stays off for
+    /// every shared/global list, which is what `hidden` means upstream
+    /// (methods_session.py:180-186). An older gateway ignores the unknown
+    /// param and simply keeps hidden rows out.
+    public func listSessions(limit: Int = 200, profile: String? = nil,
+                             includeHidden: Bool = false) async throws -> [StoredSession] {
         var params: [String: JSONValue] = ["limit": .number(Double(limit))]
         if let profile { params["profile"] = .string(profile) }
+        if includeHidden { params["include_hidden"] = .bool(true) }
         let result = try await rpc("session.list", .object(params))
         return result["sessions"]?.arrayValue?.map(StoredSession.init) ?? []
     }
 
+    /// `hidden` marks a session plugin-owned: it stays out of shared lists
+    /// (recents, the resume picker) and is browsed only by the surface that
+    /// owns it. Bot Mode's canonical chats are always born this way
+    /// (plugin.js:2758-2763). Applied as `pending_hidden` until the row exists
+    /// (methods_session.py:100, server.py:3014-3021); older gateways ignore it.
     public func createSession(profile: String? = nil, title: String? = nil,
-                              model: String? = nil) async throws -> LiveSession {
+                              model: String? = nil, hidden: Bool = false) async throws -> LiveSession {
         var params: [String: JSONValue] = ["source": "talaria", "cols": 100]
         if let profile { params["profile"] = .string(profile) }
         if let title { params["title"] = .string(title) }
         if let model { params["model"] = .string(model) }
+        if hidden { params["hidden"] = .bool(true) }
         return LiveSession(try await rpc("session.create", .object(params)))
     }
 
@@ -371,9 +395,17 @@ public actor GatewayClient {
         return try await rpc("model.options", .object(params))
     }
 
-    public func setSessionModel(sessionID: String, model: String) async throws {
+    /// Pass `provider` whenever it is known: `parse_model_switch_args`
+    /// resolves a bare name within the CURRENT aggregator first
+    /// (model_switch.py:713-716), so a self-hosted model set while a
+    /// subscription provider is active gets looked up on the wrong endpoint.
+    /// `--provider <slug>` is the documented spelling (model_switch.py:515).
+    public func setSessionModel(sessionID: String, model: String,
+                                provider: String? = nil) async throws {
+        let slug = (provider ?? "").trimmingCharacters(in: .whitespaces)
+        let value = slug.isEmpty ? model : "\(model) --provider \(slug)"
         try await rpc("config.set", ["session_id": .string(sessionID),
-                                     "key": "model", "value": .string(model)])
+                                     "key": "model", "value": .string(value)])
     }
 
     /// Reasoning effort for the session ("none" | "low" | "medium" | "high" —
@@ -383,25 +415,12 @@ public actor GatewayClient {
                                      "key": "reasoning", "value": .string(value)])
     }
 
-    // MARK: - Push relay (talaria-push gateway plugin)
-
-    /// Register this device with the gateway-side APNs relay. No-op errors
-    /// surface to the caller (the plugin may simply not be installed).
-    public func registerPushDevice(tokenHex: String, environment: String) async throws {
-        var req = URLRequest(url: baseURL.appending(path: "api/plugins/talaria-push/devices"))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        auth.apply(credential: credential, to: &req)
-        req.httpBody = try JSONEncoder().encode(JSONValue.object([
-            "device_token": .string(tokenHex),
-            "platform": "ios",
-            "environment": .string(environment),
-        ]))
-        let (_, response) = try await URLSession.shared.data(for: req)
-        guard let code = (response as? HTTPURLResponse)?.statusCode, (200..<300).contains(code) else {
-            throw GatewayError(code: -9, message: "push relay registration failed")
-        }
-    }
+    // Device registration for the talaria-push relay lives in
+    // GatewayClient+Providers.swift. It is deliberately the ONLY spelling: the
+    // relay's upsert replaces the whole record, so a registration call that
+    // cannot express `profile_filter` erases the caller's per-bot push filter
+    // every time it runs. An earlier two-argument version here did exactly
+    // that on every gateway connect.
 
     // MARK: - Cron (Routines)
 
@@ -438,15 +457,59 @@ public actor GatewayClient {
 
     // MARK: - REST helpers
 
-    /// Paginated transcript hydration (GET /api/sessions/{id}/messages).
-    public func fetchSessionMessages(storedID: String, limit: Int = 200, offset: Int = 0) async throws -> JSONValue {
-        var comps = URLComponents(url: baseURL.appending(path: "api/sessions/\(storedID)/messages"),
-                                  resolvingAgainstBaseURL: false)!
-        comps.queryItems = [URLQueryItem(name: "limit", value: String(limit)),
-                            URLQueryItem(name: "offset", value: String(offset))]
-        var req = URLRequest(url: comps.url!)
+    // MARK: - Authenticated REST
+
+    /// Perform an authenticated REST call against this gateway and return the
+    /// raw body. The public seam cross-module extensions need: `auth` and
+    /// `credential` are file-private, so TalariaUI extensions cannot build
+    /// their own authorized requests.
+    ///
+    /// `path` is relative to the gateway root ("api/sessions/search"), and any
+    /// reverse-proxy path prefix in `baseURL` is preserved.
+    @discardableResult
+    public func restData(path: String, method: String = "GET",
+                         query: [URLQueryItem] = [], body: Data? = nil,
+                         contentType: String = "application/json",
+                         timeout: TimeInterval = 30) async throws -> Data {
+        var comps = URLComponents(url: baseURL.appending(path: path),
+                                  resolvingAgainstBaseURL: false)
+        if !query.isEmpty { comps?.queryItems = query }
+        guard let url = comps?.url else {
+            throw GatewayError(code: -11, message: "bad REST path: \(path)")
+        }
+        var req = URLRequest(url: url, timeoutInterval: timeout)
+        req.httpMethod = method
+        if let body {
+            req.httpBody = body
+            req.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        }
         auth.apply(credential: credential, to: &req)
-        let (data, _) = try await URLSession.shared.data(for: req)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(code) else {
+            let detail = (try? JSONDecoder().decode(JSONValue.self, from: data))?["detail"]?.stringValue
+            throw GatewayError(code: code, message: detail ?? "HTTP \(code) for \(path)")
+        }
+        return data
+    }
+
+    /// `restData` decoded as JSON.
+    @discardableResult
+    public func restJSON(path: String, method: String = "GET",
+                         query: [URLQueryItem] = [], body: JSONValue? = nil,
+                         timeout: TimeInterval = 30) async throws -> JSONValue {
+        let payload = try body.map { try JSONEncoder().encode($0) }
+        let data = try await restData(path: path, method: method, query: query,
+                                      body: payload, timeout: timeout)
+        guard !data.isEmpty else { return .null }
         return try JSONDecoder().decode(JSONValue.self, from: data)
     }
+
+    // Transcript hydration lives in `latestSessionMessages`
+    // (TalariaUI/AppModelLive+CanonicalChat.swift). The wrapper that used to
+    // sit here sent only limit+offset, and the endpoint pages from the OLDEST
+    // message whenever a `limit` arrives without `order`
+    // (hermes_cli/web_routers/sessions.py:601-640) — so it opened a long chat
+    // at its beginning — while omitting `profile` made it read the DEFAULT
+    // profile's state.db and 404 for every other bot.
 }

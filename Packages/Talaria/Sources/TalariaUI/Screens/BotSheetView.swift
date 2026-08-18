@@ -4,12 +4,17 @@ import TalariaTheme
 
 // Bot Profile sheet — design-map.md §4 "Bot Profile" (prototype screen `detail`).
 //
-// Large avatar + description, stat cards (sessions / memories / skills),
-// recent sessions, the context-window meter, the per-bot YOLO toggle, model
-// pin chips, the animated memory "star map", Duplicate / Edit actions and the
-// CLI-only deletion footnote. Demo mode mutates AppModel directly; live mode
-// additionally drives config.set (yolo), profiles.configure (model pin) and
-// profiles.create clone_from (duplicate).
+// Large avatar (the profile's generated portrait when it has one) + description,
+// stat cards, recent sessions, the context-window meter, the per-bot YOLO
+// toggle, model pin chips, the memory "star map", Duplicate / Edit actions and
+// the CLI-only deletion footnote.
+//
+// Live mode backs the sheet with real data on open: session.list {profile} for
+// the sessions group, session.context_breakdown for the meter (only when the
+// bot already has an attached session — opening a profile sheet must never
+// mint one), profiles.describe for skill/toolset counts and the model pin, and
+// profiles.get_asset for the portrait. Demo values remain the fallback so the
+// canned world still reads correctly.
 
 @MainActor
 public struct BotSheetView: View {
@@ -18,6 +23,17 @@ public struct BotSheetView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var showEditor = false
+    @State private var showPets = false
+
+    /// profiles.describe snapshot — skills/toolsets counts and the pin.
+    @State private var snapshot: ProfileSnapshot?
+    @State private var modelChoices: [ModelChoice] = []
+    @State private var pinWarning = false
+    @State private var duplicating = false
+    @State private var duplicateFailed = false
+    /// False until the open-time RPCs settle, so empty cards say "reading…"
+    /// instead of claiming the bot has nothing.
+    @State private var hydrated = false
 
     public init(model: AppModel, botID: String) {
         self.model = model
@@ -32,17 +48,26 @@ public struct BotSheetView: View {
     private var copy: CopyPack { model.theme.copy }
     private var style: DetailStyle { DetailStyle(t: theme) }
 
-    private var bot: Bot {
-        model.bot(botID) ?? Bot(id: botID, job: "", shape: .circle, hue: .teal)
-    }
+    /// The one identity path (Components/BotIdentity.swift): the roster row
+    /// when there is one, else an unlisted stand-in that still applies
+    /// displayTitle/handle's rules.
+    private var bot: Bot { model.identity(botID) }
 
-    /// Ink names its familiars ("Researcher"); the others use handles ("@researcher").
-    private var displayName: String {
-        theme.id == .ink ? botID.prefix(1).uppercased() + botID.dropFirst() : "@" + botID
-    }
+    private var isLive: Bool { model.mode == .live }
 
+    /// session.list rows when live; the demo dictionary otherwise.
     private var sessions: [SessionSummary] {
-        model.sessions[botID] ?? model.sessions["default"] ?? []
+        let live = model.chats[botID]?.storedSessions ?? []
+        if !live.isEmpty { return live }
+        if isLive { return [] }
+        return model.sessions[botID] ?? model.sessions["default"] ?? []
+    }
+
+    /// session.context_breakdown segments when live; the demo meter otherwise.
+    private var contextSegments: [ContextSegment] {
+        let live = model.chats[botID]?.contextSegments ?? []
+        if !live.isEmpty { return live }
+        return isLive ? [] : model.contextMeter
     }
 
     private var memory: BotMemory {
@@ -50,10 +75,19 @@ public struct BotSheetView: View {
             ?? BotMemory(skillCount: 0, memoryCount: 0, recent: [])
     }
 
+    private var enabledSkillCount: Int {
+        guard isLive else { return memory.skillCount }
+        return snapshot.map { $0.skills.filter(\.enabled).count } ?? memory.skillCount
+    }
+
+    private var enabledToolsetCount: Int {
+        snapshot.map { $0.toolsets.filter(\.enabled).count } ?? 0
+    }
+
     private var yoloOn: Bool { model.chats[botID]?.yolo ?? false }
 
     private var contextTotal: Int {
-        min(100, model.contextMeter.reduce(0) { $0 + $1.percent })
+        min(100, contextSegments.reduce(0) { $0 + $1.percent })
     }
 
     // Star map: positions/sizes/delays ported from the prototype's `stars`.
@@ -80,7 +114,25 @@ public struct BotSheetView: View {
                     modelChips
                     sectionLabel(copy.memorySec)
                     memoryCard
-                    actionRow(copy.duplicate) { duplicateBot() }
+                    // Pets are profile-scoped cosmetics; the row exists only
+                    // when this gateway actually has a pet surface (see
+                    // AppModelLive+Pets). The sheet hangs off the row rather
+                    // than the container — two `.sheet` modifiers on one view
+                    // compete, and the editor owns that slot.
+                    if model.pets(for: botID).hasSurface {
+                        actionRow(copy.petRow(theme.id)) { showPets = true }
+                            .sheet(isPresented: $showPets) {
+                                PetGalleryView(model: model, botID: botID)
+                            }
+                    }
+                    actionRow(duplicating ? CopyPack.duplicating(theme.id) : copy.duplicate) {
+                        duplicateBot()
+                    }
+                    if duplicateFailed {
+                        Text(CopyPack.duplicateFailed(theme.id))
+                            .font(style.footNoteFont)
+                            .foregroundStyle(theme.danger)
+                    }
                     actionRow(copy.editLook) { showEditor = true }
                     Text(copy.deleteNote)
                         .font(style.footNoteFont)
@@ -94,9 +146,36 @@ public struct BotSheetView: View {
         }
         .background(theme.bg.ignoresSafeArea())
         .presentationBackground(theme.bg)
-        .sheet(isPresented: $showEditor) {
+        // Re-read after an edit: skills, toolsets and the pin may all have moved.
+        .sheet(isPresented: $showEditor, onDismiss: { Task { await hydrate() } }) {
             CreateBotView(model: model, editing: model.bot(botID))
         }
+        .task(id: botID) { await hydrate() }
+    }
+
+    /// One pass of live hydration when the sheet opens. Every leg degrades on
+    /// its own: a gateway that cannot answer one of them just leaves that card
+    /// on its themed empty state.
+    private func hydrate() async {
+        async let choices = model.modelChoices()
+        async let described = model.profileSnapshot(botID: botID)
+        // session.list + session.context_breakdown live in AppModelLive+Sessions.
+        await model.refreshSessions(botID: botID)
+        await model.refreshContext(botID: botID)
+        // Two small RPCs that decide whether this profile has a pet surface at
+        // all; a gateway without one answers {enabled:false} / -32601 and the
+        // row simply never appears.
+        await model.probePets(profile: botID)
+        modelChoices = await choices
+        snapshot = await described
+        hydrated = true
+    }
+
+    /// Empty-state text that never lies about which of the three cases it is:
+    /// still loading, the gateway said why it failed, or genuinely empty.
+    private func emptyLine(_ absent: String, error: String? = nil) -> String {
+        if let error { return error }
+        return hydrated ? absent : CopyPack.catalogLoading(theme.id)
     }
 
     // MARK: - Header
@@ -115,16 +194,21 @@ public struct BotSheetView: View {
             }
             .buttonStyle(.plain)
 
-            Text(displayName)
-                .font(style.subTitleFont)
-                .foregroundStyle(theme.ink)
+            // Same pair the roster row renders — title plus the @handle when
+            // it adds anything (desktop's `showsHandle`).
+            BotIdentityLabel(bot: bot, theme: theme, scale: .sheet)
+                .layoutPriority(1)
 
             Spacer(minLength: 8)
 
+            // The job yields first: a long title with its handle must not push
+            // the identity into a truncation the job could have absorbed.
             Text(theme.id == .soft ? bot.job : bot.job.uppercased())
                 .font(style.jobFont)
                 .tracking(style.jobTracking)
                 .foregroundStyle(theme.faint)
+                .lineLimit(1)
+                .truncationMode(.tail)
         }
         .padding(.horizontal, 18)
         .padding(.top, 18)
@@ -145,8 +229,7 @@ public struct BotSheetView: View {
 
     private var identityRow: some View {
         HStack(spacing: 13) {
-            AvatarView(shape: bot.shape, hue: bot.hue, size: 58,
-                       isWorking: bot.status == .working, theme: theme)
+            BotPortraitView(model: model, bot: bot, size: 58, theme: theme)
             // Fallback copy ported from the prototype (not part of CopyPack).
             Text(bot.description ?? "A fresh profile. Its story is unwritten.")
                 .font(style.aSubPlainFont)
@@ -155,11 +238,18 @@ public struct BotSheetView: View {
         }
     }
 
+    /// Live mode counts what the gateway actually reports: stored sessions,
+    /// enabled skills, enabled toolsets. "Memories" stays a demo-only number —
+    /// no profiles.* RPC exposes memory rows.
     private var statCards: some View {
         HStack(spacing: 8) {
-            statCard(String(sessions.count), "sessions")
-            statCard(String(memory.memoryCount), "memories")
-            statCard(String(memory.skillCount), "skills")
+            statCard(String(sessions.count), CopyPack.statSessions(theme.id))
+            if isLive {
+                statCard(String(enabledToolsetCount), CopyPack.statToolsets(theme.id))
+            } else {
+                statCard(String(memory.memoryCount), CopyPack.statMemories(theme.id))
+            }
+            statCard(String(enabledSkillCount), CopyPack.statSkills(theme.id))
         }
     }
 
@@ -179,82 +269,103 @@ public struct BotSheetView: View {
 
     // MARK: - Recent sessions
 
-    private var sessionsGroup: some View {
-        VStack(spacing: 0) {
-            ForEach(sessions) { session in
-                Button {
-                    openSession(session)
-                } label: {
-                    HStack(spacing: 10) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(session.title)
-                                .font(style.aTextFont)
-                                .foregroundStyle(theme.ink)
-                                .lineLimit(1)
-                            Text("\(session.when) · \(session.messageCount) msgs")
+    @ViewBuilder private var sessionsGroup: some View {
+        if sessions.isEmpty {
+            Text(emptyLine(CopyPack.noStoredSessions(theme.id),
+                           error: model.sessionsLoadError(for: botID)))
+                .font(style.aSubFont)
+                .foregroundStyle(theme.faint)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(EdgeInsets(top: 11, leading: 13, bottom: 11, trailing: 13))
+                .modifier(DetailCardChrome(theme: theme))
+        } else {
+            VStack(spacing: 0) {
+                ForEach(sessions) { session in
+                    Button {
+                        openSession(session)
+                    } label: {
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(session.title)
+                                    .font(style.aTextFont)
+                                    .foregroundStyle(theme.ink)
+                                    .lineLimit(1)
+                                Text("\(session.when) · \(session.messageCount) msgs")
+                                    .font(style.timeFont)
+                                    .foregroundStyle(theme.faint)
+                            }
+                            Spacer(minLength: 8)
+                            Text("›")
                                 .font(style.timeFont)
                                 .foregroundStyle(theme.faint)
                         }
-                        Spacer(minLength: 8)
-                        Text("›")
-                            .font(style.timeFont)
-                            .foregroundStyle(theme.faint)
+                        .padding(EdgeInsets(top: 11, leading: 13, bottom: 11, trailing: 13))
+                        .contentShape(Rectangle())
                     }
-                    .padding(EdgeInsets(top: 11, leading: 13, bottom: 11, trailing: 13))
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
+                    .buttonStyle(.plain)
 
-                if theme.rowStyle == .ledger || session.id != sessions.last?.id {
-                    Rectangle().fill(theme.line).frame(height: 1)
+                    if theme.rowStyle == .ledger || session.id != sessions.last?.id {
+                        Rectangle().fill(theme.line).frame(height: 1)
+                    }
                 }
             }
+            .modifier(DetailGroupChrome(theme: theme))
         }
-        .modifier(DetailGroupChrome(theme: theme))
     }
 
+    /// Open the session the user tapped, not just the bot's latest one
+    /// (session.resume by durable key, AppModelLive+Sessions).
     private func openSession(_ session: SessionSummary) {
-        model.openBotID = botID
+        model.openStoredSession(session.id, botID: botID)
         model.selectedTab = .home
         dismiss()
     }
 
     // MARK: - Context window
 
-    private var contextCard: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            GeometryReader { geo in
-                HStack(spacing: 0) {
-                    ForEach(Array(model.contextMeter.enumerated()), id: \.element.id) { index, segment in
-                        Rectangle()
-                            .fill(segmentColor(index))
-                            .frame(width: geo.size.width * CGFloat(segment.percent) / 100)
+    @ViewBuilder private var contextCard: some View {
+        if contextSegments.isEmpty {
+            Text(emptyLine(CopyPack.contextNeedsSession(theme.id)))
+                .font(style.aSubFont)
+                .foregroundStyle(theme.faint)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(EdgeInsets(top: 12, leading: 13, bottom: 12, trailing: 13))
+                .modifier(DetailCardChrome(theme: theme))
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                GeometryReader { geo in
+                    HStack(spacing: 0) {
+                        ForEach(Array(contextSegments.enumerated()), id: \.element.id) { index, segment in
+                            Rectangle()
+                                .fill(segmentColor(index))
+                                .frame(width: geo.size.width * CGFloat(segment.percent) / 100)
+                        }
+                        Spacer(minLength: 0)
                     }
-                    Spacer(minLength: 0)
                 }
-            }
-            .frame(height: 6)
-            .background(theme.line)
-            .clipShape(RoundedRectangle(cornerRadius: 3))
+                .frame(height: 6)
+                .background(theme.line)
+                .clipShape(RoundedRectangle(cornerRadius: 3))
 
-            ForEach(Array(model.contextMeter.enumerated()), id: \.element.id) { index, segment in
-                HStack(spacing: 7) {
-                    Circle()
-                        .fill(segmentColor(index))
-                        .frame(width: 7, height: 7)
-                    Text(segment.label)
-                        .font(style.aSubFont)
-                        .foregroundStyle(theme.sub)
-                    Spacer(minLength: 8)
-                    Text("\(segment.percent)%")
-                        .font(style.timeFont)
-                        .foregroundStyle(theme.faint)
+                ForEach(Array(contextSegments.enumerated()), id: \.element.id) { index, segment in
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(segmentColor(index))
+                            .frame(width: 7, height: 7)
+                        Text(segment.label)
+                            .font(style.aSubFont)
+                            .foregroundStyle(theme.sub)
+                        Spacer(minLength: 8)
+                        Text("\(segment.percent)%")
+                            .font(style.timeFont)
+                            .foregroundStyle(theme.faint)
+                    }
+                    .padding(.top, 7)
                 }
-                .padding(.top, 7)
             }
+            .padding(EdgeInsets(top: 12, leading: 13, bottom: 12, trailing: 13))
+            .modifier(DetailCardChrome(theme: theme))
         }
-        .padding(EdgeInsets(top: 12, leading: 13, bottom: 12, trailing: 13))
-        .modifier(DetailCardChrome(theme: theme))
     }
 
     /// Meter segments cycle through the avatar palette, same order everywhere.
@@ -278,62 +389,98 @@ public struct BotSheetView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             DetailToggle(isOn: yoloOn, theme: theme) {
-                setYolo(!yoloOn)
+                // AppModel.setYolo attaches the session first, so the toggle
+                // is not a local-only lie when the bot has never been opened.
+                model.setYolo(botID: botID, enabled: !yoloOn)
             }
         }
         .padding(EdgeInsets(top: 11, leading: 13, bottom: 11, trailing: 13))
         .modifier(DetailCardChrome(theme: theme))
     }
 
-    private func setYolo(_ enabled: Bool) {
-        let chat = model.chat(for: botID)
-        chat.yolo = enabled
-        if case .live = model.mode, let client = model.client, let sid = chat.sessionID {
-            Task { try? await client.setYolo(sessionID: sid, enabled: enabled) }
-        }
-    }
-
     // MARK: - Model pin
 
-    private var modelChips: some View {
-        DetailChipFlow(spacing: 7) {
-            ForEach(model.models, id: \.self) { name in
-                DetailChip(text: name,
-                           selected: (bot.pinnedModel ?? model.models.first) == name,
-                           theme: theme) {
-                    pinModel(name)
+    @ViewBuilder private var modelChips: some View {
+        if modelChoices.isEmpty {
+            Text(emptyLine(CopyPack.noModels(theme.id)))
+                .font(style.aSubFont)
+                .foregroundStyle(theme.faint)
+        } else {
+            DetailChipFlow(spacing: 7) {
+                ForEach(modelChoices) { choice in
+                    DetailChip(text: choice.model,
+                               selected: pinnedModel == choice.model,
+                               theme: theme) {
+                        pinModel(choice)
+                    }
                 }
+            }
+            if pinWarning {
+                Text(CopyPack.modelProviderUnknown(theme.id))
+                    .font(style.aSubFont)
+                    .foregroundStyle(theme.warn)
             }
         }
     }
 
-    private func pinModel(_ modelName: String) {
-        guard let index = model.bots.firstIndex(where: { $0.id == botID }) else { return }
-        model.bots[index].pinnedModel = modelName
-        if case .live = model.mode, let client = model.client {
-            Task { try? await client.configureProfile(name: botID, model: modelName) }
+    /// The profile's pin, falling back to the gateway's current model so the
+    /// row never renders with nothing selected.
+    private var pinnedModel: String? {
+        bot.pinnedModel ?? snapshot?.model.nilIfEmpty
+            ?? modelChoices.first(where: \.isCurrent)?.model
+    }
+
+    /// profiles.configure {model, provider} — both halves or the gateway
+    /// silently ignores the write (methods_profiles.py:751).
+    private func pinModel(_ choice: ModelChoice) {
+        let provider = choice.provider.isEmpty ? (snapshot?.provider ?? "") : choice.provider
+        guard !isLive || !provider.isEmpty else {
+            pinWarning = true
+            return
+        }
+        pinWarning = false
+        Task {
+            await model.saveProfileEdit(botID: botID,
+                                        edit: ProfileEdit(model: choice.model, provider: provider))
         }
     }
 
     // MARK: - Memory (star map)
 
+    /// The star map is decorative and stays. What it is drawn FROM is now
+    /// honest in live mode: profiles.describe carries no memory rows, so the
+    /// card reports the counts the gateway does report and says as much.
     private var memoryCard: some View {
         VStack(spacing: 0) {
             starMap
                 .frame(height: 96)
             Rectangle().fill(theme.line).frame(height: 1)
-            ForEach(Array(memory.recent.enumerated()), id: \.offset) { index, line in
+            ForEach(Array(memoryLines.enumerated()), id: \.offset) { index, line in
                 Text(line)
                     .font(style.aSubPlainFont)
                     .foregroundStyle(theme.sub)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(EdgeInsets(top: 9, leading: 13, bottom: 9, trailing: 13))
-                if index < memory.recent.count - 1 {
+                if index < memoryLines.count - 1 {
                     Rectangle().fill(theme.line).frame(height: 1)
                 }
             }
         }
         .modifier(DetailCardChrome(theme: theme))
+    }
+
+    private var memoryLines: [String] {
+        guard isLive else { return memory.recent }
+        return [CopyPack.memoryCounts(skills: enabledSkillCount,
+                                      sessions: sessions.count, theme.id),
+                CopyPack.memoryNoRows(theme.id)]
+    }
+
+    /// Star density tracks the real skill + session counts, so a busy bot's
+    /// map is visibly denser than a fresh one's.
+    private var starCount: Int {
+        guard isLive else { return Self.stars.count }
+        return max(3, min(Self.stars.count, enabledSkillCount + sessions.count))
     }
 
     private var starMap: some View {
@@ -342,7 +489,7 @@ public struct BotSheetView: View {
                 constellationLine(geo, x: 0.18, y: 0.30, width: 0.44, degrees: 9)
                 constellationLine(geo, x: 0.56, y: 0.24, width: 0.32, degrees: 38)
                 constellationLine(geo, x: 0.24, y: 0.52, width: 0.38, degrees: -14)
-                ForEach(Array(Self.stars.enumerated()), id: \.offset) { index, star in
+                ForEach(Array(Self.stars.prefix(starCount).enumerated()), id: \.offset) { index, star in
                     TwinkleStar(color: theme.color(for: bot.hue),
                                 size: index.isMultiple(of: 3) ? 5 : 3.5,
                                 delay: Double(index) * 0.4)
@@ -377,29 +524,25 @@ public struct BotSheetView: View {
         .modifier(DetailCardChrome(theme: theme))
     }
 
-    /// Desktop "Duplicate" semantics: clone config, skills and memory into a
-    /// sibling profile named `<id>-2` (first free suffix).
+    /// Desktop "Duplicate" semantics: profiles.create {clone_from,
+    /// clone_all:true} — config, skills and memory into a sibling profile
+    /// named `<id>-2` (first free suffix) — then a roster refresh.
     private func duplicateBot() {
-        guard let source = model.bot(botID) else { return }
-        let newID = cloneID(for: source.id)
-        // Preview copy ported from the prototype (not part of CopyPack).
-        let clone = Bot(id: newID, job: source.job, shape: source.shape, hue: source.hue,
-                        status: .idle, preview: "Cloned — config, skills, memory copied.",
-                        previewTime: "new", unread: 0, description: source.description,
-                        pinnedModel: source.pinnedModel)
-        model.bots.append(clone)
-        if case .live = model.mode, let client = model.client {
-            Task { try? await client.createProfile(name: newID, cloneFrom: source.id) }
+        guard !duplicating, model.bot(botID) != nil else { return }
+        duplicating = true
+        duplicateFailed = false
+        let newID = model.cloneID(for: botID)
+        Task {
+            let ok = await model.duplicateProfile(from: botID, to: newID)
+            duplicating = false
+            guard ok else {
+                duplicateFailed = true
+                return
+            }
+            model.openBotID = nil
+            model.selectedTab = .home
+            dismiss()
         }
-        model.openBotID = nil
-        model.selectedTab = .home
-        dismiss()
-    }
-
-    private func cloneID(for base: String) -> String {
-        var suffix = 2
-        while model.bots.contains(where: { $0.id == "\(base)-\(suffix)" }) { suffix += 1 }
-        return "\(base)-\(suffix)"
     }
 
     // MARK: - Section labels
@@ -413,6 +556,95 @@ public struct BotSheetView: View {
     }
 }
 
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
+// MARK: - Bot-sheet copy (the three voices)
+
+extension CopyPack {
+
+    static func statSessions(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "sessions"
+        case .control: "SESSIONS"
+        case .ink: "sittings"
+        }
+    }
+
+    static func statMemories(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "memories"
+        case .control: "MEMORIES"
+        case .ink: "memories"
+        }
+    }
+
+    static func statSkills(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "skills"
+        case .control: "SKILLS"
+        case .ink: "gifts"
+        }
+    }
+
+    static func statToolsets(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "toolsets"
+        case .control: "TOOLSETS"
+        case .ink: "implements"
+        }
+    }
+
+    static func noStoredSessions(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "No stored sessions yet — say something and one begins."
+        case .control: "NO STORED SESSIONS — SESSION.LIST RETURNED NONE."
+        case .ink: "No sittings are recorded. Speak, and one begins."
+        }
+    }
+
+    static func contextNeedsSession(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The context meter fills once this bot has a live session — open its chat."
+        case .control: "NO ATTACHED SESSION — CONTEXT BREAKDOWN UNAVAILABLE."
+        case .ink: "The measure is taken only while a sitting is open."
+        }
+    }
+
+    static func memoryCounts(skills: Int, sessions: Int, _ t: ThemeID) -> String {
+        switch t {
+        case .soft: "\(skills) skills enabled · \(sessions) sessions on record"
+        case .control: "\(skills) SKILLS ENABLED · \(sessions) SESSIONS ON RECORD"
+        case .ink: "\(skills) gifts held · \(sessions) sittings written down"
+        }
+    }
+
+    static func memoryNoRows(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The gateway doesn’t expose memory rows, so this map is drawn from skills and sessions."
+        case .control: "NO MEMORY ROWS IN PROFILES.DESCRIBE — MAP DERIVED FROM SKILLS + SESSIONS."
+        case .ink: "The gateway keeps no ledger of memories; this chart is drawn from gifts and sittings."
+        }
+    }
+
+    static func duplicating(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Duplicating…"
+        case .control: "CLONING…"
+        case .ink: "the copy is being made…"
+        }
+    }
+
+    static func duplicateFailed(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The gateway refused the duplicate — nothing was created."
+        case .control: "CLONE REJECTED — NO PROFILE CREATED."
+        case .ink: "The gateway refused the copy; nothing was made."
+        }
+    }
+}
+
 // MARK: - Per-theme styles (ported from the prototype's detail-screen CSS)
 
 fileprivate struct DetailStyle {
@@ -420,13 +652,8 @@ fileprivate struct DetailStyle {
 
     var backFg: Color { t.id == .ink ? t.ink : t.accent }
 
-    var subTitleFont: Font {
-        switch t.id {
-        case .soft: t.body(20, weight: .heavy)
-        case .control: t.body(18, weight: .heavy)
-        case .ink: t.display(22, weight: .bold).smallCaps()
-        }
-    }
+    // The header's name type scale lives in BotIdentityLabel(.sheet) — one
+    // owner for the identity pair, here and on the roster.
 
     var jobFont: Font {
         switch t.id {

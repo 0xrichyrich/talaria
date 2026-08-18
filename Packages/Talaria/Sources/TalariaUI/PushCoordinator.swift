@@ -162,11 +162,37 @@ public final class PushCoordinator: NSObject {
     /// Hand the token to the gateway's talaria-push relay plugin. Safe to call
     /// repeatedly (idempotent upsert server-side); silently skips when the
     /// gateway is absent or the plugin isn't installed.
+    ///
+    /// Connecting a gateway is the in-context moment to ask for notification
+    /// permission — approvals are the whole point of the relay — so an
+    /// undetermined status prompts once here rather than only in onboarding.
     public func registerWithRelayIfConnected() {
-        guard let hex = deviceTokenHex, let client = model?.client else { return }
-        Task {
-            // Dev builds sign with the development aps-environment.
-            try? await client.registerPushDevice(tokenHex: hex, environment: "dev")
+        guard let client = model?.client else { return }
+        Task { @MainActor in
+            if deviceTokenHex == nil {
+                let status = await authorizationStatus()
+                switch status {
+                case .notDetermined:
+                    guard await requestAuthorization() else { return }
+                case .authorized, .provisional, .ephemeral:
+                    registerForRemoteNotifications()
+                default:
+                    return  // denied — respect it
+                }
+            }
+            // Wait for the APNs token (already resolved when registration
+            // happened earlier in this launch).
+            let hex = await deviceToken
+            // The relay's upsert REPLACES the stored record wholesale
+            // (talaria_push_relay/devices.py `upsert`), and an omitted
+            // `profile_filter` normalizes to [] — "every bot". Re-sending the
+            // existing filter is what stops this connect-time handshake from
+            // silently undoing the per-bot choice made in Settings.
+            // `environment` is deliberately NOT carried over: it describes this
+            // build's aps-environment, not a user preference.
+            let existing = await client.pushDevice(tokenHex: hex)
+            try? await client.registerPushDevice(tokenHex: hex, environment: "dev",
+                                                 profileFilter: existing?.profileFilter ?? [])
         }
     }
 
@@ -187,8 +213,10 @@ public final class PushCoordinator: NSObject {
         case "bot":
             let id = url.pathComponents.count > 1 ? url.pathComponents[1] : url.lastPathComponent
             guard !id.isEmpty, id != "/" else { return false }
-            model.selectedTab = .home
-            model.openBotID = id
+            // openChat, not a raw openBotID write: it resumes the bot's
+            // canonical chat and hydrates it. A bare write lands in an empty
+            // transcript whose first send forks a new session.
+            model.openChat(botID: id)
             return true
         case "approvals":
             model.selectedTab = .approvals
@@ -234,8 +262,9 @@ public final class PushCoordinator: NSObject {
                 NotificationCenter.default.post(name: .talariaOpenConnections, object: nil)
             default:
                 if let botID, botID != "gateway" {
-                    model.selectedTab = .home
-                    model.openBotID = botID
+                    // Same rule as every other route into a chat: openChat
+                    // resumes the canonical conversation, a raw write does not.
+                    model.openChat(botID: botID)
                 } else {
                     model.selectedTab = .activity
                 }

@@ -302,14 +302,28 @@ public enum TalariaVoice {
         return String(first).uppercased() + id.dropFirst()
     }
 
-    /// "@researcher" everywhere; "Researcher" in ink (rendered small-caps).
-    public static func displayName(_ id: String, _ theme: ThemeID) -> String {
-        theme == .ink ? capitalized(id) : "@" + id
+    // The bare-id overloads that used to live here (`displayName(_ id:)` and
+    // `plainUpper(_ id:)`) are gone. Both re-derived a name from the profile
+    // id — `plainUpper` printed it verbatim, so the primary profile shouted
+    // DEFAULT where every other surface says HERMES — which is the split
+    // identity Phase 0 removed. A call site holding only an id now goes
+    // through `AppModel.identity(_:)`; one holding an optional Bot uses the
+    // `displayName(_:id:_:)` overload in Components/BotIdentity.swift.
+
+    /// Desktop Bot Mode's title (plugin.js `displayName`): a user-set title,
+    /// "Hermes" for the primary "default" profile, else the de-slugged
+    /// profile name. Ink renders it small-caps, so it stays unprefixed there;
+    /// the other packs keep the prototype's @-prefix only when the bot has no
+    /// distinct title, so a titled bot reads "skynet" rather than "@skynet".
+    public static func displayName(for bot: Bot, _ theme: ThemeID) -> String {
+        bot.showsHandle || theme == .ink ? bot.displayTitle : "@" + bot.handle
     }
 
-    /// "RESEARCHER" — message meta lines and the voice screen header.
-    public static func plainUpper(_ id: String) -> String {
-        capitalized(id).uppercased()
+    /// The @handle you tag a bot with (plugin.js `botHandle`): the profile
+    /// name, except "default" → @hermes. Shown beside the title only when the
+    /// two differ, matching desktop's `showsHandle`.
+    public static func handle(for bot: Bot) -> String {
+        "@" + bot.handle
     }
 
     /// Elapsed-time readout: soft "4m 12s" · control "04:12" · ink "4 minutes gone".

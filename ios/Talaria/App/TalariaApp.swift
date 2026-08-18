@@ -36,6 +36,15 @@ struct TalariaApp: App {
 
         // Mirror "bot is working" into the lock screen / Dynamic Island.
         LiveActivityController.shared.attach(to: model)
+
+        // Solo's `shortcuts_run` needs a real UIApplication to hand control to
+        // the Shortcuts app; with no opener installed the tool reports itself
+        // unavailable rather than pretending to have run something. The return
+        // half of the round trip is `SoloToolHost.deliver`, routed in
+        // DeepLinkRouter.
+        SoloToolHost.shared.openURL = { url in
+            await UIApplication.shared.open(url)
+        }
     }
 
     var body: some Scene {

@@ -8,12 +8,20 @@ import TalariaTheme
 // avatar). Tapping routes: approval → Approvals tab, gateway → Connections,
 // anything else → that bot's chat.
 // Ported from Talaria.dc.html `data-screen-label="Activity"`.
+//
+// Live source (AppModelLive+Feeds.swift): there is no activity endpoint. The
+// rows are an in-process journal fed by the event stream (finished turns,
+// cron.changed runs, inbound A2A mentions), the approvals array (raised and
+// cleared) and the connection monitor (link lost / restored) — persisted to
+// UserDefaults, newest 200, so the tab is never empty on relaunch.
 
 public struct ActivityView: View {
     private let model: AppModel
     /// Connections is pushed a level deep off the roster; the host wires this
     /// to its connections push (same pattern as SearchPalette's onAction).
     private let onOpenConnections: (() -> Void)?
+
+    @State private var confirmingClear = false
 
     public init(model: AppModel, onOpenConnections: (() -> Void)? = nil) {
         self.model = model
@@ -25,12 +33,23 @@ public struct ActivityView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ScreenHeader(theme: theme, kicker: copy.kickerActivity, title: copy.titleActivity)
+            ScreenHeader(theme: theme, kicker: copy.kickerActivity, title: copy.titleActivity) {
+                if model.mode == .live, !model.activity.isEmpty {
+                    HeaderIconButton(theme: theme, size: 32) {
+                        confirmingClear = true
+                    } glyph: {
+                        Text(verbatim: "⌫")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
+                    }
+                }
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 15) {
                     ForEach(model.activity) { day in
                         dayGroup(day)
                     }
+                    if model.activity.isEmpty { emptyState }
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 4)
@@ -39,6 +58,13 @@ public struct ActivityView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(theme.bg)
+        .task { model.attachActivityRouter() }
+        .confirmationDialog(copy.clearLedger(theme.id), isPresented: $confirmingClear) {
+            Button(copy.clearLedger(theme.id), role: .destructive) {
+                model.clearActivityJournal()
+            }
+            Button(copy.cancel, role: .cancel) {}
+        }
     }
 
     // MARK: Day group
@@ -54,7 +80,7 @@ public struct ActivityView: View {
                                 theme: theme, copy: copy) {
                         route(item)
                     }
-                    .modifier(RowEntrance(delay: Double(index) * 0.05))
+                    .modifier(RowEntrance(delay: Double(min(index, 10)) * 0.05))
                 }
             }
             .modifier(GroupChrome(theme: theme))
@@ -93,6 +119,23 @@ public struct ActivityView: View {
         }
     }
 
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(copy.activityEmptyTitle(theme.id))
+                .font(theme.id == .control ? theme.mono(12, weight: .bold)
+                                           : theme.body(15, weight: .bold))
+                .foregroundStyle(theme.ink)
+            Text(copy.activityEmptyBody(theme.id))
+                .font(theme.id == .control ? theme.mono(9.5) : theme.body(theme.id == .ink ? 13 : 11.5))
+                .italic(theme.id == .ink)
+                .foregroundStyle(theme.faint)
+                .lineSpacing(3)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 4)
+        .padding(.top, 24)
+    }
+
     // MARK: Routing
 
     /// approval → Approvals tab; gateway events → Connections; else the bot's
@@ -109,7 +152,7 @@ public struct ActivityView: View {
             }
         } else {
             model.selectedTab = .home
-            model.openBotID = item.botID
+            model.openChat(botID: item.botID)
         }
     }
 }
@@ -141,11 +184,15 @@ private struct ActivityRow: View {
                         .font(textFont)
                         .foregroundStyle(theme.ink)
                         .multilineTextAlignment(.leading)
-                    Text(item.subtext)
-                        .font(subFont)
-                        .italic(theme.id == .ink)
-                        .foregroundStyle(theme.sub)
-                        .multilineTextAlignment(.leading)
+                        .lineLimit(2)
+                    if !item.subtext.isEmpty {
+                        Text(item.subtext)
+                            .font(subFont)
+                            .italic(theme.id == .ink)
+                            .foregroundStyle(theme.sub)
+                            .multilineTextAlignment(.leading)
+                            .lineLimit(2)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 if item.pending {

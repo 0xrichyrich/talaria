@@ -104,8 +104,11 @@ public struct CopyPack: Sendable {
     public var demoBannerBody: String = "Everything here is canned. Connect a real gateway below, or step out."
     public var demoLeave: String = "Leave demo mode"
     public var demoReonboard: String = "Show onboarding again"
-    /// Composer placeholder for a given bot id.
-    public var composer: @Sendable (String) -> String
+    /// Composer placeholder. Takes the bot, not its profile id, so the
+    /// placeholder resolves through the one identity path — the @handle you
+    /// would actually tag (default → @hermes) or the display title — and
+    /// never prints the raw profile name.
+    public var composer: @Sendable (Bot) -> String
 
     public static func pack(for theme: ThemeID) -> CopyPack {
         switch theme {
@@ -113,10 +116,6 @@ public struct CopyPack: Sendable {
         case .control: .control
         case .ink: .ink
         }
-    }
-
-    private static func cap(_ s: String) -> String {
-        s.isEmpty ? s : s.prefix(1).uppercased() + s.dropFirst()
     }
 
     public static let soft = CopyPack(
@@ -171,7 +170,7 @@ public struct CopyPack: Sendable {
         obAllow: "Allow", obAllowed: "Enabled ✓", obCta3: "Enter the roster",
         tabs: [("Bots", .home), ("Activity", .activity), ("Approvals", .approvals),
                ("Inbox", .a2a), ("Artifacts", .artifacts)],
-        composer: { bot in "Message @\(bot)" }
+        composer: { bot in "Message @\(bot.handle)" }
     )
 
     public static let control: CopyPack = {
@@ -201,7 +200,7 @@ public struct CopyPack: Sendable {
         c.memorySec = "MEMORY"; c.yoloName = "YOLO MODE"
         c.tabs = [("BOTS", .home), ("FEED", .activity), ("HOLDS", .approvals),
                   ("COMMS", .a2a), ("VAULT", .artifacts)]
-        c.composer = { bot in "Transmit to @\(bot)" }
+        c.composer = { bot in "Transmit to @\(bot.handle)" }
         return c
     }()
 
@@ -246,7 +245,9 @@ public struct CopyPack: Sendable {
         c.obTitle3 = "Six familiars await"; c.obLook = "choose the guise"
         c.tabs = [("bots", .home), ("ledger", .activity), ("seals", .approvals),
                   ("parley", .a2a), ("relics", .artifacts)]
-        c.composer = { bot in "Address \(cap(bot))…" }
+        // Ink names its familiars rather than tagging them, so this voice
+        // takes the title (@handle is a machine address, not a form of address).
+        c.composer = { bot in "Address \(bot.displayTitle)…" }
         return c
     }()
 }

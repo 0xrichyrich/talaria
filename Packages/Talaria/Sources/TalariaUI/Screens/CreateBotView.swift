@@ -8,58 +8,114 @@ import TalariaTheme
 // Cancel / title / Create header (Create lights up once a name is set), a
 // live avatar preview inside the slow "summoning ring" (control + ink), the
 // shape and hue pickers, the grouped @name / job / soul form, the Advanced
-// disclosure (model pin + skills chips) and the profiles.create footnote.
+// disclosure (model pin + skills + toolsets + MCP) and the profiles.create
+// footnote.
 //
-// Demo mode appends to the roster; live mode drives profiles.create +
-// profiles.configure (ui_meta carries talaria:{shape,hue}) then refreshes the
-// roster. Edit mode ("Edit look & soul") prefills from the bot and calls
-// profiles.configure only — the profile id itself is immutable here, matching
-// the CLI-only lifecycle noted on the profile sheet.
+// Live-mode contract (the fix for the audit's one data-loss bug): edit mode
+// opens by reading profiles.describe and prefills EVERYTHING from it — the
+// real SOUL.md, the disabled-skill set, the model+provider pin, the toolset
+// pin, the MCP list. Save then sends only the sections the user actually
+// changed (ProfileEdit, GatewayClient+Profiles.swift). If the describe call
+// fails the sheet refuses to write soul/skills/toolsets at all, because it
+// has nothing true to diff against — profiles.configure replaces whole
+// sections, so a blank field would erase the file.
+//
+// Cosmetics take the other road (ROADMAP decision #3): title, shape and colour
+// are written back into desktop Bot Mode's own ui_meta["hermes-bots"] block
+// through AppModelLive+Cosmetics, which read-merges the live block first so a
+// phone edit can never clobber the canonical-chat pin or a key it does not
+// own. That is a separate configure call from the text sections above,
+// deliberately — the merge needs a fresh read that the dirty diff does not.
+//
+// Demo mode keeps working throughout: the same snapshot shape is synthesized
+// from DemoData and every write stays local.
 
 @MainActor
 public struct CreateBotView: View {
     @Environment(\.dismiss) private var dismiss
     private let model: AppModel
-    /// Non-nil = edit mode, prefilled from this bot.
+    /// Non-nil = edit mode, prefilled from this bot + profiles.describe.
     private let editing: Bot?
 
+    /// How far the profiles.describe prefill got. Nothing that replaces a
+    /// gateway-side section may be written before `.loaded`.
+    private enum Load: Equatable { case loading, loaded, failed }
+
     @State private var name: String
+    /// The user-set display title — desktop's Edit Profile "Title" field,
+    /// stored in ui_meta["hermes-bots"].title and read back by
+    /// `Bot.displayTitle`. Blank means "keep the derived name", which is why
+    /// the placeholder shows what that derived name would be.
+    @State private var title: String
     @State private var job: String
     @State private var soul: String
     @State private var shape: AvatarShape
     @State private var hue: AvatarHue
-    @State private var pinnedModel: String?
-    @State private var excludedSkills: Set<String> = []
     @State private var showAdvanced = false
+    /// Staged avatar bytes (generated or uploaded) — written only by Save.
+    @State private var avatar = AvatarDraft()
+
+    // Live catalogs (empty until the gateway answers).
+    @State private var modelChoices: [ModelChoice] = []
+    @State private var pinnedModel: ModelChoice?
+    /// The chip row preselects the gateway's current model; only an actual
+    /// tap turns that into a written pin on create.
+    @State private var pinTouched = false
+    @State private var skillRows: [ProfileSnapshot.Skill] = []
+    @State private var disabledSkills: Set<String> = []
+    @State private var toolsetRows: [ProfileSnapshot.Toolset] = []
+    @State private var enabledToolsets: Set<String> = []
+    @State private var mcpRows: [ProfileSnapshot.MCPServer] = []
+
+    /// The gateway's own answer, kept verbatim as the dirty-diff baseline.
+    @State private var baseline: ProfileSnapshot?
+    @State private var load: Load = .loading
+
+    @State private var saving = false
+    @State private var saveFailed = false
+    /// Set when the gateway took the profile edit but could not store the look
+    /// — an older build with no ui_meta support. Not an error (nothing was
+    /// lost that the gateway ever held), but the user should know why the
+    /// laptop will not show it.
+    @State private var lookUnsupported = false
+    @State private var portraitNote: PortraitFailure?
 
     public init(model: AppModel, editing: Bot? = nil) {
         self.model = model
         self.editing = editing
         _name = State(initialValue: editing?.id ?? "")
+        _title = State(initialValue: editing?.title ?? "")
         _job = State(initialValue: editing?.job ?? "")
-        _soul = State(initialValue: editing?.description ?? "")
+        // Soul stays EMPTY until profiles.describe answers with the real
+        // SOUL.md. It used to be seeded from the profile description, which
+        // is what an untouched save then wrote over the file.
+        _soul = State(initialValue: "")
         _shape = State(initialValue: editing?.shape ?? .circle)
         _hue = State(initialValue: editing?.hue ?? .teal)
-        _pinnedModel = State(initialValue: editing?.pinnedModel)
     }
 
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
     private var style: CreateStyle { CreateStyle(t: theme) }
 
-    /// The six roster hues, in the prototype's DB.HUES order (no gateway grey).
-    private static let hues: [AvatarHue] = [.teal, .violet, .amber, .green, .pink, .blue]
-
     private var isEditing: Bool { editing != nil }
 
-    private var canCreate: Bool {
-        guard !name.isEmpty else { return false }
-        // A new profile id must be free; edits keep their id.
-        return isEditing || model.bot(name) == nil
+    /// Who a generated portrait is of — the name being typed right now, not
+    /// the one the profile was saved under, so a rename and a new face can be
+    /// decided in the same sitting.
+    private var promptName: String {
+        let typed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !typed.isEmpty { return typed }
+        return editing?.displayTitle ?? name
     }
 
-    /// Prototype default: the first model chip reads as picked until changed.
-    private var effectiveModel: String? { pinnedModel ?? model.models.first }
+    private var canCreate: Bool {
+        guard !name.isEmpty, !saving else { return false }
+        // A new profile id must be free; edits keep their id.
+        guard isEditing || model.bot(name) == nil else { return false }
+        // Never let an edit save race the prefill it diffs against.
+        return !isEditing || load != .loading
+    }
 
     // MARK: - Body
 
@@ -69,11 +125,38 @@ public struct CreateBotView: View {
             ScrollView {
                 VStack(spacing: 14) {
                     avatarPreview
-                    shapePicker
-                    huePicker
+                    AvatarPicker(model: model, botID: editing?.id,
+                                 name: promptName, job: job, soul: soul,
+                                 shape: $shape, hue: $hue, draft: $avatar)
+                    if !isEditing {
+                        Text(CopyPack.portraitAfterCreate(theme.id))
+                            .font(style.aSubFont)
+                            .foregroundStyle(theme.faint)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity)
+                    }
+                    if isEditing, load != .loaded { prefillBanner }
                     formGroup
                     advancedRow
                     if showAdvanced { advancedBoxes }
+                    if saveFailed {
+                        Text(CopyPack.editorSaveFailed(theme.id))
+                            .font(style.footNoteFont)
+                            .foregroundStyle(theme.danger)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if lookUnsupported {
+                        Text(CopyPack.lookNotStored(theme.id))
+                            .font(style.footNoteFont)
+                            .foregroundStyle(theme.warn)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if let portraitNote {
+                        Text(CopyPack.portraitFailure(portraitNote, theme.id))
+                            .font(style.footNoteFont)
+                            .foregroundStyle(theme.warn)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                     Text(copy.createNote)
                         .font(style.footNoteFont)
                         .foregroundStyle(theme.faint)
@@ -86,6 +169,74 @@ public struct CreateBotView: View {
         }
         .background(theme.bg.ignoresSafeArea())
         .presentationBackground(theme.bg)
+        .task { await prefill() }
+    }
+
+    // MARK: - Prefill (profiles.describe + model.options)
+
+    /// Edit mode reads the profile it is about to write. Create mode reads
+    /// the gateway's default profile purely for a skills catalog — a new
+    /// profile is born with the same bundled skills.
+    private func prefill() async {
+        guard load == .loading else { return }
+
+        async let catalogTask = model.modelChoices()
+
+        let snapshot: ProfileSnapshot?
+        if let editing {
+            // The stored portrait has to be in the cache before the picker can
+            // offer to remove it, and before the preview can show what this
+            // bot's face actually is today. Idempotent and cached.
+            await model.refreshAvatar(botID: editing.id)
+            snapshot = await model.profileSnapshot(botID: editing.id)
+        } else if let seed = LiveRuntime.shared.defaultBotID ?? model.bots.first?.id {
+            snapshot = await model.profileSnapshot(botID: seed)
+        } else {
+            snapshot = nil
+        }
+
+        modelChoices = await catalogTask
+
+        if isEditing {
+            guard let snapshot else {
+                load = .failed
+                return
+            }
+            baseline = snapshot
+            soul = snapshot.soul
+            if job.isEmpty { job = snapshot.description }
+            skillRows = snapshot.skills
+            disabledSkills = Set(snapshot.disabledSkills)
+            toolsetRows = snapshot.toolsets
+            enabledToolsets = Set(snapshot.toolsets.filter(\.enabled).map(\.name))
+            mcpRows = snapshot.mcpServers
+            pinnedModel = resolvedPin(model: snapshot.model, provider: snapshot.provider)
+        } else {
+            // Catalog only — a not-yet-created profile has no snapshot to diff.
+            skillRows = snapshot?.skills ?? []
+            toolsetRows = []
+            mcpRows = []
+            // The gateway's current model reads as picked (prototype default),
+            // but an untouched chip row is NOT written as a pin: profiles.create
+            // inherits the launch profile's provider+model when none is given.
+            pinnedModel = modelChoices.first(where: \.isCurrent) ?? modelChoices.first
+        }
+        load = .loaded
+    }
+
+    /// Match the profile's pin against the live catalog so the chip row
+    /// shows it selected; fall back to the profile's own model+provider when
+    /// the gateway no longer offers it (a deconfigured provider, say).
+    private func resolvedPin(model modelID: String, provider: String) -> ModelChoice? {
+        guard !modelID.isEmpty else { return nil }
+        if let match = modelChoices.first(where: { $0.model == modelID }) {
+            return match.provider.isEmpty && !provider.isEmpty
+                ? ModelChoice(model: modelID, provider: provider, providerName: provider)
+                : match
+        }
+        let orphan = ModelChoice(model: modelID, provider: provider, providerName: provider)
+        modelChoices.insert(orphan, at: 0)
+        return orphan
     }
 
     // MARK: - Header (Cancel · title · Create)
@@ -114,13 +265,19 @@ public struct CreateBotView: View {
             Spacer(minLength: 8)
 
             Button {
-                commit()
+                Task { await commit() }
             } label: {
-                Text(copy.createOk)
-                    .font(style.hdrBtnStrongFont)
-                    .tracking(style.hdrTracking)
-                    .foregroundStyle(canCreate ? theme.accent : theme.faint)
-                    .contentShape(Rectangle())
+                Group {
+                    if saving {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text(copy.createOk)
+                            .font(style.hdrBtnStrongFont)
+                            .tracking(style.hdrTracking)
+                            .foregroundStyle(canCreate ? theme.accent : theme.faint)
+                    }
+                }
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(!canCreate)
@@ -128,15 +285,28 @@ public struct CreateBotView: View {
         .padding(EdgeInsets(top: 18, leading: 18, bottom: 10, trailing: 18))
     }
 
-    // MARK: - Avatar preview (reacts live to shape/hue picks)
+    // MARK: - Avatar preview (reacts live to picks, staged image included)
 
+    /// What this bot's face will be once Save lands: the staged image if the
+    /// user just generated or chose one, the stored portrait if there is one
+    /// and it is not being removed, else the shape × hue silhouette.
     private var avatarPreview: some View {
         ZStack {
             if theme.id != .soft {
                 SummonRing(theme: theme)
                     .frame(width: 112, height: 112)
             }
-            AvatarView(shape: shape, hue: hue, size: 84, theme: theme)
+            if let image = previewImage {
+                image
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 84, height: 84)
+                    .clipShape(AvatarSilhouette(shape))
+                    .overlay(AvatarSilhouette(shape)
+                        .stroke(theme.id == .ink ? theme.lineStrong : theme.line, lineWidth: 1))
+            } else {
+                AvatarView(shape: shape, hue: hue, size: 84, theme: theme)
+            }
         }
         .frame(width: 112, height: 112)
         .frame(maxWidth: .infinity)
@@ -144,87 +314,24 @@ public struct CreateBotView: View {
         .padding(.bottom, 2)
     }
 
-    // MARK: - Shape picker
-
-    private var shapePicker: some View {
-        HStack(spacing: 8) {
-            ForEach(AvatarShape.allCases, id: \.self) { candidate in
-                let on = shape == candidate
-                Button {
-                    withAnimation(.easeInOut(duration: 0.15)) { shape = candidate }
-                } label: {
-                    AvatarSilhouette(candidate)
-                        .fill(on ? theme.color(for: hue) : theme.faint)
-                        .frame(width: 20, height: 20)
-                        .frame(width: 34, height: 34)
-                        .background(shapeWrap(on: on))
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(maxWidth: .infinity)
+    private var previewImage: Image? {
+        if let staged = avatar.image { return ProfileAssetStore.image(from: staged) }
+        guard !avatar.clearsImage, let editing,
+              let data = ProfileAssetStore.shared.portrait(for: editing.id) else { return nil }
+        return ProfileAssetStore.image(from: data)
     }
 
-    /// Selection chrome per theme: soft = tinted rounded pad, control =
-    /// terminal cell with accent border, ink = a 2pt rule under the glyph.
-    @ViewBuilder private func shapeWrap(on: Bool) -> some View {
-        switch theme.id {
-        case .soft:
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(on ? theme.accent.opacity(0.12) : .clear)
-        case .control:
-            let cell = RoundedRectangle(cornerRadius: 7, style: .continuous)
-            cell.fill(theme.panel)
-                .overlay(cell.stroke(on ? theme.accent.opacity(0.5) : theme.line, lineWidth: 1))
-        case .ink:
-            VStack(spacing: 0) {
-                Spacer(minLength: 0)
-                Rectangle()
-                    .fill(on ? theme.ink : .clear)
-                    .frame(height: 2)
-            }
-        }
-    }
+    // MARK: - Prefill banner (loading / gateway unreadable)
 
-    // MARK: - Hue picker
-
-    private var huePicker: some View {
-        HStack(spacing: 9) {
-            ForEach(Self.hues, id: \.self) { candidate in
-                let on = hue == candidate
-                Button {
-                    withAnimation(.easeInOut(duration: 0.15)) { hue = candidate }
-                } label: {
-                    swatchShape
-                        .fill(theme.color(for: candidate))
-                        .frame(width: 23, height: 23)
-                        .overlay(swatchRing(on: on))
-                        .padding(4)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    /// Control renders square telemetry swatches; the others are dots.
-    private var swatchShape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: theme.id == .control ? 4 : 11.5, style: .continuous)
-    }
-
-    /// Ink signals selection with a parchment gap + ink halo; the others use
-    /// a plain ink border.
-    @ViewBuilder private func swatchRing(on: Bool) -> some View {
-        if on {
-            if theme.id == .ink {
-                swatchShape.inset(by: -2).stroke(theme.bg, lineWidth: 2)
-                swatchShape.inset(by: -3.25).stroke(theme.ink, lineWidth: 1.5)
-            } else {
-                swatchShape.stroke(theme.ink, lineWidth: 2.5)
-            }
-        }
+    private var prefillBanner: some View {
+        Text(load == .loading ? CopyPack.editorLoading(theme.id)
+                              : CopyPack.editorLoadFailed(theme.id))
+            .font(style.aSubFont)
+            .foregroundStyle(load == .loading ? theme.faint : theme.warn)
+            .lineSpacing(2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(EdgeInsets(top: 10, leading: 13, bottom: 10, trailing: 13))
+            .modifier(CreateBoxChrome(theme: theme, kind: .box))
     }
 
     // MARK: - Form (@name · job · soul)
@@ -258,6 +365,19 @@ public struct CreateBotView: View {
 
             Rectangle().fill(theme.line).frame(height: 1)
 
+            // Desktop's Title field (plugin.js:5076-5083). Its placeholder is
+            // the DERIVED display name, so leaving it blank visibly means
+            // "keep the name Talaria works out" rather than "unnamed".
+            TextField(derivedTitle, text: $title)
+                .textFieldStyle(.plain)
+                .font(style.fieldFont)
+                .foregroundStyle(theme.ink)
+                .tint(theme.accent)
+                .autocorrectionDisabled()
+                .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
+
+            Rectangle().fill(theme.line).frame(height: 1)
+
             TextField(copy.phJob, text: $job)
                 .textFieldStyle(.plain)
                 .font(style.fieldFont)
@@ -267,16 +387,39 @@ public struct CreateBotView: View {
 
             Rectangle().fill(theme.line).frame(height: 1)
 
-            TextField(copy.phDesc, text: $soul, axis: .vertical)
+            TextField(soulPlaceholder, text: $soul, axis: .vertical)
                 .textFieldStyle(.plain)
-                .lineLimit(3...6)
+                .lineLimit(3...10)
                 .font(style.fieldFont)
-                .foregroundStyle(theme.ink)
+                .foregroundStyle(soulEditable ? theme.ink : theme.faint)
                 .tint(theme.accent)
                 .lineSpacing(3)
+                .disabled(!soulEditable)
                 .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
         }
         .modifier(CreateBoxChrome(theme: theme, kind: .form))
+    }
+
+    /// SOUL.md is only editable once we hold the real file (or on create,
+    /// where there is nothing to overwrite).
+    private var soulEditable: Bool { !isEditing || load == .loaded }
+
+    private var soulPlaceholder: String {
+        guard isEditing else { return copy.phDesc }
+        switch load {
+        case .loading: return CopyPack.soulLoading(theme.id)
+        case .failed: return CopyPack.soulUnavailable(theme.id)
+        case .loaded: return copy.phDesc
+        }
+    }
+
+    /// What the roster would call this bot with no title set — the same rule
+    /// every other surface renders (`Bot.displayTitle`), so the placeholder is
+    /// literally what blank means.
+    private var derivedTitle: String {
+        let id = name.trimmingCharacters(in: .whitespaces)
+        guard !id.isEmpty else { return CopyPack.titleFieldPlaceholder(theme.id) }
+        return Bot.unlisted(id: id).displayTitle
     }
 
     // MARK: - Advanced disclosure
@@ -324,34 +467,115 @@ public struct CreateBotView: View {
         VStack(spacing: 11) {
             advBox {
                 secLabel(copy.modelSec)
-                DetailChipFlow(spacing: 7) {
-                    ForEach(model.models, id: \.self) { candidate in
-                        DetailChip(text: candidate,
-                                   selected: effectiveModel == candidate,
-                                   theme: theme) {
-                            pinnedModel = candidate
+                if modelChoices.isEmpty {
+                    emptyLine(catalogLine(CopyPack.noModels(theme.id)))
+                } else {
+                    DetailChipFlow(spacing: 7) {
+                        ForEach(modelChoices) { candidate in
+                            DetailChip(text: candidate.model,
+                                       selected: pinnedModel?.model == candidate.model,
+                                       theme: theme) {
+                                pinnedModel = candidate
+                                pinTouched = true
+                            }
                         }
                     }
+                }
+                if let pinnedModel, pinnedModel.provider.isEmpty, isEditing || pinTouched {
+                    Text(CopyPack.modelProviderUnknown(theme.id))
+                        .font(style.aSubFont)
+                        .foregroundStyle(theme.warn)
+                        .padding(.top, 1)
                 }
             }
             advBox {
                 secLabel(copy.skillsSec)
-                DetailChipFlow(spacing: 7) {
-                    ForEach(model.skills, id: \.self) { skill in
-                        let off = excludedSkills.contains(skill)
-                        DetailChip(text: skill, selected: !off, struck: off, theme: theme) {
-                            if off { excludedSkills.remove(skill) }
-                            else { excludedSkills.insert(skill) }
+                if skillRows.isEmpty {
+                    emptyLine(catalogLine(CopyPack.noSkills(theme.id)))
+                } else {
+                    DetailChipFlow(spacing: 7) {
+                        ForEach(skillRows) { skill in
+                            let off = disabledSkills.contains(skill.name)
+                            DetailChip(text: skill.name, selected: !off, struck: off,
+                                       theme: theme) {
+                                guard skillsEditable else { return }
+                                if off { disabledSkills.remove(skill.name) }
+                                else { disabledSkills.insert(skill.name) }
+                            }
                         }
                     }
+                    .opacity(skillsEditable ? 1 : 0.5)
                 }
                 Text(copy.skillsNote)
                     .font(style.aSubFont)
                     .foregroundStyle(theme.sub)
                     .padding(.top, 1)
             }
+            if !toolsetRows.isEmpty {
+                advBox {
+                    secLabel(CopyPack.toolsetsSec(theme.id))
+                    DetailChipFlow(spacing: 7) {
+                        ForEach(toolsetRows) { toolset in
+                            let on = enabledToolsets.contains(toolset.name)
+                            DetailChip(text: toolset.label, selected: on, struck: !on,
+                                       theme: theme) {
+                                guard skillsEditable else { return }
+                                if on { enabledToolsets.remove(toolset.name) }
+                                else { enabledToolsets.insert(toolset.name) }
+                            }
+                        }
+                    }
+                    .opacity(skillsEditable ? 1 : 0.5)
+                    Text(CopyPack.toolsetsNote(theme.id))
+                        .font(style.aSubFont)
+                        .foregroundStyle(theme.sub)
+                        .padding(.top, 1)
+                }
+            }
+            if !mcpRows.isEmpty {
+                advBox {
+                    secLabel(CopyPack.mcpSec(theme.id))
+                    ForEach(mcpRows) { server in
+                        HStack(spacing: 7) {
+                            Circle()
+                                .fill(server.enabled ? theme.ok : theme.faint)
+                                .frame(width: 6, height: 6)
+                            Text(server.name)
+                                .font(style.aSubPlainFont)
+                                .foregroundStyle(theme.ink)
+                            Spacer(minLength: 8)
+                            Text(server.transport.uppercased())
+                                .font(style.advHintFont)
+                                .tracking(1)
+                                .foregroundStyle(theme.faint)
+                        }
+                    }
+                    Text(CopyPack.mcpNote(theme.id))
+                        .font(style.aSubFont)
+                        .foregroundStyle(theme.sub)
+                        .padding(.top, 1)
+                }
+            }
         }
         .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    /// Skill/toolset toggles are replace-semantics writes: only offer them
+    /// once the current sets came back from the gateway.
+    private var skillsEditable: Bool { !isEditing || load == .loaded }
+
+    /// An empty catalog means three different things — still loading, the
+    /// gateway could not be read, or it genuinely has none. Say which.
+    private func catalogLine(_ absent: String) -> String {
+        if load == .loading { return CopyPack.catalogLoading(theme.id) }
+        if isEditing, load == .failed { return CopyPack.catalogUnavailable(theme.id) }
+        return absent
+    }
+
+    private func emptyLine(_ text: String) -> some View {
+        Text(text)
+            .font(style.aSubFont)
+            .foregroundStyle(theme.faint)
     }
 
     private func advBox(@ViewBuilder content: () -> some View) -> some View {
@@ -370,74 +594,320 @@ public struct CreateBotView: View {
 
     // MARK: - Commit
 
-    private func commit() {
+    private func commit() async {
         guard canCreate else { return }
-        let soulText = soul.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let editing {
-            applyEdit(to: editing, soul: soulText)
+        saving = true
+        saveFailed = false
+        lookUnsupported = false
+        portraitNote = nil
+        let ok = isEditing ? await applyEdit() : await create()
+        saving = false
+        // A failed cosmetics write is reported in place rather than dismissing
+        // on a lie; everything else that succeeded has already landed.
+        if ok, !lookUnsupported, portraitNote == nil { dismiss() }
+        if !ok { saveFailed = true }
+    }
+
+    /// Create: profiles.create (description + SOUL.md + model pin) then a
+    /// configure pass for the sections create does not take — including the
+    /// look, in both vocabularies, with the `created` stamp that floats a
+    /// brand-new bot to the top of the roster (plugin.js:5399-5401).
+    private func create() async -> Bool {
+        let created = await model.createBotProfile(
+            id: name,
+            job: job.trimmingCharacters(in: .whitespacesAndNewlines),
+            soul: soul.trimmingCharacters(in: .whitespacesAndNewlines),
+            model: pinTouched ? pinnedModel : nil,
+            disabledSkills: Array(disabledSkills).sorted(),
+            enabledToolsets: nil,
+            uiMeta: model.newBotUIMeta(shape: shape, hue: hue, title: title))
+        guard created else { return false }
+        // A portrait staged before the profile existed can only be written now
+        // that it does — the asset store is keyed by profile name.
+        await commitAvatar(botID: name)
+        return true
+    }
+
+    /// Edit: the dirty diff. Every section is compared against the gateway's
+    /// own snapshot, and untouched sections are simply not sent.
+    private func applyEdit() async -> Bool {
+        guard let editing else { return false }
+        var edit = ProfileEdit()
+
+        let jobText = job.trimmingCharacters(in: .whitespacesAndNewlines)
+        let soulText = soul
+
+        if let baseline {
+            if jobText != baseline.description { edit.description = jobText }
+            if soulText != baseline.soul { edit.soul = soulText }
+            if let pinnedModel,
+               pinnedModel.model != baseline.model || pinnedModel.provider != baseline.provider {
+                edit.model = pinnedModel.model
+                edit.provider = pinnedModel.provider.isEmpty ? baseline.provider : pinnedModel.provider
+            }
+            let disabled = Array(disabledSkills).sorted()
+            if disabled != baseline.disabledSkills { edit.disabledSkills = disabled }
+            let baselineToolsets = Set(baseline.toolsets.filter(\.enabled).map(\.name))
+            if enabledToolsets != baselineToolsets {
+                edit.enabledToolsets = Array(enabledToolsets).sorted()
+            }
         } else {
-            create(soul: soulText)
+            // No snapshot: cosmetics and the fields the user typed here, only.
+            // Soul, skills and toolsets are deliberately left untouched.
+            if jobText != (editing.job) { edit.description = jobText }
+            if let pinnedModel, !pinnedModel.provider.isEmpty,
+               pinnedModel.model != editing.pinnedModel {
+                edit.model = pinnedModel.model
+                edit.provider = pinnedModel.provider
+            }
         }
-        dismiss()
+
+        if !edit.isEmpty {
+            guard await model.saveProfileEdit(botID: editing.id, edit: edit) else { return false }
+        }
+
+        // The look is its own write. It has to read the live
+        // ui_meta["hermes-bots"] block and merge into it — the dirty diff above
+        // has no way to do that, and a bare block would delete the bot's
+        // canonical-chat pin, its group and its pin-to-top flag.
+        if lookChanged(from: editing) {
+            switch await model.saveBotLook(botID: editing.id, shape: shape, hue: hue,
+                                           title: title) {
+            case .persisted:
+                break
+            case .unsupported:
+                // Said once per gateway and then never again: an old gateway
+                // would otherwise hold this sheet open on every single save,
+                // which is precisely the trap desktop's three-way outcome
+                // exists to avoid (plugin.js:248-262).
+                if !RosterSignals.shared.lookUnsupportedNoticed {
+                    RosterSignals.shared.lookUnsupportedNoticed = true
+                    lookUnsupported = true
+                }
+            case .failed:
+                return false
+            }
+        }
+        await commitAvatar(botID: editing.id)
+        return true
     }
 
-    /// Demo: joins the roster immediately. Live: same optimistic append, then
-    /// profiles.create + profiles.configure (ui_meta) and a roster refresh.
-    private func create(soul: String) {
-        // Fallback job + preview copy ported from the prototype (not in CopyPack).
-        let bot = Bot(id: name,
-                      job: job.isEmpty ? "General agent" : job,
-                      shape: shape, hue: hue, status: .idle,
-                      preview: "Profile created. Say hello.", previewTime: "new",
-                      unread: 0,
-                      description: soul.isEmpty ? nil : soul,
-                      pinnedModel: pinnedModel)
-        model.bots.append(bot)
+    private func lookChanged(from bot: Bot) -> Bool {
+        shape != bot.shape || hue != bot.hue
+            || title.trimmingCharacters(in: .whitespacesAndNewlines) != (bot.title ?? "")
+    }
 
-        guard model.mode == .live, let client = model.client else { return }
-        let meta = uiMeta
-        let disabled = excludedSkills.isEmpty ? nil : Array(excludedSkills).sorted()
-        Task { @MainActor in
-            try? await client.createProfile(name: bot.id, description: bot.job,
-                                            soul: soul.isEmpty ? nil : soul,
-                                            model: pinnedModel)
-            try? await client.configureProfile(name: bot.id,
-                                              disabledSkills: disabled,
-                                              uiMeta: meta)
-            try? await model.refreshRoster()
+    /// Write the staged portrait (generated, uploaded, or removed). Bytes go to
+    /// the profile asset store, never into ui_meta — the block is 64 KB-capped
+    /// and rides every profiles.list (plugin.js:217-227).
+    private func commitAvatar(botID: String) async {
+        guard !avatar.isEmpty else { return }
+        portraitNote = await model.commitAvatarDraft(botID: botID, draft: avatar)
+        if portraitNote == nil { avatar = AvatarDraft() }
+    }
+}
+
+// MARK: - Editor copy (the three voices)
+
+extension CopyPack {
+
+    static func editorLoading(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Reading this profile from the gateway — SOUL.md, skills and model pin."
+        case .control: "READING PROFILE — SOUL.MD · SKILLS · MODEL PIN"
+        case .ink: "The familiar’s papers are being fetched — soul, gifts and chosen mind."
         }
     }
 
-    /// Edit look & soul: mutate the roster entry in place (status, preview and
-    /// unread state survive), then profiles.configure under the original id.
-    private func applyEdit(to editing: Bot, soul: String) {
-        if let idx = model.bots.firstIndex(where: { $0.id == editing.id }) {
-            if !job.isEmpty { model.bots[idx].job = job }
-            model.bots[idx].shape = shape
-            model.bots[idx].hue = hue
-            model.bots[idx].description = soul.isEmpty ? nil : soul
-            model.bots[idx].pinnedModel = pinnedModel
-        }
-
-        guard model.mode == .live, let client = model.client else { return }
-        let meta = uiMeta
-        let disabled = excludedSkills.isEmpty ? nil : Array(excludedSkills).sorted()
-        let jobText = job
-        Task { @MainActor in
-            try? await client.configureProfile(name: editing.id,
-                                              description: jobText.isEmpty ? nil : jobText,
-                                              soul: soul.isEmpty ? nil : soul,
-                                              model: pinnedModel,
-                                              disabledSkills: disabled,
-                                              uiMeta: meta)
-            try? await model.refreshRoster()
+    static func editorLoadFailed(_ t: ThemeID) -> String {
+        switch t {
+        case .soft:
+            "Couldn’t read this profile from the gateway. Look and job can still be saved — SOUL.md, skills and toolsets are left exactly as they are."
+        case .control:
+            "PROFILE READ FAILED. COSMETICS + JOB WRITABLE; SOUL.MD / SKILLS / TOOLSETS UNTOUCHED."
+        case .ink:
+            "The papers could not be read. Guise and office may still be set; the soul, the gifts and the tools remain as they were."
         }
     }
 
-    /// Shape × hue rides along in profile ui_meta so every client renders the
-    /// same look; AppModel+Live reads the same keys back on roster refresh.
-    private var uiMeta: JSONValue {
-        ["talaria": ["shape": .string(shape.rawValue), "hue": .string(hue.rawValue)]]
+    /// Placeholder for the Title field before there is a name to derive one
+    /// from (the create sheet, first keystroke).
+    static func titleFieldPlaceholder(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Display name (optional)"
+        case .control: "DISPLAY NAME (OPTIONAL)"
+        case .ink: "the name you will call it"
+        }
+    }
+
+    /// The save landed, but this gateway cannot store ui_meta — the look holds
+    /// on this phone until the next roster poll and never reaches desktop.
+    /// Desktop stays silent here because its plugin-local store keeps the look;
+    /// Talaria has no such store, so saying it once is the honest thing.
+    static func lookNotStored(_ t: ThemeID) -> String {
+        switch t {
+        case .soft:
+            "This gateway is too old to store looks, so the shape, colour and display name won’t reach your desktop. Update Hermes to keep them."
+        case .control:
+            "GATEWAY CANNOT STORE UI_META — LOOK IS LOCAL ONLY. UPDATE HERMES TO SYNC."
+        case .ink:
+            "This gateway keeps no register of guises; the look will not travel to your desk. A newer gateway would remember it."
+        }
+    }
+
+    static func editorSaveFailed(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The gateway refused the save — nothing was changed. Try again when it answers."
+        case .control: "SAVE REJECTED BY GATEWAY — NO CHANGES WRITTEN."
+        case .ink: "The gateway would not take the inscription. Nothing was altered."
+        }
+    }
+
+    static func soulLoading(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "reading SOUL.md…"
+        case .control: "READING SOUL.MD…"
+        case .ink: "the soul is being read…"
+        }
+    }
+
+    static func soulUnavailable(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "SOUL.md unavailable — left untouched"
+        case .control: "SOUL.MD UNREADABLE — LEFT UNTOUCHED"
+        case .ink: "the soul could not be read — it is left as it stands"
+        }
+    }
+
+    static func toolsetsSec(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Toolsets"
+        case .control: "TOOLSETS"
+        case .ink: "IMPLEMENTS (TOOLSETS)"
+        }
+    }
+
+    static func toolsetsNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Tap to enable or disable a toolset for this profile."
+        case .control: "TAP TO ARM / DISARM A TOOLSET FOR THIS PROFILE."
+        case .ink: "Strike through an implement to set it aside."
+        }
+    }
+
+    static func mcpSec(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "MCP servers"
+        case .control: "MCP SERVERS"
+        case .ink: "OUTSIDE SERVANTS (MCP)"
+        }
+    }
+
+    static func mcpNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "From profiles.describe — add or edit MCP servers on the gateway."
+        case .control: "SOURCE: PROFILES.DESCRIBE — EDIT SERVERS GATEWAY-SIDE."
+        case .ink: "As the profile records them; their hiring is done at the gateway."
+        }
+    }
+
+    static func noModels(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The gateway offered no models — it has no inference provider configured yet."
+        case .control: "NO MODELS FROM MODEL.OPTIONS — GATEWAY HAS NO PROVIDER."
+        case .ink: "No minds are on offer; the gateway keeps no provider yet."
+        }
+    }
+
+    static func catalogLoading(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "reading…"
+        case .control: "READING…"
+        case .ink: "being read…"
+        }
+    }
+
+    static func catalogUnavailable(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Unreadable — left untouched"
+        case .control: "UNREADABLE — LEFT UNTOUCHED"
+        case .ink: "unreadable — left as it stands"
+        }
+    }
+
+    static func noSkills(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "No skills installed on this profile."
+        case .control: "NO SKILLS INSTALLED."
+        case .ink: "This one carries no gifts yet."
+        }
+    }
+
+    static func modelProviderUnknown(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The gateway didn’t name a provider for this model, so the pin can’t be written."
+        case .control: "NO PROVIDER SLUG FOR THIS MODEL — PIN NOT WRITABLE."
+        case .ink: "No house claims this mind, so the choice cannot be inscribed."
+        }
+    }
+
+    static func portraitGenerate(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Generate a portrait"
+        case .control: "GENERATE PORTRAIT"
+        case .ink: "sit for a portrait"
+        }
+    }
+
+    static func portraitWorking(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Painting…"
+        case .control: "GENERATING…"
+        case .ink: "the likeness is being drawn…"
+        }
+    }
+
+    static func portraitAfterCreate(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Portraits are painted after the profile exists — create it, then open Edit look & soul."
+        case .control: "PORTRAIT AVAILABLE POST-DEPLOY — EDIT LOOK & SOUL."
+        case .ink: "A likeness is drawn only once the familiar is summoned."
+        }
+    }
+
+    static func portraitFailure(_ failure: PortraitFailure, _ t: ThemeID) -> String {
+        switch failure {
+        case .notLive:
+            switch t {
+            case .soft: "Portraits need a live gateway."
+            case .control: "PORTRAIT REQUIRES LIVE LINK."
+            case .ink: "A likeness requires an open way."
+            }
+        case .unavailable:
+            switch t {
+            case .soft: "This gateway has no image provider configured."
+            case .control: "NO IMAGE PROVIDER ON GATEWAY."
+            case .ink: "This gateway keeps no limner."
+            }
+        case .noBytes:
+            switch t {
+            case .soft: "The image stayed on the gateway host — nothing to store as an avatar."
+            case .control: "IMAGE RETURNED AS HOST PATH — NO BYTES TO STORE."
+            case .ink: "The likeness never left the gateway’s own hall."
+            }
+        case .tooLarge:
+            switch t {
+            case .soft: "The portrait came back too large to store (2 MB limit)."
+            case .control: "PORTRAIT EXCEEDS 2 MB ASSET LIMIT."
+            case .ink: "The likeness is too great a weight to keep (2 MB)."
+            }
+        case .failed(let message):
+            switch t {
+            case .soft: "Portrait failed — \(message)"
+            case .control: "PORTRAIT FAILED — \(message.uppercased())"
+            case .ink: "The portrait failed — \(message)"
+            }
+        }
     }
 }
 
@@ -557,6 +1027,14 @@ fileprivate struct CreateStyle {
         case .soft: t.body(12)
         case .control: t.mono(10)
         case .ink: t.body(13).italic()
+        }
+    }
+
+    var aSubPlainFont: Font {
+        switch t.id {
+        case .soft: t.body(13)
+        case .control: t.body(12.5)
+        case .ink: t.body(14.5)
         }
     }
 

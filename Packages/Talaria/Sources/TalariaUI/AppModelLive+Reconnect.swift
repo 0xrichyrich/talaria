@@ -1,0 +1,924 @@
+import Foundation
+import Observation
+import SwiftUI
+import TalariaKit
+import TalariaTheme
+
+// Connection supervision: the layer above AppModelLive's backoff loop.
+//
+// AppModelLive owns the automatic path — event-pump completion is the
+// disconnect signal, then exponential backoff 1→30 s, then session.resume of
+// every open chat inside the server's ~20 s park window. Three things that loop
+// cannot do for itself live here:
+//
+//   1. Re-auth. GatewayClient.connect() throws AuthError.sessionExpired when
+//      the refresh token is rejected, and deletes the Keychain credential on
+//      the way out (GatewayClient.swift:167-170). The backoff loop then just
+//      stops, leaving the app silently offline forever (PARITY §1, roadmap
+//      #10). A missing credential for the connected base URL is therefore an
+//      exact, side-effect-free signal that reconnect gave up on auth — the
+//      supervisor polls for it and raises ReauthBanner.
+//   2. Foreground recovery. iOS suspends the process; a socket that died in the
+//      background is only discovered when the app returns, and any surviving
+//      backoff timer may be mid-30 s sleep. applicationDidBecomeActive()
+//      re-probes health and retries immediately instead of waiting it out.
+//   3. Manual control — "Reconnect now" on the banner, and switching the live
+//      gateway from Connections.
+//
+// All of it is additive — AppModelLive is untouched. The supervised retry parks
+// itself in the SAME LiveRuntime.reconnectTask slot the automatic loop uses (so
+// the two can never dial concurrently) and re-dials the same GatewayClient the
+// same way, which keeps the event fan-out and the ~20 s park window intact.
+
+// MARK: - Supervisor state (side table)
+
+/// AppModel's stored properties live in AppModel.swift (another owner) and
+/// extensions cannot add storage, so supervision state rides an observable
+/// MainActor singleton — the same shape LiveRuntime uses, but observable
+/// because the banner and the Connections rows read it from view bodies.
+@MainActor
+@Observable
+final class ConnectionSupervisor {
+    static let shared = ConnectionSupervisor()
+
+    /// Gateway whose sign-in must be repeated; nil when auth is healthy.
+    var reauthGateway: URL?
+    /// A supervised dial is in flight (banner spinner, disabled row actions).
+    var isReconnecting = false
+    /// Last status-probe result per saved-gateway id.
+    var diagnostics: [String: GatewayDiagnostics] = [:]
+
+    @ObservationIgnored let keychain = KeychainStore()
+    /// App-lifetime watch loop; nil until the first start request.
+    @ObservationIgnored var watchTask: Task<Void, Never>?
+
+    func note(error: Error, forGatewayID id: String?) {
+        guard let id else { return }
+        var entry = diagnostics[id] ?? GatewayDiagnostics()
+        entry.lastError = GatewayDiagnostics.shortMessage(for: error)
+        entry.checkedAt = Date()
+        diagnostics[id] = entry
+    }
+}
+
+/// What the Connections health row shows for one saved gateway: the public
+/// `GET /api/status` answer plus the measured round trip and the last failure.
+public struct GatewayDiagnostics: Sendable, Equatable {
+
+    /// How the gateway gates access (auth_required + auth_flows).
+    public enum AuthMode: String, Sendable {
+        /// Loopback / trusted bind — a pasted session token is enough.
+        case open
+        /// Gated and advertising native_pkce: the in-app broker flow works.
+        case oauth
+        /// Gated without native_pkce — Talaria cannot broker a sign-in.
+        case gated
+        case unknown
+    }
+
+    public var version: String?
+    public var authMode: AuthMode
+    public var pingMS: Int?
+    public var lastError: String?
+    public var checkedAt: Date?
+
+    public init(version: String? = nil, authMode: AuthMode = .unknown,
+                pingMS: Int? = nil, lastError: String? = nil, checkedAt: Date? = nil) {
+        self.version = version
+        self.authMode = authMode
+        self.pingMS = pingMS
+        self.lastError = lastError
+        self.checkedAt = checkedAt
+    }
+
+    /// One health probe: `GET /api/status` (public, unauthenticated —
+    /// ws-protocol.md §18) with a measured round trip. A timeout reads as a
+    /// sleeping host, anything else as offline — same split the registry
+    /// probe uses, so the two agree on the state word.
+    static func probe(_ gateway: SavedGateway) async -> (ConnectionState, GatewayDiagnostics) {
+        guard let base = gateway.baseURL else {
+            return (.offline, GatewayDiagnostics(lastError: "malformed gateway URL",
+                                                 checkedAt: Date()))
+        }
+        var request = URLRequest(url: base.appending(path: "api/status"))
+        // Fail fast: a sleeping LAN box must not hold the row for 60 s.
+        request.timeoutInterval = 5
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let code = (response as? HTTPURLResponse)?.statusCode else {
+                throw URLError(.badServerResponse)
+            }
+            guard code == 200 else {
+                return (.offline, GatewayDiagnostics(lastError: "status \(code)",
+                                                     checkedAt: Date()))
+            }
+            let elapsed = start.duration(to: clock.now)
+            let ms = max(1, Int((elapsed / .milliseconds(1)).rounded()))
+            let status = GatewayStatus(try JSONDecoder().decode(JSONValue.self, from: data))
+            return (.connected, GatewayDiagnostics(version: status.version,
+                                                   authMode: authMode(for: status),
+                                                   pingMS: ms,
+                                                   lastError: nil,
+                                                   checkedAt: Date()))
+        } catch {
+            let timedOut = (error as? URLError)?.code == .timedOut
+            return (timedOut ? .asleep : .offline,
+                    GatewayDiagnostics(lastError: shortMessage(for: error), checkedAt: Date()))
+        }
+    }
+
+    static func authMode(for status: GatewayStatus) -> AuthMode {
+        guard status.authRequired else { return .open }
+        return status.supportsNativePKCE ? .oauth : .gated
+    }
+
+    /// System-localized, one line — these are diagnostics, not app voice.
+    static func shortMessage(for error: Error) -> String {
+        if let urlError = error as? URLError { return urlError.localizedDescription }
+        if let gateway = error as? GatewayError { return gateway.message }
+        switch error {
+        case AuthError.sessionExpired: return "session expired"
+        case AuthError.providerUnreachable: return "sign-in provider unreachable"
+        case AuthError.unauthorized(let detail): return detail
+        case AuthError.protocolError(let detail): return detail
+        default: return (error as NSError).localizedDescription
+        }
+    }
+}
+
+// MARK: - AppModel surface
+
+extension AppModel {
+
+    /// The gateway that needs a fresh sign-in, or nil. Observable: reading it
+    /// from a view body subscribes to changes.
+    public var needsReauth: URL? { ConnectionSupervisor.shared.reauthGateway }
+
+    /// A supervised (manual / foreground) reconnect is dialing right now.
+    public var isReconnecting: Bool { ConnectionSupervisor.shared.isReconnecting }
+
+    /// Last health probe for a saved gateway row.
+    public func diagnostics(forGatewayID id: String) -> GatewayDiagnostics? {
+        ConnectionSupervisor.shared.diagnostics[id]
+    }
+
+    /// True when this saved row is the gateway the live socket is bound to.
+    public func isActiveGateway(_ gateway: SavedGateway) -> Bool {
+        guard mode == .live, client != nil,
+              let live = LiveRuntime.shared.baseURL, let base = gateway.baseURL else { return false }
+        return live.absoluteString == base.absoluteString
+    }
+
+    // MARK: Supervision loop
+
+    /// Start the app-lifetime link watch. Idempotent — ReauthBanner asks for it
+    /// on appear and the scene-phase hook asks again, so supervision survives a
+    /// banner that is torn down and rebuilt. Cheap: the Keychain is only read in
+    /// the one state that can mean "reconnect gave up" — offline, nobody
+    /// retrying.
+    public func startLinkSupervision() {
+        let supervisor = ConnectionSupervisor.shared
+        guard supervisor.watchTask == nil else { return }
+        supervisor.watchTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                guard !Task.isCancelled, let self else { return }
+                self.evaluateLinkHealth()
+            }
+        }
+    }
+
+    private func evaluateLinkHealth() {
+        let supervisor = ConnectionSupervisor.shared
+        let runtime = LiveRuntime.shared
+        guard mode == .live, client != nil, let base = runtime.baseURL else { return }
+
+        if !isOffline {
+            // Only the live gateway's own banner is cleared here: a re-auth
+            // raised for some other saved row (tapped while signed out) has to
+            // survive a healthy current link.
+            if supervisor.reauthGateway?.absoluteString == base.absoluteString {
+                supervisor.reauthGateway = nil
+            }
+            return
+        }
+        // Somebody is already working on it.
+        guard runtime.reconnectTask == nil, !supervisor.isReconnecting else { return }
+
+        if supervisor.keychain.load(for: base) == nil {
+            // AppModelLive.scheduleReconnect() stops dead on
+            // AuthError.sessionExpired, and that path has already dropped the
+            // Keychain credential — the one state where the user must act.
+            supervisor.reauthGateway = base
+        } else if supervisor.reauthGateway == nil {
+            // Offline, credential intact, no retry loop alive: the automatic
+            // path either never started or ended on a non-auth failure. Take
+            // it over rather than sit dark.
+            scheduleSupervisedReconnect()
+        }
+    }
+
+    // MARK: Foreground / manual entry points
+
+    /// Scene-phase hook (`scenePhase == .active`). Re-probes every saved
+    /// gateway, then either reconnects a dead link immediately or refreshes the
+    /// roster of a healthy one.
+    public func applicationDidBecomeActive() {
+        startLinkSupervision()
+        // The socket that was supposed to deliver `message.complete` died when
+        // the process was parked, so the roster's "working" flags are beliefs
+        // and not facts until `session.active_list` says otherwise. Asked
+        // before the roster refresh below and independently of it: this runs
+        // even when the link is down (it records the debt and the reaper pays
+        // it once the link is back), and it is the only thing that clears a
+        // bot left spinning on a turn that finished while we were away.
+        foregroundReseed()
+        Task { @MainActor in
+            await refreshConnectionHealth()
+            guard mode == .live, let client else { return }
+            guard await client.isConnected else {
+                reconnectNow()
+                return
+            }
+            if isOffline {
+                // The socket outlived the flag (a send failed, then the link
+                // recovered): the transport is the authority.
+                isOffline = false
+                if let base = LiveRuntime.shared.baseURL {
+                    ConnectionRegistry.shared.noteState(.connected, forURL: base)
+                    connections = ConnectionRegistry.shared.rows
+                }
+                await flushComposeQueue()
+            }
+            // The socket survived the suspension; the roster may not have.
+            try? await refreshRoster()
+        }
+    }
+
+    /// "Reconnect now" — abandons any backoff sleep and dials at once.
+    public func reconnectNow() {
+        guard !ConnectionSupervisor.shared.isReconnecting else { return }
+        Task { @MainActor in
+            let runtime = LiveRuntime.shared
+            runtime.reconnectTask?.cancel()
+            runtime.reconnectTask = nil
+            let reconnected = await attemptReconnect()
+            if !reconnected, ConnectionSupervisor.shared.reauthGateway == nil {
+                scheduleSupervisedReconnect()
+            }
+        }
+    }
+
+    /// Re-probe every saved gateway: state + ping into the registry (so the
+    /// rows and the roster's net chip stay honest) and version / auth mode /
+    /// last error into the diagnostics table the Connections rows render.
+    public func refreshConnectionHealth() async {
+        let registry = ConnectionRegistry.shared
+        let saved = registry.saved
+        guard !saved.isEmpty else { return }
+
+        let results = await withTaskGroup(
+            of: (SavedGateway, ConnectionState, GatewayDiagnostics).self
+        ) { group -> [(SavedGateway, ConnectionState, GatewayDiagnostics)] in
+            for gateway in saved {
+                group.addTask { @Sendable in
+                    let (state, diagnostics) = await GatewayDiagnostics.probe(gateway)
+                    return (gateway, state, diagnostics)
+                }
+            }
+            var rows: [(SavedGateway, ConnectionState, GatewayDiagnostics)] = []
+            for await row in group { rows.append(row) }
+            return rows
+        }
+
+        let supervisor = ConnectionSupervisor.shared
+        for (gateway, state, fresh) in results {
+            var merged = fresh
+            // A failed probe knows nothing about the gateway itself; keep the
+            // last good facts so the row does not blank out while a host naps.
+            if merged.version == nil { merged.version = supervisor.diagnostics[gateway.id]?.version }
+            if merged.authMode == .unknown,
+               let previous = supervisor.diagnostics[gateway.id]?.authMode {
+                merged.authMode = previous
+            }
+            supervisor.diagnostics[gateway.id] = merged
+            if let base = gateway.baseURL {
+                // The live socket is the better authority for its own row.
+                if isActiveGateway(gateway), !isOffline {
+                    registry.noteState(.connected, pingMS: merged.pingMS, forURL: base)
+                } else {
+                    registry.noteState(state, pingMS: merged.pingMS, forURL: base)
+                }
+            }
+        }
+        if mode == .live { connections = registry.rows }
+    }
+
+    // MARK: Reconnect mechanics
+
+    /// One supervised dial. Re-dials the EXISTING client — GatewayClient.connect
+    /// refreshes the OAuth tokens, mints a fresh single-use WS ticket and hangs
+    /// a new transport off the same event fan-out, so the pump AppModelLive
+    /// wired at connect time keeps delivering. Deliberately not connectGateway:
+    /// that tears the link down and cancels whatever sits in
+    /// LiveRuntime.reconnectTask — which, called from the backoff loop, would be
+    /// the loop cancelling itself mid-dial.
+    @discardableResult
+    func attemptReconnect() async -> Bool {
+        let runtime = LiveRuntime.shared
+        let supervisor = ConnectionSupervisor.shared
+        // One dial at a time: the backoff loop, the banner button and the
+        // foreground hook can all arrive at once.
+        guard !supervisor.isReconnecting else { return false }
+        guard mode == .live, let base = runtime.baseURL else { return false }
+        guard let credential = supervisor.keychain.load(for: base) else {
+            supervisor.reauthGateway = base
+            return false
+        }
+
+        supervisor.isReconnecting = true
+        defer { supervisor.isReconnecting = false }
+
+        // Every cached runtime sid dies with the old socket; drop them before
+        // dialing so nothing can submit into a session that no longer exists.
+        let parked = chats.filter { $0.value.storedSessionID != nil }.map(\.key)
+        for chat in chats.values {
+            chat.sessionID = nil
+            chat.isTyping = false
+        }
+
+        let registry = ConnectionRegistry.shared
+        let gatewayID = registry.gateway(forURL: base)?.id
+        do {
+            if let client {
+                try await client.connect()
+            } else {
+                // No client in this process (a launch-time restore that never
+                // completed): build one the ordinary way.
+                try await connectGateway(baseURL: base, credential: credential)
+            }
+        } catch AuthError.sessionExpired {
+            supervisor.reauthGateway = base
+            supervisor.note(error: AuthError.sessionExpired, forGatewayID: gatewayID)
+            isOffline = true
+            return false
+        } catch {
+            isOffline = true
+            registry.noteState(.offline, forURL: base)
+            supervisor.note(error: error, forGatewayID: gatewayID)
+            connections = registry.rows
+            return false
+        }
+
+        supervisor.reauthGateway = nil
+        await adoptReconnectedLink(base: base, parked: parked)
+        return true
+    }
+
+    /// Post-dial housekeeping, mirroring AppModelLive's own reattach (that one
+    /// is file-private, so the sequence is repeated rather than called): retire
+    /// the old generation, re-arm the disconnect watch, re-resume every parked
+    /// chat, then resync the surfaces the outage may have staled.
+    private func adoptReconnectedLink(base: URL, parked: [String]) async {
+        let runtime = LiveRuntime.shared
+        runtime.generation += 1
+        runtime.resetSessionState()
+        // Pending approvals replay through session.resume below; keeping the
+        // old cards would let the user answer request ids that no longer exist.
+        approvals.removeAll()
+        isOffline = false
+        ConnectionRegistry.shared.noteState(.connected, forURL: base)
+
+        if let client { startSupervisedMonitor(for: client, generation: runtime.generation) }
+
+        // ensureSession does the whole reattach: resume by durable key, bind the
+        // new sid, replay the inflight snapshot and any pending approval. The
+        // transcript is already in memory, so history is never re-hydrated.
+        for botID in parked {
+            _ = try? await ensureSession(botID: botID, hydrate: false)
+        }
+
+        try? await refreshRoster()
+        try? await refreshRoutines()
+        connections = ConnectionRegistry.shared.rows
+        await flushComposeQueue()
+    }
+
+    /// The client's event pump finishes exactly when the socket dies; awaiting
+    /// it is the disconnect signal (ws-protocol §3 — liveness is socket-level).
+    private func startSupervisedMonitor(for client: GatewayClient, generation: Int) {
+        let runtime = LiveRuntime.shared
+        runtime.monitorTask?.cancel()
+        runtime.monitorTask = Task { @MainActor [weak self] in
+            guard let pump = await client.eventsTask else { return }
+            await pump.value
+            guard !Task.isCancelled, let self,
+                  LiveRuntime.shared.generation == generation else { return }
+            guard self.mode == .live, self.client != nil else { return }
+            self.isOffline = true
+            if let base = LiveRuntime.shared.baseURL {
+                ConnectionRegistry.shared.noteState(.offline, forURL: base)
+                self.connections = ConnectionRegistry.shared.rows
+            }
+            self.scheduleSupervisedReconnect()
+        }
+    }
+
+    /// Backoff retry owned by the supervisor: same 1→30 s full-second ladder
+    /// with jitter as AppModelLive's, but it ends on the re-auth banner instead
+    /// of silence. Parks in LiveRuntime.reconnectTask so the automatic loop and
+    /// this one are mutually exclusive.
+    func scheduleSupervisedReconnect() {
+        let runtime = LiveRuntime.shared
+        guard runtime.reconnectTask == nil, !ConnectionSupervisor.shared.isReconnecting,
+              mode == .live, runtime.baseURL != nil else { return }
+        let generation = runtime.generation
+        runtime.reconnectTask = Task { @MainActor [weak self] in
+            var attempt = 0
+            while !Task.isCancelled {
+                let backoff = min(30.0, Double(1 << min(attempt, 5))) + Double.random(in: 0...0.5)
+                try? await Task.sleep(for: .seconds(backoff))
+                guard let self, !Task.isCancelled,
+                      LiveRuntime.shared.generation == generation else { return }
+                if await self.attemptReconnect() {
+                    LiveRuntime.shared.reconnectTask = nil
+                    return
+                }
+                if ConnectionSupervisor.shared.reauthGateway != nil {
+                    // Only a human can move this forward now.
+                    LiveRuntime.shared.reconnectTask = nil
+                    return
+                }
+                attempt += 1
+            }
+        }
+    }
+
+    // MARK: Re-auth completion
+
+    /// Adopt a credential minted by the re-auth sheet and get back on the wire.
+    public func completeReauth(baseURL: URL, credential: GatewayCredential) async {
+        let registry = ConnectionRegistry.shared
+        registry.upsert(urlString: baseURL.absoluteString, credential: credential)
+        ConnectionSupervisor.shared.reauthGateway = nil
+
+        let runtime = LiveRuntime.shared
+        runtime.reconnectTask?.cancel()
+        runtime.reconnectTask = nil
+
+        if runtime.baseURL?.absoluteString == baseURL.absoluteString, client != nil {
+            if await attemptReconnect() == false,
+               ConnectionSupervisor.shared.reauthGateway == nil {
+                scheduleSupervisedReconnect()
+            }
+        } else if let saved = registry.gateway(forURL: baseURL) {
+            await switchGateway(to: saved)
+        }
+        connections = registry.rows
+    }
+
+    /// Dismiss the banner without signing in (the gateway stays offline).
+    public func dismissReauth() {
+        ConnectionSupervisor.shared.reauthGateway = nil
+    }
+
+    // MARK: Multi-gateway (Connections row actions)
+
+    /// Make `gateway` the live one. The previous gateway's world — roster,
+    /// chats, approvals, routines — is flushed first: bot ids and session keys
+    /// are per-gateway, so carrying them across would bind chats to sessions
+    /// that do not exist on the new host.
+    public func switchGateway(to gateway: SavedGateway) async {
+        guard let base = gateway.baseURL else { return }
+        let registry = ConnectionRegistry.shared
+        guard let credential = registry.credential(for: gateway) else {
+            // Saved metadata with no Keychain credential: signed out here, or
+            // restored on a new device. Sign-in is the only way forward.
+            ConnectionSupervisor.shared.reauthGateway = base
+            return
+        }
+        // Already the live gateway: a "switch" to it is a reconnect, never a
+        // teardown — flushing here would throw away chats for no reason.
+        if isActiveGateway(gateway) {
+            if isOffline { reconnectNow() }
+            return
+        }
+
+        let supervisor = ConnectionSupervisor.shared
+        guard !supervisor.isReconnecting else { return }
+        supervisor.isReconnecting = true
+        defer { supervisor.isReconnecting = false }
+
+        let runtime = LiveRuntime.shared
+        runtime.reconnectTask?.cancel()
+        runtime.reconnectTask = nil
+        flushWorldForGatewaySwitch()
+
+        do {
+            try await connectGateway(baseURL: base, credential: credential)
+            supervisor.reauthGateway = nil
+            supervisor.diagnostics[gateway.id]?.lastError = nil
+        } catch AuthError.sessionExpired {
+            supervisor.reauthGateway = base
+            supervisor.note(error: AuthError.sessionExpired, forGatewayID: gateway.id)
+        } catch {
+            isOffline = true
+            registry.noteState(.offline, forURL: base)
+            supervisor.note(error: error, forGatewayID: gateway.id)
+        }
+        connections = registry.rows
+    }
+
+    /// Rename a saved gateway (metadata only; the credential is keyed by URL).
+    public func renameGateway(_ gateway: SavedGateway, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        ConnectionRegistry.shared.rename(id: gateway.id, to: trimmed)
+        connections = ConnectionRegistry.shared.rows
+    }
+
+    /// Forget the credential but keep the row: the gateway stays listed and
+    /// probeable, and the next tap runs sign-in again.
+    public func signOutGateway(_ gateway: SavedGateway) async {
+        guard let base = gateway.baseURL else { return }
+        if isActiveGateway(gateway) {
+            await disconnectGateway()
+            flushWorldForGatewaySwitch()
+        }
+        ConnectionSupervisor.shared.keychain.delete(for: base)
+        if ConnectionSupervisor.shared.reauthGateway?.absoluteString == base.absoluteString {
+            ConnectionSupervisor.shared.reauthGateway = nil
+        }
+        connections = ConnectionRegistry.shared.rows
+    }
+
+    /// Remove the gateway entirely — registry row and Keychain credential.
+    public func removeGateway(_ gateway: SavedGateway) async {
+        if isActiveGateway(gateway) {
+            await disconnectGateway()
+            flushWorldForGatewaySwitch()
+        }
+        let supervisor = ConnectionSupervisor.shared
+        if let base = gateway.baseURL,
+           supervisor.reauthGateway?.absoluteString == base.absoluteString {
+            supervisor.reauthGateway = nil
+        }
+        supervisor.diagnostics.removeValue(forKey: gateway.id)
+        // ConnectionRegistry.remove deletes the Keychain credential with the row.
+        ConnectionRegistry.shared.remove(id: gateway.id)
+        connections = ConnectionRegistry.shared.rows
+    }
+
+    /// Drop the outgoing gateway's world. flushDemoWorld() is the single place
+    /// that knows every surface to clear, so it is reused rather than copied —
+    /// a new surface added there cannot be forgotten here.
+    private func flushWorldForGatewaySwitch() {
+        flushDemoWorld()
+        let runtime = LiveRuntime.shared
+        runtime.lastSessionByBot.removeAll()
+        runtime.defaultBotID = nil
+        isOffline = false
+    }
+}
+
+// MARK: - Banner
+
+/// The persistent link banner: "sign in again" when reconnect stopped on an
+/// expired session, otherwise the offline notice with a manual retry. Renders
+/// nothing (zero height) when the link is healthy, and owns the supervision
+/// loop for the life of the app — mount it once, at the top of the screen graph.
+public struct ReauthBanner: View {
+    private let model: AppModel
+
+    /// Captured when the button is tapped so the sheet keeps its gateway even
+    /// if the banner's own state clears underneath it.
+    @State private var signInTarget: SignInTarget?
+
+    public init(model: AppModel) {
+        self.model = model
+    }
+
+    private struct SignInTarget: Identifiable {
+        let url: URL
+        var id: String { url.absoluteString }
+    }
+
+    private var theme: ThemePack { model.theme.pack }
+    private var copy: CopyPack { model.theme.copy }
+
+    public var body: some View {
+        VStack(spacing: 8) {
+            if let gateway = model.needsReauth {
+                card(tone: theme.danger) {
+                    reauthContent(gateway)
+                }
+            } else if model.mode == .live, model.isOffline {
+                card(tone: theme.warn) {
+                    offlineContent
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .onAppear { model.startLinkSupervision() }
+        .sheet(item: $signInTarget) { target in
+            ReauthSheet(model: model, baseURL: target.url)
+        }
+    }
+
+    // MARK: Content
+
+    private func reauthContent(_ gateway: URL) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            headline(copy.reauthTitle(theme.id), tone: theme.danger)
+            Text(copy.reauthBody(theme.id, host: gateway.host() ?? gateway.absoluteString))
+                .font(bodyFont)
+                .italic(theme.id == .ink)
+                .foregroundStyle(theme.sub)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                LinkBannerButton(theme: theme, label: copy.reauthCTA(theme.id), role: .primary) {
+                    signInTarget = SignInTarget(url: gateway)
+                }
+                LinkBannerButton(theme: theme, label: copy.later, role: .secondary) {
+                    model.dismissReauth()
+                }
+            }
+        }
+    }
+
+    /// Deliberately short: the roster already prints the full `copy.offline`
+    /// sentence, and this card follows the user onto every other screen. What
+    /// it adds is the manual retry.
+    private var offlineContent: some View {
+        HStack(spacing: 10) {
+            headline(copy.linkDownTitle(theme.id), tone: theme.warn)
+            Spacer(minLength: 8)
+            LinkBannerButton(theme: theme,
+                             label: model.isReconnecting ? copy.reconnecting(theme.id)
+                                                         : copy.reconnectCTA(theme.id),
+                             role: .primary) {
+                model.reconnectNow()
+            }
+            .disabled(model.isReconnecting)
+            .opacity(model.isReconnecting ? 0.6 : 1)
+        }
+    }
+
+    private func headline(_ text: String, tone: Color) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Circle()
+                .fill(tone)
+                .frame(width: 7, height: 7)
+                .shadow(color: theme.glowRadius > 0 ? tone : .clear, radius: theme.glowRadius / 2)
+                .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }
+            Text(text)
+                .font(titleFont)
+                .tracking(theme.id == .control ? 0.5 : 0)
+                .foregroundStyle(tone)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func card<Content: View>(tone: Color,
+                                     @ViewBuilder content: () -> Content) -> some View {
+        content()
+            .padding(theme.id == .ink ? 12 : 14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(bannerBackground(tone))
+            .overlay(bannerShape.strokeBorder(tone.opacity(theme.id == .soft ? 0.35 : 0.5),
+                                              lineWidth: 1))
+            .clipShape(bannerShape)
+            .shadow(color: theme.id == .soft ? theme.ink.opacity(0.08) : .clear, radius: 8, y: 3)
+    }
+
+    private func bannerBackground(_ tone: Color) -> some View {
+        ZStack {
+            theme.panel
+            tone.opacity(theme.id == .control ? 0.07 : 0.05)
+        }
+    }
+
+    private var bannerShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: theme.id == .ink ? 0 : theme.cardRadius, style: .continuous)
+    }
+
+    private var titleFont: Font {
+        switch theme.id {
+        case .soft: theme.body(13.5, weight: .bold)
+        case .control: theme.mono(11, weight: .bold)
+        case .ink: theme.body(15, weight: .bold).smallCaps()
+        }
+    }
+
+    private var bodyFont: Font {
+        switch theme.id {
+        case .soft: theme.body(12.5)
+        case .control: theme.mono(10)
+        case .ink: theme.body(13.5)
+        }
+    }
+}
+
+/// Compact themed button for the banner (the flow buttons are full-width).
+struct LinkBannerButton: View {
+    enum Role { case primary, secondary }
+
+    var theme: ThemePack
+    var label: String
+    var role: Role
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            text
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(background)
+                .clipShape(shape)
+                .overlay(shape.strokeBorder(border, lineWidth: 1))
+                .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: theme.buttonRadius, style: .continuous)
+    }
+
+    @ViewBuilder private var text: some View {
+        switch theme.id {
+        case .soft:
+            Text(label).font(theme.body(12.5, weight: .bold)).foregroundStyle(foreground)
+        case .control:
+            Text(label).font(theme.mono(10, weight: .bold)).tracking(1).foregroundStyle(foreground)
+        case .ink:
+            Text(label).font(theme.body(13.5, weight: .bold).smallCaps()).tracking(1)
+                .foregroundStyle(foreground)
+        }
+    }
+
+    private var foreground: Color {
+        switch role {
+        case .primary: theme.id == .ink ? theme.bg : theme.accentFg
+        case .secondary: theme.id == .ink ? theme.ink.opacity(0.7) : theme.sub
+        }
+    }
+
+    private var background: Color {
+        switch role {
+        case .primary: theme.id == .ink ? theme.ink : theme.accent
+        case .secondary: theme.id == .soft ? theme.ink.opacity(0.05) : .clear
+        }
+    }
+
+    private var border: Color {
+        role == .secondary ? theme.lineStrong : .clear
+    }
+}
+
+// MARK: - Re-auth sheet
+
+/// Re-runs sign-in against one known gateway. The stored-credential
+/// short-circuit is disabled: we are here precisely because the stored one was
+/// rejected, and a token that still answers /api/auth/me would otherwise send
+/// the user straight back into the same failing reconnect.
+private struct ReauthSheet: View {
+    let model: AppModel
+    let baseURL: URL
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var auth = AuthController()
+
+    private var theme: ThemePack { model.theme.pack }
+    private var copy: CopyPack { model.theme.copy }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            ScrollView {
+                VStack(alignment: .leading, spacing: 13) {
+                    Text(baseURL.host() ?? baseURL.absoluteString)
+                        .font(theme.id == .soft ? theme.body(13, weight: .semibold) : theme.mono(11))
+                        .foregroundStyle(theme.sub)
+
+                    GatewayAuthPhasePanel(auth: auth, theme: theme, copy: copy,
+                                          onRetry: { probe() },
+                                          onDemoSelect: nil)
+                }
+                .padding(.horizontal, 18)
+                .padding(.top, 6)
+                .padding(.bottom, 40)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(theme.bg)
+        .task { probe() }
+        .onChange(of: auth.phase) { _, phase in
+            if phase == .done { finish() }
+        }
+        .onDisappear { auth.cancelSignIn() }
+    }
+
+    private var header: some View {
+        HStack {
+            Button {
+                auth.cancelSignIn()
+                dismiss()
+            } label: {
+                Text(copy.cancel)
+                    .font(theme.id == .control ? theme.mono(11, weight: .semibold)
+                                               : theme.body(14, weight: .semibold))
+                    .foregroundStyle(theme.id == .ink ? theme.ink.opacity(0.55) : theme.accent)
+            }
+            .buttonStyle(.plain)
+
+            Spacer()
+
+            Text(copy.reauthTitle(theme.id))
+                .font(theme.id == .ink ? theme.display(20, weight: .bold).smallCaps()
+                                       : theme.body(16, weight: .heavy))
+                .foregroundStyle(theme.ink)
+
+            Spacer()
+
+            Text(copy.cancel)
+                .font(theme.id == .control ? theme.mono(11, weight: .semibold)
+                                           : theme.body(14, weight: .semibold))
+                .hidden()
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 16)
+        .padding(.bottom, 10)
+    }
+
+    private func probe() {
+        Task { await auth.probe(baseURL.absoluteString, allowStoredCredential: false) }
+    }
+
+    private func finish() {
+        guard let base = auth.baseURL, let credential = auth.credential else { return }
+        Task { @MainActor in
+            await model.completeReauth(baseURL: base, credential: credential)
+        }
+        dismiss()
+    }
+}
+
+// MARK: - Copy (link supervision)
+
+extension CopyPack {
+
+    func reauthTitle(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Sign in again"
+        case .control: "AUTH EXPIRED"
+        case .ink: "the seal has lapsed"
+        }
+    }
+
+    func reauthBody(_ t: ThemeID, host: String) -> String {
+        switch t {
+        case .soft: "\(host) ended your session, so reconnecting stopped. Sign in to bring the link back."
+        case .control: "\(host.uppercased()) REJECTED THE REFRESH TOKEN. RELINK REQUIRES A NEW SIGN-IN."
+        case .ink: "The way to \(host) no longer knows your hand. Set your seal upon it again."
+        }
+    }
+
+    func reauthCTA(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Sign in"
+        case .control: "REAUTH"
+        case .ink: "seal anew"
+        }
+    }
+
+    /// Short link-down headline for the floating banner (the roster prints the
+    /// full `offline` sentence in place).
+    func linkDownTitle(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Gateway unreachable"
+        case .control: "LINK DOWN"
+        case .ink: "the way is severed"
+        }
+    }
+
+    func reconnectCTA(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Reconnect now"
+        case .control: "RELINK NOW"
+        case .ink: "mend the way"
+        }
+    }
+
+    func reconnecting(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Reconnecting…"
+        case .control: "RELINKING…"
+        case .ink: "mending…"
+        }
+    }
+}

@@ -4,6 +4,96 @@ All notable changes to Talaria. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org). Talaria is MIT licensed.
 
+## [Unreleased] — 2026-08-18
+
+The overnight run: roadmap phases 0–5, landed unattended in one session and
+reviewed the next morning. Six commits, ~27,000 lines, 73 files.
+
+**Read this first: nothing in this entry has been run against a live gateway.**
+No gateway was reachable during the run, so every behaviour below is a shape
+read from the upstream Python and compiled, not a shape seen on the wire. The
+parity docs record that distinction rather than smoothing it over — 26 of the 30
+rows moved in [PARITY.md](PARITY.md) are 🔶 "built but never run against a live
+gateway", not ✅. [docs/OVERNIGHT-REPORT.md](docs/OVERNIGHT-REPORT.md) lists the
+live checks to run first, in the order most likely to find a real bug.
+
+### Fixed
+
+- **Tapping a bot opened a chat with no history, and the first message forked a
+  new session away from it.** Every entry point — roster row, deep link, push
+  tap, search result, activity row, artifact and inbox jumps — now routes
+  through `openChat(botID:)`. This was the run's blocking bug: each phone
+  conversation was silently orphaning itself from the bot's real history.
+- **The canonical forever-chat is honored.** One resolver
+  (`AppModelLive+CanonicalChat.swift`) is the single door every open and send
+  funnels through, in the plugin's order — explicit binding, then the pin from
+  `ui_meta["hermes-bots"].chat`, then the canonical "Bot Chat" title, then the
+  previewed session, and only then birth. The pin is written back, so phone and
+  desktop open the same conversation.
+- **One identity path.** `BotSheetView`'s local `displayName` — which hardcoded
+  `"@" + botID` — is gone, and `CopyPack.composer` takes the resolved handle.
+  A sheet reading "@default" behind a header reading "Skynet" is no longer
+  possible.
+- **The connect-time push handshake no longer erases your per-bot filter.** The
+  relay's upsert replaces the whole record, and registration re-sent an empty
+  `profile_filter` on every connect.
+- **A voice-started turn has a stop button** — voice submits through
+  `sendOrSteer` rather than `send`.
+
+### Added
+
+- **Liveness** (`AppModelLive+Liveness.swift`, `Components/NetworkMonitor.swift`)
+  — a phone suspends and desktop does not, which produced *wrong state* rather
+  than missing features. Foreground re-seed and a reaper over
+  `session.active_list`, coalesced so concurrent triggers ask once and
+  generation-guarded so a re-dial mid-pass cannot apply a stale snapshot; an
+  NWPathMonitor nudge with a settle delay and a nudge floor so a flapping
+  interface cannot dial in a loop. A gateway that lacks the method is remembered
+  and never asked again.
+- **Settings** (`Screens/SettingsView.swift`, `Screens/Settings/*`) — the app's
+  first settings screen: Gateways, Appearance (themes, text size, motion),
+  Notifications, Models & providers, Voice, Solo, Privacy & data, About &
+  diagnostics. Deliberately not desktop's 202 controls; raw config and env
+  editing stay off the phone, with an honest pointer to desktop.
+- **Fleet management** — cron create/edit/delete with run history and
+  `last_error` (`RoutineEditorView.swift`, `AppModelLive+Cron2.swift`); session
+  pin, rename, export, archive, delete, branch and compress behind long-press,
+  never as primary navigation; an artifacts index that fetches and previews real
+  bytes with share-sheet export; approval policy — mode, bypass, wait, and a
+  revocable allowlist; and messaging-platform pairing approvals.
+- **Bot Mode depth** — A2A with sender attribution and @mention routing
+  (`AppModelLive+A2A.swift`, `Components/MentionField.swift`); a union roster
+  across every saved Connection; the cosmetics bridge made two-way, so a bot
+  renamed or recolored on the phone reads the same on the laptop; avatar
+  generation via `image.generate` → `profiles.set_asset`; and roster craft —
+  recency ranking, the 90-second liveness window, pinning, and an unread
+  watermark that catches CLI, cron and other-machine deliveries.
+- **Solo mode** (`SoloEngine.swift`, `FoundationModelsProvider.swift`,
+  `SoloTools.swift`, `Screens/SoloExplainerView.swift`) — a native agent loop
+  over Apple Foundation Models, with the tool set iOS permits and the *same*
+  approval vocabulary as a gateway bot. Two gates: a permission that is off
+  keeps its tools out of the registry entirely rather than making them refuse,
+  and every call still raises an ordinary approval. `web_fetch` enforces
+  http/https only, a byte ceiling applied while streaming, and no cross-host
+  redirects. The explainer asserts nothing — engine rows are live probes and the
+  tool list is generated from the registry, so it cannot drift.
+
+### Changed
+
+- `GatewayClient.listSessions` takes `includeHidden`, and `createSession` takes
+  `hidden` — Bot Mode's sessions are born hidden, and the surfaces that own them
+  are the only ones that pass the flag.
+- `deleteAllLocalData` now takes Solo's transcripts, memory and images with it.
+  They are the one part of Talaria with no server copy, so leaving them behind
+  would be the worst possible reading of "delete everything".
+
+### Known gaps
+
+Group rooms (Region 5 of the Bot Mode contract) are still unbuilt; `/new` inside
+a canonical chat is not rerouted to `/compact`; there is no `set_hidden`
+reconciliation sweep for sessions created before the fix. Full list in
+[docs/ROADMAP.md](docs/ROADMAP.md#what-is-actually-left).
+
 ## [0.1.0] — 2026-08-17
 
 Initial scaffold. This is a foundation release: the protocol, auth, theme,

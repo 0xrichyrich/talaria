@@ -7,19 +7,30 @@ import TalariaTheme
 // - soft:    floating glass capsule with a dark active pill,
 // - control: full-width mono terminal bar, glowing tick above the active tab,
 // - ink:     parchment ledger footer, double top rule, roman numerals i–v.
-// Labels come from CopyPack.tabs; the approvals tab carries the pending badge.
+// Labels come from CopyPack.tabs; any tab can carry a count badge. Two tones:
+// alerts (blocked approvals) burn in danger/warn, unread counts sit in the
+// accent so a waiting seal never reads as "three new messages".
 
 public struct TalariaTabBar: View {
     public var theme: ThemePack
     public var copy: CopyPack
     public var selected: CopyPack.Tab
-    public var badgeCount: Int
+    /// Count per tab; absent or non-positive entries render no badge.
+    public var badges: [CopyPack.Tab: Int]
     public var onSelect: (CopyPack.Tab) -> Void
 
     public init(theme: ThemePack, copy: CopyPack, selected: CopyPack.Tab,
-                badgeCount: Int, onSelect: @escaping (CopyPack.Tab) -> Void) {
+                badges: [CopyPack.Tab: Int], onSelect: @escaping (CopyPack.Tab) -> Void) {
         self.theme = theme; self.copy = copy; self.selected = selected
-        self.badgeCount = badgeCount; self.onSelect = onSelect
+        self.badges = badges; self.onSelect = onSelect
+    }
+
+    /// Approvals-only convenience, kept for callers that predate per-tab badges.
+    public init(theme: ThemePack, copy: CopyPack, selected: CopyPack.Tab,
+                badgeCount: Int, onSelect: @escaping (CopyPack.Tab) -> Void) {
+        self.init(theme: theme, copy: copy, selected: selected,
+                  badges: badgeCount > 0 ? [.approvals: badgeCount] : [:],
+                  onSelect: onSelect)
     }
 
     /// The prototype's ROM array — lowercase numerals set in mono.
@@ -163,29 +174,57 @@ public struct TalariaTabBar: View {
 
     // MARK: - Badge
 
+    /// Blocked work reads hotter than unread traffic.
+    private enum BadgeTone { case alert, unread }
+
+    private func tone(for tab: CopyPack.Tab) -> BadgeTone {
+        tab == .approvals ? .alert : .unread
+    }
+
+    /// Counts past two digits stop being readable at 16pt.
+    private func badgeText(_ count: Int) -> String {
+        count > 99 ? "99+" : "\(count)"
+    }
+
+    private func fill(_ tone: BadgeTone) -> Color {
+        switch tone {
+        case .alert:
+            // Vermilion in soft/ink, amber on the phosphor bar.
+            return theme.id == .control ? theme.warn : theme.danger
+        case .unread:
+            // Ink's danger and accent are the same vermilion, so unread there
+            // is a plain ledger dot instead — the seal must stay unique.
+            return theme.id == .ink ? theme.ink : theme.accent
+        }
+    }
+
     @ViewBuilder private func badge(for tab: CopyPack.Tab) -> some View {
-        if tab == .approvals, badgeCount > 0 {
-            let text = Text("\(badgeCount)")
+        let count = badges[tab] ?? 0
+        if count > 0 {
+            let text = Text(badgeText(count))
+            let color = fill(tone(for: tab))
             switch theme.id {
             case .soft:
                 text.font(theme.body(10, weight: .heavy))
                     .foregroundStyle(theme.panel)
                     .padding(.horizontal, 4)
                     .frame(minWidth: 16, minHeight: 16)
-                    .background(theme.danger, in: RoundedRectangle(cornerRadius: 8))
+                    .background(color, in: RoundedRectangle(cornerRadius: 8))
             case .control:
                 text.font(theme.mono(9, weight: .bold))
                     .foregroundStyle(theme.bg)
                     .padding(.horizontal, 4)
                     .frame(minWidth: 16, minHeight: 16)
-                    .background(theme.warn, in: RoundedRectangle(cornerRadius: 3))
+                    .background(color, in: RoundedRectangle(cornerRadius: 3))
+                    .shadow(color: color.opacity(0.5), radius: theme.glowRadius / 2)
             case .ink:
-                // Wax-seal badge: vermilion disc with an inner parchment ring.
+                // Wax-seal badge: disc with an inner parchment ring.
                 text.font(theme.mono(8.5, weight: .semibold))
                     .foregroundStyle(theme.bg)
-                    .frame(width: 16, height: 16)
-                    .background(theme.danger, in: Circle())
-                    .overlay(Circle().inset(by: 1.5).strokeBorder(theme.bg, lineWidth: 1))
+                    .frame(minWidth: 16, minHeight: 16)
+                    .padding(.horizontal, count > 9 ? 3 : 0)
+                    .background(color, in: Capsule())
+                    .overlay(Capsule().inset(by: 1.5).strokeBorder(theme.bg, lineWidth: 1))
             }
         }
     }

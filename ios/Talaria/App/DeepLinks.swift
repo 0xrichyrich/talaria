@@ -13,6 +13,7 @@
 // (onOpenURL), so both paths land in identical AppModel state.
 
 import Foundation
+import TalariaKit
 import TalariaUI
 
 /// A parsed talaria:// destination.
@@ -51,6 +52,11 @@ struct DeepLinkRouter {
     /// `onOpenURL` entry point. Returns whether the URL was recognized.
     @discardableResult
     func open(_ url: URL) -> Bool {
+        // talaria://solo/shortcut?token=… is the x-callback-url return leg of
+        // Solo's `shortcuts_run` (SoloShortcutsRunTool.callbackURL). It carries
+        // no navigation — a Solo turn is parked on it — so it is answered here
+        // and never reaches the navigation switch below.
+        if SoloToolHost.shared.deliver(url) { return true }
         guard let link = DeepLink(url: url) else { return false }
         route(link)
         return true
@@ -66,8 +72,10 @@ struct DeepLinkRouter {
             // Not validated against the roster on purpose: on a cold start in
             // live mode the roster may still be loading when the island tap
             // arrives; the root view resolves the id once bots land.
-            model.selectedTab = .home
-            model.openBotID = id
+            //
+            // openChat, not a raw openBotID write: it resumes the bot's
+            // canonical forever-chat and hydrates the transcript.
+            model.openChat(botID: id)
 
         case .connections:
             // Connections is pushed off the roster, not a tab; surface the

@@ -79,6 +79,15 @@ extension AppModel {
         runtime.monitorTask?.cancel(); runtime.monitorTask = nil
         runtime.eventPump?.cancel(); runtime.eventPump = nil
         runtime.resetSessionState()
+        // Session ids are per-gateway; a pin from the previous one resolves to
+        // nothing (or worse, something else) here.
+        CanonicalChatRuntime.shared.reset()
+        // Switching gateways reaches here WITHOUT going through
+        // disconnectGateway (switchGateway calls connectGateway directly), so
+        // the per-gateway caches have to be dropped on both paths. Done before
+        // the old socket closes, so the pairing watch can still surrender its
+        // handler to the client that owns it.
+        dropPerGatewayCaches()
         if let old = client { await old.disconnect() }
 
         let client = GatewayClient(baseURL: baseURL, credential: credential)
@@ -133,7 +142,64 @@ extension AppModel {
         runtime.baseURL = nil
         client = nil
         isOffline = false
+        // Each area's router owns state belonging to *that* gateway. Without
+        // this they survive the disconnect: cached session titles from a store
+        // that is gone, and — the visible one — a parked clarify/sudo/secret
+        // prompt left modal over an empty world with no socket to answer on.
+        // The attach* calls all early-return once `client` is nil, so this is
+        // the only chance to tear them down.
+        detachApprovalBridges()
+        detachSessionEventRouter()
+        detachVoiceRouter()
+        // The liveness watches are not event subscriptions but they have the
+        // same lifetime: a reaper polling `session.active_list`, a foreground
+        // observer and an NWPathMonitor all outlive this call otherwise, and
+        // every conclusion they draw is scoped to the gateway that just left.
+        stopLivenessSupervision()
+        // Canonical-chat pins name sessions in THIS gateway's per-profile
+        // state.db; carrying them to the next gateway would resume ids that
+        // mean nothing there.
+        CanonicalChatRuntime.shared.reset()
+        // ~11 MB of decoded spritesheets and a per-profile pet cache belong to
+        // the gateway that served them, not to the next one.
+        detachPetEventRouter()
+        // Same rule for the About panel's facts: `desktop_contract`, the health
+        // probe and the runtime model all describe THIS gateway. Left standing,
+        // the next gateway's About page would report the departed one's
+        // contract version — which is precisely the number a client uses to
+        // decide which RPC shapes it may send.
+        detachSettingsDiagnostics()
+        dropPerGatewayCaches()
         connections = ConnectionRegistry.shared.rows
+    }
+
+    /// Everything Phase 3 caches per gateway, dropped in one place because two
+    /// paths end a link: `disconnectGateway()` (sign out, Connections →
+    /// disconnect) and `connectGateway()` (a switch, which never disconnects
+    /// first). A cache that only one of them clears is a cache that survives
+    /// half the time — which is worse than one that never clears, because the
+    /// bug only reproduces on one route.
+    private func dropPerGatewayCaches() {
+        // Cron detail: the `cron.changed` subscription, per-job records, run
+        // histories, and the "this gateway has no cron REST router" verdict —
+        // the last of which decides whether editing and history exist at all.
+        detachCronDetailRouter()
+        // The approval-policy store re-probes itself on the next load, but its
+        // `pairing.changed` subscription is a live registration on the socket
+        // being closed and has to be surrendered while that client is still
+        // around to surrender it to.
+        detachPairingWatch()
+        // Up to 40 MB of decoded artifact bodies and thumbnails fetched from
+        // the departing gateway. Keys are gateway-scoped, so this is about the
+        // memory rather than a mix-up — but holding another machine's files
+        // resident after leaving it is not a thing to do quietly.
+        ArtifactStore.shared.flush()
+        // Agent-to-agent: a `sessions.changed` subscription on the socket being
+        // closed, plus reply watches holding stored-session ids that only mean
+        // something on the departing gateway. Those watches re-read `client`
+        // every tick, so left standing they poll the NEXT gateway with the last
+        // one's ids — the one way a2a state can cross a switch.
+        detachA2ARouter()
     }
 
     /// Probe every saved gateway and sync the Connections rows.
@@ -150,6 +216,10 @@ extension AppModel {
     /// task lines survive the refresh.
     public func refreshRoster() async throws {
         guard let client else { return }
+        // Sampled BEFORE the await: any pin written while this poll was in
+        // flight makes the block it returns stale, and the merge below reads a
+        // missing `chat` key as an authoritative deletion.
+        let pinWrites = CanonicalChatRuntime.shared.writeCount
         let profiles = try await client.listProfiles()
         let runtime = LiveRuntime.shared
         runtime.defaultBotID = profiles.first(where: \.isDefault)?.name ?? profiles.first?.name
@@ -159,11 +229,28 @@ extension AppModel {
                 runtime.lastSessionByBot[profile.name] = last
             }
             let existing = bots.first { $0.id == profile.name }
+            // Desktop Bot Mode's own metadata block wins over Talaria's, so a
+            // bot titled/recolored on desktop reads identically here.
+            let deskMeta = BotModeMeta(uiMeta: profile.uiMeta)
+            // The canonical-chat pin travels in that same block, and desktop's
+            // mergeServerMeta is precise about it (plugin.js:441-470): when the
+            // server block EXISTS it is authoritative and an omitted `chat` key
+            // is a deletion — so this assignment, nil included, is the whole
+            // merge. When there is no block at all (a gateway that cannot store
+            // ui_meta) the locally resolved pin survives instead. A bot whose
+            // own pin write is still in flight — or landed while this poll was
+            // out — is skipped: that answer predates the write, and reading it
+            // as a deletion would drop the pin just made.
+            let canonical = CanonicalChatRuntime.shared
+            if profile.uiMeta?["hermes-bots"]?.objectValue != nil,
+               !canonical.hasLocalPinWrite(profile.name, since: pinWrites) {
+                canonical.pins[profile.name] = profile.uiMeta?["hermes-bots"]?["chat"]?.stringValue
+            }
             var bot = Bot(
                 id: profile.name,
                 job: profile.description ?? "",
-                shape: Self.derivedShape(for: profile),
-                hue: Self.derivedHue(for: profile),
+                shape: deskMeta?.talariaShape ?? Self.derivedShape(for: profile),
+                hue: deskMeta?.talariaHue ?? Self.derivedHue(for: profile),
                 status: .idle,
                 task: existing?.task,
                 minutesElapsed: existing?.minutesElapsed ?? 0,
@@ -172,7 +259,8 @@ extension AppModel {
                 unread: existing?.unread ?? 0,
                 mentionsYou: existing?.mentionsYou ?? false,
                 description: profile.description,
-                pinnedModel: profile.model)
+                pinnedModel: profile.model,
+                title: deskMeta?.title)
             if approvals.contains(where: { $0.botID == bot.id }) { bot.status = .approval }
             if runtime.workingBotIDs.contains(bot.id) { bot.status = .working }
             return bot
@@ -214,67 +302,62 @@ extension AppModel {
         return f.string(from: date)
     }
 
-    // MARK: - Opening a chat (resume latest session + hydrate history)
+    // MARK: - Opening a chat (canonical forever-chat + hydration)
 
-    /// Navigate into a bot's chat. Live mode resumes the profile's most
-    /// recent stored session with deferred history, then hydrates the
-    /// transcript over REST (GET /api/sessions/{id}/messages).
+    /// Navigate into a bot's chat. THE entry point: every route into a bot —
+    /// roster row, deep link, notification tap, search result, activity row,
+    /// banner — goes through here, because this is what resumes the bot's
+    /// conversation instead of leaving the chat empty and letting the first
+    /// send fork a brand-new session.
+    ///
+    /// Live mode lands in the bot's canonical forever-chat, resolved in
+    /// AppModelLive+CanonicalChat.swift (plugin.js:2802-2896). Never "the most
+    /// recent session": a cron delivery or a CLI run would otherwise hijack
+    /// what a tap opens.
     public func openChat(botID: String) {
+        // Some routes in carry a @handle rather than a profile id — an A2A
+        // attribution prefix names the sender `@hermes`, and a deep link or
+        // push payload can quote whatever the desktop displayed. Every
+        // gateway call below wants the profile id, so resolve once, here, at
+        // the single entry point (Components/BotIdentity.swift).
+        let botID = resolvedBotID(botID)
         openBotID = botID
+        selectedTab = .home
         if let idx = bots.firstIndex(where: { $0.id == botID }) {
             bots[idx].unread = 0
             bots[idx].mentionsYou = false
         }
         guard mode == .live, !isOffline else { return }
-        guard chat(for: botID).sessionID == nil else { return }
-        Task { @MainActor in
-            _ = try? await self.ensureSession(botID: botID, hydrate: true)
-        }
+        Task { @MainActor in await self.enterCanonicalChat(botID: botID) }
     }
 
     /// Create-or-resume the bot's session and bind it to the chat. Coalesces
     /// concurrent callers (openChat racing a send) onto one attach.
+    ///
+    /// The resolution itself lives in `attachCanonicalSession`: an explicit
+    /// binding wins, otherwise the canonical chat. That is what keeps a send
+    /// typed before the chat finished opening out of a fresh forked session.
     func ensureSession(botID: String, hydrate: Bool) async throws -> String {
         let runtime = LiveRuntime.shared
-        let chat = chat(for: botID)
-        if let sid = chat.sessionID { return sid }
+        if let sid = chat(for: botID).sessionID { return sid }
         if let pending = runtime.attachTasks[botID] { return try await pending.value }
-        guard let client else { throw GatewayError(code: -3, message: "not connected") }
+        guard client != nil else { throw GatewayError(code: -3, message: "not connected") }
 
-        let stored = chat.storedSessionID ?? runtime.lastSessionByBot[botID]
         let task = Task<String, Error> { @MainActor in
-            var live: LiveSession
-            var resumed = false
-            if let stored {
-                do {
-                    // Full projection in the resume ack (deferHistory returns a
-                    // bounded stub and leaves history to a REST shape that has
-                    // proven flaky) — one round trip, authoritative rows.
-                    live = try await client.resumeSession(stored, profile: botID, deferHistory: false)
-                    resumed = true
-                } catch let error as GatewayError where error.code == GatewayError.sessionNotFound {
-                    live = try await client.createSession(profile: botID)
-                }
-            } else {
-                live = try await client.createSession(profile: botID)
-            }
-            guard !live.sessionID.isEmpty else {
-                throw GatewayError(code: -8, message: "session create/resume returned no id")
-            }
-            self.bindSession(live, botID: botID)
-            if hydrate, resumed {
-                await self.hydrateTranscript(live, botID: botID)
-            }
-            self.replayInflight(live, botID: botID)
-            if let pending = live.pendingApproval { self.ingest(pending) }
-            return live.sessionID
+            try await self.attachCanonicalSession(botID: botID, hydrate: hydrate)
         }
         runtime.attachTasks[botID] = task
-        defer { runtime.attachTasks[botID] = nil }
+        // Clear only OUR entry. `openStoredSession` cancels the in-flight
+        // attach and drops the slot, so by the time this frame resumes the
+        // slot may already hold a newer task; blanking it unconditionally
+        // un-coalesces that one, and two concurrent resolutions of the same
+        // bot can mint two canonical chats — the fork this phase exists to
+        // prevent. Task is Equatable, so identity is exact.
+        defer { if runtime.attachTasks[botID] == task { runtime.attachTasks[botID] = nil } }
         return try await task.value
     }
 
-    private func bindSession(_ live: LiveSession, botID: String) {
+    func bindSession(_ live: LiveSession, botID: String) {
         let chat = chat(for: botID)
         chat.sessionID = live.sessionID
         if !live.storedSessionID.isEmpty { chat.storedSessionID = live.storedSessionID }
@@ -285,24 +368,17 @@ extension AppModel {
         }
     }
 
-    /// Replace local history with the stored transcript. REST hydration first
-    /// (defer_history contract), falling back to the projection rows the
-    /// resume ack carried.
-    private func hydrateTranscript(_ live: LiveSession, botID: String) async {
-        // The resume ack's projection is the known-good shape; REST is only a
-        // fallback for resumes that omitted messages.
-        var history = Self.chatMessages(fromTranscript: .array(live.messages))
-        if history.isEmpty, !live.storedSessionID.isEmpty, let client,
-           let payload = try? await client.fetchSessionMessages(storedID: live.storedSessionID) {
-            history = Self.chatMessages(fromTranscript: payload)
-        }
-        guard !history.isEmpty else { return }
-        chat(for: botID).messages = history
-    }
-
-    /// Map transcript projection rows (server.py:_history_to_messages shape:
-    /// {role, text, timestamp?, display_kind?} + tool rows {role:"tool",…})
-    /// to chat messages. Hidden scaffolding and tool rows are dropped.
+    /// Map transcript rows to chat messages. Two shapes reach here and both
+    /// have to work, because the REST route is the hydration fallback:
+    ///
+    /// - the WS display projection (server.py:_history_to_messages) —
+    ///   `{role, text, timestamp?, row_id?, reasoning?, display_kind?}`, tool
+    ///   rows carrying `{role:"tool", name, args}`;
+    /// - raw `messages` rows from GET /api/sessions/{id}/messages
+    ///   (hermes_state.py:get_messages returns `SELECT *`) — the same fields
+    ///   under their column names: `content` for the body, `id` for the row.
+    ///
+    /// Hidden scaffolding and tool rows are dropped either way.
     static func chatMessages(fromTranscript payload: JSONValue) -> [ChatMessage] {
         var rows = payload["messages"]?.arrayValue ?? payload.arrayValue ?? []
         // The REST page may serve newest-first; normalize to oldest-first.
@@ -314,24 +390,51 @@ extension AppModel {
         }
         return rows.compactMap { row in
             guard row["display_kind"]?.stringValue != "hidden" else { return nil }
-            let text = row["text"]?.stringValue ?? ""
+            let role = row["role"]?.stringValue
+            let text = transcriptText(row)
             guard !text.isEmpty else { return nil }
+            // Gateway bookkeeping (model switches, personality notices) is
+            // persisted as role=user "[System: …]" so strict providers accept
+            // it mid-history. The WS projection filters it
+            // (server.py:_is_display_hidden_marker); raw DB rows do not, so it
+            // has to be filtered here too or it renders as a user bubble.
+            guard !(role == "user" && text.hasPrefix("[System:")) else { return nil }
             let time = row["timestamp"]?.doubleValue.map { shortTime($0) }
             let reasoning = row["reasoning"]?.stringValue
                 ?? row["reasoning_content"]?.stringValue
-            switch row["role"]?.stringValue {
-            case "user": return ChatMessage(author: .user, time: time, text: text)
+            // Durable row identity (_history_to_messages stamps `row_id` from
+            // _rows_to_conversation; the DB column it comes from is `id`).
+            // Without it only the newest assistant row is addressable by
+            // `message.react`, which names rows by id.
+            let rowID = row["row_id"]?.intValue ?? row["id"]?.intValue
+            switch role {
+            case "user": return ChatMessage(author: .user, time: time, text: text,
+                                            rowID: rowID)
             case "assistant": return ChatMessage(author: .bot, time: time, text: text,
-                                                 reasoning: reasoning)
+                                                 reasoning: reasoning, rowID: rowID)
             case "system": return ChatMessage(author: .system, time: time, text: text)
             default: return nil
             }
         }
     }
 
+    /// The body of a transcript row. `text` is the projection's field name and
+    /// `content` the column's; a multimodal `content` is a parts array
+    /// (`[{type:"text", text:…}, {type:"image_url", …}]`), whose text parts are
+    /// the only renderable half.
+    private static func transcriptText(_ row: JSONValue) -> String {
+        if let text = row["text"]?.stringValue { return text.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let content = row["content"] else { return "" }
+        if let text = content.stringValue { return text.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let parts = content.arrayValue else { return "" }
+        return parts.compactMap { $0["text"]?.stringValue }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Replay a reconnect/resume inflight snapshot ({user, assistant,
     /// streaming, error?}) into the chat so a dropped socket loses nothing.
-    private func replayInflight(_ live: LiveSession, botID: String) {
+    func replayInflight(_ live: LiveSession, botID: String) {
         guard let inflight = live.inflight, inflight != .null else { return }
         let chat = chat(for: botID)
         if let user = inflight["user"]?.stringValue, !user.isEmpty,
@@ -352,6 +455,19 @@ extension AppModel {
         }
         if let error = inflight["error"]?.stringValue, !error.isEmpty {
             chat.messages.append(ChatMessage(author: .system, text: error))
+        }
+    }
+
+    /// Replay the blocking prompts `session.resume` carries. Both park a real
+    /// agent thread, and neither is re-emitted as an event after a reconnect:
+    /// the approval sweep would find the approval a round trip later, but a
+    /// clarify has no `*.pending` RPC at all, so this block is its only
+    /// recovery channel. Routed through the approvals surface so a replayed
+    /// approval arrives with its real choice set rather than once/deny.
+    func replayPendingPrompts(_ live: LiveSession) {
+        if let pending = live.pendingApproval { ingestPendingApproval(pending) }
+        if let clarify = live.pendingClarify, clarify != .null {
+            ingestPendingClarify(clarify, sessionID: live.sessionID)
         }
     }
 
@@ -735,7 +851,7 @@ extension AppModel {
             if let live = try? await client.resumeSession(stored, profile: botID, deferHistory: true) {
                 bindSession(live, botID: botID)
                 replayInflight(live, botID: botID)
-                if let pending = live.pendingApproval { ingest(pending) }
+                replayPendingPrompts(live)
             }
         }
 
@@ -786,28 +902,9 @@ extension AppModel {
         }
     }
 
-    /// Model ids offered by the gateway. Payload shape
-    /// (hermes_cli/inventory.py build_models_payload):
-    /// {"providers":[{"slug","name","is_current","models":[<id strings>],…}],
-    ///  "model":<current>,"provider":<current>} — current model listed first.
-    public func availableModels() async -> [String] {
-        guard mode == .live, let client else { return DemoData.models }
-        guard let payload = try? await client.modelOptions() else { return DemoData.models }
-        var ids: [String] = []
-        if let current = payload["model"]?.stringValue, !current.isEmpty {
-            ids.append(current)
-        }
-        for provider in payload["providers"]?.arrayValue ?? [] {
-            for model in provider["models"]?.arrayValue ?? [] {
-                if let id = model.stringValue ?? (model["id"] ?? model["model"])?.stringValue {
-                    ids.append(id)
-                }
-            }
-        }
-        var seen = Set<String>()
-        let unique = ids.filter { seen.insert($0).inserted }
-        return unique.isEmpty ? DemoData.models : unique
-    }
+    // The flat `availableModels()` that used to live here is superseded by the
+    // typed catalog in AppModelLive+Models.swift, which keeps the same
+    // signature for the profile editor's fallback path.
 
     // MARK: - Offline queue
 

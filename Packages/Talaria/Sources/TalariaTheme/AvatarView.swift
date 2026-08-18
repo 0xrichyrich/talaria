@@ -59,6 +59,7 @@ public struct AvatarView: View {
 
     @State private var blinkPhase = false
     @State private var scanPhase = false
+    @Environment(\.talariaReducedMotion) private var reducedMotion
 
     public init(shape: AvatarShape, hue: AvatarHue, size: CGFloat,
                 isWorking: Bool = false, theme: ThemePack) {
@@ -85,8 +86,21 @@ public struct AvatarView: View {
                 .offset(y: size * eyeOffsetFraction(for: shape))
         }
         .frame(width: size, height: size)
-        .onAppear { startAnimations() }
+        // Driven by the value rather than by `onAppear` alone: a bot that
+        // starts working while its row is already on screen has to start
+        // scanning too, and the old appear-only form left it staring.
+        .onAppear { scanPhase = scans }
+        .onChange(of: scans) { _, on in scanPhase = on }
+        // `.task`, not a Task spawned from `onAppear`: SwiftUI cancels this one
+        // when the avatar leaves the tree. The old form outlived its view, so
+        // every roster scroll left another blink loop running for the life of
+        // the process.
+        .task(id: reducedMotion) { await blinkLoop() }
     }
+
+    /// The eye-scan loop runs only for a working bot, and only when motion is
+    /// allowed.
+    private var scans: Bool { isWorking && !reducedMotion }
 
     private var eyes: some View {
         HStack(spacing: size * 0.115) {
@@ -94,7 +108,7 @@ public struct AvatarView: View {
             eye
         }
         .offset(x: isWorking ? (scanPhase ? size * 0.09 : -size * 0.09) : 0)
-        .animation(isWorking ? .easeInOut(duration: 2.1).repeatForever(autoreverses: true) : .default,
+        .animation(scans ? .easeInOut(duration: 2.1).repeatForever(autoreverses: true) : .default,
                    value: scanPhase)
     }
 
@@ -105,16 +119,21 @@ public struct AvatarView: View {
             .scaleEffect(y: blinkPhase ? 0.08 : 1, anchor: .center)
     }
 
-    private func startAnimations() {
-        if isWorking { scanPhase = true }
-        // Periodic blink: quick close/open every ~4.5s.
-        Task { @MainActor in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(Double.random(in: 3.6...5.2)))
-                withAnimation(.easeIn(duration: 0.09)) { blinkPhase = true }
-                try? await Task.sleep(for: .milliseconds(120))
-                withAnimation(.easeOut(duration: 0.12)) { blinkPhase = false }
-            }
+    /// Periodic blink: quick close/open every ~4.5s. Held open entirely when
+    /// motion is damped — a blink is a loop like any other.
+    @MainActor
+    private func blinkLoop() async {
+        guard !reducedMotion else {
+            blinkPhase = false
+            return
+        }
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(Double.random(in: 3.6...5.2)))
+            if Task.isCancelled { return }
+            withAnimation(.easeIn(duration: 0.09)) { blinkPhase = true }
+            try? await Task.sleep(for: .milliseconds(120))
+            if Task.isCancelled { return }
+            withAnimation(.easeOut(duration: 0.12)) { blinkPhase = false }
         }
     }
 }
@@ -124,6 +143,7 @@ public struct WorkingPulse: View {
     public var color: Color
     public var lineWidth: CGFloat
     @State private var animate = false
+    @Environment(\.talariaReducedMotion) private var reducedMotion
 
     public init(color: Color, lineWidth: CGFloat = 2) {
         self.color = color; self.lineWidth = lineWidth
@@ -132,9 +152,15 @@ public struct WorkingPulse: View {
     public var body: some View {
         Circle()
             .stroke(color, lineWidth: lineWidth)
-            .scaleEffect(animate ? 1.5 : 0.9)
-            .opacity(animate ? 0 : 0.5)
-            .animation(.easeOut(duration: 1.9).repeatForever(autoreverses: false), value: animate)
-            .onAppear { animate = true }
+            // Damped, the ring becomes a plain static marker rather than
+            // disappearing: "bot is working" still has to read at a glance.
+            .scaleEffect(reducedMotion ? 1 : (animate ? 1.5 : 0.9))
+            .opacity(reducedMotion ? 0.35 : (animate ? 0 : 0.5))
+            .animation(reducedMotion
+                        ? .default
+                        : .easeOut(duration: 1.9).repeatForever(autoreverses: false),
+                       value: animate)
+            .onAppear { animate = !reducedMotion }
+            .onChange(of: reducedMotion) { _, reduced in animate = !reduced }
     }
 }

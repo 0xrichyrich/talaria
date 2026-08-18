@@ -49,15 +49,63 @@ public struct Bot: Identifiable, Codable, Sendable, Equatable {
     public var description: String?
     /// Pinned model override for this profile (nil = gateway default).
     public var pinnedModel: String?
+    /// User-set display title from desktop Bot Mode
+    /// (`ui_meta["hermes-bots"].title`). Shared with desktop so a bot renamed
+    /// there reads the same here.
+    public var title: String?
+    /// Explicit @handle when the roster precomputed one (multi-gateway rosters
+    /// disambiguate duplicates as `name-device`).
+    public var handleOverride: String?
 
     public init(id: String, job: String, shape: AvatarShape, hue: AvatarHue,
                 status: BotStatus = .idle, task: String? = nil, minutesElapsed: Int = 0,
                 preview: String = "", previewTime: String = "", unread: Int = 0,
-                mentionsYou: Bool = false, description: String? = nil, pinnedModel: String? = nil) {
+                mentionsYou: Bool = false, description: String? = nil, pinnedModel: String? = nil,
+                title: String? = nil, handleOverride: String? = nil) {
         self.id = id; self.job = job; self.shape = shape; self.hue = hue
         self.status = status; self.task = task; self.minutesElapsed = minutesElapsed
         self.preview = preview; self.previewTime = previewTime; self.unread = unread
         self.mentionsYou = mentionsYou; self.description = description; self.pinnedModel = pinnedModel
+        self.title = title; self.handleOverride = handleOverride
+    }
+}
+
+// MARK: - Identity (desktop Bot Mode parity)
+
+// Desktop renders two stable identities per roster row: a customizable
+// display name and the profile's @handle. Ported verbatim from
+// apps/desktop/src/plugins/hermes-bots/plugin.js `displayName()` (2935) and
+// `botHandle()` (2406) so the same profile reads identically in both apps.
+public extension Bot {
+
+    /// The friendly name. A user title wins; the primary profile is literally
+    /// named "default", which "reads like nobody bothered", so it presents as
+    /// Hermes; everything else is de-slugged and title-cased.
+    var displayTitle: String {
+        if let title, !title.trimmingCharacters(in: .whitespaces).isEmpty {
+            return title.trimmingCharacters(in: .whitespaces)
+        }
+        if id.trimmingCharacters(in: .whitespaces).lowercased() == "default" {
+            return "Hermes"
+        }
+        let spaced = id.replacingOccurrences(of: "[-_]+", with: " ",
+                                             options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        return spaced.split(separator: " ")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
+    }
+
+    /// The @handle you tag the bot with — the profile name, except "default",
+    /// which is tagged @hermes.
+    var handle: String {
+        if let handleOverride, handleOverride != id { return handleOverride }
+        return id.trimmingCharacters(in: .whitespaces).lowercased() == "default" ? "hermes" : id
+    }
+
+    /// Desktop only shows the handle alongside the title when they differ.
+    var showsHandle: Bool {
+        displayTitle.lowercased() != handle.lowercased()
     }
 }
 
@@ -84,6 +132,51 @@ public enum MessageCard: Codable, Sendable, Equatable {
     }
 }
 
+/// One tool invocation inside a turn, rendered as a collapsible chip in the
+/// transcript (desktop shows these inline under the assistant message).
+public struct ToolCall: Identifiable, Codable, Sendable, Equatable {
+    public enum State: String, Codable, Sendable { case running, done, failed }
+
+    /// The gateway's tool_id.
+    public var id: String
+    public var name: String
+    /// ≤80-char argument preview from tool.start.
+    public var context: String
+    public var state: State
+    /// One-line result summary from tool.complete.
+    public var summary: String?
+    /// Full result text, shown when the chip is expanded.
+    public var resultText: String?
+    public var durationSeconds: Double?
+
+    public init(id: String, name: String, context: String, state: State = .running,
+                summary: String? = nil, resultText: String? = nil,
+                durationSeconds: Double? = nil) {
+        self.id = id; self.name = name; self.context = context; self.state = state
+        self.summary = summary; self.resultText = resultText
+        self.durationSeconds = durationSeconds
+    }
+}
+
+/// A file/image staged on the composer, consumed by the next prompt.submit.
+public struct PendingAttachment: Identifiable, Codable, Sendable, Equatable {
+    public enum Kind: String, Codable, Sendable { case image, pdf, file }
+
+    public var id: String
+    public var kind: Kind
+    public var name: String
+    /// Gateway-side path returned by the attach RPC.
+    public var path: String?
+    /// Local thumbnail data for images (never sent again).
+    public var thumbnail: Data?
+
+    public init(id: String = UUID().uuidString, kind: Kind, name: String,
+                path: String? = nil, thumbnail: Data? = nil) {
+        self.id = id; self.kind = kind; self.name = name
+        self.path = path; self.thumbnail = thumbnail
+    }
+}
+
 public struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     public var id: UUID
     public var author: MessageAuthor
@@ -96,13 +189,17 @@ public struct ChatMessage: Identifiable, Codable, Sendable, Equatable {
     /// thinking.delta accumulation, or the stored transcript's reasoning
     /// fields). Rendered as a collapsible "Thought" block, desktop parity.
     public var reasoning: String?
+    /// Tools this turn ran, in call order (tool.start / tool.complete).
+    public var toolCalls: [ToolCall]
+    /// Durable transcript row id — needed for reactions and rewind.
+    public var rowID: Int?
 
     public init(id: UUID = UUID(), author: MessageAuthor, time: String? = nil,
                 text: String, card: MessageCard? = nil, isStreaming: Bool = false,
-                reasoning: String? = nil) {
+                reasoning: String? = nil, toolCalls: [ToolCall] = [], rowID: Int? = nil) {
         self.id = id; self.author = author; self.time = time
         self.text = text; self.card = card; self.isStreaming = isStreaming
-        self.reasoning = reasoning
+        self.reasoning = reasoning; self.toolCalls = toolCalls; self.rowID = rowID
     }
 }
 

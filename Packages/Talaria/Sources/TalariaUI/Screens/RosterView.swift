@@ -8,6 +8,24 @@ import TalariaTheme
 // live status lines (working bots tick an elapsed timer every second, in each
 // theme's own time format); the roster-count footer.
 // Ported from Talaria.dc.html `data-screen-label="Roster"`.
+//
+// Phase 4 adds the ranking and presence craft the desktop plugin gets from its
+// 5 s `profiles.list` poll, sourced here from `AppModelLive+Cosmetics`
+// (BOT-MODE-PARITY §4.2-4.4, plugin.js:7637-7666, 3823-3839, 86-150):
+//
+//   * **Messaging-app order.** Pinned bots float as a group; inside each
+//     group, recency — `max(created, last_active)` — rules. A brand-new bot
+//     tops the list until someone else gets a message, and the primary bot
+//     competes on recency like everyone else.
+//   * **Two dots, two meanings.** Solid + bigger = you have something to read;
+//     smaller + breathing = active in the last 90 seconds. They coexist and
+//     are never merged.
+//   * **Presence never reorders.** A bot waking up lights its dot; it does not
+//     move under a thumb mid-tap.
+//   * **Motion.** Idle faces sway (±1.5°); a working face leans into its work,
+//     which is a more legible status cue than any spinner. The row entrance
+//     stays Talaria's own, capped so a 40-bot roster does not read as a slow
+//     load, and never replayed on a refresh or a scroll back.
 
 public struct RosterView: View {
     private let model: AppModel
@@ -15,8 +33,11 @@ public struct RosterView: View {
     private let onCreate: () -> Void
     private let onConnections: () -> Void
 
-    /// Global 1s ticker driving every elapsed readout (the prototype's `secs`).
-    @State private var seconds = 0
+    /// The look-and-soul sheet, opened from a row's long-press menu. The
+    /// roster is where desktop puts Edit Profile too (plugin.js:4051-4111);
+    /// before this the only way in was to open the bot first.
+    @State private var editing: Bot?
+    @Environment(\.talariaReducedMotion) private var reducedMotion
 
     public init(model: AppModel,
                 onSearch: @escaping () -> Void = {},
@@ -90,10 +111,24 @@ public struct RosterView: View {
                         emptyState
                             .padding(.top, 60)
                     } else {
-                        ForEach(Array(model.bots.enumerated()), id: \.element.id) { index, bot in
+                        let ranked = model.rankedBots
+                        ForEach(Array(ranked.enumerated()), id: \.element.id) { index, bot in
                             row(for: bot, index: index)
-                                .modifier(RosterEntrance(delay: Double(index) * 0.045))
+                                // Keyed by id, never by index: the entrance is
+                                // arrival, and a re-rank must not replay it.
+                                .modifier(RosterEntrance(botID: bot.id,
+                                                         delay: Double(min(index, 12)) * 0.045))
                         }
+                        .animation(.easeOut(duration: 0.35), value: ranked.map(\.id))
+                    }
+                    // The rest of the fleet: every bot on a saved gateway that
+                    // is not the live one, under its own divider. Deliberately
+                    // OUTSIDE the empty branch — with nothing connected, the
+                    // other gateways are the only roster there is, and an
+                    // "add a gateway" empty state above rows this phone
+                    // already knows about would be a lie.
+                    MultiGatewayRosterSection(model: model)
+                    if !model.bots.isEmpty {
                         footer
                             .padding(.top, 10)
                     }
@@ -105,11 +140,34 @@ public struct RosterView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(theme.bg)
+        .sheet(item: $editing) { bot in
+            CreateBotView(model: model, editing: bot)
+        }
+        // Ranking, the 90 s liveness window and the unread watermark all come
+        // off one `profiles.list` poll. Armed here because the roster is the
+        // first screen the app paints; the poll itself keeps running behind
+        // other tabs (at a quarter cadence) so a cron delivery still badges.
         .task {
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
-                seconds += 1
-            }
+            RosterSignals.shared.rosterVisible = true
+            model.startRosterSignals()
+            // Coming back from another tab, the numbers can be up to a slow
+            // tick old; ask once on arrival rather than showing stale ranking.
+            await model.refreshRosterSignalsNow()
+        }
+        // The union roster's own refresh. It lives HERE rather than on the
+        // section it feeds because that section sits inside a LazyVStack: below
+        // the fold on a long roster SwiftUI never builds it, and a probe that
+        // only runs when you happen to scroll to the bottom is not a refresh.
+        // Tied to the screen, so leaving the tab stops dialling other people's
+        // machines.
+        .task { await model.superviseUnionRoster() }
+        .onDisappear { RosterSignals.shared.rosterVisible = false }
+        // Chat opens over the roster rather than replacing it, so this is the
+        // one place that sees every route in — row tap, push, deep link,
+        // palette. The bot you are reading must never badge you for the
+        // conversation you are having with it.
+        .onChange(of: model.openBotID) {
+            if let botID = model.openBotID { model.noteChatOpened(botID) }
         }
     }
 
@@ -256,8 +314,11 @@ public struct RosterView: View {
 
     private func row(for bot: Bot, index: Int) -> some View {
         Button {
-            model.selectedTab = .home
-            model.openBotID = bot.id
+            // openChat, never a raw openBotID write: it is what resumes the
+            // bot's canonical forever-chat and hydrates the transcript. A bare
+            // navigation write opens an empty chat whose first send forks a
+            // brand-new session away from the bot's real history.
+            model.openChat(botID: bot.id)
         } label: {
             HStack(alignment: .center, spacing: 13) {
                 avatar(for: bot)
@@ -270,10 +331,11 @@ public struct RosterView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 VStack(alignment: .trailing, spacing: 5) {
-                    Text(bot.previewTime.isEmpty ? "new" : bot.previewTime)
-                        .font(timeFont)
-                        .foregroundStyle(theme.id == .soft ? theme.ink.opacity(0.38) : theme.faint)
-                    badge(for: bot)
+                    timeText(for: bot)
+                    HStack(spacing: 6) {
+                        activeDot(for: bot)
+                        badge(for: bot)
+                    }
                 }
             }
             .padding(rowPadding)
@@ -286,33 +348,85 @@ public struct RosterView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .contextMenu { rowMenu(for: bot) }
+    }
+
+    /// Desktop's row context menu, trimmed to what a phone owns
+    /// (plugin.js:4051-4111). Sessions and Delete deliberately stay off the
+    /// roster: the canonical forever-chat is the mobile model, and session
+    /// verbs are a tucked-away power-user surface (ROADMAP decision #4).
+    @ViewBuilder private func rowMenu(for bot: Bot) -> some View {
+        let pinned = model.isPinned(bot.id)
+        Button {
+            Task { await model.setBotPinned(botID: bot.id, pinned: !pinned) }
+        } label: {
+            Label(pinned ? CopyPack.rosterUnpin(theme.id) : CopyPack.rosterPin(theme.id),
+                  systemImage: pinned ? "pin.slash" : "pin")
+        }
+        Button {
+            editing = bot
+        } label: {
+            Label(copy.editLook, systemImage: "paintbrush")
+        }
+        Button {
+            Task { await model.duplicateProfile(from: bot.id, to: model.cloneID(for: bot.id)) }
+        } label: {
+            Label(CopyPack.rosterDuplicate(theme.id), systemImage: "plus.square.on.square")
+        }
     }
 
     private func avatar(for bot: Bot) -> some View {
-        ZStack {
+        // A bot that spoke in the last 90 s wears its working face even when
+        // this app never saw the turn — a cron run, the laptop, another client
+        // (plugin.js:3852-3856: the pose is conditional, never ambient).
+        let live = bot.status == .working || model.isActiveNow(bot.id)
+        return ZStack {
             if bot.status == .working {
                 WorkingPulse(color: theme.id == .ink ? theme.ink.opacity(0.55)
                                 : theme.color(for: bot.hue),
                              lineWidth: theme.id == .soft ? 2 : 1.5)
                     .frame(width: 54, height: 54)
             }
-            AvatarView(bot: bot, size: 46, theme: theme)
+            // The real profile portrait when the roster row says there is one
+            // (`has_avatar`), the geometric face otherwise — asking only for
+            // the faces the gateway has already confirmed exist.
+            Group {
+                if model.hasStoredAvatar(bot.id) {
+                    BotPortraitView(model: model, bot: bot, size: 46, theme: theme)
+                } else {
+                    AvatarView(bot: bot, size: 46, theme: theme)
+                }
+            }
+            .modifier(AvatarSway(botID: bot.id, working: live))
         }
         .frame(width: 46, height: 46)
-    }
-
-    private func nameText(for bot: Bot) -> some View {
-        let name = TalariaVoice.displayName(bot.id, theme.id)
-        return Group {
-            switch theme.id {
-            case .soft: Text(name).font(theme.body(16, weight: .bold))
-            case .control: Text(name).font(theme.body(15, weight: .bold))
-            case .ink: Text(name).font(theme.body(19, weight: .bold).smallCaps()).tracking(0.5)
+        // Bot Mode's petMode: the profile's mascot keeps a working bot
+        // company. Pinned to the avatar's corner like the prototype's marker —
+        // an overlay, so a pet appearing never reflows the row, and it renders
+        // nothing at all on a gateway without pets.
+        .overlay(alignment: .bottomTrailing) {
+            if bot.status == .working {
+                PetCompanionView(model: model, bot: bot)
+                    .offset(x: 4, y: 2)
             }
         }
-        .foregroundStyle(theme.ink)
-        .lineLimit(1)
-        .layoutPriority(1)
+    }
+
+    /// Title + @handle, from the one identity path
+    /// (Components/BotIdentity.swift) — the same pair the profile sheet
+    /// renders, so a bot never reads two different names in two places.
+    /// A pinned bot carries its marker at the head of the cluster, where
+    /// desktop puts its 📌 (plugin.js:3972-3978), and it never truncates.
+    private func nameText(for bot: Bot) -> some View {
+        HStack(spacing: 5) {
+            if model.isPinned(bot.id) {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: theme.id == .ink ? 8.5 : 9.5))
+                    .foregroundStyle(theme.faint)
+                    .accessibilityLabel(Text(CopyPack.rosterPinnedMarker(theme.id)))
+            }
+            BotIdentityLabel(bot: bot, theme: theme, scale: .row)
+        }
     }
 
     private func jobText(for bot: Bot) -> some View {
@@ -335,11 +449,27 @@ public struct RosterView: View {
     /// The live line: working = task + ticking elapsed, approval/mention/idle
     /// = preview, tinted and weighted per state. Control appends a blinking
     /// block cursor while working.
-    private func statusLine(for bot: Bot, index: Int) -> some View {
-        // Per-row second offset so timers don't tick in lockstep (prototype:
-        // `(secs + i * 17) % 60`).
-        let rowSeconds = (seconds + index * 17) % 60
-        let line = TalariaVoice.rosterLine(for: bot, seconds: rowSeconds, theme.id)
+    ///
+    /// The elapsed readout ticks on a timeline scoped to THIS row, and only
+    /// while the row is working. It used to be one app-wide 1 s counter in
+    /// view state, which repainted the whole roster every second whether or
+    /// not anything was running — desktop's cost model is the opposite: "an
+    /// empty roster costs zero frames" (BOT-MODE-PARITY §4.2).
+    @ViewBuilder private func statusLine(for bot: Bot, index: Int) -> some View {
+        if bot.status == .working {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                // Per-row second offset so timers don't tick in lockstep
+                // (prototype: `(secs + i * 17) % 60`).
+                let tick = Int(context.date.timeIntervalSinceReferenceDate)
+                statusText(for: bot, seconds: (tick + index * 17) % 60)
+            }
+        } else {
+            statusText(for: bot, seconds: 0)
+        }
+    }
+
+    private func statusText(for bot: Bot, seconds: Int) -> some View {
+        let line = TalariaVoice.rosterLine(for: bot, seconds: seconds, theme.id)
         let working = bot.status == .working
         let hot = bot.mentionsYou || bot.status == .approval || working
 
@@ -354,6 +484,40 @@ public struct RosterView: View {
             if working && theme.id == .control {
                 BlinkingCursor(color: theme.color(for: bot.hue))
             }
+        }
+    }
+
+    /// Relative time — "4m", "2h" — reads better on a chat roster than a wall
+    /// clock (plugin.js:4011-4016). A bot with no history gets the themed
+    /// "new" rather than desktop's nothing: on a phone the column would
+    /// otherwise look broken, and "new" is true.
+    private func timeText(for bot: Bot) -> some View {
+        let relative = model.rosterTimeLabel(bot.id)
+        let label = relative.isEmpty
+            ? (bot.previewTime.isEmpty ? CopyPack.rosterNever(theme.id) : bot.previewTime)
+            : relative
+        return Text(label)
+            .font(timeFont)
+            .monospacedDigit()
+            .foregroundStyle(theme.id == .soft ? theme.ink.opacity(0.38) : theme.faint)
+    }
+
+    /// "Active in the last 90s" — 6 pt, opacity-pulsing, and deliberately a
+    /// different animal from the unread badge beside it: solid and bigger
+    /// means you have something to read, smaller and breathing means it is
+    /// alive right now (plugin.js:4005-4010, BOT-MODE-PARITY §4.4).
+    @ViewBuilder private func activeDot(for bot: Bot) -> some View {
+        if model.isActiveNow(bot.id) {
+            Group {
+                if reducedMotion {
+                    Circle().fill(theme.id == .ink ? theme.ink : theme.accent)
+                } else {
+                    Circle().fill(theme.id == .ink ? theme.ink : theme.accent)
+                        .glowPulse(period: 1.2)
+                }
+            }
+            .frame(width: 6, height: 6)
+            .accessibilityLabel(Text(CopyPack.rosterActiveNow(theme.id)))
         }
     }
 
@@ -468,6 +632,63 @@ public struct RosterView: View {
     }
 }
 
+// MARK: - Roster copy (the three voices)
+
+extension CopyPack {
+
+    static func rosterPin(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Pin to top"
+        case .control: "PIN TO TOP"
+        case .ink: "Keep at the head"
+        }
+    }
+
+    static func rosterUnpin(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Unpin"
+        case .control: "UNPIN"
+        case .ink: "Release from the head"
+        }
+    }
+
+    static func rosterDuplicate(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Duplicate"
+        case .control: "DUPLICATE"
+        case .ink: "Copy the familiar"
+        }
+    }
+
+    /// Screen-reader name for the pin marker; desktop's tooltip is "Pinned".
+    static func rosterPinnedMarker(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Pinned"
+        case .control: "PINNED"
+        case .ink: "kept at the head"
+        }
+    }
+
+    /// Screen-reader name for the liveness dot — desktop's title is
+    /// "Active in the last 90s" (plugin.js:4008).
+    static func rosterActiveNow(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Active in the last 90 seconds"
+        case .control: "ACTIVE WITHIN 90S"
+        case .ink: "stirring within the minute and a half"
+        }
+    }
+
+    /// A bot with no conversation behind it yet.
+    static func rosterNever(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "new"
+        case .control: "NEW"
+        case .ink: "unwritten"
+        }
+    }
+}
+
 // MARK: - Local effects
 
 /// The prototype's `cursorU`: a hard step blink, on for half the second.
@@ -486,16 +707,82 @@ private struct BlinkingCursor: View {
 }
 
 /// rowU — staggered fade + rise entrance.
+///
+/// Two rules from BOT-MODE-PARITY §4.2, which calls this Talaria's own
+/// invention and better than desktop's nothing: the stagger is CAPPED by the
+/// caller so a 40-bot roster does not spend two seconds arriving, and a row
+/// only ever enters ONCE per gateway. Rows recycle constantly here — a
+/// re-rank, a scroll back up, a tab switch — and animation that reads as
+/// arrival the first time reads as a slow load every time after.
 private struct RosterEntrance: ViewModifier {
+    var botID: String
     var delay: Double
     @State private var shown = false
+    @Environment(\.talariaReducedMotion) private var reducedMotion
 
     func body(content: Content) -> some View {
         content
             .opacity(shown ? 1 : 0)
-            .offset(y: shown ? 0 : 12)
+            // Damped, the row still fades in — but it does not travel, and the
+            // stagger collapses so the whole roster is legible at once.
+            .offset(y: shown || reducedMotion ? 0 : 12)
             .onAppear {
-                withAnimation(.easeOut(duration: 0.45).delay(delay)) { shown = true }
+                guard !shown else { return }
+                guard RosterSignals.shared.entered.insert(botID).inserted else {
+                    shown = true
+                    return
+                }
+                if reducedMotion {
+                    withAnimation(.easeOut(duration: 0.2)) { shown = true }
+                } else {
+                    withAnimation(.easeOut(duration: 0.45).delay(delay)) { shown = true }
+                }
             }
+    }
+}
+
+/// The idle sway and the working lean (plugin.js:999-1025, 3852-3856).
+///
+/// Desktop re-projects a 52-point face outline every frame; SwiftUI's answer
+/// to the same impression is a static silhouette under a rotation, which is
+/// what BOT-MODE-PARITY §4.2 recommends as "the single highest-leverage feel
+/// change in this region". Idle is ±1.5° — breathing, not bouncing. Working
+/// leans into the work, because a bot bent over its task is a more legible
+/// status cue than any spinner.
+///
+/// Deliberately NOT desktop's per-frame clock: a repeating implicit animation
+/// runs on the render server, so a swaying roster re-evaluates zero view
+/// bodies and an idle phone is left alone. Desktop's own budget rule points
+/// the same way — "an empty roster costs zero frames" — it just has to reach
+/// it by hand in a browser.
+private struct AvatarSway: ViewModifier {
+    var botID: String
+    var working: Bool
+    @Environment(\.talariaReducedMotion) private var reducedMotion
+    @State private var swung = false
+
+    /// ±1.5° idle; working leans forward and sways wider.
+    private var amplitude: Double { working ? 4 : 1.5 }
+    private var center: Double { working ? -6 : 0 }
+    private var period: Double { working ? 2.8 : 6.2 }
+
+    /// Per-bot phase so a roster of faces never sways in lockstep. Stable
+    /// across launches: the same bot always starts on the same beat.
+    private var phase: Double {
+        Double(abs(AppModel.stableHash(botID)) % 240) / 100
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .rotationEffect(.degrees(reducedMotion ? 0 : center + (swung ? amplitude : -amplitude)),
+                            anchor: UnitPoint(x: 0.5, y: 0.7))
+            .animation(reducedMotion ? nil : .easeInOut(duration: period)
+                        .repeatForever(autoreverses: true).delay(phase),
+                       value: swung)
+            .onAppear { swung = true }
+            // Starting or finishing a turn changes the pose; toggling restarts
+            // the repeat with the new lean instead of leaving it mid-swing on
+            // the old one.
+            .onChange(of: working) { swung.toggle() }
     }
 }

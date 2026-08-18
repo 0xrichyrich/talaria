@@ -132,8 +132,14 @@ public final class LiveActivityController {
         if let activity, activity.attributes.botID == bot.id { return }
         stopActivity()
 
+        // Both halves of the identity, never the raw profile id: the widget
+        // chooses its theme at render time and applies the same
+        // title-or-@handle rule as TalariaVoice.displayName(for:). Sending only
+        // the handle made the island read "@researcher-1" for a bot the app
+        // calls "Athena".
         let attributes = BotWorkAttributes(
-            botID: bot.id, botName: bot.id, shape: bot.shape, hue: bot.hue)
+            botID: bot.id, botName: bot.handle, botTitle: bot.displayTitle,
+            shape: bot.shape, hue: bot.hue)
         let state = BotWorkAttributes.ContentState(
             task: taskLine(for: bot),
             startedAt: Date().addingTimeInterval(-Double(bot.minutesElapsed) * 60),

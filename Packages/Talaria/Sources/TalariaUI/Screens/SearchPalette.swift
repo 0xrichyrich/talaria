@@ -4,15 +4,38 @@ import TalariaTheme
 
 // The search palette — scrim + input over everything, opened from the
 // magnifier on the roster. Empty query shows "Live now" (working bots) plus
-// the actions; a query filters bots, sessions across all bots, artifacts, and
-// actions. Every row routes on tap and dismisses the palette.
-// Ported from Talaria.dc.html `sc-if searchOpen`.
+// the action registry; a query searches bots, sessions, artifacts and actions,
+// grouped by kind with one header per group.
+//
+// Sessions are the only server-backed group: live mode runs a 250 ms-debounced
+// GET /api/sessions/search through `model.searchSessions`, demo mode filters
+// the canned index. Bots, artifacts and actions stay client-side — they are
+// already fully in memory, so making them async would only add latency.
+//
+// Every row routes on tap and dismisses the palette. Ported from
+// Talaria.dc.html `sc-if searchOpen`, extended for live search.
 
 /// Palette actions the palette cannot route through `AppModel` alone; the
-/// host wires these to its create-bot sheet / connections push.
+/// host wires these to its sheets and pushes.
 public enum SearchPaletteAction: Sendable {
     case newBot
     case addGateway
+    /// Jump to a tab. Routed through the host because reaching a tab means
+    /// popping whatever is stacked over it, which is the host's state.
+    case tab(CopyPack.Tab)
+    /// Skills / toolsets / MCP — hosted as a sheet so it never crowds the
+    /// five prototype tabs.
+    case capabilities
+    /// Device settings. Tabless for the same reason Capabilities is, and
+    /// reached the same two ways: here, and from Connections.
+    case settings
+    /// Approval rules — mode, bypass, wait, the permanent allowlist, pairing.
+    /// Tabless like the two above; also reached from the Approvals tab header.
+    case approvalPolicy
+    /// Browse stored sessions for a bot (the palette resolves which one).
+    case sessions(botID: String)
+    /// A cross-session search hit: open this bot on this stored session.
+    case openSession(botID: String, sessionID: String)
 }
 
 public struct SearchPalette: View {
@@ -23,6 +46,11 @@ public struct SearchPalette: View {
     @State private var query = ""
     @FocusState private var focused: Bool
 
+    // Live session search (see `runSessionSearch`).
+    @State private var sessionHits: [PaletteSession] = []
+    @State private var searchState: SessionSearchState = .idle
+    @State private var searchTask: Task<Void, Never>?
+
     public init(model: AppModel, isPresented: Binding<Bool>,
                 onAction: ((SearchPaletteAction) -> Void)? = nil) {
         self.model = model
@@ -32,6 +60,20 @@ public struct SearchPalette: View {
 
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
+
+    /// Where the server-backed session group stands for the current query.
+    private enum SessionSearchState: Equatable {
+        /// Nothing to run: demo mode, or a query shorter than the floor.
+        case idle
+        case searching
+        case done
+        /// Live mode with no reachable gateway — degrade, don't spin.
+        case unreachable
+    }
+
+    /// Below this, an FTS query matches most of the transcript store; desktop
+    /// applies the same floor before hitting /api/sessions/search.
+    private static let minimumLiveQuery = 2
 
     // MARK: Result sets (mirrors the prototype's sr* pipelines)
 
@@ -49,14 +91,23 @@ public struct SearchPalette: View {
         return model.bots.filter { matches($0.id) || matches($0.job) || matches($0.preview) }
     }
 
-    private var resultSessions: [(botID: String, session: SessionSummary)] {
+    /// Demo mode has no search endpoint — filter the canned per-bot index so
+    /// the palette behaves identically without a gateway.
+    private var demoSessions: [PaletteSession] {
         guard !trimmedQuery.isEmpty else { return [] }
         return model.sessions
             .filter { $0.key != "default" }
             .sorted { $0.key < $1.key }
             .flatMap { botID, list in
-                list.filter { matches($0.title) }.map { (botID, $0) }
+                list.filter { matches($0.title) }.map {
+                    PaletteSession(sessionID: $0.id, botID: botID, title: $0.title,
+                                   snippet: "", when: $0.when)
+                }
             }
+    }
+
+    private var resultSessions: [PaletteSession] {
+        model.mode == .live ? sessionHits : demoSessions
     }
 
     private var resultArtifacts: [Artifact] {
@@ -64,20 +115,52 @@ public struct SearchPalette: View {
         return model.artifacts.filter { matches($0.title) || matches($0.meta) }
     }
 
-    // The prototype keeps these four action names identical across all three
-    // theme voices (they are not CopyPack keys).
-    private var resultActions: [(label: String, run: () -> Void)] {
-        let all: [(String, () -> Void)] = [
-            ("New bot", { onAction?(.newBot) }),
-            ("Add gateway", { onAction?(.addGateway) }),
-            ("Approvals", { model.selectedTab = .approvals }),
-            ("Cycle theme", { model.theme.cycle() }),
-        ]
-        return all.filter { trimmedQuery.isEmpty || $0.0.lowercased().contains(trimmedQuery) }
+    // MARK: Action registry
+
+    private struct PaletteAction: Identifiable {
+        let id: String
+        let label: String
+        let run: () -> Void
     }
 
-    private var sectionHead: String {
-        trimmedQuery.isEmpty ? "Live now · Actions" : "Results"
+    /// "Sessions…" needs a subject: the open chat, else the first bot on the
+    /// roster. With an empty roster the row is simply not offered.
+    private var sessionsActionBot: String? {
+        model.openBotID ?? model.bots.first?.id
+    }
+
+    private var resultActions: [PaletteAction] {
+        var all: [PaletteAction] = [
+            PaletteAction(id: "new-bot", label: copy.createTitle) { onAction?(.newBot) },
+            PaletteAction(id: "add-gateway", label: copy.paletteAddGateway(theme.id)) { onAction?(.addGateway) },
+            PaletteAction(id: "capabilities", label: copy.paletteCapabilities(theme.id)) { onAction?(.capabilities) },
+            PaletteAction(id: "settings", label: copy.paletteSettings(theme.id)) { onAction?(.settings) },
+            PaletteAction(id: "approval-policy",
+                          label: copy.policyTitle(theme.id)) { onAction?(.approvalPolicy) },
+        ]
+        if let botID = sessionsActionBot {
+            all.append(PaletteAction(id: "sessions", label: copy.paletteSessionsAction(theme.id)) {
+                onAction?(.sessions(botID: botID))
+            })
+        }
+        // Destinations, in tab-bar order and tab-bar voice. Home is omitted —
+        // the palette is opened from it.
+        for entry in copy.tabs where entry.tab != .home {
+            all.append(PaletteAction(id: "tab-\(entry.tab.rawValue)", label: entry.label) {
+                onAction?(.tab(entry.tab))
+            })
+        }
+        all.append(PaletteAction(id: "cycle-theme", label: copy.paletteCycleTheme(theme.id)) {
+            model.theme.cycle()
+        })
+        return all.filter { trimmedQuery.isEmpty || $0.label.lowercased().contains(trimmedQuery) }
+    }
+
+    /// True once every group has reported empty and nothing is still in flight.
+    private var showsEmptyState: Bool {
+        !trimmedQuery.isEmpty && searchState != .searching
+            && resultBots.isEmpty && resultSessions.isEmpty
+            && resultArtifacts.isEmpty && resultActions.isEmpty
     }
 
     // MARK: Body
@@ -101,6 +184,8 @@ public struct SearchPalette: View {
         .onAppear {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { focused = true }
         }
+        .onDisappear { searchTask?.cancel() }
+        .onChange(of: query) { scheduleSessionSearch() }
     }
 
     private var inputRow: some View {
@@ -113,7 +198,9 @@ public struct SearchPalette: View {
                 .autocorrectionDisabled()
                 #if os(iOS)
                 .textInputAutocapitalization(.never)
+                .submitLabel(.search)
                 #endif
+                .onSubmit { runSessionSearchNow() }
                 .textFieldStyle(.plain)
                 .padding(.horizontal, 15)
                 .frame(height: 44)
@@ -156,44 +243,88 @@ public struct SearchPalette: View {
     private var results: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 7) {
-                Text(sectionHead)
-                    .font(theme.mono(theme.id == .soft ? 10 : 9.5, weight: .bold))
-                    .tracking(theme.id == .soft ? 1 : 1.8)
-                    .foregroundStyle(theme.accentFg)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(theme.accent)
-
-                ForEach(resultBots) { bot in
-                    botRow(bot)
-                }
-                ForEach(resultSessions, id: \.session.id) { hit in
-                    metaRow(title: hit.session.title,
-                            trail: "\(themedBotName(hit.botID, theme: theme)) · \(hit.session.when)") {
-                        openBot(hit.botID)
-                    }
-                }
-                ForEach(resultArtifacts) { artifact in
-                    metaRow(title: artifact.title,
-                            trail: "\(themedBotName(artifact.botID, theme: theme)) · \(artifact.when)") {
-                        openBot(artifact.botID)
+                if !resultBots.isEmpty {
+                    sectionHeader(trimmedQuery.isEmpty
+                                  ? copy.paletteLiveNow(theme.id) : copy.titleHome)
+                    ForEach(resultBots) { bot in
+                        botRow(bot)
                     }
                 }
 
-                WrapLayout(spacing: 7) {
-                    ForEach(Array(resultActions.enumerated()), id: \.offset) { _, action in
-                        actionChip(action.label) {
-                            close()
-                            action.run()
+                if !trimmedQuery.isEmpty {
+                    sessionSection
+                }
+
+                if !resultArtifacts.isEmpty {
+                    sectionHeader(copy.titleArtifacts)
+                    ForEach(resultArtifacts) { artifact in
+                        metaRow(title: artifact.title,
+                                trail: "\(model.botName(artifact.botID, theme.id)) · \(artifact.when)") {
+                            openBot(artifact.botID)
                         }
                     }
                 }
-                .padding(.top, 4)
+
+                if !resultActions.isEmpty {
+                    sectionHeader(copy.paletteActions(theme.id))
+                    WrapLayout(spacing: 7) {
+                        ForEach(resultActions) { action in
+                            actionChip(action.label) {
+                                close()
+                                action.run()
+                            }
+                        }
+                    }
+                    .padding(.top, 1)
+                }
+
+                if showsEmptyState {
+                    noteRow(copy.paletteNoMatches(theme.id))
+                }
             }
             .padding(.horizontal, 1)
             .padding(.vertical, 2)
         }
         .scrollDismissesKeyboard(.interactively)
+    }
+
+    /// The sessions group carries its own status: a spinner while the REST
+    /// search is in flight, and a themed note when the gateway is out of reach
+    /// rather than a spinner that never resolves.
+    @ViewBuilder private var sessionSection: some View {
+        if searchState == .searching || searchState == .unreachable || !resultSessions.isEmpty {
+            HStack(spacing: 8) {
+                sectionHeader(copy.paletteSessionsHead(theme.id))
+                if searchState == .searching {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .controlSize(.small)
+                        .tint(theme.accent)
+                    Text(copy.paletteSearching(theme.id))
+                        .font(theme.mono(theme.id == .soft ? 10 : 9.5))
+                        .tracking(theme.id == .soft ? 0.6 : 1.2)
+                        .foregroundStyle(theme.faint)
+                }
+                Spacer(minLength: 0)
+            }
+
+            if searchState == .unreachable {
+                noteRow(copy.paletteSearchUnreachable(theme.id))
+            }
+            ForEach(resultSessions) { hit in
+                sessionRow(hit)
+            }
+        }
+    }
+
+    private func sectionHeader(_ text: String) -> some View {
+        Text(text)
+            .font(theme.mono(theme.id == .soft ? 10 : 9.5, weight: .bold))
+            .tracking(theme.id == .soft ? 1 : 1.8)
+            .foregroundStyle(theme.accentFg)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(theme.accent)
     }
 
     // MARK: Rows
@@ -202,7 +333,7 @@ public struct SearchPalette: View {
         Button { openBot(bot.id) } label: {
             HStack(spacing: 10) {
                 AvatarView(bot: bot, size: 26, theme: theme)
-                Text(themedBotName(bot.id, theme: theme))
+                Text(TalariaVoice.displayName(for: bot, theme.id))
                     .font(nameFont)
                     .foregroundStyle(theme.ink)
                 Text(liveLine(for: bot))
@@ -211,6 +342,39 @@ public struct SearchPalette: View {
                     .foregroundStyle(theme.sub)
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+        }
+        .buttonStyle(.plain)
+        .modifier(PaletteCard(theme: theme))
+    }
+
+    /// A cross-session hit: title, the FTS snippet that matched, then the
+    /// owning bot and age.
+    private func sessionRow(_ hit: PaletteSession) -> some View {
+        Button { openSession(hit) } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 9) {
+                    Text(hit.title)
+                        .font(theme.body(theme.id == .ink ? 15.5 : 13.5, weight: .semibold))
+                        .foregroundStyle(theme.ink)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text("\(model.botName(hit.botID, theme.id)) · \(hit.when)")
+                        .font(theme.id == .soft ? theme.body(11, weight: .medium) : theme.mono(theme.id == .ink ? 9 : 10))
+                        .foregroundStyle(theme.faint)
+                        .lineLimit(1)
+                }
+                if !hit.snippet.isEmpty {
+                    Text(hit.snippet)
+                        .font(theme.id == .control ? theme.mono(10) : theme.body(theme.id == .ink ? 13 : 12))
+                        .italic(theme.id == .ink)
+                        .foregroundStyle(theme.sub)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -237,6 +401,18 @@ public struct SearchPalette: View {
         }
         .buttonStyle(.plain)
         .modifier(PaletteCard(theme: theme))
+    }
+
+    /// Non-interactive status line in the result stack (empty / degraded).
+    private func noteRow(_ text: String) -> some View {
+        Text(text)
+            .font(theme.id == .control ? theme.mono(10.5) : theme.body(theme.id == .ink ? 14 : 12.5))
+            .italic(theme.id == .ink)
+            .foregroundStyle(theme.sub)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 11)
+            .modifier(PaletteCard(theme: theme))
     }
 
     private func actionChip(_ label: String, run: @escaping () -> Void) -> some View {
@@ -290,17 +466,190 @@ public struct SearchPalette: View {
         }
     }
 
+    // MARK: Live session search
+
+    /// Debounce the server search: every keystroke cancels the pending task
+    /// and restarts the 250 ms timer, so a fast typist issues one request.
+    private func scheduleSessionSearch() {
+        searchTask?.cancel()
+        let q = trimmedQuery
+        guard model.mode == .live, q.count >= Self.minimumLiveQuery else {
+            sessionHits = []
+            searchState = .idle
+            return
+        }
+        guard model.client != nil, !model.isOffline else {
+            sessionHits = []
+            searchState = .unreachable
+            return
+        }
+        searchState = .searching
+        searchTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            await performSessionSearch(q)
+        }
+    }
+
+    /// Return key — skip the debounce and search on what is typed now.
+    private func runSessionSearchNow() {
+        searchTask?.cancel()
+        let q = trimmedQuery
+        guard model.mode == .live, q.count >= Self.minimumLiveQuery,
+              model.client != nil, !model.isOffline else { return }
+        searchState = .searching
+        searchTask = Task { @MainActor in
+            await performSessionSearch(q)
+        }
+    }
+
+    private func performSessionSearch(_ q: String) async {
+        let hits = await model.searchSessions(q)
+        // A slow response must not overwrite results for a newer query.
+        guard !Task.isCancelled, q == trimmedQuery else { return }
+        sessionHits = hits.map {
+            PaletteSession(sessionID: $0.sessionID, botID: $0.botID, title: $0.title,
+                           snippet: $0.snippet, when: $0.when)
+        }
+        searchState = .done
+    }
+
     // MARK: Routing
 
     private func close() {
+        searchTask?.cancel()
         query = ""
+        sessionHits = []
+        searchState = .idle
         isPresented = false
     }
 
     private func openBot(_ id: String) {
         close()
         model.selectedTab = .home
-        model.openBotID = id
+        // openChat (not a raw openBotID write) clears unread and resumes the
+        // live session with deferred history.
+        model.openChat(botID: id)
+    }
+
+    private func openSession(_ hit: PaletteSession) {
+        close()
+        model.selectedTab = .home
+        onAction?(.openSession(botID: hit.botID, sessionID: hit.sessionID))
+    }
+}
+
+// MARK: - Result view models
+
+/// One session result, from either the live search endpoint or the demo index.
+private struct PaletteSession: Identifiable, Equatable {
+    /// Session ids are only unique within a profile, so rows key on bot+session.
+    let id: String
+    let sessionID: String
+    let botID: String
+    let title: String
+    let snippet: String
+    let when: String
+
+    init(sessionID: String, botID: String, title: String, snippet: String, when: String) {
+        self.id = botID + "/" + sessionID
+        self.sessionID = sessionID
+        self.botID = botID
+        self.title = title
+        self.snippet = snippet
+        self.when = when
+    }
+}
+
+// MARK: - Palette copy (three voices, same as CopyPack proper)
+
+extension CopyPack {
+    func paletteLiveNow(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Live now"
+        case .control: "LIVE NOW"
+        case .ink: "AT WORK NOW"
+        }
+    }
+
+    func paletteActions(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Actions"
+        case .control: "ACTIONS"
+        case .ink: "DEEDS"
+        }
+    }
+
+    func paletteSessionsHead(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Sessions"
+        case .control: "SESSIONS"
+        case .ink: "AUDIENCES"
+        }
+    }
+
+    func paletteSearching(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Searching…"
+        case .control: "QUERYING…"
+        case .ink: "SEEKING…"
+        }
+    }
+
+    func paletteNoMatches(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Nothing matches that."
+        case .control: "NO MATCHES."
+        case .ink: "Nothing of that name is written here."
+        }
+    }
+
+    func paletteSearchUnreachable(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Sessions live on the gateway — reconnect to search them."
+        case .control: "LINK DOWN — SESSION INDEX UNREACHABLE."
+        case .ink: "The way is severed; the past audiences cannot be read."
+        }
+    }
+
+    func paletteCapabilities(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Capabilities"
+        case .control: "CAPABILITIES"
+        case .ink: "gifts & arts"
+        }
+    }
+
+    func paletteSettings(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Settings"
+        case .control: "SETTINGS"
+        case .ink: "the settings"
+        }
+    }
+
+    func paletteSessionsAction(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Sessions…"
+        case .control: "SESSIONS…"
+        case .ink: "past audiences…"
+        }
+    }
+
+    func paletteCycleTheme(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Cycle theme"
+        case .control: "CYCLE THEME"
+        case .ink: "change the guise"
+        }
+    }
+
+    func paletteAddGateway(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Add gateway"
+        case .control: "ADD UPLINK"
+        case .ink: "open a way"
+        }
     }
 }
 
@@ -365,8 +714,4 @@ private extension ThemePack {
     var scrimColor: Color {
         id == .control ? Color.black.opacity(0.62) : ink.opacity(0.4)
     }
-}
-
-private func themedBotName(_ id: String, theme: ThemePack) -> String {
-    theme.id == .ink ? id.prefix(1).uppercased() + id.dropFirst() : "@" + id
 }
