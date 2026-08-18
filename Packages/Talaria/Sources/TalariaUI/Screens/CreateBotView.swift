@@ -20,6 +20,13 @@ import TalariaTheme
 // has nothing true to diff against — profiles.configure replaces whole
 // sections, so a blank field would erase the file.
 //
+// Cosmetics take the other road (ROADMAP decision #3): title, shape and colour
+// are written back into desktop Bot Mode's own ui_meta["hermes-bots"] block
+// through AppModelLive+Cosmetics, which read-merges the live block first so a
+// phone edit can never clobber the canonical-chat pin or a key it does not
+// own. That is a separate configure call from the text sections above,
+// deliberately — the merge needs a fresh read that the dirty diff does not.
+//
 // Demo mode keeps working throughout: the same snapshot shape is synthesized
 // from DemoData and every write stays local.
 
@@ -35,11 +42,18 @@ public struct CreateBotView: View {
     private enum Load: Equatable { case loading, loaded, failed }
 
     @State private var name: String
+    /// The user-set display title — desktop's Edit Profile "Title" field,
+    /// stored in ui_meta["hermes-bots"].title and read back by
+    /// `Bot.displayTitle`. Blank means "keep the derived name", which is why
+    /// the placeholder shows what that derived name would be.
+    @State private var title: String
     @State private var job: String
     @State private var soul: String
     @State private var shape: AvatarShape
     @State private var hue: AvatarHue
     @State private var showAdvanced = false
+    /// Staged avatar bytes (generated or uploaded) — written only by Save.
+    @State private var avatar = AvatarDraft()
 
     // Live catalogs (empty until the gateway answers).
     @State private var modelChoices: [ModelChoice] = []
@@ -59,16 +73,18 @@ public struct CreateBotView: View {
 
     @State private var saving = false
     @State private var saveFailed = false
-
-    // Portrait generation (image.generate → profiles.set_asset).
-    @State private var portraitAvailable = false
-    @State private var generating = false
+    /// Set when the gateway took the profile edit but could not store the look
+    /// — an older build with no ui_meta support. Not an error (nothing was
+    /// lost that the gateway ever held), but the user should know why the
+    /// laptop will not show it.
+    @State private var lookUnsupported = false
     @State private var portraitNote: PortraitFailure?
 
     public init(model: AppModel, editing: Bot? = nil) {
         self.model = model
         self.editing = editing
         _name = State(initialValue: editing?.id ?? "")
+        _title = State(initialValue: editing?.title ?? "")
         _job = State(initialValue: editing?.job ?? "")
         // Soul stays EMPTY until profiles.describe answers with the real
         // SOUL.md. It used to be seeded from the profile description, which
@@ -82,10 +98,16 @@ public struct CreateBotView: View {
     private var copy: CopyPack { model.theme.copy }
     private var style: CreateStyle { CreateStyle(t: theme) }
 
-    /// The six roster hues, in the prototype's DB.HUES order (no gateway grey).
-    private static let hues: [AvatarHue] = [.teal, .violet, .amber, .green, .pink, .blue]
-
     private var isEditing: Bool { editing != nil }
+
+    /// Who a generated portrait is of — the name being typed right now, not
+    /// the one the profile was saved under, so a rename and a new face can be
+    /// decided in the same sitting.
+    private var promptName: String {
+        let typed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !typed.isEmpty { return typed }
+        return editing?.displayTitle ?? name
+    }
 
     private var canCreate: Bool {
         guard !name.isEmpty, !saving else { return false }
@@ -103,9 +125,16 @@ public struct CreateBotView: View {
             ScrollView {
                 VStack(spacing: 14) {
                     avatarPreview
-                    portraitRow
-                    shapePicker
-                    huePicker
+                    AvatarPicker(model: model, botID: editing?.id,
+                                 name: promptName, job: job, soul: soul,
+                                 shape: $shape, hue: $hue, draft: $avatar)
+                    if !isEditing {
+                        Text(CopyPack.portraitAfterCreate(theme.id))
+                            .font(style.aSubFont)
+                            .foregroundStyle(theme.faint)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity)
+                    }
                     if isEditing, load != .loaded { prefillBanner }
                     formGroup
                     advancedRow
@@ -114,6 +143,18 @@ public struct CreateBotView: View {
                         Text(CopyPack.editorSaveFailed(theme.id))
                             .font(style.footNoteFont)
                             .foregroundStyle(theme.danger)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if lookUnsupported {
+                        Text(CopyPack.lookNotStored(theme.id))
+                            .font(style.footNoteFont)
+                            .foregroundStyle(theme.warn)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if let portraitNote {
+                        Text(CopyPack.portraitFailure(portraitNote, theme.id))
+                            .font(style.footNoteFont)
+                            .foregroundStyle(theme.warn)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     Text(copy.createNote)
@@ -140,10 +181,13 @@ public struct CreateBotView: View {
         guard load == .loading else { return }
 
         async let catalogTask = model.modelChoices()
-        async let portraitTask = model.portraitGenerationAvailable()
 
         let snapshot: ProfileSnapshot?
         if let editing {
+            // The stored portrait has to be in the cache before the picker can
+            // offer to remove it, and before the preview can show what this
+            // bot's face actually is today. Idempotent and cached.
+            await model.refreshAvatar(botID: editing.id)
             snapshot = await model.profileSnapshot(botID: editing.id)
         } else if let seed = LiveRuntime.shared.defaultBotID ?? model.bots.first?.id {
             snapshot = await model.profileSnapshot(botID: seed)
@@ -152,7 +196,6 @@ public struct CreateBotView: View {
         }
 
         modelChoices = await catalogTask
-        portraitAvailable = await portraitTask
 
         if isEditing {
             guard let snapshot else {
@@ -242,17 +285,18 @@ public struct CreateBotView: View {
         .padding(EdgeInsets(top: 18, leading: 18, bottom: 10, trailing: 18))
     }
 
-    // MARK: - Avatar preview (reacts live to shape/hue picks)
+    // MARK: - Avatar preview (reacts live to picks, staged image included)
 
+    /// What this bot's face will be once Save lands: the staged image if the
+    /// user just generated or chose one, the stored portrait if there is one
+    /// and it is not being removed, else the shape × hue silhouette.
     private var avatarPreview: some View {
         ZStack {
             if theme.id != .soft {
                 SummonRing(theme: theme)
                     .frame(width: 112, height: 112)
             }
-            if let editing,
-               let data = ProfileAssetStore.shared.portrait(for: editing.id),
-               let image = ProfileAssetStore.image(from: data) {
+            if let image = previewImage {
                 image
                     .resizable()
                     .scaledToFill()
@@ -270,62 +314,11 @@ public struct CreateBotView: View {
         .padding(.bottom, 2)
     }
 
-    // MARK: - Portrait (image.generate → profiles.set_asset)
-
-    @ViewBuilder private var portraitRow: some View {
-        VStack(spacing: 6) {
-            if isEditing, portraitAvailable {
-                HStack(spacing: 10) {
-                    Button {
-                        Task { await generatePortrait() }
-                    } label: {
-                        Text(generating ? CopyPack.portraitWorking(theme.id)
-                                        : CopyPack.portraitGenerate(theme.id))
-                            .font(style.aSubFont)
-                            .foregroundStyle(generating ? theme.faint : theme.accent)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(generating)
-
-                    if let editing, ProfileAssetStore.shared.hasPortrait(editing.id) {
-                        Text("·").foregroundStyle(theme.faint)
-                        Button {
-                            Task { await model.clearAvatarPortrait(botID: editing.id) }
-                        } label: {
-                            Text(CopyPack.portraitRemove(theme.id))
-                                .font(style.aSubFont)
-                                .foregroundStyle(theme.sub)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(generating)
-                    }
-                }
-            } else if !isEditing {
-                Text(CopyPack.portraitAfterCreate(theme.id))
-                    .font(style.aSubFont)
-                    .foregroundStyle(theme.faint)
-            }
-
-            if let portraitNote {
-                Text(CopyPack.portraitFailure(portraitNote, theme.id))
-                    .font(style.footNoteFont)
-                    .foregroundStyle(theme.warn)
-                    .multilineTextAlignment(.center)
-            }
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    private func generatePortrait() async {
-        guard let editing else { return }
-        generating = true
-        portraitNote = nil
-        let prompt = AppModel.portraitPrompt(name: editing.id, job: job, soul: soul,
-                                             shape: shape, hue: hue)
-        portraitNote = await model.generateAvatarPortrait(botID: editing.id, prompt: prompt)
-        generating = false
+    private var previewImage: Image? {
+        if let staged = avatar.image { return ProfileAssetStore.image(from: staged) }
+        guard !avatar.clearsImage, let editing,
+              let data = ProfileAssetStore.shared.portrait(for: editing.id) else { return nil }
+        return ProfileAssetStore.image(from: data)
     }
 
     // MARK: - Prefill banner (loading / gateway unreadable)
@@ -339,89 +332,6 @@ public struct CreateBotView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(EdgeInsets(top: 10, leading: 13, bottom: 10, trailing: 13))
             .modifier(CreateBoxChrome(theme: theme, kind: .box))
-    }
-
-    // MARK: - Shape picker
-
-    private var shapePicker: some View {
-        HStack(spacing: 8) {
-            ForEach(AvatarShape.allCases, id: \.self) { candidate in
-                let on = shape == candidate
-                Button {
-                    withAnimation(.easeInOut(duration: 0.15)) { shape = candidate }
-                } label: {
-                    AvatarSilhouette(candidate)
-                        .fill(on ? theme.color(for: hue) : theme.faint)
-                        .frame(width: 20, height: 20)
-                        .frame(width: 34, height: 34)
-                        .background(shapeWrap(on: on))
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    /// Selection chrome per theme: soft = tinted rounded pad, control =
-    /// terminal cell with accent border, ink = a 2pt rule under the glyph.
-    @ViewBuilder private func shapeWrap(on: Bool) -> some View {
-        switch theme.id {
-        case .soft:
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(on ? theme.accent.opacity(0.12) : .clear)
-        case .control:
-            let cell = RoundedRectangle(cornerRadius: 7, style: .continuous)
-            cell.fill(theme.panel)
-                .overlay(cell.stroke(on ? theme.accent.opacity(0.5) : theme.line, lineWidth: 1))
-        case .ink:
-            VStack(spacing: 0) {
-                Spacer(minLength: 0)
-                Rectangle()
-                    .fill(on ? theme.ink : .clear)
-                    .frame(height: 2)
-            }
-        }
-    }
-
-    // MARK: - Hue picker
-
-    private var huePicker: some View {
-        HStack(spacing: 9) {
-            ForEach(Self.hues, id: \.self) { candidate in
-                let on = hue == candidate
-                Button {
-                    withAnimation(.easeInOut(duration: 0.15)) { hue = candidate }
-                } label: {
-                    swatchShape
-                        .fill(theme.color(for: candidate))
-                        .frame(width: 23, height: 23)
-                        .overlay(swatchRing(on: on))
-                        .padding(4)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    /// Control renders square telemetry swatches; the others are dots.
-    private var swatchShape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: theme.id == .control ? 4 : 11.5, style: .continuous)
-    }
-
-    /// Ink signals selection with a parchment gap + ink halo; the others use
-    /// a plain ink border.
-    @ViewBuilder private func swatchRing(on: Bool) -> some View {
-        if on {
-            if theme.id == .ink {
-                swatchShape.inset(by: -2).stroke(theme.bg, lineWidth: 2)
-                swatchShape.inset(by: -3.25).stroke(theme.ink, lineWidth: 1.5)
-            } else {
-                swatchShape.stroke(theme.ink, lineWidth: 2.5)
-            }
-        }
     }
 
     // MARK: - Form (@name · job · soul)
@@ -452,6 +362,19 @@ public struct CreateBotView: View {
                     }
             }
             .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
+
+            Rectangle().fill(theme.line).frame(height: 1)
+
+            // Desktop's Title field (plugin.js:5076-5083). Its placeholder is
+            // the DERIVED display name, so leaving it blank visibly means
+            // "keep the name Talaria works out" rather than "unnamed".
+            TextField(derivedTitle, text: $title)
+                .textFieldStyle(.plain)
+                .font(style.fieldFont)
+                .foregroundStyle(theme.ink)
+                .tint(theme.accent)
+                .autocorrectionDisabled()
+                .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
 
             Rectangle().fill(theme.line).frame(height: 1)
 
@@ -488,6 +411,15 @@ public struct CreateBotView: View {
         case .failed: return CopyPack.soulUnavailable(theme.id)
         case .loaded: return copy.phDesc
         }
+    }
+
+    /// What the roster would call this bot with no title set — the same rule
+    /// every other surface renders (`Bot.displayTitle`), so the placeholder is
+    /// literally what blank means.
+    private var derivedTitle: String {
+        let id = name.trimmingCharacters(in: .whitespaces)
+        guard !id.isEmpty else { return CopyPack.titleFieldPlaceholder(theme.id) }
+        return Bot.unlisted(id: id).displayTitle
     }
 
     // MARK: - Advanced disclosure
@@ -666,22 +598,34 @@ public struct CreateBotView: View {
         guard canCreate else { return }
         saving = true
         saveFailed = false
+        lookUnsupported = false
+        portraitNote = nil
         let ok = isEditing ? await applyEdit() : await create()
         saving = false
-        if ok { dismiss() } else { saveFailed = true }
+        // A failed cosmetics write is reported in place rather than dismissing
+        // on a lie; everything else that succeeded has already landed.
+        if ok, !lookUnsupported, portraitNote == nil { dismiss() }
+        if !ok { saveFailed = true }
     }
 
     /// Create: profiles.create (description + SOUL.md + model pin) then a
-    /// configure pass for the sections create does not take.
+    /// configure pass for the sections create does not take — including the
+    /// look, in both vocabularies, with the `created` stamp that floats a
+    /// brand-new bot to the top of the roster (plugin.js:5399-5401).
     private func create() async -> Bool {
-        await model.createBotProfile(
+        let created = await model.createBotProfile(
             id: name,
             job: job.trimmingCharacters(in: .whitespacesAndNewlines),
             soul: soul.trimmingCharacters(in: .whitespacesAndNewlines),
             model: pinTouched ? pinnedModel : nil,
             disabledSkills: Array(disabledSkills).sorted(),
             enabledToolsets: nil,
-            uiMeta: uiMeta)
+            uiMeta: model.newBotUIMeta(shape: shape, hue: hue, title: title))
+        guard created else { return false }
+        // A portrait staged before the profile existed can only be written now
+        // that it does — the asset store is keyed by profile name.
+        await commitAvatar(botID: name)
+        return true
     }
 
     /// Edit: the dirty diff. Every section is compared against the gateway's
@@ -718,15 +662,48 @@ public struct CreateBotView: View {
             }
         }
 
-        if shape != editing.shape || hue != editing.hue { edit.uiMeta = uiMeta }
-        guard !edit.isEmpty else { return true }
-        return await model.saveProfileEdit(botID: editing.id, edit: edit)
+        if !edit.isEmpty {
+            guard await model.saveProfileEdit(botID: editing.id, edit: edit) else { return false }
+        }
+
+        // The look is its own write. It has to read the live
+        // ui_meta["hermes-bots"] block and merge into it — the dirty diff above
+        // has no way to do that, and a bare block would delete the bot's
+        // canonical-chat pin, its group and its pin-to-top flag.
+        if lookChanged(from: editing) {
+            switch await model.saveBotLook(botID: editing.id, shape: shape, hue: hue,
+                                           title: title) {
+            case .persisted:
+                break
+            case .unsupported:
+                // Said once per gateway and then never again: an old gateway
+                // would otherwise hold this sheet open on every single save,
+                // which is precisely the trap desktop's three-way outcome
+                // exists to avoid (plugin.js:248-262).
+                if !RosterSignals.shared.lookUnsupportedNoticed {
+                    RosterSignals.shared.lookUnsupportedNoticed = true
+                    lookUnsupported = true
+                }
+            case .failed:
+                return false
+            }
+        }
+        await commitAvatar(botID: editing.id)
+        return true
     }
 
-    /// Shape × hue rides along in profile ui_meta so every client renders the
-    /// same look; AppModel+Live reads the same keys back on roster refresh.
-    private var uiMeta: JSONValue {
-        ["talaria": ["shape": .string(shape.rawValue), "hue": .string(hue.rawValue)]]
+    private func lookChanged(from bot: Bot) -> Bool {
+        shape != bot.shape || hue != bot.hue
+            || title.trimmingCharacters(in: .whitespacesAndNewlines) != (bot.title ?? "")
+    }
+
+    /// Write the staged portrait (generated, uploaded, or removed). Bytes go to
+    /// the profile asset store, never into ui_meta — the block is 64 KB-capped
+    /// and rides every profiles.list (plugin.js:217-227).
+    private func commitAvatar(botID: String) async {
+        guard !avatar.isEmpty else { return }
+        portraitNote = await model.commitAvatarDraft(botID: botID, draft: avatar)
+        if portraitNote == nil { avatar = AvatarDraft() }
     }
 }
 
@@ -750,6 +727,31 @@ extension CopyPack {
             "PROFILE READ FAILED. COSMETICS + JOB WRITABLE; SOUL.MD / SKILLS / TOOLSETS UNTOUCHED."
         case .ink:
             "The papers could not be read. Guise and office may still be set; the soul, the gifts and the tools remain as they were."
+        }
+    }
+
+    /// Placeholder for the Title field before there is a name to derive one
+    /// from (the create sheet, first keystroke).
+    static func titleFieldPlaceholder(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Display name (optional)"
+        case .control: "DISPLAY NAME (OPTIONAL)"
+        case .ink: "the name you will call it"
+        }
+    }
+
+    /// The save landed, but this gateway cannot store ui_meta — the look holds
+    /// on this phone until the next roster poll and never reaches desktop.
+    /// Desktop stays silent here because its plugin-local store keeps the look;
+    /// Talaria has no such store, so saying it once is the honest thing.
+    static func lookNotStored(_ t: ThemeID) -> String {
+        switch t {
+        case .soft:
+            "This gateway is too old to store looks, so the shape, colour and display name won’t reach your desktop. Update Hermes to keep them."
+        case .control:
+            "GATEWAY CANNOT STORE UI_META — LOOK IS LOCAL ONLY. UPDATE HERMES TO SYNC."
+        case .ink:
+            "This gateway keeps no register of guises; the look will not travel to your desk. A newer gateway would remember it."
         }
     }
 
@@ -862,14 +864,6 @@ extension CopyPack {
         case .soft: "Painting…"
         case .control: "GENERATING…"
         case .ink: "the likeness is being drawn…"
-        }
-    }
-
-    static func portraitRemove(_ t: ThemeID) -> String {
-        switch t {
-        case .soft: "Remove portrait"
-        case .control: "CLEAR PORTRAIT"
-        case .ink: "take down the likeness"
         }
     }
 

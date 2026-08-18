@@ -11,6 +11,16 @@ import TalariaKit
 // via GatewayAuthClient.status(), measuring round-trip time for the ping
 // column. Bot counts come from profiles.list once a live link is up and are
 // cached so rows stay populated while a gateway is unreachable.
+//
+// Secondary rosters (Phase 4). Desktop paints ONE roster spanning every
+// configured Connection: the Electron main process inventories each source and
+// `buildAgentRoster` flattens them, applying the duplicate `@name-device` rule
+// once across all of them (electron/connection-registry.ts:330-372). Talaria
+// binds one gateway at a time, so the union is assembled here instead: each
+// saved gateway that is not the live one gets a SHORT-LIVED probe socket, its
+// `profiles.list` answer is cached, and the socket is closed again. Nothing is
+// multiplexed — a foreign row is a picture of another machine, and opening it
+// switches this phone to that gateway.
 
 /// One saved gateway — metadata only, never credentials.
 public struct SavedGateway: Codable, Identifiable, Sendable, Equatable {
@@ -31,11 +41,120 @@ public struct SavedGateway: Codable, Identifiable, Sendable, Equatable {
     }
 }
 
+/// One profile enumerated from a gateway that is not the live one. Carries the
+/// cosmetics that ride `ui_meta` (methods_profiles.py:212-226) so a foreign row
+/// wears the same face it will wear after the switch, and nothing else: the
+/// unread watermark, pinned chat and session bindings are per-gateway state
+/// that must not leak across sources.
+public struct SecondaryProfile: Codable, Sendable, Equatable, Identifiable {
+    public var id: String { name }
+    public var name: String
+    /// `ui_meta["hermes-bots"].title` — the desktop-set display title.
+    public var title: String?
+    /// The profile's one-line description (its "job" on the roster row).
+    public var job: String
+    public var shape: AvatarShape?
+    public var hue: AvatarHue?
+    /// `last_session.preview` — the newest exchange on that gateway.
+    public var preview: String
+    /// `last_session.last_active`, unix seconds.
+    public var lastActive: Double?
+
+    public init(name: String, title: String? = nil, job: String = "",
+                shape: AvatarShape? = nil, hue: AvatarHue? = nil,
+                preview: String = "", lastActive: Double? = nil) {
+        self.name = name; self.title = title; self.job = job
+        self.shape = shape; self.hue = hue
+        self.preview = preview; self.lastActive = lastActive
+    }
+}
+
+/// A saved gateway's last-known roster, and how much to trust it.
+public struct SecondaryRoster: Codable, Sendable, Equatable {
+    public enum Freshness: String, Codable, Sendable {
+        /// Enumerated from this gateway during this launch.
+        case fresh
+        /// Last-known list; the gateway did not answer the most recent attempt.
+        case stale
+        /// Saved metadata with no Keychain credential — signed out here, or
+        /// restored onto a new device. Nothing to list until sign-in.
+        case needsSignIn
+        /// The gateway answered, but has no profiles surface (-32601).
+        case unsupported
+    }
+
+    public var profiles: [SecondaryProfile]
+    /// When `profiles` was last successfully fetched.
+    public var fetchedAt: Date
+    public var freshness: Freshness
+
+    public init(profiles: [SecondaryProfile], fetchedAt: Date, freshness: Freshness) {
+        self.profiles = profiles; self.fetchedAt = fetchedAt; self.freshness = freshness
+    }
+}
+
+/// One row of the union roster that lives on a gateway other than the live one.
+///
+/// `id` is desktop's source-qualified `botRosterKey` — `connectionId::name`
+/// (plugin.js:2669) — because names alone are not unique across sources: two
+/// connections can both expose `default`, and a bare-name key makes a list
+/// repeat whole blocks of rows on every repaint.
+public struct ForeignRosterEntry: Sendable, Equatable, Identifiable {
+    public var id: String { "\(gatewayID)::\(profile)" }
+    public var gatewayID: String
+    public var connectionLabel: String
+    public var connectionKind: ConnectionKind
+    public var profile: String
+    /// Bare profile name, or `<profile>-<label-slug>` when the name exists on
+    /// more than one source (`agentHandle`, connection-registry.ts:137).
+    public var handle: String
+    public var title: String?
+    public var job: String
+    public var shape: AvatarShape?
+    public var hue: AvatarHue?
+    public var preview: String
+    public var lastActive: Double?
+    /// When this row's gateway was last successfully listed — the age of the
+    /// picture, as distinct from when the bot itself last spoke.
+    public var fetchedAt: Date
+    /// Last-known rather than just-fetched — the gateway is unreachable.
+    public var isStale: Bool
+    /// No credential in the Keychain for this gateway.
+    public var needsSignIn: Bool
+
+    public init(gatewayID: String, connectionLabel: String, connectionKind: ConnectionKind,
+                profile: String, handle: String, title: String? = nil, job: String = "",
+                shape: AvatarShape? = nil, hue: AvatarHue? = nil, preview: String = "",
+                lastActive: Double? = nil, fetchedAt: Date = Date(),
+                isStale: Bool = false, needsSignIn: Bool = false) {
+        self.gatewayID = gatewayID; self.connectionLabel = connectionLabel
+        self.connectionKind = connectionKind; self.profile = profile; self.handle = handle
+        self.title = title; self.job = job; self.shape = shape; self.hue = hue
+        self.preview = preview; self.lastActive = lastActive; self.fetchedAt = fetchedAt
+        self.isStale = isStale; self.needsSignIn = needsSignIn
+    }
+}
+
+/// A saved gateway that contributed no rows, and why. Identifiable so the
+/// roster can list them beside the rows without inventing a key.
+public struct SecondaryRosterProblem: Sendable, Equatable, Identifiable {
+    public var id: String { gateway.id }
+    public var gateway: SavedGateway
+    public var freshness: SecondaryRoster.Freshness
+
+    public init(gateway: SavedGateway, freshness: SecondaryRoster.Freshness) {
+        self.gateway = gateway; self.freshness = freshness
+    }
+}
+
 @MainActor
 @Observable
 public final class ConnectionRegistry {
     public static let shared = ConnectionRegistry()
     public static let defaultsKey = "talaria-gateways"
+    /// Cached secondary rosters. Names and cosmetics only — never credentials,
+    /// never transcript text.
+    public static let rostersKey = "talaria-gateway-rosters"
 
     /// Latest health-probe result for one saved gateway.
     public struct Health: Sendable, Equatable {
@@ -54,12 +173,27 @@ public final class ConnectionRegistry {
 
     public private(set) var saved: [SavedGateway] = []
     public private(set) var health: [String: Health] = [:]
+    /// Last-known roster of each saved gateway that is not the live one, keyed
+    /// by gateway id. Persisted, so a secondary that is asleep still lists its
+    /// bots — marked stale rather than vanishing.
+    public private(set) var secondaryRosters: [String: SecondaryRoster] = [:]
+
+    /// The gateway this app is bound to (or was last bound to). Set from the
+    /// live link's own reports — `noteState(.connected)` and `noteBotCount`
+    /// are only ever called for the connected gateway — and used to keep the
+    /// secondary enumerator from opening a second socket to it.
+    public private(set) var liveGatewayURL: URL?
 
     private let keychain: KeychainStore
     private let defaults: UserDefaults
     /// Short-timeout session so a sleeping LAN box fails fast, not in 60 s.
     private let probeSession: URLSession
     @ObservationIgnored private var probeTask: Task<Void, Never>?
+    /// One enumeration pass at a time; a foreground burst must not stack dials.
+    @ObservationIgnored private var enumerationTask: Task<Void, Never>?
+    /// gateway id → when we last *attempted* a dial, so a gateway that refuses
+    /// to answer is not re-dialled on every probe tick.
+    @ObservationIgnored private var lastEnumerationAttempt: [String: Date] = [:]
 
     public init(defaults: UserDefaults = .standard, keychain: KeychainStore = KeychainStore()) {
         self.defaults = defaults
@@ -72,6 +206,16 @@ public final class ConnectionRegistry {
         if let data = defaults.data(forKey: Self.defaultsKey),
            let list = try? JSONDecoder().decode([SavedGateway].self, from: data) {
             saved = list
+        }
+        if let data = defaults.data(forKey: Self.rostersKey),
+           let cached = try? JSONDecoder().decode([String: SecondaryRoster].self, from: data) {
+            // Everything restored from disk describes a gateway we have not
+            // talked to yet this launch.
+            secondaryRosters = cached.mapValues { roster in
+                var row = roster
+                if row.freshness == .fresh { row.freshness = .stale }
+                return row
+            }
         }
     }
 
@@ -104,8 +248,11 @@ public final class ConnectionRegistry {
         guard let idx = saved.firstIndex(where: { $0.id == id }) else { return }
         if let base = saved[idx].baseURL { keychain.delete(for: base) }
         health.removeValue(forKey: id)
+        secondaryRosters.removeValue(forKey: id)
+        lastEnumerationAttempt.removeValue(forKey: id)
         saved.remove(at: idx)
         persist()
+        persistRosters()
     }
 
     public func rename(id: String, to name: String) {
@@ -131,6 +278,10 @@ public final class ConnectionRegistry {
 
     /// Roster size from profiles.list once a live connection is up.
     public func noteBotCount(_ count: Int, forURL url: URL) {
+        // Only the live link reports its own roster size, so this doubles as
+        // the "this is the gateway we are bound to" beacon the secondary
+        // enumerator needs in order to skip it.
+        liveGatewayURL = url
         guard let idx = saved.firstIndex(where: { $0.urlString == url.absoluteString }),
               saved[idx].lastBotCount != count else { return }
         saved[idx].lastBotCount = count
@@ -140,6 +291,12 @@ public final class ConnectionRegistry {
     /// Direct state report from the live WS link (connect / drop) so the row
     /// flips without waiting for the next HTTP probe.
     public func noteState(_ state: ConnectionState, pingMS: Int? = nil, forURL url: URL) {
+        // Same beacon as noteBotCount: the live link is the only caller that
+        // reports .connected here (the HTTP probe writes `health` directly).
+        // Deliberately not cleared on .offline — a dropped socket is still the
+        // gateway this app is bound to, and dialling it as a "secondary" while
+        // reconnect is racing would open a second socket to the same host.
+        if state == .connected { liveGatewayURL = url }
         guard let row = gateway(forURL: url) else { return }
         var h = health[row.id] ?? Health(state: state)
         h.state = state
@@ -175,6 +332,10 @@ public final class ConnectionRegistry {
                 group.addTask { [weak self] in await self?.probe(row) }
             }
         }
+        // Now that health is fresh, top up the secondary rosters — detached,
+        // because callers await probeAll() to paint the Connections list and a
+        // WebSocket dial is an order of magnitude slower than a status GET.
+        kickSecondaryEnumeration()
     }
 
     /// One async health probe: GET /api/status with a measured round trip.
@@ -203,6 +364,272 @@ public final class ConnectionRegistry {
             let timedOut = (error as? URLError)?.code == .timedOut
             health[gateway.id] = Health(state: timedOut ? .asleep : .offline)
         }
+    }
+
+    // MARK: - Secondary rosters (the union roster's other sources)
+
+    /// Enumerate saved gateways in the background. Fire-and-forget and
+    /// self-coalescing: a foreground burst, a Connections repaint and the
+    /// roster's own refresh all land on the one in-flight pass.
+    public func kickSecondaryEnumeration(activeURL: URL? = nil) {
+        guard enumerationTask == nil else { return }
+        let active = activeURL ?? liveGatewayURL
+        let excluded = Set([active?.absoluteString].compactMap { $0 })
+        enumerationTask = Task { [weak self] in
+            // A short debounce, not a delay for its own sake: at cold launch
+            // this fires from the scene becoming active, in a race with the
+            // launch reconnect. Letting that reconnect land first is what keeps
+            // us from opening a probe socket to the very gateway about to
+            // become live. `enumerate` re-checks the same thing at dial time,
+            // for the case where the reconnect is slower than this.
+            try? await Task.sleep(for: .seconds(2))
+            await self?.enumerateSecondaryRosters(excluding: excluded)
+            self?.enumerationTask = nil
+        }
+    }
+
+    /// Ask every saved gateway for its roster, except the URLs in `excluding` —
+    /// which is how the caller says "this one already has a live socket".
+    /// An empty set means nothing is live and every saved gateway is fair game.
+    ///
+    /// Each answer costs one short-lived WebSocket: dial, `profiles.list`,
+    /// hang up. `minInterval` keeps a gateway from being re-dialled on every
+    /// probe tick — desktop's own inventory is equally conservative about
+    /// re-enumerating a source that is not the active one
+    /// (`shouldRetrySshInventory`, connection-registry.ts:288-302).
+    public func enumerateSecondaryRosters(excluding: Set<String>,
+                                          minInterval: TimeInterval = 90) async {
+        let now = Date()
+        let targets = saved.filter { gateway in
+            guard !excluding.contains(gateway.urlString) else { return false }
+            guard let attempted = lastEnumerationAttempt[gateway.id] else { return true }
+            return now.timeIntervalSince(attempted) >= minInterval
+        }
+        guard !targets.isEmpty else { return }
+        // Cache whatever we learned even if the pass is cut short — a
+        // half-finished sweep still leaves the roster better than it found it.
+        defer { persistRosters() }
+        for gateway in targets {
+            if Task.isCancelled { return }
+            await enumerate(gateway)
+        }
+    }
+
+    /// One gateway's roster. Every failure keeps whatever was listed before —
+    /// an unreachable homelab should read "last seen 3h ago", not go blank.
+    private func enumerate(_ gateway: SavedGateway) async {
+        guard let base = gateway.baseURL else { return }
+        // Re-checked here, not only when the sweep was planned: a connect that
+        // lands mid-sweep makes this gateway the live one, and a second socket
+        // to a host we already hold open is never worth a roster refresh the
+        // live link is about to deliver anyway. Not recorded as an attempt —
+        // this gateway was skipped, not tried.
+        guard base.absoluteString != liveGatewayURL?.absoluteString else { return }
+        lastEnumerationAttempt[gateway.id] = Date()
+        guard let credential = credential(for: gateway) else {
+            mark(gateway.id, .needsSignIn)
+            return
+        }
+        // A gateway the status probe just found asleep or offline will not
+        // answer a WebSocket either; skip the dial and keep the cache.
+        if let state = health[gateway.id]?.state, state == .offline || state == .asleep {
+            mark(gateway.id, .stale)
+            return
+        }
+
+        let client = GatewayClient(baseURL: base, credential: credential)
+        defer { Task { await client.disconnect() } }
+        do {
+            let profiles = try await Self.withTimeout(seconds: 12) {
+                try await client.connect()
+                // include_sessions gives the preview + last_active in the same
+                // round trip (methods_profiles.py:22-31); a foreign row is only
+                // worth painting if it can say when that machine last spoke.
+                return try await client.listProfiles(includeSessions: true)
+            }
+            let rows = profiles
+                .filter { !$0.name.isEmpty }
+                .map(Self.secondaryProfile(from:))
+            secondaryRosters[gateway.id] = SecondaryRoster(profiles: rows,
+                                                           fetchedAt: Date(),
+                                                           freshness: .fresh)
+            noteBotCountForSecondary(rows.count, gatewayID: gateway.id)
+        } catch let error as GatewayError where error.code == GatewayClient.methodNotFound {
+            // A gateway too old for profiles.list has no roster to contribute.
+            // Hide the surface rather than showing an error nobody can act on.
+            mark(gateway.id, .unsupported)
+        } catch AuthError.sessionExpired {
+            // The credential is gone/rejected; ConnectionSupervisor owns the
+            // re-auth prompt for the LIVE gateway, and a secondary simply
+            // reads as needing sign-in until the user switches to it.
+            mark(gateway.id, .needsSignIn)
+        } catch {
+            mark(gateway.id, .stale)
+        }
+    }
+
+    /// Roster size for a gateway we are not connected to, so the Connections
+    /// row stops reporting whatever it happened to hold the last time it was
+    /// the live one.
+    private func noteBotCountForSecondary(_ count: Int, gatewayID: String) {
+        guard let idx = saved.firstIndex(where: { $0.id == gatewayID }),
+              saved[idx].lastBotCount != count else { return }
+        saved[idx].lastBotCount = count
+        persist()
+    }
+
+    /// Record why a gateway could not be listed, without throwing away what it
+    /// listed last time — desktop keeps previously painted remote rows for the
+    /// same reason (plugin.js:2359-2394): a source going quiet must not empty
+    /// the roster. Only `.unsupported` clears, because a gateway that has no
+    /// profiles surface never had rows of its own to keep.
+    private func mark(_ gatewayID: String, _ freshness: SecondaryRoster.Freshness) {
+        var roster = secondaryRosters[gatewayID]
+            ?? SecondaryRoster(profiles: [], fetchedAt: .distantPast, freshness: freshness)
+        roster.freshness = freshness
+        if freshness == .unsupported { roster.profiles = [] }
+        secondaryRosters[gatewayID] = roster
+    }
+
+    static func secondaryProfile(from profile: HermesProfile) -> SecondaryProfile {
+        // Same precedence the live roster uses: desktop Bot Mode's own block
+        // wins over Talaria's, so a bot titled or recolored on desktop reads
+        // identically here (plugin.js mergeServerMeta:432-482).
+        let desk = BotModeMeta(uiMeta: profile.uiMeta)
+        let shape = desk?.talariaShape
+            ?? profile.uiMeta?["talaria"]?["shape"]?.stringValue.flatMap(AvatarShape.init(rawValue:))
+        let hue = desk?.talariaHue
+            ?? profile.uiMeta?["talaria"]?["hue"]?.stringValue.flatMap(AvatarHue.init(rawValue:))
+        return SecondaryProfile(name: profile.name,
+                                title: desk?.title,
+                                job: profile.description ?? "",
+                                shape: shape,
+                                hue: hue,
+                                preview: profile.lastSession?.preview ?? "",
+                                lastActive: profile.lastSession?.lastActive)
+    }
+
+    /// Bound an await that has no deadline of its own. `GatewayClient.connect`
+    /// already caps the socket handshake, but token refresh and the RPC round
+    /// trip after it do not, and a secondary must never hold the enumerator.
+    static func withTimeout<T: Sendable>(seconds: TimeInterval,
+                                         _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await body() }
+            group.addTask {
+                try await Task.sleep(for: .seconds(seconds))
+                throw URLError(.timedOut)
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else { throw URLError(.timedOut) }
+            return first
+        }
+    }
+
+    // MARK: - The union roster
+
+    /// Foreign rows for the one roster that spans every configured Connection.
+    ///
+    /// Port of `buildAgentRoster` (electron/connection-registry.ts:330-372):
+    /// collapse to one identity per connection+profile, count bare names ONCE
+    /// across every source — the live gateway included — and hand duplicates
+    /// the `<profile>-<label-slug>` handle. The live gateway's own rows are not
+    /// returned; they are already the roster.
+    ///
+    /// `activeGatewayID` nil means nothing is connected, so every saved gateway
+    /// is a foreign source — the honest empty state still lists what it knows.
+    public func foreignRoster(activeProfiles: [String],
+                              activeGatewayID: String?) -> [ForeignRosterEntry] {
+        let liveID = activeGatewayID
+
+        // Bare-name occurrences across all sources. Deduplicated per source
+        // first, exactly like the upstream `identities` map, so a gateway that
+        // transiently repeats a profile cannot invent a collision.
+        var counts: [String: Int] = [:]
+        for name in Set(activeProfiles.map { Self.profileName($0) }) {
+            counts[name, default: 0] += 1
+        }
+        for gateway in saved where gateway.id != liveID {
+            guard let roster = secondaryRosters[gateway.id] else { continue }
+            for name in Set(roster.profiles.map { Self.profileName($0.name) }) {
+                counts[name, default: 0] += 1
+            }
+        }
+
+        var entries: [ForeignRosterEntry] = []
+        for gateway in saved where gateway.id != liveID {
+            guard let roster = secondaryRosters[gateway.id] else { continue }
+            let stale = roster.freshness == .stale
+            let needsSignIn = roster.freshness == .needsSignIn
+            var seen = Set<String>()
+            for profile in roster.profiles {
+                let name = Self.profileName(profile.name)
+                guard seen.insert(name).inserted else { continue }
+                entries.append(ForeignRosterEntry(
+                    gatewayID: gateway.id,
+                    connectionLabel: gateway.name,
+                    connectionKind: gateway.kind,
+                    profile: name,
+                    handle: Self.agentHandle(profile: name,
+                                             connectionLabel: gateway.name,
+                                             duplicated: (counts[name] ?? 0) > 1),
+                    title: profile.title,
+                    job: profile.job,
+                    shape: profile.shape,
+                    hue: profile.hue,
+                    preview: profile.preview,
+                    lastActive: profile.lastActive,
+                    fetchedAt: roster.fetchedAt,
+                    isStale: stale,
+                    needsSignIn: needsSignIn))
+            }
+        }
+        // Newest-spoken first within a gateway, gateways in saved order — the
+        // same "who moved most recently" ordering the live roster reads by.
+        return entries.sorted { lhs, rhs in
+            if lhs.gatewayID != rhs.gatewayID {
+                return (saved.firstIndex { $0.id == lhs.gatewayID } ?? 0)
+                    < (saved.firstIndex { $0.id == rhs.gatewayID } ?? 0)
+            }
+            return (lhs.lastActive ?? 0) > (rhs.lastActive ?? 0)
+        }
+    }
+
+    /// Saved gateways that could not be listed and why — for the roster
+    /// section's footnote. Only gateways the user could act on are reported.
+    public func secondaryRosterProblems(activeGatewayID: String?) -> [SecondaryRosterProblem] {
+        saved.compactMap { gateway in
+            guard gateway.id != activeGatewayID,
+                  let roster = secondaryRosters[gateway.id],
+                  roster.profiles.isEmpty,
+                  roster.freshness == .needsSignIn || roster.freshness == .stale
+            else { return nil }
+            return SecondaryRosterProblem(gateway: gateway, freshness: roster.freshness)
+        }
+    }
+
+    /// `labelSlug` (connection-registry.ts:121) — lowercase, non-alphanumerics
+    /// to single hyphens, trimmed, capped at 48 chars.
+    static func labelSlug(_ label: String) -> String {
+        let lowered = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let hyphenated = lowered.replacingOccurrences(of: "[^a-z0-9]+", with: "-",
+                                                      options: .regularExpression)
+        let slug = hyphenated.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return slug.isEmpty ? "connection" : String(slug.prefix(48))
+    }
+
+    /// `agentHandle` (connection-registry.ts:137) — the one place the
+    /// `@name-device` rule lives. Ambiguity must refuse rather than guess:
+    /// silently picking one of two bots named `default` would deliver a real
+    /// message to the wrong machine (plugin.js:2434-2470).
+    static func agentHandle(profile: String, connectionLabel: String, duplicated: Bool) -> String {
+        let name = profileName(profile)
+        return duplicated ? "\(name)-\(labelSlug(connectionLabel))" : name
+    }
+
+    static func profileName(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "default" : trimmed
     }
 
     // MARK: - Rows for the Connections screen
@@ -251,6 +678,29 @@ public final class ConnectionRegistry {
     private func persist() {
         if let data = try? JSONEncoder().encode(saved) {
             defaults.set(data, forKey: Self.defaultsKey)
+        }
+    }
+
+    /// Names and cosmetics only — the preview line is dropped on the way to
+    /// disk, which is what makes the promise at `rostersKey` true.
+    ///
+    /// It is not a trade either: a roster restored from disk is forced `.stale`
+    /// (see `init`), and a stale row shows the age of the picture rather than
+    /// its preview. So a persisted preview is never painted — it would only
+    /// leave another machine's conversation sitting in plaintext UserDefaults,
+    /// which is backed up off the device, to buy nothing.
+    private func persistRosters() {
+        let sanitized = secondaryRosters.mapValues { roster -> SecondaryRoster in
+            var row = roster
+            row.profiles = row.profiles.map { profile in
+                var stripped = profile
+                stripped.preview = ""
+                return stripped
+            }
+            return row
+        }
+        if let data = try? JSONEncoder().encode(sanitized) {
+            defaults.set(data, forKey: Self.rostersKey)
         }
     }
 }

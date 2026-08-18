@@ -194,6 +194,12 @@ extension AppModel {
         // memory rather than a mix-up — but holding another machine's files
         // resident after leaving it is not a thing to do quietly.
         ArtifactStore.shared.flush()
+        // Agent-to-agent: a `sessions.changed` subscription on the socket being
+        // closed, plus reply watches holding stored-session ids that only mean
+        // something on the departing gateway. Those watches re-read `client`
+        // every tick, so left standing they poll the NEXT gateway with the last
+        // one's ids — the one way a2a state can cross a switch.
+        detachA2ARouter()
     }
 
     /// Probe every saved gateway and sync the Connections rows.

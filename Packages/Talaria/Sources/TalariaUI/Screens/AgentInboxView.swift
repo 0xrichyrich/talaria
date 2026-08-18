@@ -10,11 +10,13 @@ import TalariaTheme
 //
 // Live source (AppModelLive+Feeds.swift): handoffs upstream are per-invocation
 // —`hermes -p <bot> chat -c "Agent Inbox" -q "Message from 🤖 …"` — so there is
-// no inbox object to fetch. The feed is each profile's own "Agent Inbox"
-// session, read over the transcript REST and split back into from → to rows by
-// that attribution prefix. Compose does the same thing from the phone:
-// resume-or-create the target bot's Agent Inbox session and prompt.submit an
-// attributed message into it.
+// no inbox object to fetch. The feed is each profile's own Bot Chat, read over
+// the transcript REST and split back into from → to rows by that attribution
+// prefix. `AppModelLive+A2A.swift` keeps it LIVE (the gateway's
+// `sessions.changed` fires on any state.db write, including the ones the CLI
+// and cron make) and owns the compose path: resolve @handles against the
+// roster, deliver into each recipient's canonical Bot Chat, and relay the
+// reply back into this feed, attributed.
 
 public struct AgentInboxView: View {
     private let model: AppModel
@@ -44,8 +46,9 @@ public struct AgentInboxView: View {
                 VStack(alignment: .leading, spacing: listGap) {
                     ForEach(Array(model.agentInbox.enumerated()), id: \.element.id) { index, message in
                         A2ARow(message: message,
-                               fromBot: model.bot(message.fromBotID),
+                               fromBot: model.bot(model.resolvedBotID(message.fromBotID)),
                                toBot: model.bot(message.toBotID),
+                               delivery: model.delivery(for: message),
                                theme: theme, copy: copy) {
                             model.openInboxMessage(message)
                         }
@@ -65,8 +68,12 @@ public struct AgentInboxView: View {
         .background(theme.bg)
         .task {
             model.attachActivityRouter()
-            await model.refreshAgentInbox()
+            // Sweeps now, then follows sessions.changed with a slow poll behind
+            // it. Paired with endInboxLive so a screen nobody is looking at
+            // stops costing radio.
+            model.beginInboxLive()
         }
+        .onDisappear { model.endInboxLive() }
         .sheet(isPresented: $showCompose) {
             HandoffSheet(model: model)
         }
@@ -93,7 +100,7 @@ public struct AgentInboxView: View {
                 Spacer(minLength: 6)
                 if model.mode == .live {
                     HeaderIconButton(theme: theme, size: 32) {
-                        Task { await model.refreshAgentInbox(force: true) }
+                        model.sweepInbox(after: 0)
                     } glyph: {
                         Text(verbatim: "↻")
                             .font(.system(size: 15, weight: .semibold))
@@ -209,9 +216,15 @@ private struct A2ARow: View {
     let message: A2AMessage
     let fromBot: Bot?
     let toBot: Bot?
+    let delivery: A2ADelivery?
     let theme: ThemePack
     let copy: CopyPack
     let open: () -> Void
+
+    /// Progressive disclosure, ported from desktop's group transcript
+    /// (plugin.js:7316-7332): the line stays quiet by default and expands to
+    /// carry the @handles on demand. Desktop hovers; touch taps the names.
+    @State private var revealed = false
 
     private var isBroadcast: Bool { message.toBotID == "all" }
 
@@ -222,16 +235,32 @@ private struct A2ARow: View {
         isBroadcast ? theme.sub : theme.color(for: toBot?.hue ?? .teal)
     }
 
+    /// Only offer the reveal when a handle would actually add something —
+    /// desktop's `showsHandle` rule (plugin.js:2721). An untitled bot's name IS
+    /// its handle, so tapping it would be a gesture with nothing to say; the
+    /// tap falls through to opening the conversation instead.
+    private var canReveal: Bool {
+        (fromBot?.showsHandle ?? false) || (!isBroadcast && (toBot?.showsHandle ?? false))
+    }
+
+    private var fromName: String {
+        let name = TalariaVoice.displayName(fromBot, id: message.fromBotID, theme.id)
+        guard revealed, let fromBot, fromBot.showsHandle else { return name }
+        return "\(name) (@\(fromBot.handle))"
+    }
+
     /// "all bots" / "ALL" / "All" for broadcasts, else the themed bot name.
     private var toName: String {
-        guard isBroadcast else {
-            return TalariaVoice.displayName(toBot, id: message.toBotID, theme.id)
+        guard !isBroadcast else {
+            switch theme.id {
+            case .soft: return "all bots"
+            case .control: return "ALL"
+            case .ink: return "All"
+            }
         }
-        switch theme.id {
-        case .soft: return "all bots"
-        case .control: return "ALL"
-        case .ink: return "All"
-        }
+        let name = TalariaVoice.displayName(toBot, id: message.toBotID, theme.id)
+        guard revealed, let toBot, toBot.showsHandle else { return name }
+        return "\(name) (@\(toBot.handle))"
     }
 
     /// Ink wraps the parley in quotation marks.
@@ -240,15 +269,19 @@ private struct A2ARow: View {
     }
 
     var body: some View {
-        Button(action: open) {
-            HStack(alignment: .top, spacing: 10) {
-                AvatarView(shape: fromBot?.shape ?? .circle,
-                           hue: fromBot?.hue ?? .teal,
-                           size: 26, theme: theme)
-                    .padding(.top, 1)
-                VStack(alignment: .leading, spacing: 6) {
+        HStack(alignment: .top, spacing: 10) {
+            AvatarView(shape: fromBot?.shape ?? .circle,
+                       hue: fromBot?.hue ?? .teal,
+                       size: 26, theme: theme)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    // Tapping the names reveals the handles; tapping anywhere
+                    // else opens the conversation the message lives in. The
+                    // inner gesture wins because SwiftUI delivers a tap to the
+                    // innermost view that handles it.
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(TalariaVoice.displayName(fromBot, id: message.fromBotID, theme.id))
+                        Text(fromName)
                             .font(nameFont)
                             .foregroundStyle(fromColor)
                             .lineLimit(1)
@@ -261,26 +294,71 @@ private struct A2ARow: View {
                             .font(nameFont)
                             .foregroundStyle(toColor)
                             .lineLimit(1)
-                        Spacer(minLength: 6)
-                        Text(message.time)
-                            .font(timeFont)
-                            .foregroundStyle(theme.faint)
-                            .lineLimit(1)
                     }
-                    Text(bodyText)
-                        .font(bodyFont)
-                        .italic(theme.id == .ink)
-                        .foregroundStyle(bodyColor)
-                        .lineSpacing(2.5)
-                        .multilineTextAlignment(.leading)
-                        .lineLimit(6)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        guard canReveal else { return open() }
+                        withAnimation(.easeOut(duration: 0.16)) { revealed.toggle() }
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityHint(Text(canReveal ? copy.a2aRevealHint(theme.id)
+                                                      : copy.a2aOpenHint(theme.id)))
+
+                    Spacer(minLength: 6)
+                    Text(message.time)
+                        .font(timeFont)
+                        .foregroundStyle(theme.faint)
+                        .lineLimit(1)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Text(bodyText)
+                    .font(bodyFont)
+                    .italic(theme.id == .ink)
+                    .foregroundStyle(bodyColor)
+                    .lineSpacing(2.5)
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(6)
+                if let note = deliveryNote { deliveryLine(note) }
             }
-            .modifier(A2ARowChrome(theme: theme))
-            .contentShape(Rectangle())
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .buttonStyle(.plain)
+        .modifier(A2ARowChrome(theme: theme))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: open)
+        .accessibilityAddTraits(.isButton)
+    }
+
+    // MARK: Delivery state
+
+    /// What became of a handoff this app sent. Honest about the one limit that
+    /// matters: a recipient mid-run finishes first (see `submitHandoff`).
+    private var deliveryNote: (text: String, tone: Color)? {
+        guard let delivery else { return nil }
+        switch delivery.state {
+        case .waiting:
+            return delivery.queuedBehindRun
+                ? (copy.a2aQueuedNote(theme.id), theme.warn)
+                : (copy.a2aWaitingNote(theme.id), theme.faint)
+        case .replied:
+            return (copy.a2aRepliedNote(theme.id), theme.ok)
+        case .quiet:
+            return (copy.a2aQuietNote(theme.id), theme.faint)
+        case .failed(let reason):
+            return (copy.a2aFailedNote(theme.id, reason: reason), theme.danger)
+        }
+    }
+
+    private func deliveryLine(_ note: (text: String, tone: Color)) -> some View {
+        HStack(spacing: 5) {
+            Text(verbatim: theme.id == .control ? "▸" : "·")
+                .font(noteFont)
+                .foregroundStyle(note.tone)
+            Text(note.text)
+                .font(noteFont)
+                .italic(theme.id == .ink)
+                .foregroundStyle(note.tone)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private var nameFont: Font {
@@ -319,6 +397,14 @@ private struct A2ARow: View {
         }
     }
 
+    private var noteFont: Font {
+        switch theme.id {
+        case .soft: theme.body(11)
+        case .control: theme.mono(9)
+        case .ink: theme.mono(9)
+        }
+    }
+
     private var bodyColor: Color {
         theme.id == .ink ? theme.ink.opacity(0.85) : theme.ink.opacity(0.92)
     }
@@ -326,16 +412,15 @@ private struct A2ARow: View {
 
 // MARK: - Handoff composer
 
-/// From-bot → to-bot → message. The send resumes (or creates) the target's own
-/// "Agent Inbox" session and submits the message with the sender attribution
-/// the roster convention expects, so the target reads it exactly like a CLI
-/// handoff.
+/// Speaker → @mentions → message. The send resolves each @handle against the
+/// live roster, opens that bot's canonical Bot Chat and submits the message
+/// with the sender attribution the roster convention expects, so the target
+/// reads it exactly like a CLI handoff — then watches for the reply.
 private struct HandoffSheet: View {
     @Environment(\.dismiss) private var dismiss
     let model: AppModel
 
     @State private var from: String = ""
-    @State private var to: String = ""
     @State private var text = ""
     @State private var sending = false
     @State private var error: String?
@@ -343,9 +428,28 @@ private struct HandoffSheet: View {
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
 
+    private var resolution: MentionResolution {
+        var resolved = model.resolveMentions(in: text, speaking: from)
+        // A handle half-typed is not a mistake yet. While the completion strip
+        // is still offering candidates for the token under the caret, that
+        // token gets no "no such handle" line — the strip is the answer.
+        if let active = BotMention.activeToken(in: text),
+           !model.mentionSuggestions(for: active.token, speaking: from).isEmpty {
+            resolved.unknown.removeAll { $0 == active.token }
+            resolved.ambiguous.removeAll { $0 == active.token }
+        }
+        return resolved
+    }
+
+    /// The message has to say something beyond the handles that route it.
+    private var hasBody: Bool {
+        var rest = text
+        for bot in resolution.bots { rest = BotMention.remove(bot.handle, from: rest) }
+        return !rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private var canSend: Bool {
-        !from.isEmpty && !to.isEmpty && from != to
-            && !text.trimmingCharacters(in: .whitespaces).isEmpty && !sending
+        !from.isEmpty && !resolution.bots.isEmpty && hasBody && !sending
     }
 
     var body: some View {
@@ -353,24 +457,26 @@ private struct HandoffSheet: View {
             header
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    picker(copy.handoffFrom(theme.id), selection: $from, exclude: to)
-                    picker(copy.handoffTo(theme.id), selection: $to, exclude: from)
-                    TextField(copy.handoffPlaceholder(theme.id), text: $text, axis: .vertical)
-                        .textFieldStyle(.plain)
-                        .lineLimit(4...12)
-                        .font(fieldFont)
-                        .foregroundStyle(theme.ink)
-                        .tint(theme.accent)
-                        .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
-                        .background(theme.id == .ink ? Color.clear : theme.panel)
-                        .clipShape(RoundedRectangle(cornerRadius: fieldRadius, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: fieldRadius, style: .continuous)
-                            .strokeBorder(theme.id == .soft ? theme.line : theme.lineStrong, lineWidth: 1))
+                    speakerPicker
+                    MentionField(model: model, text: $text, speaking: from,
+                                 placeholder: copy.mentionPlaceholder(theme.id))
+                    MentionRecipients(model: model, resolution: resolution) { bot in
+                        text = BotMention.remove(bot.handle, from: text)
+                    }
+                    rosterStrip
                     if let error {
                         Text(error)
                             .font(footFont)
                             .foregroundStyle(theme.danger)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+                    // The limit, said plainly and once.
+                    Text(copy.a2aLimitNote(theme.id))
+                        .font(footFont)
+                        .italic(theme.id == .ink)
+                        .foregroundStyle(theme.faint)
+                        .lineSpacing(3)
+                        .fixedSize(horizontal: false, vertical: true)
                     Text(copy.a2aFoot)
                         .font(footFont)
                         .italic(theme.id == .ink)
@@ -385,7 +491,6 @@ private struct HandoffSheet: View {
         .background(theme.bg.ignoresSafeArea())
         .onAppear {
             if from.isEmpty { from = model.openBotID ?? model.bots.first?.id ?? "" }
-            if to.isEmpty { to = model.bots.first(where: { $0.id != from })?.id ?? "" }
         }
     }
 
@@ -413,30 +518,17 @@ private struct HandoffSheet: View {
         .overlay(alignment: .bottom) { theme.line.frame(height: 1) }
     }
 
-    private func picker(_ label: String, selection: Binding<String>, exclude: String) -> some View {
+    /// Who is speaking. The attribution prefix carries this bot's title and
+    /// @handle, so the recipient's messaging protocol knows an agent — not its
+    /// human — is talking (plugin.js:2635).
+    private var speakerPicker: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(label)
-                .font(theme.id == .control ? theme.mono(9.5, weight: .bold) : theme.body(11, weight: .bold))
-                .tracking(theme.id == .soft ? 0.5 : 1.5)
-                .textCase(theme.id == .ink ? nil : .uppercase)
-                .foregroundStyle(theme.faint)
+            label(copy.handoffFrom(theme.id))
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 7) {
-                    ForEach(model.bots.filter { $0.id != exclude }) { bot in
-                        Button {
-                            selection.wrappedValue = bot.id
-                        } label: {
-                            HStack(spacing: 6) {
-                                AvatarView(shape: bot.shape, hue: bot.hue, size: 16, theme: theme)
-                                Text(TalariaVoice.displayName(for: bot, theme.id))
-                                    .font(theme.id == .control ? theme.mono(10.5, weight: .semibold)
-                                                               : theme.body(12.5, weight: .semibold))
-                                    .foregroundStyle(selection.wrappedValue == bot.id
-                                                     ? theme.color(for: bot.hue) : theme.sub)
-                            }
-                            .padding(.vertical, 6)
-                            .padding(.horizontal, 10)
-                            .chipShell(theme)
+                    ForEach(model.bots) { bot in
+                        Button { select(speaker: bot) } label: {
+                            chip(bot, selected: from == bot.id)
                         }
                         .buttonStyle(.plain)
                     }
@@ -446,21 +538,83 @@ private struct HandoffSheet: View {
         }
     }
 
+    /// The mobile way in to a grammar the phone cannot teach by hovering: tap
+    /// a bot and its @handle lands in the draft. Same mechanism as typing it —
+    /// the mentions in the text are the single source of routing.
+    private var rosterStrip: some View {
+        let addressable = model.bots.filter { bot in
+            bot.id != from && !resolution.bots.contains(where: { $0.id == bot.id })
+        }
+        return Group {
+            if !addressable.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    label(copy.mentionRosterLabel(theme.id))
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 7) {
+                            ForEach(addressable) { bot in
+                                Button {
+                                    text = BotMention.append(bot.handle, to: text)
+                                } label: {
+                                    chip(bot, selected: false)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.vertical, 1)
+                    }
+                    if resolution.bots.isEmpty {
+                        Text(copy.mentionNoRecipients(theme.id))
+                            .font(footFont)
+                            .italic(theme.id == .ink)
+                            .foregroundStyle(theme.faint)
+                    }
+                }
+            }
+        }
+    }
+
+    private func chip(_ bot: Bot, selected: Bool) -> some View {
+        HStack(spacing: 6) {
+            AvatarView(shape: bot.shape, hue: bot.hue, size: 16, theme: theme)
+            Text(TalariaVoice.displayName(for: bot, theme.id))
+                .font(theme.id == .control ? theme.mono(10.5, weight: .semibold)
+                                           : theme.body(12.5, weight: .semibold))
+                .foregroundStyle(selected ? theme.color(for: bot.hue) : theme.sub)
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 10)
+        .chipShell(theme)
+    }
+
+    private func label(_ text: String) -> some View {
+        Text(text)
+            .font(theme.id == .control ? theme.mono(9.5, weight: .bold) : theme.body(11, weight: .bold))
+            .tracking(theme.id == .soft ? 0.5 : 1.5)
+            .textCase(theme.id == .ink ? nil : .uppercase)
+            .foregroundStyle(theme.faint)
+    }
+
+    /// Changing the speaker un-addresses it: a bot never @s itself
+    /// (plugin.js:2414), so a handle already in the draft has to come out.
+    private func select(speaker bot: Bot) {
+        from = bot.id
+        text = BotMention.remove(bot.handle, from: text)
+    }
+
     private func send() {
+        let recipients = resolution.bots.map(\.id)
         sending = true
         error = nil
         Task { @MainActor in
             defer { sending = false }
             do {
-                try await model.sendHandoff(from: from, to: to, text: text)
+                try await model.deliverHandoff(from: from, to: recipients, text: text)
                 dismiss()
             } catch {
                 self.error = (error as? GatewayError)?.message ?? error.localizedDescription
             }
         }
     }
-
-    private var fieldRadius: CGFloat { theme.inputRadius > 100 ? 14 : theme.inputRadius }
 
     private var titleFont: Font {
         switch theme.id {
@@ -475,14 +629,6 @@ private struct HandoffSheet: View {
         case .soft: theme.body(14, weight: .semibold)
         case .control: theme.mono(11, weight: .semibold)
         case .ink: theme.body(14, weight: .semibold).smallCaps()
-        }
-    }
-
-    private var fieldFont: Font {
-        switch theme.id {
-        case .soft: theme.body(14)
-        case .control: theme.mono(12)
-        case .ink: theme.body(15.5)
         }
     }
 
@@ -551,5 +697,23 @@ private struct RowEntrance: ViewModifier {
             .onAppear {
                 withAnimation(.easeOut(duration: 0.42).delay(delay)) { shown = true }
             }
+    }
+}
+
+extension CopyPack {
+    func a2aRevealHint(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Show handles"
+        case .control: "SHOW HANDLES"
+        case .ink: "show their true names"
+        }
+    }
+
+    func a2aOpenHint(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Open the conversation"
+        case .control: "OPEN SESSION"
+        case .ink: "open the audience"
+        }
     }
 }
