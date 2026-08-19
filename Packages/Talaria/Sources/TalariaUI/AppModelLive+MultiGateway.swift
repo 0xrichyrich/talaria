@@ -30,6 +30,14 @@ final class MultiGatewayRuntime {
     /// Gateway id of a switch in flight — a second tap while the world is
     /// being torn down and rebuilt would race `switchGateway` against itself.
     var switchingGatewayID: String?
+
+    struct RoutedEvents {
+        var client: GatewayClient
+        var handlerID: UUID
+        var pump: Task<Void, Never>
+    }
+
+    var routedEvents: [String: RoutedEvents] = [:]
 }
 
 public extension AppModel {
@@ -86,6 +94,39 @@ public extension AppModel {
         return try await registry.clientPool.connect(gatewayID: gateway.id,
                                                      baseURL: baseURL,
                                                      credential: credential)
+    }
+
+    /// Subscribe once to a secondary gateway and retain source information on
+    /// every event. An AsyncStream pump preserves the order in which the
+    /// GatewayClient fan-out delivered deltas.
+    func attachRoutedEventsIfNeeded(client: GatewayClient, gatewayID: String) async {
+        guard gatewayID != activeGatewayID else { return }
+        let runtime = MultiGatewayRuntime.shared
+        if let existing = runtime.routedEvents[gatewayID],
+           ObjectIdentifier(existing.client) == ObjectIdentifier(client) { return }
+        await detachRoutedEvents(gatewayID: gatewayID)
+
+        let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let handlerID = await client.addEventHandler { continuation.yield($0) }
+        let pump = Task { @MainActor [weak self] in
+            for await event in stream {
+                guard let self else { return }
+                self.handle(event: event, sourceGatewayID: gatewayID)
+                self.routeToolEvent(event, sourceGatewayID: gatewayID)
+            }
+        }
+        runtime.routedEvents[gatewayID] = MultiGatewayRuntime.RoutedEvents(
+            client: client, handlerID: handlerID, pump: pump)
+    }
+
+    func detachRoutedEvents(gatewayID: String) async {
+        if let subscription = MultiGatewayRuntime.shared.routedEvents.removeValue(
+            forKey: gatewayID) {
+            subscription.pump.cancel()
+            await subscription.client.removeEventHandler(subscription.handlerID)
+        }
+        LiveRuntime.shared.resetRoutedState(gatewayID: gatewayID)
+        CanonicalChatRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
     }
 
     // MARK: - The union roster
@@ -293,31 +334,13 @@ public extension AppModel {
         MultiGatewayRuntime.shared.switchingGatewayID != nil
     }
 
-    /// Tapping a foreign row: become that gateway, then open the bot.
-    ///
-    /// `switchGateway` is Phase 2's path and already does the hard part —
-    /// flush the outgoing world (bot ids and session keys are per-gateway),
-    /// dial, re-roster — and on failure it raises the re-auth banner or marks
-    /// the gateway offline. Both of those already tell the user what happened,
-    /// so a failed switch simply stops here rather than adding a second story.
+    /// Tapping a foreign row opens its source-qualified canonical chat while
+    /// the primary app gateway stays in place. The connection and transcript
+    /// attach happen asynchronously through the same openChat door as local
+    /// bots, so failures render in that bot's chat instead of erasing the
+    /// current world.
     func openForeignBot(_ entry: ForeignRosterEntry) async {
-        guard let gateway = ConnectionRegistry.shared.saved.first(where: { $0.id == entry.gatewayID })
-        else { return }
-
-        await becomeGateway(gateway)
-        guard isActiveGateway(gateway) else { return }
-
-        // The cached row may predate a profile being renamed or deleted on that
-        // machine. The live roster is now authoritative; opening a name it does
-        // not list would ask the gateway to create a session on a profile that
-        // does not exist. Landing on the freshly-loaded roster is the honest
-        // outcome — the bot the user tapped is simply not there any more.
-        guard bots.contains(where: { $0.id == entry.profile }) else { return }
-
-        // THE door into a chat (AppModelLive.openChat): resumes the canonical
-        // forever-chat and hydrates it, instead of opening an empty chat whose
-        // first send forks a new session away from the bot's real history.
-        openChat(botID: entry.profile)
+        openChat(botID: entry.id)
     }
 
     /// Become a saved gateway, from a roster row rather than the Connections

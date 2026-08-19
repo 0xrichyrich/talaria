@@ -88,8 +88,10 @@ extension AppModel {
 
     /// Route one gateway event into chat-core state. Public so the router (and
     /// anything replaying events) can hand events in from outside this file.
-    public func routeToolEvent(_ event: GatewayEvent) {
-        guard mode == .live, let botID = botID(forSession: event.sessionID) else { return }
+    public func routeToolEvent(_ event: GatewayEvent, sourceGatewayID: String? = nil) {
+        guard mode == .live,
+              let botID = botID(forSession: event.sessionID,
+                                sourceGatewayID: sourceGatewayID) else { return }
         let chat = chat(for: botID)
 
         switch TypedGatewayEvent(event) {
@@ -263,7 +265,8 @@ extension AppModel {
             chat.messages.append(ChatMessage(author: .user, time: AppModel.clock(), text: trimmed))
             startDemoTurn(botID: botID, chat: chat)
         case .live:
-            if chat.isRunning, !isOffline, !trimmed.isEmpty, let sessionID = chat.sessionID {
+            let routeAvailable = !isOffline || GatewayBotRoute(qualifiedID: botID) != nil
+            if chat.isRunning, routeAvailable, !trimmed.isEmpty, let sessionID = chat.sessionID {
                 // Deliberately mention-free. Desktop has no steer path at all
                 // — its middleware only ever sees a fresh submit — so there is
                 // no upstream answer for "@ops" typed into a turn already
@@ -274,7 +277,7 @@ extension AppModel {
                 steer(text: trimmed, botID: botID, sessionID: sessionID, chat: chat)
             } else {
                 ChatRuntime.shared.turnFloor[botID] = chat.messages.count + 1
-                chat.isRunning = !isOffline
+                chat.isRunning = routeAvailable
                 // The composer middleware runs FIRST, on the raw draft, which
                 // is where desktop registers it (plugin.js:8214 reads
                 // `draft.text`). Order is not incidental: the attachment
@@ -308,7 +311,7 @@ extension AppModel {
                 // offline) — going around it would duplicate the bubble.
                 send(text: prompt, to: botID)
                 clearAttachments(botID: botID)
-                if !isOffline { startWatchdog(botID) }
+                if routeAvailable { startWatchdog(botID) }
             }
         }
     }
@@ -316,7 +319,8 @@ extension AppModel {
     private func steer(text: String, botID: String, sessionID: String, chat: ChatState) {
         chat.messages.append(ChatMessage(author: .user, time: AppModel.clock(), text: text))
         Task { @MainActor in
-            guard let client else { return }
+            guard let route = gatewayRoute(for: botID),
+                  let client = try? await routedClient(for: route) else { return }
             let steered = (try? await client.steerTurn(sessionID: sessionID, text: text)) ?? ""
             if steered == "queued" { return }
             // Too late to steer: re-aim the turn, and failing that queue the
@@ -385,12 +389,14 @@ extension AppModel {
         guard wasRunning else { return }
         let note = theme.copy.stopNote(theme.themeID)
 
-        guard mode == .live, let client, let sessionID = chat.sessionID else {
+        guard mode == .live, let sessionID = chat.sessionID else {
             chat.messages.append(ChatMessage(author: .system, text: note))
             return
         }
         Task { @MainActor in
             do {
+                guard let route = gatewayRoute(for: botID) else { throw GatewayRouteError.noRoute }
+                let client = try await routedClient(for: route)
                 try await client.interruptSession(sessionID)
                 chat.messages.append(ChatMessage(author: .system, text: note))
                 self.approvals.removeAll { $0.botID == botID }
@@ -425,15 +431,16 @@ extension AppModel {
         let retracting = runtime.reactions[message.id] == emoji
         runtime.reactions[message.id] = retracting ? nil : emoji
 
-        guard mode == .live, let client,
-              let sessionID = chat(for: botID).sessionID else { return }
+        guard mode == .live, let sessionID = chat(for: botID).sessionID else { return }
         let rowID = message.rowID
         guard rowID != nil || isNewestBotMessage(message, in: botID) else { return }
         let role: String? = rowID == nil ? "assistant" : nil
         let payload: String? = retracting ? nil : emoji
-        Task {
-            try? await client.reactToMessage(sessionID: sessionID, rowID: rowID,
-                                             newestRole: role, emoji: payload)
+        Task { @MainActor in
+            guard let route = gatewayRoute(for: botID),
+                  let client = try? await routedClient(for: route) else { return }
+            _ = try? await client.reactToMessage(sessionID: sessionID, rowID: rowID,
+                                                 newestRole: role, emoji: payload)
         }
     }
 

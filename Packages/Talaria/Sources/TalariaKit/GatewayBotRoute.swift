@@ -38,3 +38,16 @@ public struct GatewayBotRoute: Codable, Hashable, Sendable {
         return Self(gatewayID: activeGatewayID, profile: rosterID)
     }
 }
+
+/// A runtime session id scoped to the gateway that issued it. Hermes runtime
+/// ids are intentionally short and can collide across simultaneously connected
+/// machines, so they are never a process-global key on their own.
+public struct GatewaySessionRoute: Codable, Hashable, Sendable {
+    public var gatewayID: String
+    public var sessionID: String
+
+    public init(gatewayID: String, sessionID: String) {
+        self.gatewayID = gatewayID
+        self.sessionID = sessionID
+    }
+}

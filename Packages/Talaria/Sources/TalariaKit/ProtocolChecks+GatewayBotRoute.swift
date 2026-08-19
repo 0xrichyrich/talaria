@@ -18,5 +18,8 @@ extension ProtocolChecks {
                    "empty gateway is rejected")
         try expect(GatewayBotRoute(qualifiedID: "homelab::") == nil,
                    "empty profile is rejected")
+        try expect(GatewaySessionRoute(gatewayID: "mac", sessionID: "deadbeef")
+            != GatewaySessionRoute(gatewayID: "homelab", sessionID: "deadbeef"),
+                   "same runtime session id remains distinct across gateways")
     }
 }
