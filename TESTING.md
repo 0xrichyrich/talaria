@@ -14,7 +14,7 @@ else works with a free one.
 ## 1. Simulator (fastest — no Apple account needed)
 
 ```sh
-git clone https://github.com/0xrichyrich/talaria.git && cd talaria
+git clone https://github.com/Skynet-Ventures/talaria.git && cd talaria
 make ios
 ```
 

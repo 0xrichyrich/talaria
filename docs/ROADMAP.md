@@ -300,10 +300,12 @@ mint one, which is the safe asymmetry to keep unless it proves annoying.
 
 ### 4. Known-latent, not yet a bug
 
-- **APNs environment is hardcoded to `"dev"`** at `PushCoordinator.swift:194`.
-  Correct today — both entitlement files declare `aps-environment: development` —
-  and wrong the moment a TestFlight or App Store build is cut. It predates this
-  run; it is listed here so it is not discovered by way of silent pushes.
+- **APNs environment now follows the signed configuration.** Debug uses the
+  sandbox entitlement and sends `dev`; Release uses the production entitlement
+  and sends `prod`. Both carry the Time Sensitive entitlement used by approval
+  and gateway alerts; current Apple SDKs no longer require a separate
+  authorization option. The relay source-stamps every multi-gateway payload
+  and bounds APNs storage with per-kind expiration.
 - **`ConnectionRegistry.startAutoProbe` is still dead code** (PARITY.md row on
   backstop polling). Harmless, but it is a probe nobody calls.
 - **Solo's `BridgedTool` silently drops any tool whose parameters are not a flat

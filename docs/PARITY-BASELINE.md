@@ -7,11 +7,15 @@ are not current until they are regenerated against this baseline.
 ## Exact authority
 
 - Hermes repository: <https://github.com/nousresearch/hermes-agent>
-- Hermes commit: `395c70d616f6426e990632ff8b57cf1e9499702f`
-- Talaria baseline: `e5fe2e7633cd4b0cc25034733c405e82efaf3d54`
-- Audited: 2026-08-18
+- Hermes commit: `b5455fdd16fe608214f91149233660e1836b067c`
+- Talaria baseline: `1c4d04f547dad1e045efa4ecf6fa65f1cd890e8e`
+- Audited: 2026-08-19
 - Machine-readable pin and authority-file hashes:
   [`parity/hermes-upstream.json`](../parity/hermes-upstream.json)
+
+The final `13ce0c5c..b5455fdd` drift contained one additive curated-model row in
+`hermes_cli/models.py` (`nvidia/nemotron-3.5-lightning-30b-a3b`). None of the
+Bot Mode, Desktop, gateway, management, or hashed authority files changed.
 
 Run the local check against an exact Hermes checkout:
 
@@ -62,8 +66,9 @@ older Hermes snapshot and current upstream expanded materially. There is no
 defensible newer percentage until the granular ledgers are regenerated.
 
 The current implementation is best described as a mobile Hermes client with
-substantial Bot Mode support, not a 1:1 client. The largest correctness gaps
-are the remaining multi-connection management surfaces and group rooms:
+substantial Bot Mode support, not yet a 1:1 client. The largest remaining
+product gaps are group rooms, rich transcript controls, and gateway-backed
+workspace/command-center surfaces:
 
 - Talaria retains authenticated clients for multiple gateways and routes chat,
   events, sessions, full approval recovery/prompts, and unread state by source.
@@ -71,11 +76,17 @@ are the remaining multi-connection management surfaces and group rooms:
   routed. Skills, toolsets, plugins, and MCP/OAuth management are routed too;
   profile read/edit/create/duplicate, model catalogs, looks, and portraits are
   routed too. Pet state, galleries, selection, generation/hatching, and event
-  progress are also source-qualified; several other management mutations remain
-  primary-only.
+  progress are also source-qualified. Mobile management now includes typed,
+  source-qualified inference OAuth/custom endpoints, voice providers, memory
+  providers, profile rename/delete, runtime controls, logs, and push filters;
+  these new paths remain partial until live-gateway certification.
 - Talaria's in-flight room work models one group per bot; current Hermes uses
   multiple memberships and standalone rooms.
 - Foreign room members are not yet delivered through their owning connection.
+- Current Hermes also exposes agent-guided `tour.request` prompts, whole-turn
+  activity across transcript gaps, and a bounded room activity feed. These are
+  queued with Talaria's transcript and room batches rather than being mistaken
+  for management API drift.
 
 ## Delivery ledger
 
@@ -86,7 +97,7 @@ written.
 - [x] Pin the exact current Hermes authority and automate upstream drift detection.
 - [ ] Regenerate both granular ledgers from the pinned source and stabilize the
       crash-recovery work as reviewable, tested slices.
-- [ ] Replace global gateway switching with a managed multi-connection pool and
+- [x] Replace global gateway switching with a managed multi-connection pool and
       source-qualified state, events, sessions, and mutations.
 - [ ] Migrate group metadata to multiple memberships and standalone room identities.
 - [ ] Implement cross-machine room delivery, explicit failure semantics,
@@ -94,6 +105,11 @@ written.
 - [ ] Close current Bot Mode gaps: roster hiding, avatars, remote creation,
       target capabilities, mentions, routines, canonical chats, and profile lifecycle.
 - [ ] Add rich transcripts and full session interaction controls.
+      Default working presentation is an animated agent avatar; tool activity
+      and gateway-exposed reasoning summaries are opt-in advanced views. The
+      mobile composer must give multiline drafts the full available width,
+      keep accessory/send controls stable, and scroll internally after its
+      height cap instead of squeezing text into a narrow center column.
 - [ ] Add mobile management for providers, models, profiles, tools, skills, MCP,
       plugins, routines, messaging, memory, and agents.
 - [ ] Add gateway-backed files, artifacts, projects, git, terminal, and command-center UI.
@@ -134,7 +150,11 @@ Multi-connection implementation checkpoints:
 - [x] Source-qualified gateway default model/reasoning settings, provider
       credential save/disconnect, and catalog refresh with generation-fenced
       reads and secret scrubbing across gateway switches.
-- [ ] Source-qualified remaining management mutations.
+- [x] Source-qualified inference OAuth/custom endpoints, dynamic memory and
+      voice providers, profile rename/delete, push registration/filtering,
+      runtime/image/memory controls, and authenticated log reads are implemented
+      with captured-target/generation fencing. Live-gateway certification is
+      still required before the delivery-ledger management row can close.
 
 ## Crash-recovery snapshot disposition
 
