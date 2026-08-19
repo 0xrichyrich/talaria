@@ -41,6 +41,32 @@ private final class ProfileLifecycleRuntime {
     var heldGateways: Set<String> = []
     var routeGenerations: [GatewayBotRoute: UInt64] = [:]
     var blockedRoutes: Set<GatewayBotRoute> = []
+    var ordinaryTrafficCounts: [String: Int] = [:]
+
+    func beginLifecycle(gatewayID: String) -> Bool {
+        guard !heldGateways.contains(gatewayID),
+              !gatewaysInFlight.contains(gatewayID),
+              ordinaryTrafficCounts[gatewayID, default: 0] == 0 else { return false }
+        gatewaysInFlight.insert(gatewayID)
+        return true
+    }
+
+    func acquireOrdinaryTraffic(gatewayID: String) -> GatewayClient.TrafficLease? {
+        guard !heldGateways.contains(gatewayID),
+              !gatewaysInFlight.contains(gatewayID) else { return nil }
+        ordinaryTrafficCounts[gatewayID, default: 0] += 1
+        return GatewayClient.TrafficLease { @Sendable in
+            await MainActor.run {
+                let runtime = ProfileLifecycleRuntime.shared
+                let remaining = runtime.ordinaryTrafficCounts[gatewayID, default: 1] - 1
+                if remaining > 0 {
+                    runtime.ordinaryTrafficCounts[gatewayID] = remaining
+                } else {
+                    runtime.ordinaryTrafficCounts.removeValue(forKey: gatewayID)
+                }
+            }
+        }
+    }
 
     func block(_ route: GatewayBotRoute) {
         routeGenerations[route, default: 0] &+= 1
@@ -55,6 +81,43 @@ private final class ProfileLifecycleRuntime {
     func activate(_ route: GatewayBotRoute) {
         routeGenerations[route, default: 0] &+= 1
         blockedRoutes.remove(route)
+    }
+}
+
+@MainActor
+enum ProfileLifecycleTrafficAdmission {
+    static func beginLifecycle(_ gatewayID: String) -> Bool {
+        ProfileLifecycleRuntime.shared.beginLifecycle(gatewayID: gatewayID)
+    }
+
+    static func endLifecycle(_ gatewayID: String) {
+        ProfileLifecycleRuntime.shared.gatewaysInFlight.remove(gatewayID)
+    }
+
+    static func allows(_ gatewayID: String) -> Bool {
+        let runtime = ProfileLifecycleRuntime.shared
+        return !runtime.gatewaysInFlight.contains(gatewayID)
+            && !runtime.heldGateways.contains(gatewayID)
+    }
+
+    static func acquire(_ gatewayID: String) -> GatewayClient.TrafficLease? {
+        ProfileLifecycleRuntime.shared.acquireOrdinaryTraffic(gatewayID: gatewayID)
+    }
+
+    /// Static GatewayREST surfaces carry a base URL rather than a saved source
+    /// id. Resolve that exact registered source, then acquire the same ordinary
+    /// lease as GatewayClient. Unknown pre-registration URLs have no lifecycle
+    /// target yet and therefore need no lease.
+    static func acquire(baseURL: URL) throws -> GatewayClient.TrafficLease? {
+        guard let gatewayID = ConnectionRegistry.shared.gateway(forURL: baseURL)?.id else {
+            return nil
+        }
+        guard let lease = acquire(gatewayID) else {
+            throw GatewayError(
+                code: GatewayClient.trafficFenced,
+                message: "Gateway traffic is paused while a profile change is being resolved.")
+        }
+        return lease
     }
 }
 
@@ -91,9 +154,7 @@ extension AppModel {
     /// can outlive one profile route. Both an active mutation and an unresolved
     /// postcondition must stop new traffic until lifecycle authority returns.
     internal func profileLifecycleAllowsGatewayTraffic(_ gatewayID: String) -> Bool {
-        let runtime = ProfileLifecycleRuntime.shared
-        return !runtime.gatewaysInFlight.contains(gatewayID)
-            && !runtime.heldGateways.contains(gatewayID)
+        ProfileLifecycleTrafficAdmission.allows(gatewayID)
     }
 
     /// A successful explicit create/recreate makes a formerly deleted identity
@@ -131,9 +192,9 @@ extension AppModel {
             }
             guard cleanName != target.route.profile else { return .refused("The profile name is unchanged.") }
         }
-        guard ProfileLifecycleRuntime.shared.gatewaysInFlight.insert(target.route.gatewayID).inserted
-        else { return .refused("Another profile change is already running on that gateway.") }
-        defer { ProfileLifecycleRuntime.shared.gatewaysInFlight.remove(target.route.gatewayID) }
+        guard ProfileLifecycleTrafficAdmission.beginLifecycle(target.route.gatewayID)
+        else { return .refused("That gateway is busy with another request or profile change. Try again when it finishes.") }
+        defer { ProfileLifecycleTrafficAdmission.endLifecycle(target.route.gatewayID) }
 
         let changesDirectory = target.route.profile != "default"
         let preserved = captureProfileLifecycleState(target)
@@ -229,9 +290,9 @@ extension AppModel {
         guard !ProfileLifecycleRuntime.shared.heldGateways.contains(target.route.gatewayID) else {
             return .refused("That gateway has an unresolved profile change. Verify its profiles outside Talaria, then restart the app before trying again.")
         }
-        guard ProfileLifecycleRuntime.shared.gatewaysInFlight.insert(target.route.gatewayID).inserted
-        else { return .refused("Another profile change is already running on that gateway.") }
-        defer { ProfileLifecycleRuntime.shared.gatewaysInFlight.remove(target.route.gatewayID) }
+        guard ProfileLifecycleTrafficAdmission.beginLifecycle(target.route.gatewayID)
+        else { return .refused("That gateway is busy with another request or profile change. Try again when it finishes.") }
+        defer { ProfileLifecycleTrafficAdmission.endLifecycle(target.route.gatewayID) }
 
         let preserved = captureProfileLifecycleState(target)
         parkProfileLifecycleState(target)

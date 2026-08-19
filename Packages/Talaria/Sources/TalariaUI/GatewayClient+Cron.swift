@@ -350,22 +350,15 @@ public enum GatewayREST {
     @discardableResult
     public static func triggerCronJob(baseURL: URL, credential: GatewayCredential,
                                       jobID: String, profile: String?) async throws -> Bool {
-        var comps = URLComponents(url: baseURL.appending(path: "api/cron/jobs/\(jobID)/trigger"),
-                                  resolvingAgainstBaseURL: false)
+        var query: [URLQueryItem] = []
         if let profile, !profile.isEmpty {
-            comps?.queryItems = [URLQueryItem(name: "profile", value: profile)]
+            query = [URLQueryItem(name: "profile", value: profile)]
         }
-        guard let url = comps?.url else {
-            throw GatewayError(code: -9, message: "bad trigger URL")
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 45
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        GatewayAuthClient(baseURL: baseURL).apply(credential: credential, to: &req)
         do {
-            let (data, response) = try await URLSession.shared.data(for: req)
-            try check(response, data, what: "trigger")
+            _ = try await restData(baseURL: baseURL, credential: credential,
+                                   path: "api/cron/jobs/\(jobID)/trigger",
+                                   query: query, method: "POST",
+                                   timeout: 45, what: "trigger")
             return true
         } catch let error as URLError where error.code == .timedOut {
             return false
@@ -379,31 +372,15 @@ public enum GatewayREST {
     public static func sessionMessages(baseURL: URL, credential: GatewayCredential,
                                        storedID: String, profile: String?,
                                        limit: Int) async throws -> [JSONValue] {
-        var comps = URLComponents(url: baseURL.appending(path: "api/sessions/\(storedID)/messages"),
-                                  resolvingAgainstBaseURL: false)
         var query = [URLQueryItem(name: "limit", value: String(limit)),
                      URLQueryItem(name: "order", value: "latest")]
         if let profile, !profile.isEmpty {
             query.append(URLQueryItem(name: "profile", value: profile))
         }
-        comps?.queryItems = query
-        guard let url = comps?.url else {
-            throw GatewayError(code: -9, message: "bad transcript URL")
-        }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 25
-        GatewayAuthClient(baseURL: baseURL).apply(credential: credential, to: &req)
-        let (data, response) = try await URLSession.shared.data(for: req)
-        try check(response, data, what: "transcript")
+        let data = try await restData(baseURL: baseURL, credential: credential,
+                                      path: "api/sessions/\(storedID)/messages",
+                                      query: query, timeout: 25, what: "transcript")
         let payload = try JSONDecoder().decode(JSONValue.self, from: data)
         return payload["messages"]?.arrayValue ?? []
-    }
-
-    private static func check(_ response: URLResponse, _ data: Data, what: String) throws {
-        guard let code = (response as? HTTPURLResponse)?.statusCode else { return }
-        guard (200..<300).contains(code) else {
-            let detail = (try? JSONDecoder().decode(JSONValue.self, from: data))?["detail"]?.stringValue
-            throw GatewayError(code: code, message: detail ?? "\(what) failed (HTTP \(code))")
-        }
     }
 }

@@ -9,6 +9,15 @@ enum ProfileLifecycleCompletionFence {
     }
 }
 
+enum ProfileLifecycleCompletionSelection {
+    /// SwiftUI does not publish `onChange` for an idempotent assignment. Only
+    /// arm the one-shot suppression flag when a completion actually changes
+    /// the picker value, otherwise the next manual selection would consume it.
+    static func requiresSuppression(current: String?, next: String?) -> Bool {
+        current != next
+    }
+}
+
 /// Mobile profile-directory lifecycle. Creation/editing already live in the
 /// roster; Settings owns rename/delete because they change identity across
 /// every session and cannot be mistaken for cosmetic title editing.
@@ -268,9 +277,11 @@ public struct ProfileLifecycleSettingsSection: View {
             notice = displayName.map { "Display name changed to \($0)." }
                 ?? "Profile renamed to \(canonical)."
             let route = GatewayBotRoute(gatewayID: original.route.gatewayID, profile: canonical)
-            applyingCompletionSelection = true
-            selectedRosterID = original.route.gatewayID == LiveRuntime.shared.gatewayID
+            let nextSelection = original.route.gatewayID == LiveRuntime.shared.gatewayID
                 ? canonical : route.qualifiedID
+            applyingCompletionSelection = ProfileLifecycleCompletionSelection.requiresSuppression(
+                current: selectedRosterID, next: nextSelection)
+            selectedRosterID = nextSelection
             renameText = canonical == "default" ? "" : canonical
         case .deleted:
             noticeIsWarning = false

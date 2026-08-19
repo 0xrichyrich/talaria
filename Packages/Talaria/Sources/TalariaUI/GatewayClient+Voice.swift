@@ -187,39 +187,14 @@ extension GatewayClient {
     /// One authorized JSON POST against the audio routes.
     private func audioPOST(path: String, profile: String?, body: JSONValue,
                            timeout: TimeInterval) async throws -> JSONValue {
-        guard let credential = KeychainStore().load(for: baseURL) else {
-            throw GatewayError(code: -10, message: "no stored credential for this gateway")
-        }
-        var comps = URLComponents(url: baseURL.appending(path: path),
-                                  resolvingAgainstBaseURL: false)!
+        var query: [URLQueryItem] = []
         if let profile, !profile.isEmpty {
-            comps.queryItems = [URLQueryItem(name: "profile", value: profile)]
+            query = [URLQueryItem(name: "profile", value: profile)]
         }
-        guard let url = comps.url else {
-            throw GatewayError(code: -10, message: "could not build audio URL")
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = timeout
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // The live credential is private to GatewayClient and unreachable from
-        // another module; the Keychain holds the same one (ConnectionRegistry
-        // stores it on connect, and refreshed OAuth tokens are written back).
-        GatewayAuthClient(baseURL: baseURL).apply(credential: credential, to: &req)
-        req.httpBody = try JSONEncoder().encode(body)
-
-        let (data, response) = try await URLSession.shared.data(for: req)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        let payload = try? JSONDecoder().decode(JSONValue.self, from: data)
-        guard (200..<300).contains(status) else {
-            // FastAPI errors carry {"detail": "..."}.
-            let detail = payload?["detail"]?.stringValue ?? "audio request failed (\(status))"
-            throw GatewayError(code: -status, message: detail)
-        }
-        guard let payload else {
-            throw GatewayError(code: -11, message: "audio response was not JSON")
-        }
-        return payload
+        // Use the actor's shared REST transport so lifecycle admission is held
+        // from immediately before dispatch through the complete provider wait.
+        return try await restJSON(path: path, method: "POST", query: query,
+                                  body: body, timeout: timeout)
     }
 
     /// Split `data:<mime>;base64,<payload>` into bytes + mime.

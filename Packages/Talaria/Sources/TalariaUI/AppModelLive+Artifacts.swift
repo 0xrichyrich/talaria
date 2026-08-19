@@ -551,6 +551,25 @@ struct ExportedFile: Identifiable, Equatable {
 
 public extension GatewayREST {
 
+    /// Acquire the same source-qualified ordinary-traffic lease used by
+    /// `GatewayClient.rpc/restData`, and retain it across the complete HTTP
+    /// await. Lifecycle's rename/delete and authoritative inventory calls do
+    /// not use this executor: they are the explicit exclusive-fence owner.
+    static func withTrafficLease<Value: Sendable>(
+        baseURL: URL,
+        operation: @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let lease = try await ProfileLifecycleTrafficAdmission.acquire(baseURL: baseURL)
+        do {
+            let value = try await operation()
+            await lease?.release()
+            return value
+        } catch {
+            await lease?.release()
+            throw error
+        }
+    }
+
     /// One authed request against the gateway's HTTP surface, with the status
     /// code mapped onto `GatewayError` so callers can tell 403 from 404 from
     /// 413 — which is the whole difference between "refused", "gone" and "too
@@ -559,28 +578,30 @@ public extension GatewayREST {
                          query: [URLQueryItem] = [], method: String = "GET",
                          body: Data? = nil, timeout: TimeInterval = 30,
                          what: String) async throws -> Data {
-        var comps = URLComponents(url: baseURL.appending(path: path),
-                                  resolvingAgainstBaseURL: false)
-        if !query.isEmpty { comps?.queryItems = query }
-        guard let url = comps?.url else {
-            throw GatewayError(code: -9, message: "bad \(what) URL")
+        try await withTrafficLease(baseURL: baseURL) {
+            var comps = URLComponents(url: baseURL.appending(path: path),
+                                      resolvingAgainstBaseURL: false)
+            if !query.isEmpty { comps?.queryItems = query }
+            guard let url = comps?.url else {
+                throw GatewayError(code: -9, message: "bad \(what) URL")
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = method
+            request.timeoutInterval = timeout
+            if let body {
+                request.httpBody = body
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            }
+            GatewayAuthClient(baseURL: baseURL).apply(credential: credential, to: &request)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(code) else {
+                let payload = try? JSONDecoder().decode(JSONValue.self, from: data)
+                let detail = payload?["detail"]?.stringValue ?? payload?["error"]?.stringValue
+                throw GatewayError(code: code, message: detail ?? "\(what) failed (HTTP \(code))")
+            }
+            return data
         }
-        var request = URLRequest(url: url)
-        request.httpMethod = method
-        request.timeoutInterval = timeout
-        if let body {
-            request.httpBody = body
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        }
-        GatewayAuthClient(baseURL: baseURL).apply(credential: credential, to: &request)
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(code) else {
-            let payload = try? JSONDecoder().decode(JSONValue.self, from: data)
-            let detail = payload?["detail"]?.stringValue ?? payload?["error"]?.stringValue
-            throw GatewayError(code: code, message: detail ?? "\(what) failed (HTTP \(code))")
-        }
-        return data
     }
 
     static func restJSON(baseURL: URL, credential: GatewayCredential, path: String,

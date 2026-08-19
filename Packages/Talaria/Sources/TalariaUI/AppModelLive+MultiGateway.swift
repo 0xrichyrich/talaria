@@ -103,7 +103,23 @@ public extension AppModel {
     /// Resolve a connection when the protocol request has no profile field
     /// (sudo/secret responses are keyed only by request_id).
     func routedClient(gatewayID: String) async throws -> GatewayClient {
-        if gatewayID == activeGatewayID, let client { return client }
+        guard profileLifecycleAllowsGatewayTraffic(gatewayID) else {
+            throw GatewayError(code: GatewayClient.trafficFenced,
+                               message: "Gateway traffic is paused while a profile change is being resolved.")
+        }
+        if gatewayID == activeGatewayID, let client {
+            // Pool adoption installs this on normal primary connections. Set
+            // it again defensively for restored/test clients that predate the
+            // pool entry, then re-check after the actor hop.
+            await client.setTrafficAdmission {
+                await ProfileLifecycleTrafficAdmission.acquire(gatewayID)
+            }
+            guard profileLifecycleAllowsGatewayTraffic(gatewayID) else {
+                throw GatewayError(code: GatewayClient.trafficFenced,
+                                   message: "Gateway traffic is paused while a profile change is being resolved.")
+            }
+            return client
+        }
         let registry = ConnectionRegistry.shared
         guard let gateway = registry.saved.first(where: { $0.id == gatewayID }),
               let baseURL = gateway.baseURL else {
@@ -112,9 +128,14 @@ public extension AppModel {
         guard let credential = registry.credential(for: gateway) else {
             throw GatewayRouteError.missingCredential(gateway.name)
         }
-        return try await registry.clientPool.connect(gatewayID: gateway.id,
-                                                     baseURL: baseURL,
-                                                     credential: credential)
+        let routed = try await registry.clientPool.connect(gatewayID: gateway.id,
+                                                           baseURL: baseURL,
+                                                           credential: credential)
+        guard profileLifecycleAllowsGatewayTraffic(gatewayID) else {
+            throw GatewayError(code: GatewayClient.trafficFenced,
+                               message: "Gateway traffic is paused while a profile change is being resolved.")
+        }
+        return routed
     }
 
     /// Subscribe once to a secondary gateway and retain source information on

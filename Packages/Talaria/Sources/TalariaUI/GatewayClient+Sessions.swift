@@ -290,13 +290,21 @@ extension GatewayClient {
     /// Run a REST request and decode it, mapping HTTP failures onto
     /// `GatewayError` so callers handle one error type.
     private func send(_ request: URLRequest, describing what: String) async throws -> JSONValue {
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        let payload = (try? JSONDecoder().decode(JSONValue.self, from: data)) ?? .null
-        guard (200..<300).contains(code) else {
-            let detail = payload["detail"]?.stringValue ?? payload["error"]?.stringValue
-            throw GatewayError(code: code, message: detail ?? "\(what) failed (HTTP \(code))")
+        let lease = try await acquireTrafficLease()
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let payload = (try? JSONDecoder().decode(JSONValue.self, from: data)) ?? .null
+            guard (200..<300).contains(code) else {
+                let detail = payload["detail"]?.stringValue ?? payload["error"]?.stringValue
+                throw GatewayError(code: code,
+                                   message: detail ?? "\(what) failed (HTTP \(code))")
+            }
+            await lease?.release()
+            return payload
+        } catch {
+            await lease?.release()
+            throw error
         }
-        return payload
     }
 }

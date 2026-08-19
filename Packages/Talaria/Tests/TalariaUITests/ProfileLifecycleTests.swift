@@ -74,6 +74,64 @@ struct ProfileLifecycleTests {
         #expect(!(await routed.isConnected))
     }
 
+    @Test func clientAdmissionRejectsRPCAndRESTBeforeTransportOrNetworkUse() async throws {
+        let client = GatewayClient(
+            baseURL: try #require(URL(string: "https://gateway.invalid")),
+            credential: .sessionToken("unused"))
+        await client.setTrafficAdmission { nil }
+
+        do {
+            _ = try await client.rpc("profiles.list")
+            Issue.record("fenced RPC unexpectedly reached transport")
+        } catch let error as GatewayError {
+            #expect(error.code == GatewayClient.trafficFenced)
+        }
+
+        do {
+            _ = try await client.restJSON(path: "api/config", timeout: 1)
+            Issue.record("fenced REST unexpectedly reached URLSession")
+        } catch let error as GatewayError {
+            #expect(error.code == GatewayClient.trafficFenced)
+        }
+    }
+
+    @Test @MainActor func ordinaryTrafficLeaseExcludesLifecycleForItsEntireAwait() async throws {
+        let gatewayID = "lease-\(UUID().uuidString)"
+        let lease = try #require(ProfileLifecycleTrafficAdmission.acquire(gatewayID))
+        let concurrentLease = try #require(ProfileLifecycleTrafficAdmission.acquire(gatewayID))
+        #expect(!ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
+
+        await lease.release()
+        #expect(!ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
+        await concurrentLease.release()
+        #expect(ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
+        #expect(ProfileLifecycleTrafficAdmission.acquire(gatewayID) == nil)
+        ProfileLifecycleTrafficAdmission.endLifecycle(gatewayID)
+
+        let replacement = try #require(ProfileLifecycleTrafficAdmission.acquire(gatewayID))
+        await replacement.release()
+    }
+
+    @Test @MainActor func clientReleasesOrdinaryLeaseOnTransportFailure() async throws {
+        let gatewayID = "release-\(UUID().uuidString)"
+        let client = GatewayClient(
+            baseURL: try #require(URL(string: "https://gateway.invalid")),
+            credential: .sessionToken("unused"))
+        await client.setTrafficAdmission {
+            await ProfileLifecycleTrafficAdmission.acquire(gatewayID)
+        }
+
+        do {
+            _ = try await client.rpc("profiles.list")
+            Issue.record("disconnected test client unexpectedly completed an RPC")
+        } catch let error as GatewayError {
+            #expect(error.code == -3)
+        }
+
+        #expect(ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
+        ProfileLifecycleTrafficAdmission.endLifecycle(gatewayID)
+    }
+
     @Test func defaultRenameResponsePreservesCanonicalIdentity() {
         let result = ProfileRenameResult(.object([
             "ok": .bool(true), "name": .string("default"),
@@ -167,6 +225,15 @@ struct ProfileLifecycleTests {
         #expect(!ProfileLifecycleCompletionFence.accepts(
             generation: 4, currentGeneration: 4,
             gatewayID: "homelab", currentGatewayID: "mac"))
+    }
+
+    @Test func idempotentDefaultRenameDoesNotArmNextPickerSuppression() {
+        #expect(!ProfileLifecycleCompletionSelection.requiresSuppression(
+            current: "default", next: "default"))
+        #expect(ProfileLifecycleCompletionSelection.requiresSuppression(
+            current: "default", next: "worker"))
+        #expect(ProfileLifecycleCompletionSelection.requiresSuppression(
+            current: "homelab::default", next: "homelab::worker"))
     }
 
     @Test func statePlanNeverBorrowsCollidingBareNameAfterGatewaySwitch() {

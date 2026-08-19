@@ -62,6 +62,7 @@ public actor GatewayClientPool {
                 await client.disconnect()
                 throw CancellationError()
             }
+            await installLifecycleAdmission(on: client, gatewayID: gatewayID)
             slots[gatewayID] = Slot(generation: generation, task: nil, client: client)
             return client
         } catch {
@@ -75,6 +76,7 @@ public actor GatewayClientPool {
     /// identity is installed, so a re-entrant lookup never returns the loser.
     public func adopt(_ client: GatewayClient, for gatewayID: String) async {
         let previous = slots[gatewayID]
+        await installLifecycleAdmission(on: client, gatewayID: gatewayID)
         nextGeneration &+= 1
         slots[gatewayID] = Slot(generation: nextGeneration, task: nil, client: client)
 
@@ -100,5 +102,11 @@ public actor GatewayClientPool {
     public func disconnectAll() async {
         let ids = Array(slots.keys)
         for id in ids { await disconnect(gatewayID: id) }
+    }
+
+    private func installLifecycleAdmission(on client: GatewayClient, gatewayID: String) async {
+        await client.setTrafficAdmission {
+            await ProfileLifecycleTrafficAdmission.acquire(gatewayID)
+        }
     }
 }
