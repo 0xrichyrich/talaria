@@ -239,7 +239,7 @@ private struct ToastCard: View {
         .shadow(color: shadowColor, radius: shadowRadius, y: shadowY)
         .padding(.horizontal, 12)
         .offset(y: min(drag, 0))
-        .opacity(drag < 0 ? max(0, 1 + drag / 60) : 1)
+        .opacity(drag < 0 ? max(0.0, 1.0 + Double(drag / 60.0)) : 1.0)
         .contentShape(Rectangle())
         // A toast answers a tap the user already made; tapping it again means
         // "understood, go away" rather than "take me somewhere", so it never
