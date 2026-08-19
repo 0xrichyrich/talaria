@@ -24,6 +24,7 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         FeedsRuntime.shared.routineTargets.removeAll()
         CronDetailRuntime.shared.reset()
         CronDetailRuntime.shared.changeTick = 0
+        CapabilityRuntime.shared.states.removeAll()
         SessionsRuntime.shared.resetPrimaryScope()
         SessionsRuntime.shared.resetRoutedScope(gatewayID: "homelab")
         super.tearDown()
@@ -397,6 +398,55 @@ final class SourceQualifiedRoutingTests: XCTestCase {
                                              fallbackBotID: "default"), "default")
         XCTAssertEqual(model.routineRunBotID(run, routineID: remoteID,
                                              fallbackBotID: "default"), "homelab::default")
+    }
+
+    func testCollidingCapabilityProfilesKeepDistinctGatewayState() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let primary = model.capabilities(for: "default")
+        let remote = model.capabilities(for: "homelab::default")
+
+        XCTAssertFalse(primary === remote)
+        XCTAssertEqual(primary.target,
+                       CapabilityTarget(gatewayID: "primary", profile: "default"))
+        XCTAssertEqual(remote.target,
+                       CapabilityTarget(gatewayID: "homelab", profile: "default"))
+        XCTAssertNotEqual(primary.target?.stateKey, remote.target?.stateKey)
+        XCTAssertEqual(model.capabilityTarget(profileID: "homelab::default")?.profile,
+                       "default")
+    }
+
+    func testCapabilityStateFollowsGatewayRoleWithoutCollision() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let before = model.capabilities(for: "default")
+        LiveRuntime.shared.gatewayID = "homelab"
+        let after = model.capabilities(for: "default")
+
+        XCTAssertFalse(before === after)
+        XCTAssertEqual(before.target?.gatewayID, "primary")
+        XCTAssertEqual(after.target?.gatewayID, "homelab")
+    }
+
+    func testCapabilityGatewayDetachPreservesOtherGatewayState() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let primary = model.capabilities(for: "default")
+        let remote = model.capabilities(for: "homelab::default")
+        let primaryKey = primary.target!.stateKey
+        let remoteKey = remote.target!.stateKey
+        remote.skills = [SkillEntry(name: "browser", category: "web",
+                                    scope: .profile, enabled: true)]
+        remote.busy.insert("skill:browser")
+        remote.hasLoaded = true
+
+        model.dropCapabilityScope(gatewayID: "homelab")
+
+        XCTAssertTrue(CapabilityRuntime.shared.states[primaryKey] === primary)
+        XCTAssertNil(CapabilityRuntime.shared.states[remoteKey])
+        XCTAssertTrue(remote.skills.isEmpty)
+        XCTAssertTrue(remote.busy.isEmpty)
+        XCTAssertFalse(remote.hasLoaded)
     }
 
     func testRoutineGatewayDetachPreservesOtherGatewayRows() {

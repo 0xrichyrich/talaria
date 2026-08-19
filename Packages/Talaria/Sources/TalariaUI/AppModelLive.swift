@@ -236,6 +236,12 @@ extension AppModel {
     /// half the time — which is worse than one that never clears, because the
     /// bug only reproduces on one route.
     private func dropPerGatewayCaches() {
+        if let gatewayID = LiveRuntime.shared.gatewayID {
+            // Skills/MCP/plugin state carries profile names that are only
+            // meaningful inside this gateway. Keep foreign-source states, but
+            // never let the departing primary survive a role switch.
+            dropCapabilityScope(gatewayID: gatewayID)
+        }
         // Cron detail: the `cron.changed` subscription, per-job records, run
         // histories, and the "this gateway has no cron REST router" verdict —
         // the last of which decides whether editing and history exist at all.
