@@ -716,6 +716,21 @@ private extension AppModel {
                        text: theme.copy.feedHandoffSent(theme.themeID)
                            + " @" + identity(sender).handle,
                        subtext: Self.previewLine(body))
+        // …and out loud, the first of desktop's three delivery outcomes
+        // (plugin.js:2637-2641). The composer has already closed on the send, so
+        // without this a handoff typed in one bot's chat vanishes with nothing
+        // to say it is on its way — the promise being made here is specifically
+        // *"will relay the reply here"*, which is the part a user cannot guess.
+        //
+        // `ledger: false` on all three: the rows above and in `relay` /
+        // `recordFailure` are this event's ledger entries already, written by the
+        // A2A path with its own keys. A mirror would file a second row for one
+        // delivery, which is the thing `toast()`'s key pairing exists to prevent.
+        toast(kind: .info,
+              title: theme.copy.toastHandoffSent(identity(target).handle,
+                                                 on: activeConnectionLabel, theme.themeID),
+              message: Self.previewLine(body),
+              botID: target, key: "handoff:\(key)", ledger: false)
     }
 
     /// One recipient could not be reached while others could. The composer has
@@ -734,6 +749,15 @@ private extension AppModel {
                        text: theme.copy.a2aFailedNote(theme.themeID,
                                                       reason: Self.reason(error)),
                        subtext: Self.previewLine(body))
+        // plugin.js:2659 — `notifyError(error, "Could not reach <label>")`. It
+        // replaces the "on its way" card under the same key, so one delivery
+        // stays one card even when it ends badly.
+        toast(kind: .failure,
+              title: theme.copy.toastCouldNotReach(activeConnectionLabel
+                                                       ?? identity(target).displayTitle,
+                                                   theme.themeID),
+              message: Self.reason(error),
+              botID: target, key: "handoff:\(key)", ledger: false)
     }
 
     /// Wait out the recipient's turn and relay its answer, bounded
@@ -775,8 +799,24 @@ private extension AppModel {
             if var delivery = A2ARuntime.shared.deliveries[key], delivery.state == .waiting {
                 delivery.state = .quiet
                 A2ARuntime.shared.deliveries[key] = delivery
+                // The third outcome (plugin.js:2652-2655). Not a failure and
+                // deliberately not worded as one: the message IS in their chat
+                // and the next sweep will find the answer whenever it lands —
+                // what expired is this watch, not the delivery. Saying nothing
+                // here is what left the "will relay the reply here" promise
+                // with no ending at all.
+                self?.reportQuietHandoff(to: target, key: key)
             }
         }
+    }
+
+    /// The reply watch ran out. Split off the closure above so the toast reads
+    /// as one statement rather than four optional-chained fragments.
+    private func reportQuietHandoff(to target: String, key: String) {
+        toast(kind: .info,
+              title: theme.copy.toastNoReplyYet(identity(target).handle,
+                                                on: activeConnectionLabel, theme.themeID),
+              botID: target, key: "handoff:\(key)", ledger: false)
     }
 
     /// The reply to OUR message: the newest assistant turn that follows the
@@ -814,6 +854,16 @@ private extension AppModel {
                        text: theme.copy.feedHandoffReply(theme.themeID)
                            + " @" + identity(target).handle,
                        subtext: Self.previewLine(reply))
+        // The answer, out loud (plugin.js:2646-2650): title `🤖 <name>
+        // (<label>)`, body the reply clipped to 500. Filed under the RESPONDER,
+        // whose face the card wears — the event being reported is that bot
+        // having spoken, and the ledger row above is filed under the sender
+        // because what IT records is the reply arriving back.
+        toast(kind: .success,
+              title: theme.copy.toastHandoffReply(identity(target).displayTitle,
+                                                  on: activeConnectionLabel, theme.themeID),
+              message: ActivityNotice.clip(reply, to: ActivityNotice.replyLimit),
+              botID: target, key: "handoff:\(key)", ledger: false)
         // Let the transcript be the source of truth for the row.
         sweepInbox(after: 0.5)
     }

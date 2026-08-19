@@ -613,7 +613,7 @@ public struct CreateBotView: View {
     /// look, in both vocabularies, with the `created` stamp that floats a
     /// brand-new bot to the top of the roster (plugin.js:5399-5401).
     private func create() async -> Bool {
-        let created = await model.createBotProfile(
+        let created = await model.createBotProfileWithFeedback(
             id: name,
             job: job.trimmingCharacters(in: .whitespacesAndNewlines),
             soul: soul.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -663,7 +663,9 @@ public struct CreateBotView: View {
         }
 
         if !edit.isEmpty {
-            guard await model.saveProfileEdit(botID: editing.id, edit: edit) else { return false }
+            guard await model.saveProfileEditWithFeedback(botID: editing.id, edit: edit) else {
+                return false
+            }
         }
 
         // The look is its own write. It has to read the live
@@ -671,8 +673,12 @@ public struct CreateBotView: View {
         // has no way to do that, and a bare block would delete the bot's
         // canonical-chat pin, its group and its pin-to-top flag.
         if lookChanged(from: editing) {
-            switch await model.saveBotLook(botID: editing.id, shape: shape, hue: hue,
-                                           title: title) {
+            // The feedback wrapper adds desktop's two beats and the ledger row;
+            // the three outcomes it returns are the same ones this switch has
+            // always handled, and `.unsupported` retracts its own card so the
+            // once-per-gateway notice below stays the only thing said.
+            switch await model.saveBotLookWithFeedback(botID: editing.id, shape: shape,
+                                                       hue: hue, title: title) {
             case .persisted:
                 break
             case .unsupported:

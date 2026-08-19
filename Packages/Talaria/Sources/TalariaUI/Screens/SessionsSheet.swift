@@ -589,7 +589,12 @@ public struct SessionsSheet: View {
     private func delete(_ row: Row) {
         Task { @MainActor in
             working = true
-            let failure = await model.deleteStoredSession(row.id, botID: botID)
+            // Narrated through the toast bus (and mirrored into the Activity
+            // ledger); the inline banner below stays for the failure the user is
+            // looking straight at, since a root-hosted toast cannot be seen over
+            // this sheet.
+            let failure = await model.deleteSessionWithFeedback(row.id, botID: botID,
+                                                                title: row.title)
             working = false
             hits.removeAll { $0.sessionID == row.id }
             if let failure {
@@ -605,7 +610,9 @@ public struct SessionsSheet: View {
     private func deleteArchived(_ record: ArchivedSessionRecord) {
         Task { @MainActor in
             working = true
-            let failure = await model.deleteStoredSession(record.sessionID, botID: botID)
+            let failure = await model.deleteSessionWithFeedback(record.sessionID,
+                                                                botID: botID,
+                                                                title: record.title)
             working = false
             if let failure {
                 withAnimation(.easeOut(duration: 0.2)) {
@@ -705,7 +712,7 @@ public struct SessionsSheet: View {
         cancelRename()
         Task { @MainActor in
             working = true
-            let failure = await model.renameStoredSession(id, botID: botID, to: title)
+            let failure = await model.renameSessionWithFeedback(id, botID: botID, to: title)
             working = false
             if let failure {
                 withAnimation(.easeOut(duration: 0.2)) {

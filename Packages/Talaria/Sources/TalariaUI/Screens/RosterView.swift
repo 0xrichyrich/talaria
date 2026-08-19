@@ -264,11 +264,58 @@ public struct RosterView: View {
 
     private var headerControls: some View {
         HStack(spacing: 8) {
+            bellButton
             HeaderIconButton(theme: theme, action: onSearch) { searchGlyph }
             HeaderIconButton(theme: theme, action: { model.theme.cycle() }) { themeGlyph }
             netChip
             plusButton
         }
+    }
+
+    /// Desktop's bell / bell-slash (plugin.js:7732-7741): activity toasts on or
+    /// off. Live only — demo mode's roster never moves a watermark, so the
+    /// control would govern nothing there.
+    ///
+    /// The tooltip upstream carries ("Activity toasts on — click to silence")
+    /// has no home on a phone, so it becomes the accessibility label, and the
+    /// flip answers with a toast of its own.
+    @ViewBuilder private var bellButton: some View {
+        if model.mode == .live {
+            let on = model.activityToastsEnabled
+            HeaderIconButton(theme: theme, action: { model.setActivityToasts(!on) }) {
+                bellGlyph(on: on)
+            }
+            .accessibilityLabel(Text(CopyPack.activityToastsToggle(on, theme.id)))
+            .accessibilityAddTraits(on ? .isSelected : [])
+        }
+    }
+
+    /// A bell, and the same bell struck through. Drawn rather than an SF Symbol
+    /// for the same reason the magnifier beside it is: these two sit shoulder to
+    /// shoulder and a system glyph next to a hand-drawn one reads as a mistake.
+    private func bellGlyph(on: Bool) -> some View {
+        let ink = on ? theme.ink : theme.ink.opacity(0.45)
+        return ZStack {
+            VStack(spacing: 0) {
+                UnevenRoundedRectangle(topLeadingRadius: 4.5, bottomLeadingRadius: 0,
+                                       bottomTrailingRadius: 0, topTrailingRadius: 4.5,
+                                       style: .continuous)
+                    .strokeBorder(ink, lineWidth: 1.4)
+                    .frame(width: 9, height: 8.5)
+                Rectangle().fill(ink).frame(width: 12, height: 1.4)
+                Circle().fill(ink).frame(width: 2.6, height: 2.6).padding(.top, 0.6)
+            }
+            if !on {
+                // The strike is drawn in the background colour first, then the
+                // line — so it reads as a cut through the bell at any size
+                // instead of a stroke laid over it.
+                Rectangle().fill(theme.bg).frame(width: 17, height: 3)
+                    .rotationEffect(.degrees(-45))
+                Rectangle().fill(ink).frame(width: 17, height: 1.4)
+                    .rotationEffect(.degrees(-45))
+            }
+        }
+        .frame(width: 14, height: 14)
     }
 
     /// Hand-drawn magnifier, matching the prototype's ring + handle.
@@ -522,8 +569,10 @@ public struct RosterView: View {
         Button {
             // Pinning re-ranks the list under the thumb; the buzz is the
             // acknowledgement that the tap took, before the write round-trips.
-            model.feedback(pinned ? .unpin : .pin)
-            Task { await model.setBotPinned(botID: bot.id, pinned: !pinned) }
+            // `pinBotWithFeedback` owns that haptic and the two-beat toast
+            // (plugin.js:4056-4066) — without it a gateway that refuses the
+            // write just slides the row back with no explanation.
+            Task { await model.pinBotWithFeedback(botID: bot.id, pinned: !pinned) }
         } label: {
             Label(pinned ? CopyPack.rosterUnpin(theme.id) : CopyPack.rosterPin(theme.id),
                   systemImage: pinned ? "pin.slash" : "pin")
@@ -534,7 +583,10 @@ public struct RosterView: View {
             Label(copy.editLook, systemImage: "paintbrush")
         }
         Button {
-            Task { await model.duplicateProfile(from: bot.id, to: model.cloneID(for: bot.id)) }
+            // Narrated: "Duplicating <name>…" → "Created <new> — full copy of
+            // <name>", or the failure in its place (plugin.js:4079-4085). The
+            // roster has no other surface to report a clone from.
+            Task { await model.duplicateBotWithFeedback(from: bot.id) }
         } label: {
             Label(CopyPack.rosterDuplicate(theme.id), systemImage: "plus.square.on.square")
         }
@@ -753,6 +805,13 @@ public struct RosterView: View {
                 }
             }
             .foregroundStyle(fg)
+            // A bare digit beside a bot's name is read out as a number with no
+            // noun attached — "3" could as easily be a model or a position in
+            // the list. The hold marker has the same problem one step further
+            // on: its glyph is "!", which VoiceOver reads as punctuation or not
+            // at all.
+            .accessibilityLabel(Text(isHold ? CopyPack.rosterHoldMarker(theme.id)
+                                            : CopyPack.unreadBadge(bot.unread, theme.id)))
         }
     }
 
@@ -839,6 +898,16 @@ extension CopyPack {
         case .soft: "Pinned"
         case .control: "PINNED"
         case .ink: "kept at the head"
+        }
+    }
+
+    /// Screen-reader name for the badge in its hold form. The glyph is a bare
+    /// "!", which VoiceOver reads as punctuation or not at all.
+    static func rosterHoldMarker(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Waiting for approval"
+        case .control: "AWAITING APPROVAL"
+        case .ink: "held, pending your leave"
         }
     }
 

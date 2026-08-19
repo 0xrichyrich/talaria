@@ -202,11 +202,12 @@ public struct RoutinesView: View {
         actionNote = nil
         Task { @MainActor in
             defer { busyRoutineID = nil }
-            do {
-                try await model.deleteRoutine(routine)
-            } catch {
-                actionError = AppModel.reason(error)
-            }
+            // Routines is a pushed screen rather than a sheet, so the toast is
+            // actually visible here — and it is the only thing that puts a
+            // routine deletion into the Activity ledger. `cron.manage` reports
+            // its own failures inside a successful envelope, which the wrapper
+            // surfaces in the gateway's own words.
+            actionError = await model.deleteRoutineWithFeedback(routine)
         }
     }
 

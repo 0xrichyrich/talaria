@@ -280,7 +280,26 @@ extension AppModel {
                 // `draft.text`). Order is not incidental: the attachment
                 // rewrite below prepends "@file:<path>" refs, and a mention
                 // scan downstream of it would read those as an @file handle.
-                let routed = routeMentions(in: trimmed, from: botID)
+                // Bot Mode's canonical chat is one conversation forever.
+                // Desktop's composer middleware intercepts a bare `/new` or
+                // `/reset` aimed at that pinned chat and runs `/compact`
+                // instead (plugin.js:8215-8241). Scratch sessions keep the
+                // commands unchanged, and an unresolved pin is deliberately
+                // not guessed at.
+                let pin = CanonicalChatRuntime.shared.pins[botID]
+                let canonical = pin != nil && chat.storedSessionID == pin
+                let guarded: String
+                switch ForeverChatGuard.resolve(trimmed, isCanonicalChat: canonical) {
+                case .run(let text):
+                    guarded = text
+                case .rewritten(let replacement):
+                    guarded = replacement
+                    toast(kind: .info,
+                          title: theme.copy.toastNeverResetsTitle(theme.themeID),
+                          message: theme.copy.toastNeverResetsBody(theme.themeID),
+                          botID: botID)
+                }
+                let routed = routeMentions(in: guarded, from: botID)
                 // Staged attachments only reach the agent if their "@file:"
                 // refs ride the prompt (images ride the session) — the
                 // attachments surface owns that rewrite.

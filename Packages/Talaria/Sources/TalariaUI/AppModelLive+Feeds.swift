@@ -518,7 +518,14 @@ public extension AppModel {
     func setRoutineEnabled(_ routine: Routine, enabled: Bool) {
         guard let idx = routines.firstIndex(where: { $0.id == routine.id }) else { return }
         routines[idx].isOn = enabled
-        guard mode == .live, let client else { return }
+        let key = "routine-toggle:\(routine.id)"
+        toast(kind: .info,
+              title: theme.copy.toastRoutinePaused(routine.name, on: enabled, theme.themeID),
+              botID: routine.botID, key: key)
+        guard mode == .live, let client else {
+            settleToast(key: key)
+            return
+        }
         Task { @MainActor in
             let runtime = FeedsRuntime.shared
             do {
@@ -526,11 +533,16 @@ public extension AppModel {
                                                profile: runtime.cronScope[routine.id] ?? nil)
                 runtime.routinesError = nil
                 await refreshRoutinesLive(force: true)
+                settleToast(key: key)
             } catch {
                 if let i = routines.firstIndex(where: { $0.id == routine.id }) {
                     routines[i].isOn = !enabled
                 }
-                runtime.routinesError = (error as? GatewayError)?.message ?? error.localizedDescription
+                let reason = (error as? GatewayError)?.message ?? error.localizedDescription
+                runtime.routinesError = reason
+                toast(kind: .failure,
+                      title: theme.copy.toastRoutineUpdateFailed(theme.themeID),
+                      message: reason, botID: routine.botID, key: key)
             }
         }
     }

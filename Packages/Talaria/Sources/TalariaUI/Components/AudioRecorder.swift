@@ -378,7 +378,7 @@ public enum VoiceAudioSession {
         let session = AVAudioSession.sharedInstance()
         if session.category != .playAndRecord || session.mode != .voiceChat {
             try session.setCategory(.playAndRecord, mode: .voiceChat,
-                                    options: [.defaultToSpeaker, .allowBluetoothHFP, .duckOthers])
+                                    options: [.defaultToSpeaker, .allowBluetooth, .duckOthers])
         }
         try session.setActive(true)
     }

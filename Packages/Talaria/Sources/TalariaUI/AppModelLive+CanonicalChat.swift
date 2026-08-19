@@ -445,11 +445,24 @@ extension AppModel {
     /// One themed line in the transcript, in the voice every session failure
     /// uses. Never a fork: a failed open is transient and the pin stays
     /// (plugin.js:2864-2871).
+    ///
+    /// Since Phase D it also says so out loud — `notifyError(error, "Could not
+    /// open <name>'s chat — try again")` (plugin.js:2878). The transcript line
+    /// alone was not enough: the tap has already switched tabs and put an empty
+    /// chat on screen, so the one surface carrying the explanation is the one
+    /// the user is least likely to be looking at, and "try again" is the whole
+    /// instruction — the pin is innocent and a second tap usually works.
+    ///
+    /// Both halves are guarded by the same repeat check. A retry loop against a
+    /// dead link would otherwise stack an identical card three times over.
     private func reportCanonicalFailure(_ error: Error, botID: String) {
         let text = Self.sessionFailure(error, theme: theme)
         let chat = chat(for: botID)
         guard chat.messages.last?.text != text else { return }
         chat.messages.append(ChatMessage(author: .system, text: text))
+        toast(kind: .failure,
+              title: theme.copy.toastOpenChatFailed(botName(botID, theme.themeID), theme.themeID),
+              message: Self.reason(error), botID: botID)
     }
 }
 

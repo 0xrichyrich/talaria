@@ -96,6 +96,12 @@ extension AppModel {
         let client = GatewayClient(baseURL: baseURL, credential: credential)
         self.client = client
         runtime.baseURL = baseURL
+        // The unread marks survive a switch (being durable is the point), but
+        // the store has to be pointed at the gateway now being answered for.
+        // Nothing else does it until the first roster answer lands, and an
+        // `acknowledge` inside that window would otherwise advance the DEPARTED
+        // gateway's mark for a profile that merely shares a name.
+        rescopeUnreadWatermarks()
 
         // Events fan out of the client on its own actor; funnel them through
         // one AsyncStream so MainActor delivery preserves wire order (deltas
@@ -143,6 +149,10 @@ extension AppModel {
             ConnectionRegistry.shared.noteState(.offline, forURL: base)
         }
         runtime.baseURL = nil
+        // No gateway, no scope: with the key cleared the store records nothing
+        // until a connection names one again, so a disconnected app can never
+        // write a mark into the departed gateway's bucket.
+        rescopeUnreadWatermarks()
         client = nil
         isOffline = false
         // Each area's router owns state belonging to *that* gateway. Without
@@ -203,6 +213,11 @@ extension AppModel {
         // every tick, so left standing they poll the NEXT gateway with the last
         // one's ids — the one way a2a state can cross a switch.
         detachA2ARouter()
+        // A toast is the app answering a mutation aimed at THIS gateway. Left
+        // standing across a switch, "Duplicating inbox…" hangs over a roster
+        // that never had an `inbox`, and its ledger row would settle into the
+        // next gateway's journal when the answer finally arrives.
+        clearToasts()
     }
 
     /// Probe every saved gateway and sync the Connections rows.
@@ -250,10 +265,16 @@ extension AppModel {
         // no `has_avatar` until the next poll landed. Which is the same flip
         // this whole path exists to prevent, one layer down.
         RosterSignals.shared.rescope(to: runtime.baseURL)
-        // Ranking, the 90 s liveness window, unread watermarks and `has_avatar`,
-        // taken from the SAME answer the map below reads — not from a second
-        // call landing seconds later.
-        let moved = RosterSignals.shared.ingest(profiles)
+        // Ranking, the 90 s liveness window and `has_avatar`, taken from the
+        // SAME answer the map below reads — not from a second call landing
+        // seconds later.
+        RosterSignals.shared.ingest(profiles)
+        // …and the unread diff off the stamps that ingest just restated. It runs
+        // HERE, synchronously between the fold and the rows, rather than from an
+        // observer on `lastActive`: an observer's MainActor hop lands the badge
+        // write either side of `bots` being rebuilt purely by run-loop ordering,
+        // which is a race that has to be insured against instead of avoided.
+        let moved = unreadMoves(scope: runtime.baseURL)
         // A bot with a cosmetics write in flight keeps the look the user just
         // picked: this answer was composed before that write, and reading it as
         // authority would flip the row back under their thumb.
@@ -371,6 +392,11 @@ extension AppModel {
             bots[idx].unread = 0
             bots[idx].mentionsYou = false
         }
+        // The durable mark has to move with the badge, or the next roster poll
+        // finds activity this app already counted from the event stream and
+        // raises the dot again on a chat the user is reading
+        // (AppModelLive+Unread.swift).
+        noteChatOpened(botID)
         guard mode == .live, !isOffline else { return }
         Task { @MainActor in await self.enterCanonicalChat(botID: botID) }
     }
@@ -637,6 +663,15 @@ extension AppModel {
                 if what == "sessions.changed" { try? await self.refreshRoster() }
                 if what == "cron.changed" { try? await self.refreshRoutines() }
             }
+
+        case .notificationShow(let payload):
+            showAgentNotice(payload)
+
+        case .notificationClear(let key):
+            clearAgentNotice(key)
+
+        case .backgroundComplete(let taskID, let text):
+            reportBackgroundCompletion(taskID: taskID, text: text, botID: botID)
 
         case .other(let raw) where raw.type == "session.reclaimed":
             // Backend reclaimed a parked runtime session (idle TTL / orphan

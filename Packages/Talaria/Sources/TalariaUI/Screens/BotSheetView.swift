@@ -440,8 +440,9 @@ public struct BotSheetView: View {
         }
         pinWarning = false
         Task {
-            await model.saveProfileEdit(botID: botID,
-                                        edit: ProfileEdit(model: choice.model, provider: provider))
+            await model.saveProfileEditWithFeedback(
+                botID: botID,
+                edit: ProfileEdit(model: choice.model, provider: provider))
         }
     }
 
@@ -531,11 +532,14 @@ public struct BotSheetView: View {
         guard !duplicating, model.bot(botID) != nil else { return }
         duplicating = true
         duplicateFailed = false
-        let newID = model.cloneID(for: botID)
         Task {
-            let ok = await model.duplicateProfile(from: botID, to: newID)
+            // Narrated through the toast bus as well as the sheet's own inline
+            // flag: the sheet dismisses on success, so the row that names the
+            // clone has to land somewhere that outlives it (and in the Activity
+            // ledger, which the inline flag never reached).
+            let clone = await model.duplicateBotWithFeedback(from: botID)
             duplicating = false
-            guard ok else {
+            guard clone != nil else {
                 duplicateFailed = true
                 return
             }

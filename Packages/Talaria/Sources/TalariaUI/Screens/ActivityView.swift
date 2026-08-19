@@ -14,6 +14,26 @@ import TalariaTheme
 // cron.changed runs, inbound A2A mentions), the approvals array (raised and
 // cleared) and the connection monitor (link lost / restored) — persisted to
 // UserDefaults, newest 200, so the tab is never empty on relaunch.
+//
+// Since the toast bus (AppModelLive+Toasts.swift) the journal also carries the
+// half of the story that used to leave no trace: what YOU did. A pin, a
+// duplicate, a look save, a delete, a model switch — each posts its optimistic
+// toast and its confirmation under one key, so the ledger keeps ONE row per act
+// that goes from pending to settled rather than two rows arguing.
+//
+// What that means for this screen:
+//
+//  · Live mode renders the persisted journal, never DemoData. `publishActivity`
+//    is guarded on `mode == .live`, and every toast-mirrored row goes through
+//    `toast()`, which carries the same guard — `recordActivity` itself has none,
+//    so a demo pin stays out of the persisted journal because the bus keeps it
+//    out, not because the journal refuses it.
+//  · A pending row is an act whose answer had not landed yet. Answers arrive in
+//    memory, so a row left pending by a killed app is swept on appear
+//    (`settleStalePendingToasts`) instead of pulsing forever at a question that
+//    stopped being open hours ago.
+//  · The footer says where these rows come from, because "Activity" on a tab bar
+//    reads like a server-side feed and this one is emphatically local.
 
 public struct ActivityView: View {
     private let model: AppModel
@@ -49,7 +69,7 @@ public struct ActivityView: View {
                     ForEach(model.activity) { day in
                         dayGroup(day)
                     }
-                    if model.activity.isEmpty { emptyState }
+                    if model.activity.isEmpty { emptyState } else { provenanceNote }
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 4)
@@ -58,7 +78,13 @@ public struct ActivityView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(theme.bg)
-        .task { model.attachActivityRouter() }
+        .task {
+            model.attachActivityRouter()
+            // Answers live in memory; the ledger lives on disk. Anything still
+            // marked pending from a previous launch is settled before the first
+            // paint, so a wax seal only ever pulses at something real.
+            model.settleStalePendingToasts()
+        }
         .confirmationDialog(copy.clearLedger(theme.id), isPresented: $confirmingClear) {
             Button(copy.clearLedger(theme.id), role: .destructive) {
                 model.clearActivityJournal()
@@ -116,6 +142,24 @@ public struct ActivityView: View {
                 .overlay(alignment: .bottom) {
                     theme.ink.opacity(0.5).frame(height: 2)
                 }
+        }
+    }
+
+    /// Where these rows came from. The other derived screens carry the same kind
+    /// of footnote (`artifactsDerivationNote`, the routines note) for the same
+    /// reason: this app makes a point of never letting a derived surface pass
+    /// itself off as a server-side feed. Demo mode is not annotated — there is
+    /// nothing honest to say about a canned ledger.
+    @ViewBuilder private var provenanceNote: some View {
+        if model.mode == .live {
+            Text(copy.ledgerScopeNote(theme.id, count: model.activityRowCount,
+                                      cap: model.activityRowLimit))
+                .font(theme.id == .control ? theme.mono(9) : theme.body(11))
+                .italic(theme.id == .ink)
+                .foregroundStyle(theme.faint)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 4)
+                .padding(.top, 2)
         }
     }
 

@@ -1,6 +1,7 @@
 # Plan — 1:1 with the Bot Mode plugin
 
-**Status: proposed, awaiting review. Nothing here is implemented.**
+**Status: Phases B, C and D have landed. A–F below are unchanged from the proposal;
+the per-phase notes record what actually shipped.**
 
 Target: [`apps/desktop/src/plugins/hermes-bots/plugin.js`](../../hermes-agent-upstream/apps/desktop/src/plugins/hermes-bots/plugin.js),
 8,323 lines, audited row-by-row in [BOT-MODE-PARITY.md](BOT-MODE-PARITY.md).
@@ -13,23 +14,23 @@ against a real gateway.
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 1. Roster rows | 73 | 26 | 34 | 8 | 5 |
 | 2. Bot CRUD, cosmetics, meta | 73 | 24 | 28 | 13 | 8 |
-| 3. Canonical chat | 58 | 17 | 29 | 7 | 5 |
-| 4. Handles, search, mentions | 54 | 23 | 17 | 3 | 11 |
-| 5. A2A + group rooms | 63 | 30 | 15 | 11 | 7 |
-| 6. Notifications & activity | 63 | 30 | 15 | 13 | 5 |
-| 7. Plugin/shell integration | 59 | 19 | 24 | 5 | 11 |
-| **Total** | **443** | **169** | **162** | **60** | **52** |
+| 3. Canonical chat | 58 | 16 | 29 | 8 | 5 |
+| 4. Handles, search, mentions | 54 | 15 | 15 | 13 | 11 |
+| 5. A2A + group rooms | 63 | 29 | 14 | 14 | 6 |
+| 6. Notifications & activity | 63 | 14 | 17 | 27 | 5 |
+| 7. Plugin/shell integration | 59 | 16 | 22 | 10 | 11 |
+| **Total** | **443** | **140** | **159** | **93** | **51** |
 
-**~36% of the portable surface** (391 rows once the 52 ➖ are excluded,
+**~44% of the portable surface** (392 rows once the 51 ➖ are excluded,
 counting a 🔶 as half). The shape of that number matters more than the number:
 
-- **162 🔶 are written but unproven.** The overnight run believed no gateway
+- **159 🔶 are written but unproven.** The overnight run believed no gateway
   was reachable — it was probing loopback while the gateway binds the tailnet
   IP — so everything gateway-dependent was marked partial regardless of
   quality. This is the cheapest parity in the document.
-- **169 ⭕ are concentrated**, not spread thin: Region 4 (handles/search/
-  mentions) has 3 ✅ of 54, and Region 5 carries **group rooms**, an entire
-  unbuilt feature rather than a gap.
+- **140 ⭕ are concentrated**, not spread thin: Region 4's handle/search/
+  mention core has landed, while Region 5 still carries **group rooms**, an
+  entire unbuilt feature rather than a scatter of small gaps.
 - **Region 1 at 8 ✅ of 73** is not a broken roster — the roster works. It is
   that the plugin puts enormous craft into that one screen, and each piece of
   craft is its own row.
@@ -102,18 +103,36 @@ carry more weight here than they do on a laptop.
 
 ---
 
-## Phase D — Notifications & activity (~2 days)
+## Phase D — Notifications & activity (~2 days) — ✅ **landed 2026-08-18**
 
 Region 6's 30 ⭕. Mostly about a phone that was asleep catching up correctly.
 
-1. **Roster unread watermarks** — the only model that catches cron, CLI,
-   another machine, or anything that happened while the phone slept.
-2. **A live toast bus** — today a failed pin, duplicate, or cosmetic save
-   produces *no* user-visible feedback in live mode. Optimistic-then-confirm
-   pairs across every mutation.
-3. **Activity ledger completeness** — every toast mirrored into the feed, so
-   the Activity tab is a real log rather than a demo artifact.
-4. **Notification copy + routing parity** with the plugin's own strings.
+1. **Roster unread watermarks** — ✅ the only model that catches cron, CLI,
+   another machine, or anything that happened while the phone slept. Durable and
+   per-gateway, which is a deliberate divergence from upstream's per-mount flag:
+   a phone is killed minutes after backgrounding, so a per-launch seed would
+   declare the whole backlog read on every cold start. The fold is a pure
+   function in TalariaKit and `talaria-verify` replays three snapshots captured
+   off a live gateway through it on every build.
+2. **A live toast bus** — ✅ built and populated. One entry point, one card, and
+   a pairing key that makes the optimistic half and its confirmation the same
+   card and the same ledger row. Six mutations narrated — pin, duplicate, look
+   save, session delete/rename, routine create/edit/toggle/delete, profile
+   create/edit/model pin, model-family switches and reasoning effort. Gateway
+   `notification.show` / `notification.clear` also use the same queue with
+   keyed replacement, sticky/TTL lifetimes and explicit clear.
+3. **Activity ledger completeness** — ✅ every toast mirrors into the journal
+   under one key that goes pending → settled, live mode only, with a stale-
+   pending sweep on appear so a row left open by a killed app stops pulsing at a
+   question that closed hours ago.
+4. **Notification copy + routing parity** — ✅ the opt-in activity toast is OFF
+   by default, persists locally, and has the roster's bell/bell-slash control;
+   inbound/generic titles and the raw 140-character body follow the plugin;
+   contextual failures and all three A2A outcomes are routed; background
+   completions surface instead of falling through the event switch; and a bare
+   `/new` or `/reset` in the pinned forever chat is rewritten to `/compact` with
+   the plugin's teaching notice. Group-room and cross-gateway-only notices stay
+   with Phases E/F because their triggering features do not exist yet.
 
 ---
 

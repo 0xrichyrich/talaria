@@ -442,8 +442,15 @@ extension AppModel {
 
     /// Session reasoning effort. "" inherits the profile default; "none" is
     /// thinking off (not a level on the scale).
+    ///
+    /// - Returns: nil when it took (including the local-only demo path), else
+    ///   the gateway's own sentence. The value used to be swallowed here and
+    ///   posted to the picker's note line alone, which is invisible the moment
+    ///   the sheet closes — `setReasoningEffortWithFeedback` needs it to say so
+    ///   anywhere durable.
+    @discardableResult
     public func applyReasoningEffort(botID: String, effort: String,
-                                     provider: String = "", model: String = "") async {
+                                     provider: String = "", model: String = "") async -> String? {
         let state = modelPicker(for: botID)
         let chat = chat(for: botID)
         let previous = chat.reasoningEffort
@@ -453,13 +460,15 @@ extension AppModel {
         }
 
         guard mode == .live, let client,
-              let sessionID = try? await ensureSession(botID: botID, hydrate: false) else { return }
+              let sessionID = try? await ensureSession(botID: botID, hydrate: false) else { return nil }
         do {
             _ = try await client.applyReasoningEffort(sessionID: sessionID, value: effort)
+            return nil
         } catch {
             chat.reasoningEffort = previous
-            state.note((error as? GatewayError)?.message ?? error.localizedDescription,
-                       warning: true)
+            let reason = (error as? GatewayError)?.message ?? error.localizedDescription
+            state.note(reason, warning: true)
+            return reason
         }
     }
 

@@ -23,6 +23,16 @@ import TalariaTheme
 // (AppModel.requestCapabilities) and `.talariaOpenSessions` — so a screen this
 // view doesn't own can ask for a push without a binding threaded through it.
 
+/// Reports the on-stage push banner's height up to the root, so the toast stack
+/// can offset under it. Zero when no banner is mounted, which is the default and
+/// every live session.
+private struct BannerHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 public struct TalariaRootView: View {
     private let model: AppModel
 
@@ -59,6 +69,9 @@ public struct TalariaRootView: View {
 
     // Demo push banner cycle.
     @State private var activeBanner: BannerPush?
+    /// Height of the banner currently on stage, so the toast stack can sit
+    /// under it instead of over it. Zero whenever there is no banner.
+    @State private var bannerHeight: CGFloat = 0
 
     // Theme-swap flash (tSwapX/tSwapY).
     @State private var themeSwapDim = false
@@ -132,6 +145,26 @@ public struct TalariaRootView: View {
             .opacity(themeSwapDim ? 0.3 : 1)
             .scaleEffect(themeSwapDim ? 0.982 : 1)
 
+            // The toast stack (Components/ToastBus.swift). Deliberately OUTSIDE
+            // the VStack above: Settings, the approval-policy screen and Solo
+            // all push over the screen graph from modifiers applied inside it,
+            // so a toast mounted in `screenGraph` would be covered by the very
+            // screen that fired it.
+            //
+            // No zIndex, on purpose. The two overlays below carry none either,
+            // and in a ZStack an explicit zIndex sorts above every default-0
+            // sibling regardless of declaration order — stamping one here would
+            // lift toasts over the parked-agent prompts, which outrank
+            // everything because a tool thread is blocked on the answer.
+            // Declaration order puts this exactly where it belongs: over the
+            // screen graph, under those prompts.
+            //
+            // The inset is the one collision the two surfaces genuinely have:
+            // the demo push banner is on stage for 4.8 s and a demo mutation can
+            // toast underneath it. Its own height, so they stack rather than
+            // overlap; zero the rest of the time, which is every live session.
+            ToastHost(model: model, topInset: activeBanner == nil ? 0 : bannerHeight + 8)
+
             // Parked-agent prompts (z55). Mounted unconditionally — each
             // renders nothing until its request arrives, and each outranks
             // every other surface, banner included, because a tool thread is
@@ -143,6 +176,7 @@ public struct TalariaRootView: View {
                 ScanlineOverlay()
             }
         }
+        .onPreferenceChange(BannerHeightKey.self) { bannerHeight = $0 }
         .preferredColorScheme(theme.statusBarDark ? .dark : .light)
         .tint(theme.accent)
         // Appearance (Settings → Appearance) is app-wide, so it is adopted at
@@ -305,6 +339,16 @@ public struct TalariaRootView: View {
             if let banner = activeBanner {
                 VStack {
                     bannerView(banner)
+                        // Measured rather than guessed: the toast stack sits
+                        // above this and offsets by exactly this much while a
+                        // banner is on stage, and the card's height moves with
+                        // Dynamic Type and with the approve/later row.
+                        .background(
+                            GeometryReader { proxy in
+                                Color.clear.preference(key: BannerHeightKey.self,
+                                                       value: proxy.size.height)
+                            }
+                        )
                     Spacer()
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))

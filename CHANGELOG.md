@@ -9,13 +9,11 @@ All notable changes to Talaria. Format follows
 The overnight run: roadmap phases 0–5, landed unattended in one session and
 reviewed the next morning. Six commits, ~27,000 lines, 73 files.
 
-**Read this first: nothing in this entry has been run against a live gateway.**
-No gateway was reachable during the run, so every behaviour below is a shape
-read from the upstream Python and compiled, not a shape seen on the wire. The
-parity docs record that distinction rather than smoothing it over — 26 of the 30
-rows moved in [PARITY.md](PARITY.md) are 🔶 "built but never run against a live
-gateway", not ✅. [docs/OVERNIGHT-REPORT.md](docs/OVERNIGHT-REPORT.md) lists the
-live checks to run first, in the order most likely to find a real bug.
+**Verification note.** The overnight batch itself had no live gateway. A
+same-day phone/gateway pass subsequently verified and fixed cron job ids, model
+provider routing, and roster-cosmetics refresh. Phase D below passes every build
+gate but still needs its focused live-device checks. The parity docs keep those
+distinctions explicit rather than treating compiled wire shapes as observed.
 
 ### Fixed
 
@@ -68,6 +66,12 @@ live checks to run first, in the order most likely to find a real bug.
   generation via `image.generate` → `profiles.set_asset`; and roster craft —
   recency ranking, the 90-second liveness window, pinning, and an unread
   watermark that catches CLI, cron and other-machine deliveries.
+- **Notifications and activity (Phase D)** — durable per-gateway unread
+  watermarks; a default-off activity-toast preference with a roster bell;
+  themed optimistic→confirmed mutation cards mirrored into the Activity
+  journal; contextual failures and A2A/routine/profile/session/model feedback;
+  gateway-native keyed sticky/TTL notices and background completions; and the
+  canonical-chat guard that rewrites bare `/new` and `/reset` to `/compact`.
 - **Solo mode** (`SoloEngine.swift`, `FoundationModelsProvider.swift`,
   `SoloTools.swift`, `Screens/SoloExplainerView.swift`) — a native agent loop
   over Apple Foundation Models, with the tool set iOS permits and the *same*
@@ -89,9 +93,9 @@ live checks to run first, in the order most likely to find a real bug.
 
 ### Known gaps
 
-Group rooms (Region 5 of the Bot Mode contract) are still unbuilt; `/new` inside
-a canonical chat is not rerouted to `/compact`; there is no `set_hidden`
-reconciliation sweep for sessions created before the fix. Full list in
+Group rooms (Region 5 of the Bot Mode contract) are still unbuilt; there is no
+`set_hidden` reconciliation sweep for sessions created before the fix; and full
+multi-gateway federation remains a later phase. Full list in
 [docs/ROADMAP.md](docs/ROADMAP.md#what-is-actually-left).
 
 ## [0.1.0] — 2026-08-17
