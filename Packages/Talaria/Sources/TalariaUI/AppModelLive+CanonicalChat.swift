@@ -62,13 +62,27 @@ final class CanonicalChatRuntime {
         writing.contains(botID) || writeCount[botID] != sampled[botID]
     }
 
-    /// Pins belong to the gateway that served them; a swap starts clean.
-    func reset() {
-        pins.removeAll()
-        writing.removeAll()
-        writeCount.removeAll()
-        for task in opens.values { task.cancel() }
-        opens.removeAll()
+    /// Clear bare ids owned by the primary gateway while retaining qualified
+    /// remote chats whose clients remain connected.
+    func resetPrimaryScope() {
+        let primary = pins.keys.filter { GatewayBotRoute(qualifiedID: $0) == nil }
+        for key in primary { pins.removeValue(forKey: key) }
+        writing = Set(writing.filter { GatewayBotRoute(qualifiedID: $0) != nil })
+        writeCount = writeCount.filter { GatewayBotRoute(qualifiedID: $0.key) != nil }
+        let primaryOpens = opens.filter { GatewayBotRoute(qualifiedID: $0.key) == nil }
+        for task in primaryOpens.values { task.cancel() }
+        for key in primaryOpens.keys { opens.removeValue(forKey: key) }
+    }
+
+    func resetRoutedScope(gatewayID: String) {
+        let prefix = gatewayID + GatewayBotRoute.separator
+        let keys = pins.keys.filter { $0.hasPrefix(prefix) }
+        for key in keys { pins.removeValue(forKey: key) }
+        writing = Set(writing.filter { !$0.hasPrefix(prefix) })
+        writeCount = writeCount.filter { !$0.key.hasPrefix(prefix) }
+        let tasks = opens.filter { $0.key.hasPrefix(prefix) }
+        for task in tasks.values { task.cancel() }
+        for key in tasks.keys { opens.removeValue(forKey: key) }
     }
 }
 
@@ -109,7 +123,8 @@ extension AppModel {
     /// desktop's roster row still opens the pin (plugin.js:2726-2738), so the
     /// primary tap re-resolves rather than resuming whatever is bound.
     func enterCanonicalChat(botID: String) async {
-        guard mode == .live, !isOffline else { return }
+        guard mode == .live,
+              !isOffline || GatewayBotRoute(qualifiedID: botID) != nil else { return }
         let runtime = CanonicalChatRuntime.shared
 
         // Coalesce: a double tap, or a tap racing a deep link, must resolve
@@ -161,15 +176,17 @@ extension AppModel {
     /// `ensureSession` funnels every create/resume through here, so a message
     /// typed before the chat finished opening lands in the forever chat rather
     /// than forking a fresh session — the failure this phase exists to fix.
-    func attachCanonicalSession(botID: String, hydrate: Bool) async throws -> String {
-        guard let client else { throw GatewayError(code: -3, message: "not connected") }
+    func attachCanonicalSession(botID: String, route: GatewayBotRoute,
+                                client: GatewayClient, hydrate: Bool) async throws -> String {
         let chat = chat(for: botID)
         let runtime = CanonicalChatRuntime.shared
+        let profile = route.profile
 
         // An explicit binding wins: the user named this conversation (sessions
         // sheet, artifact jump, inbox jump), or a reconnect is re-attaching it.
         if let bound = chat.storedSessionID, !bound.isEmpty {
-            switch await attach(bound, botID: botID, hydrate: hydrate, client: client) {
+            switch await attach(bound, botID: botID, route: route,
+                                hydrate: hydrate, client: client) {
             case .attached(let sid, _): return sid
             case .missing: break            // vanished under us — re-resolve
             case .failed(let error): throw error
@@ -183,7 +200,8 @@ extension AppModel {
         //     (methods_session.py:346-380). One round trip instead of two, and
         //     the answer describes the exact operation we care about.
         if let pin = runtime.pins[botID], !pin.isEmpty, pin != chat.storedSessionID {
-            switch await attach(pin, botID: botID, hydrate: hydrate, client: client) {
+            switch await attach(pin, botID: botID, route: route,
+                                hydrate: hydrate, client: client) {
             case .attached(let sid, _): return sid
             case .missing: break            // definitively gone → recover below
             case .failed(let error): throw error
@@ -197,7 +215,7 @@ extension AppModel {
         //     session deliberately: adopting whatever ran last would let a
         //     cron delivery become the forever chat, which is the hijack the
         //     pin exists to prevent.
-        switch await attach(Self.canonicalChatTitle, botID: botID,
+        switch await attach(Self.canonicalChatTitle, botID: botID, route: route,
                             hydrate: hydrate, client: client) {
         case .attached(let sid, let stored):
             await pinCanonicalChat(stored, botID: botID)
@@ -229,13 +247,14 @@ extension AppModel {
         // (methods_session.py:180-186), so without it this "does the bot have
         // history?" probe reads a desktop-born forever chat as no history at
         // all — and answers by minting a second one.
-        if let newest = (try? await client.listSessions(limit: 20, profile: botID,
+        if let newest = (try? await client.listSessions(limit: 20, profile: profile,
                                                         includeHidden: true))?
             .first(where: { !$0.id.isEmpty })?.id, !candidates.contains(newest) {
             candidates.append(newest)
         }
         for candidate in candidates {
-            switch await attach(candidate, botID: botID, hydrate: hydrate, client: client) {
+            switch await attach(candidate, botID: botID, route: route,
+                                hydrate: hydrate, client: client) {
             case .attached(let sid, let stored):
                 await pinCanonicalChat(stored, botID: botID)
                 return sid
@@ -266,21 +285,22 @@ extension AppModel {
         //     secret. Without it a phone-born forever chat drops a "Bot Chat"
         //     row into every shared list — desktop recents, the resume picker
         //     — that a desktop-born one never appears in.
-        let live = try await client.createSession(profile: botID,
+        let live = try await client.createSession(profile: profile,
                                                   title: Self.canonicalChatTitle,
                                                   hidden: true)
         guard !live.sessionID.isEmpty else {
             throw GatewayError(code: -8, message: "session.create returned no id")
         }
         let stored = live.storedSessionID
-        adopt(live, storedID: stored.isEmpty ? nil : stored, botID: botID)
+        adopt(live, storedID: stored.isEmpty ? nil : stored, botID: botID,
+              sourceGatewayID: route.gatewayID)
         if !stored.isEmpty { await pinCanonicalChat(stored, botID: botID) }
         return live.sessionID
     }
 
     /// Resume `target` — a durable key or the canonical title — and bind the
     /// bot's chat to whatever it resolved to.
-    private func attach(_ target: String, botID: String, hydrate: Bool,
+    private func attach(_ target: String, botID: String, route: GatewayBotRoute, hydrate: Bool,
                         client: GatewayClient) async -> CanonicalAttach {
         let chat = chat(for: botID)
         let rebinding = chat.storedSessionID != target
@@ -290,16 +310,18 @@ extension AppModel {
             // shape that has proven flaky, so one round trip with
             // authoritative rows is the better trade — the same one
             // `openStoredSession` makes.
-            let live = try await client.resumeSession(target, profile: botID,
+            let live = try await client.resumeSession(target, profile: route.profile,
                                                       deferHistory: false)
             guard !live.sessionID.isEmpty else {
                 return .failed(GatewayError(code: -8, message: "session.resume returned no id"))
             }
             // `target` may have been the TITLE; the ack carries the real key.
             let stored = live.storedSessionID.isEmpty ? target : live.storedSessionID
-            adopt(live, storedID: stored, botID: botID)
+            adopt(live, storedID: stored, botID: botID,
+                  sourceGatewayID: route.gatewayID)
             if hydrate {
-                await hydrateCanonical(live, botID: botID, clearWhenEmpty: rebinding)
+                await hydrateCanonical(live, botID: botID, profile: route.profile,
+                                       client: client, clearWhenEmpty: rebinding)
             }
             replayInflight(live, botID: botID)
             replayPendingPrompts(live)
@@ -317,11 +339,17 @@ extension AppModel {
     /// Bind the chat to a resolved session. Message history is left alone —
     /// the hydration step owns it, so a message typed before the chat finished
     /// opening keeps its optimistic bubble.
-    private func adopt(_ live: LiveSession, storedID: String?, botID: String) {
+    private func adopt(_ live: LiveSession, storedID: String?, botID: String,
+                       sourceGatewayID: String) {
         let chat = chat(for: botID)
         let runtime = LiveRuntime.shared
         if let old = chat.sessionID, old != live.sessionID {
-            runtime.sessionToBot.removeValue(forKey: old)
+            if sourceGatewayID == runtime.gatewayID {
+                runtime.sessionToBot.removeValue(forKey: old)
+            } else {
+                runtime.routedSessionToBot.removeValue(forKey: GatewaySessionRoute(
+                    gatewayID: sourceGatewayID, sessionID: old))
+            }
         }
         if let storedID, !storedID.isEmpty {
             chat.storedSessionID = storedID
@@ -329,7 +357,7 @@ extension AppModel {
             runtime.lastSessionByBot[botID] = storedID
         }
         chat.isTyping = false
-        bindSession(live, botID: botID)
+        bindSession(live, botID: botID, sourceGatewayID: sourceGatewayID)
     }
 
     /// Drop the current binding so the next attach re-resolves from scratch.
@@ -338,7 +366,14 @@ extension AppModel {
     private func unbindChat(botID: String) {
         let chat = chat(for: botID)
         let runtime = LiveRuntime.shared
-        if let sid = chat.sessionID { runtime.sessionToBot.removeValue(forKey: sid) }
+        if let sid = chat.sessionID, let route = gatewayRoute(for: botID) {
+            if route.gatewayID == runtime.gatewayID {
+                runtime.sessionToBot.removeValue(forKey: sid)
+            } else {
+                runtime.routedSessionToBot.removeValue(forKey: GatewaySessionRoute(
+                    gatewayID: route.gatewayID, sessionID: sid))
+            }
+        }
         chat.sessionID = nil
         chat.storedSessionID = nil
         chat.isTyping = false
@@ -368,12 +403,13 @@ extension AppModel {
     /// projection is primary (it is the shape every surface reads,
     /// server.py:_history_to_messages); REST is the fallback for a resume that
     /// omitted messages.
-    private func hydrateCanonical(_ live: LiveSession, botID: String,
+    private func hydrateCanonical(_ live: LiveSession, botID: String, profile: String,
+                                  client: GatewayClient,
                                   clearWhenEmpty: Bool) async {
         var history = Self.chatMessages(fromTranscript: .array(live.messages))
-        if history.isEmpty, !live.storedSessionID.isEmpty, let client,
+        if history.isEmpty, !live.storedSessionID.isEmpty,
            let payload = try? await client.latestSessionMessages(storedID: live.storedSessionID,
-                                                                 profile: botID) {
+                                                                 profile: profile) {
             history = Self.chatMessages(fromTranscript: payload)
         }
         let chat = chat(for: botID)
@@ -418,7 +454,9 @@ extension AppModel {
         // gateway that cannot store ui_meta) still has to outrank the stale
         // roster answer that a poll already in flight is about to deliver.
         runtime.writeCount[botID, default: 0] += 1
-        guard previous != storedID, mode == .live, !isOffline, let client else { return }
+        guard previous != storedID, mode == .live,
+              let route = gatewayRoute(for: botID),
+              let client = try? await routedClient(for: route) else { return }
 
         runtime.writing.insert(botID)
         defer { runtime.writing.remove(botID) }
@@ -427,11 +465,12 @@ extension AppModel {
             // have rewritten the block since the last roster poll. Sessions are
             // not needed here and cost a per-profile db scan.
             let profiles = try await client.listProfiles(includeSessions: false)
-            guard let row = profiles.first(where: { $0.name == botID }) else { return }
+            guard let row = profiles.first(where: { $0.name == route.profile }) else { return }
             var block = row.uiMeta?["hermes-bots"]?.objectValue ?? [:]
             block["chat"] = .string(storedID)
             try await client.applyProfileEdit(
-                name: botID, ProfileEdit(uiMeta: .object(["hermes-bots": .object(block)])))
+                name: route.profile,
+                ProfileEdit(uiMeta: .object(["hermes-bots": .object(block)])))
         } catch {
             // Desktop's three-valued outcome (plugin.js:250-270) exists so an
             // older gateway that does not speak the contract produces no toast

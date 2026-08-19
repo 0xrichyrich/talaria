@@ -27,10 +27,14 @@ final class LiveRuntime {
 
     /// Runtime session id (8-hex sid) → bot/profile id.
     var sessionToBot: [String: String] = [:]
+    /// Secondary sessions require a gateway-qualified key because two Hermes
+    /// processes can issue the same short runtime id.
+    var routedSessionToBot: [GatewaySessionRoute: String] = [:]
     /// Bots with a turn in flight (drives BotStatus.working).
     var workingBotIDs: Set<String> = []
     /// approval request_id → runtime session id (for approval.respond).
     var approvalSessions: [String: String] = [:]
+    var routedApprovalSessions: [String: GatewaySessionRoute] = [:]
     /// bot id → durable stored-session key from profiles.list last_session.
     var lastSessionByBot: [String: String] = [:]
     /// The gateway's default profile — owner of un-namespaced cron jobs and
@@ -53,10 +57,23 @@ final class LiveRuntime {
 
     func resetSessionState() {
         sessionToBot.removeAll()
-        workingBotIDs.removeAll()
+        // Primary reconnects must not erase sessions that are still attached
+        // through retained secondary clients.
+        workingBotIDs = Set(workingBotIDs.filter { GatewayBotRoute(qualifiedID: $0) != nil })
         approvalSessions.removeAll()
-        for task in attachTasks.values { task.cancel() }
-        attachTasks.removeAll()
+        let primaryTasks = attachTasks.filter { GatewayBotRoute(qualifiedID: $0.key) == nil }
+        for task in primaryTasks.values { task.cancel() }
+        for key in primaryTasks.keys { attachTasks.removeValue(forKey: key) }
+    }
+
+    func resetRoutedState(gatewayID: String) {
+        routedSessionToBot = routedSessionToBot.filter { $0.key.gatewayID != gatewayID }
+        routedApprovalSessions = routedApprovalSessions.filter { $0.value.gatewayID != gatewayID }
+        let prefix = gatewayID + GatewayBotRoute.separator
+        workingBotIDs = Set(workingBotIDs.filter { !$0.hasPrefix(prefix) })
+        let tasks = attachTasks.filter { $0.key.hasPrefix(prefix) }
+        for task in tasks.values { task.cancel() }
+        for key in tasks.keys { attachTasks.removeValue(forKey: key) }
     }
 }
 
@@ -87,7 +104,7 @@ extension AppModel {
         runtime.resetSessionState()
         // Session ids are per-gateway; a pin from the previous one resolves to
         // nothing (or worse, something else) here.
-        CanonicalChatRuntime.shared.reset()
+        CanonicalChatRuntime.shared.resetPrimaryScope()
         // Switching gateways reaches here WITHOUT going through
         // disconnectGateway (switchGateway calls connectGateway directly), so
         // the per-gateway caches have to be dropped on both paths. Done before
@@ -193,7 +210,7 @@ extension AppModel {
         // Canonical-chat pins name sessions in THIS gateway's per-profile
         // state.db; carrying them to the next gateway would resume ids that
         // mean nothing there.
-        CanonicalChatRuntime.shared.reset()
+        CanonicalChatRuntime.shared.resetPrimaryScope()
         // ~11 MB of decoded spritesheets and a per-profile pet cache belong to
         // the gateway that served them, not to the next one.
         detachPetEventRouter()
@@ -418,7 +435,8 @@ extension AppModel {
         // raises the dot again on a chat the user is reading
         // (AppModelLive+Unread.swift).
         noteChatOpened(botID)
-        guard mode == .live, !isOffline else { return }
+        guard mode == .live,
+              !isOffline || GatewayBotRoute(qualifiedID: botID) != nil else { return }
         Task { @MainActor in await self.enterCanonicalChat(botID: botID) }
     }
 
@@ -432,10 +450,13 @@ extension AppModel {
         let runtime = LiveRuntime.shared
         if let sid = chat(for: botID).sessionID { return sid }
         if let pending = runtime.attachTasks[botID] { return try await pending.value }
-        guard client != nil else { throw GatewayError(code: -3, message: "not connected") }
+        guard let route = gatewayRoute(for: botID) else { throw GatewayRouteError.noRoute }
 
         let task = Task<String, Error> { @MainActor in
-            try await self.attachCanonicalSession(botID: botID, hydrate: hydrate)
+            let client = try await self.routedClient(for: route)
+            await self.attachRoutedEventsIfNeeded(client: client, gatewayID: route.gatewayID)
+            return try await self.attachCanonicalSession(botID: botID, route: route,
+                                                         client: client, hydrate: hydrate)
         }
         runtime.attachTasks[botID] = task
         // Clear only OUR entry. `openStoredSession` cancels the in-flight
@@ -448,11 +469,18 @@ extension AppModel {
         return try await task.value
     }
 
-    func bindSession(_ live: LiveSession, botID: String) {
+    func bindSession(_ live: LiveSession, botID: String, sourceGatewayID: String? = nil) {
         let chat = chat(for: botID)
         chat.sessionID = live.sessionID
         if !live.storedSessionID.isEmpty { chat.storedSessionID = live.storedSessionID }
-        LiveRuntime.shared.sessionToBot[live.sessionID] = botID
+        let runtime = LiveRuntime.shared
+        let gatewayID = sourceGatewayID ?? gatewayRoute(for: botID)?.gatewayID
+        if gatewayID == runtime.gatewayID {
+            runtime.sessionToBot[live.sessionID] = botID
+        } else if let gatewayID {
+            runtime.routedSessionToBot[GatewaySessionRoute(gatewayID: gatewayID,
+                                                           sessionID: live.sessionID)] = botID
+        }
         if live.running {
             setWorking(botID, true)
             chat.isTyping = true
@@ -564,12 +592,21 @@ extension AppModel {
 
     // MARK: - Event routing
 
-    func botID(forSession sessionID: String) -> String? {
-        LiveRuntime.shared.sessionToBot[sessionID]
+    func botID(forSession sessionID: String, sourceGatewayID: String? = nil) -> String? {
+        let runtime = LiveRuntime.shared
+        let gatewayID = sourceGatewayID ?? runtime.gatewayID
+        if gatewayID == runtime.gatewayID { return runtime.sessionToBot[sessionID] }
+        guard let gatewayID else { return nil }
+        return runtime.routedSessionToBot[GatewaySessionRoute(gatewayID: gatewayID,
+                                                              sessionID: sessionID)]
     }
 
     public func handle(event: GatewayEvent) {
-        let botID = botID(forSession: event.sessionID)
+        handle(event: event, sourceGatewayID: LiveRuntime.shared.gatewayID)
+    }
+
+    func handle(event: GatewayEvent, sourceGatewayID: String?) {
+        let botID = botID(forSession: event.sessionID, sourceGatewayID: sourceGatewayID)
         switch TypedGatewayEvent(event) {
         case .messageStart:
             if let botID {
@@ -633,7 +670,7 @@ extension AppModel {
                 chat.messages.append(ChatMessage(author: .system, text: error))
             }
             chat.usage = payload.usage
-            pruneApprovals(sessionID: event.sessionID)
+            pruneApprovals(sessionID: event.sessionID, sourceGatewayID: sourceGatewayID)
             setWorking(botID, false)
             if let idx = bots.firstIndex(where: { $0.id == botID }) {
                 if !payload.text.isEmpty {
@@ -672,7 +709,7 @@ extension AppModel {
             }
 
         case .approvalRequest(let request):
-            ingest(request)
+            ingest(request, sourceGatewayID: sourceGatewayID, owner: botID)
 
         case .errorEvent(let message):
             if let botID, !message.isEmpty {
@@ -681,8 +718,13 @@ extension AppModel {
 
         case .changed(let what):
             Task { @MainActor in
-                if what == "sessions.changed" { try? await self.refreshRoster() }
-                if what == "cron.changed" { try? await self.refreshRoutines() }
+                if sourceGatewayID == LiveRuntime.shared.gatewayID {
+                    if what == "sessions.changed" { try? await self.refreshRoster() }
+                    if what == "cron.changed" { try? await self.refreshRoutines() }
+                } else if let sourceGatewayID, what == "sessions.changed" {
+                    await ConnectionRegistry.shared.refreshSecondaryRoster(
+                        gatewayID: sourceGatewayID)
+                }
             }
 
         case .notificationShow(let payload):
@@ -700,11 +742,18 @@ extension AppModel {
             // from the durable key.
             let sid = raw.payload?["session_id"]?.stringValue ?? ""
             guard !sid.isEmpty else { return }
-            for chat in chats.values where chat.sessionID == sid || chat.storedSessionID == sid {
-                chat.sessionID = nil
-                chat.isTyping = false
-            }
-            if let owner = LiveRuntime.shared.sessionToBot.removeValue(forKey: sid) {
+            if let owner = self.botID(forSession: sid, sourceGatewayID: sourceGatewayID) {
+                let chat = chat(for: owner)
+                if chat.sessionID == sid || chat.storedSessionID == sid {
+                    chat.sessionID = nil
+                    chat.isTyping = false
+                }
+                if sourceGatewayID == LiveRuntime.shared.gatewayID {
+                    LiveRuntime.shared.sessionToBot.removeValue(forKey: sid)
+                } else if let sourceGatewayID {
+                    LiveRuntime.shared.routedSessionToBot.removeValue(
+                        forKey: GatewaySessionRoute(gatewayID: sourceGatewayID, sessionID: sid))
+                }
                 setWorking(owner, false)
             }
 
@@ -715,13 +764,20 @@ extension AppModel {
 
     // MARK: - Approvals
 
-    private func ingest(_ request: ApprovalRequest) {
+    private func ingest(_ request: ApprovalRequest, sourceGatewayID: String? = nil,
+                        owner explicitOwner: String? = nil) {
         guard !request.requestID.isEmpty,
               !approvals.contains(where: { $0.id == request.requestID }) else { return }
         let runtime = LiveRuntime.shared
-        let owner = runtime.sessionToBot[request.sessionID]
+        let owner = explicitOwner ?? botID(forSession: request.sessionID,
+                                           sourceGatewayID: sourceGatewayID)
             ?? runtime.defaultBotID ?? bots.first?.id ?? "default"
-        runtime.approvalSessions[request.requestID] = request.sessionID
+        if let sourceGatewayID, sourceGatewayID != runtime.gatewayID {
+            runtime.routedApprovalSessions[request.requestID] = GatewaySessionRoute(
+                gatewayID: sourceGatewayID, sessionID: request.sessionID)
+        } else {
+            runtime.approvalSessions[request.requestID] = request.sessionID
+        }
         approvals.append(Approval(
             id: request.requestID,
             botID: owner,
@@ -739,11 +795,17 @@ extension AppModel {
 
     /// A finished turn can hold no approvals — drop the stale ones (they were
     /// answered elsewhere, timed out, or denied by an interrupt).
-    private func pruneApprovals(sessionID: String) {
+    private func pruneApprovals(sessionID: String, sourceGatewayID: String? = nil) {
         let runtime = LiveRuntime.shared
-        let stale = runtime.approvalSessions.filter { $0.value == sessionID }.map(\.key)
+        var stale = runtime.approvalSessions.filter { $0.value == sessionID }.map(\.key)
+        if let sourceGatewayID, sourceGatewayID != runtime.gatewayID {
+            stale += runtime.routedApprovalSessions.filter {
+                $0.value == GatewaySessionRoute(gatewayID: sourceGatewayID, sessionID: sessionID)
+            }.map(\.key)
+        }
         guard !stale.isEmpty else { return }
         for id in stale { runtime.approvalSessions.removeValue(forKey: id) }
+        for id in stale { runtime.routedApprovalSessions.removeValue(forKey: id) }
         let owners = Set(approvals.filter { stale.contains($0.id) }.map(\.botID))
         approvals.removeAll { stale.contains($0.id) }
         for owner in owners { recomputeStatus(for: owner) }
@@ -763,13 +825,20 @@ extension AppModel {
         Task { @MainActor in
             do {
                 let sid = try await ensureSession(botID: botID, hydrate: false)
-                guard let client else { return }
+                guard let route = gatewayRoute(for: botID) else { throw GatewayRouteError.noRoute }
+                let client = try await routedClient(for: route)
                 try await client.submitPrompt(sessionID: sid, text: text)
             } catch let error as GatewayError where error.code == -3 || error.code == -7 {
-                // Link died mid-send — the bubble stays, the text queues, the
-                // reconnect flush retries it.
-                isOffline = true
-                composeQueue.append((botID, text))
+                if GatewayBotRoute(qualifiedID: botID) == nil {
+                    // Primary link died mid-send — the bubble stays, the text
+                    // queues, and the supervised reconnect retries it.
+                    isOffline = true
+                    composeQueue.append((botID, text))
+                } else {
+                    // A secondary failure must not mark the primary gateway
+                    // offline or silently enqueue work behind its reconnect.
+                    chat.messages.append(ChatMessage(author: .system, text: error.message))
+                }
             } catch {
                 let detail = (error as? GatewayError)?.message ?? error.localizedDescription
                 chat.messages.append(ChatMessage(author: .system, text: detail))
@@ -779,11 +848,13 @@ extension AppModel {
 
     func liveResolveApproval(_ approval: Approval, approve: Bool) {
         Task { @MainActor in
-            guard let client else { return }
+            guard let route = gatewayRoute(for: approval.botID),
+                  let client = try? await routedClient(for: route) else { return }
             let runtime = LiveRuntime.shared
             // The request → session binding was recorded when the approval
             // arrived; fall back to the bot's live session.
-            let sid = runtime.approvalSessions.removeValue(forKey: approval.id)
+            let sid = runtime.routedApprovalSessions.removeValue(forKey: approval.id)?.sessionID
+                ?? runtime.approvalSessions.removeValue(forKey: approval.id)
                 ?? chats[approval.botID]?.sessionID
             if let sid {
                 try? await client.respondToApproval(sessionID: sid,
@@ -933,7 +1004,9 @@ extension AppModel {
         let runtime = LiveRuntime.shared
         runtime.generation += 1
         runtime.resetSessionState()
-        approvals.removeAll()   // pending ones replay via session.resume below
+        approvals.removeAll { GatewayBotRoute(qualifiedID: $0.botID) == nil }
+        // Primary pending prompts replay via session.resume below; remote
+        // approvals remain backed by their still-live source connections.
 
         isOffline = false
         if let base = runtime.baseURL {
@@ -944,7 +1017,7 @@ extension AppModel {
         // Reattach every chat that had a session. Within the ~20 s grace this
         // is the live fast path (inflight + pending approval replayed); later
         // it's a cold resume from the durable key.
-        for (botID, chat) in chats {
+        for (botID, chat) in chats where GatewayBotRoute(qualifiedID: botID) == nil {
             guard let stored = chat.storedSessionID else { continue }
             chat.sessionID = nil
             chat.isTyping = false
@@ -971,9 +1044,9 @@ extension AppModel {
         }
         guard mode == .live else { return }
         Task { @MainActor in
-            guard let client else { return }
             let sid = try? await ensureSession(botID: botID, hydrate: false)
-            guard let sid else { return }
+            guard let sid, let route = gatewayRoute(for: botID),
+                  let client = try? await routedClient(for: route) else { return }
             try? await client.setSessionModel(sessionID: sid, model: modelID)
         }
     }
@@ -983,9 +1056,9 @@ extension AppModel {
         chat(for: botID).reasoningEffort = effort
         guard mode == .live else { return }
         Task { @MainActor in
-            guard let client else { return }
             let sid = try? await ensureSession(botID: botID, hydrate: false)
-            guard let sid else { return }
+            guard let sid, let route = gatewayRoute(for: botID),
+                  let client = try? await routedClient(for: route) else { return }
             try? await client.setReasoningEffort(sessionID: sid, value: effort)
         }
     }
@@ -995,9 +1068,9 @@ extension AppModel {
         chat(for: botID).yolo = enabled
         guard mode == .live else { return }
         Task { @MainActor in
-            guard let client else { return }
             let sid = try? await ensureSession(botID: botID, hydrate: false)
-            guard let sid else { return }
+            guard let sid, let route = gatewayRoute(for: botID),
+                  let client = try? await routedClient(for: route) else { return }
             try? await client.setYolo(sessionID: sid, enabled: enabled)
         }
     }

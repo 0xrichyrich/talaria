@@ -211,10 +211,10 @@ public struct MultiGatewayRosterSection: View {
         } label: {
             HStack(alignment: .center, spacing: 13) {
                 AvatarView(bot: bot, size: 38, theme: theme)
-                    // Dimmed on purpose: this bot is somewhere else. The face
-                    // is the one it will wear once the switch lands, so the
-                    // row does not appear to change identity mid-tap.
-                    .opacity(entry.isStale || entry.needsSignIn ? 0.45 : 0.72)
+                    // Dim stale/sign-in-required rows; a healthy remote bot is
+                    // fully present because opening it no longer switches the
+                    // app away from the current gateway.
+                    .opacity(entry.isStale || entry.needsSignIn ? 0.45 : 1)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(alignment: .firstTextBaseline, spacing: 7) {
                         BotIdentityLabel(bot: bot, theme: theme, scale: .row)
@@ -242,8 +242,6 @@ public struct MultiGatewayRosterSection: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(model.isSwitchingGateway)
-        .opacity(model.isSwitchingGateway ? 0.5 : 1)
     }
 
     private func badgeState(for entry: ForeignRosterEntry) -> ConnectionBadge.State {
@@ -263,7 +261,7 @@ public struct MultiGatewayRosterSection: View {
             return copy.gatewayLastSeen(Self.relative(since: entry.fetchedAt), theme.id)
         }
         let preview = entry.preview.trimmingCharacters(in: .whitespacesAndNewlines)
-        return preview.isEmpty ? copy.switchToGateway(entry.connectionLabel, theme.id) : preview
+        return preview.isEmpty ? copy.remoteBotReady(entry.connectionLabel, theme.id) : preview
     }
 
     /// A gateway that listed nothing: it needs a sign-in, or it is not
@@ -369,14 +367,13 @@ public extension CopyPack {
         }
     }
 
-    /// What tapping a foreign row will actually do. Desktop can message across
-    /// connections without moving; Talaria binds one gateway, so this promises
-    /// the move instead of pretending otherwise.
-    func switchToGateway(_ label: String, _ theme: ThemeID) -> String {
+    /// Empty-preview fallback for a healthy remote row. Tapping routes through
+    /// that bot's retained connection without moving the primary app gateway.
+    func remoteBotReady(_ label: String, _ theme: ThemeID) -> String {
         switch theme {
-        case .soft: "Tap to switch this phone to \(label)"
-        case .control: "TAP TO RE-BIND UPLINK → \(label.uppercased())"
-        case .ink: "touch to travel to \(label)"
+        case .soft: "Ready on \(label)"
+        case .control: "REMOTE UPLINK READY · \(label.uppercased())"
+        case .ink: "attending from \(label)"
         }
     }
 

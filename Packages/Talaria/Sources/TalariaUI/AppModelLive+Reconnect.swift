@@ -345,8 +345,9 @@ extension AppModel {
 
         // Every cached runtime sid dies with the old socket; drop them before
         // dialing so nothing can submit into a session that no longer exists.
-        let parked = chats.filter { $0.value.storedSessionID != nil }.map(\.key)
-        for chat in chats.values {
+        let primaryChats = chats.filter { GatewayBotRoute(qualifiedID: $0.key) == nil }
+        let parked = primaryChats.filter { $0.value.storedSessionID != nil }.map(\.key)
+        for chat in primaryChats.values {
             chat.sessionID = nil
             chat.isTyping = false
         }
@@ -389,7 +390,7 @@ extension AppModel {
         runtime.resetSessionState()
         // Pending approvals replay through session.resume below; keeping the
         // old cards would let the user answer request ids that no longer exist.
-        approvals.removeAll()
+        approvals.removeAll { GatewayBotRoute(qualifiedID: $0.botID) == nil }
         isOffline = false
         ConnectionRegistry.shared.noteState(.connected, forURL: base)
 
@@ -549,6 +550,7 @@ extension AppModel {
             await disconnectGateway()
             flushWorldForGatewaySwitch()
         } else {
+            await detachRoutedEvents(gatewayID: gateway.id)
             await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gateway.id)
         }
         ConnectionSupervisor.shared.keychain.delete(for: base)
@@ -564,6 +566,7 @@ extension AppModel {
             await disconnectGateway()
             flushWorldForGatewaySwitch()
         } else {
+            await detachRoutedEvents(gatewayID: gateway.id)
             await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gateway.id)
         }
         let supervisor = ConnectionSupervisor.shared
@@ -578,12 +581,24 @@ extension AppModel {
     }
 
     /// Drop the outgoing gateway's world. flushDemoWorld() is the single place
-    /// that knows every surface to clear, so it is reused rather than copied —
-    /// a new surface added there cannot be forgotten here.
+    /// that knows every primary surface to clear. Source-qualified remote chat
+    /// state is restored afterward because those clients remain connected.
     private func flushWorldForGatewaySwitch() {
+        let remoteChats = chats.filter { GatewayBotRoute(qualifiedID: $0.key) != nil }
+        let remoteApprovals = approvals.filter { GatewayBotRoute(qualifiedID: $0.botID) != nil }
+        let remoteQueue = composeQueue.filter { GatewayBotRoute(qualifiedID: $0.botID) != nil }
+        let remoteOpenBot = openBotID.flatMap {
+            GatewayBotRoute(qualifiedID: $0) == nil ? nil : $0
+        }
         flushDemoWorld()
+        chats = remoteChats
+        approvals = remoteApprovals
+        composeQueue = remoteQueue
+        openBotID = remoteOpenBot
         let runtime = LiveRuntime.shared
-        runtime.lastSessionByBot.removeAll()
+        runtime.lastSessionByBot = runtime.lastSessionByBot.filter {
+            GatewayBotRoute(qualifiedID: $0.key) != nil
+        }
         runtime.defaultBotID = nil
         isOffline = false
     }

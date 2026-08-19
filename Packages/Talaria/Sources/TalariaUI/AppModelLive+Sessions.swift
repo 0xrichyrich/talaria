@@ -141,7 +141,9 @@ extension AppModel {
             chat(for: botID).contextSegments = contextMeter
             return
         }
-        guard let client, !isOffline, let sid = chats[botID]?.sessionID else {
+        guard let route = gatewayRoute(for: botID),
+              let client = try? await routedClient(for: route),
+              let sid = chats[botID]?.sessionID else {
             chat(for: botID).contextSegments = []
             return
         }

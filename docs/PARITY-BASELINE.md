@@ -100,8 +100,11 @@ Multi-connection implementation checkpoints:
 - [x] Canonical source-qualified bot identity with fail-closed bare-name resolution.
 - [x] Coalescing, retryable authenticated client pool shared by primary and
       secondary roster connections.
-- [ ] Source-qualified chat/session state and event routing.
-- [ ] Open and message foreign bots without changing the primary connection.
+- [x] Source-qualified canonical chat state, streaming/tool events, and runtime
+      session routing, including colliding short session ids.
+- [x] Open, send, steer, stop, react, and change session controls for foreign
+      bots without changing the primary connection.
+- [ ] Source-qualified stored-session browsing and lifecycle actions.
 - [ ] Source-qualified approvals, unread state, routines, capabilities, and mutations.
 
 ## Crash-recovery snapshot disposition

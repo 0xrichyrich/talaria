@@ -418,6 +418,17 @@ public final class ConnectionRegistry {
         }
     }
 
+    /// Refresh one retained source in response to that gateway's own change
+    /// event. This bypasses the periodic sweep interval because the source has
+    /// just told us its roster/session projection changed.
+    public func refreshSecondaryRoster(gatewayID: String) async {
+        guard let gateway = saved.first(where: { $0.id == gatewayID }) else { return }
+        if gateway.urlString == liveGatewayURL?.absoluteString { return }
+        lastEnumerationAttempt[gatewayID] = Date()
+        await enumerate(gateway)
+        persistRosters()
+    }
+
     /// One gateway's roster. Every failure keeps whatever was listed before —
     /// an unreachable homelab should read "last seen 3h ago", not go blank.
     private func enumerate(_ gateway: SavedGateway) async {

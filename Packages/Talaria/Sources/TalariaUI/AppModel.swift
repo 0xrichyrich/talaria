@@ -192,7 +192,7 @@ public final class AppModel {
         let chat = chat(for: botID)
         chat.messages.append(ChatMessage(author: .user, time: Self.clock(), text: text))
 
-        if isOffline {
+        if isOffline && GatewayBotRoute(qualifiedID: botID) == nil {
             composeQueue.append((botID, text))
             return
         }
