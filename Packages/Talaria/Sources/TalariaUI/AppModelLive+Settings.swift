@@ -32,12 +32,15 @@ import TalariaTheme
 @MainActor
 @Observable
 public final class TalariaSettingsStore {
-    public static let shared = TalariaSettingsStore()
+    public static let shared = TalariaSettingsStore(defaults: .standard)
+
+    private let defaults: UserDefaults
 
     /// Namespaced like every other Talaria default, so the privacy inventory
     /// and "delete local data" find them by prefix without a hardcoded list.
     public static let textSizeKey = "talaria.settings.text-size"
     public static let motionKey = "talaria.settings.motion"
+    public static let transcriptDetailKey = "talaria.settings.transcript-detail"
 
     /// App-level Dynamic Type override. `.system` means "whatever iOS says",
     /// which is the default and the only setting most people should need.
@@ -68,21 +71,29 @@ public final class TalariaSettingsStore {
     }
 
     public var textSize: TextSize {
-        didSet { UserDefaults.standard.set(textSize.rawValue, forKey: Self.textSizeKey) }
+        didSet { defaults.set(textSize.rawValue, forKey: Self.textSizeKey) }
     }
 
     public var motion: MotionPreference {
-        didSet { UserDefaults.standard.set(motion.rawValue, forKey: Self.motionKey) }
+        didSet { defaults.set(motion.rawValue, forKey: Self.motionKey) }
+    }
+
+    /// How much execution detail Talaria paints. The underlying transcript is
+    /// never filtered or rewritten; this is a local, reversible view choice.
+    public var transcriptDetail: TranscriptPresentationPolicy.Detail {
+        didSet { defaults.set(transcriptDetail.rawValue, forKey: Self.transcriptDetailKey) }
     }
 
     /// One store per process: `AppModel.settings` hands out `shared`, and a
     /// second instance would drift from the one every view is reading.
-    private init() {
-        let defaults = UserDefaults.standard
+    init(defaults: UserDefaults) {
+        self.defaults = defaults
         textSize = defaults.string(forKey: Self.textSizeKey)
             .flatMap(TextSize.init(rawValue:)) ?? .system
         motion = defaults.string(forKey: Self.motionKey)
             .flatMap(MotionPreference.init(rawValue:)) ?? .system
+        transcriptDetail = defaults.string(forKey: Self.transcriptDetailKey)
+            .flatMap(TranscriptPresentationPolicy.Detail.init(rawValue:)) ?? .quiet
     }
 
     /// Back to shipped defaults — used by "delete local data", which has just
@@ -90,6 +101,7 @@ public final class TalariaSettingsStore {
     func resetToDefaults() {
         textSize = .system
         motion = .system
+        transcriptDetail = .quiet
     }
 
     /// Whether motion should be damped, given what the system currently says.

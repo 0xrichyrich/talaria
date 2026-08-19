@@ -68,6 +68,11 @@ public struct ChatView: View {
     private let onVoice: () -> Void
 
     @State private var draft = ""
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.talariaReducedMotion) private var reducedMotion
+    @ScaledMetric(relativeTo: .body) private var softComposerSize = 14.5
+    @ScaledMetric(relativeTo: .body) private var controlComposerSize = 13
+    @ScaledMetric(relativeTo: .body) private var inkComposerSize = 15
     @State private var showModelSheet = false
     @State private var showCommands = false
     @FocusState private var composerFocused: Bool
@@ -103,6 +108,16 @@ public struct ChatView: View {
     }
 
     private var attachmentCount: Int { chat?.attachments.count ?? 0 }
+    private var transcriptPolicy: TranscriptPresentationPolicy {
+        TranscriptPresentationPolicy(detail: model.settings.transcriptDetail)
+    }
+
+    private var hasLiveTranscriptDetail: Bool {
+        messages.contains { message in
+            (message.isStreaming && !(message.reasoning ?? "").isEmpty)
+                || message.toolCalls.contains { $0.state == .running }
+        }
+    }
 
     private var quickReplies: [String] {
         model.mode == .demo ? (DemoData.quickReplies[botID] ?? []) : []
@@ -238,8 +253,12 @@ public struct ChatView: View {
                     ForEach(messages) { message in
                         messageRow(message)
                     }
-                    if chat?.isTyping == true {
-                        TypingDots(theme: theme, color: botColor)
+                    if transcriptPolicy.showsWorkingAvatar(
+                        isTurnRunning: turnRunning,
+                        hasLiveDetail: hasLiveTranscriptDetail
+                    ) {
+                        TranscriptWorkingAvatar(model: model, bot: bot, theme: theme,
+                                                label: copy.workingLabel(theme.id))
                             .modifier(ChatEntrance())
                     }
                     Color.clear.frame(height: 1).id("chat-bottom")
@@ -263,12 +282,16 @@ public struct ChatView: View {
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
             .onChange(of: messages.count) {
-                withAnimation(.easeOut(duration: 0.25)) {
+                withAnimation(ChatComposerLayoutPolicy.animation(
+                    reducedMotion: reducedMotion, duration: 0.25
+                )) {
                     proxy.scrollTo("chat-bottom", anchor: .bottom)
                 }
             }
             .onChange(of: chat?.isTyping ?? false) {
-                withAnimation(.easeOut(duration: 0.25)) {
+                withAnimation(ChatComposerLayoutPolicy.animation(
+                    reducedMotion: reducedMotion, duration: 0.25
+                )) {
                     proxy.scrollTo("chat-bottom", anchor: .bottom)
                 }
             }
@@ -344,7 +367,8 @@ public struct ChatView: View {
                         .foregroundStyle(theme.ink.opacity(0.45))
                         .padding(.bottom, 4)
                 }
-                if let reasoning = message.reasoning, !reasoning.isEmpty {
+                if let reasoning = message.reasoning, !reasoning.isEmpty,
+                   transcriptPolicy.showsReasoning(isLive: message.isStreaming) {
                     ThoughtBlock(reasoning: reasoning, theme: theme,
                                  isLive: message.isStreaming && message.text.isEmpty)
                         .padding(.bottom, message.text.isEmpty ? 0 : 5)
@@ -353,8 +377,9 @@ public struct ChatView: View {
                     botBubble(message.text)
                         .contextMenu { messageMenu(message) }
                 }
-                if !message.toolCalls.isEmpty {
-                    ToolCallList(calls: message.toolCalls, theme: theme, copy: copy, accent: botColor)
+                let visibleToolCalls = transcriptPolicy.visibleToolCalls(message.toolCalls)
+                if !visibleToolCalls.isEmpty {
+                    ToolCallList(calls: visibleToolCalls, theme: theme, copy: copy, accent: botColor)
                         .padding(.top, message.text.isEmpty ? 0 : 7)
                         .padding(.leading, theme.id == .ink ? 12 : 0)
                 }
@@ -744,43 +769,48 @@ public struct ChatView: View {
             if !handles.isEmpty {
                 MentionSuggestionStrip(theme: theme, items: handles, pick: complete(with:))
             }
-            // Bottom-aligned: the field grows upward as it fills, and the
-            // controls stay level with its last line rather than floating in
-            // the middle of a tall box.
-            HStack(alignment: .bottom, spacing: 8) {
+            // The editor owns the full container width. Controls live on a
+            // fixed toolbar below it, so a 320 pt phone never turns prose into
+            // the narrow vertical column produced by three inline buttons.
+            TextField("", text: $draft,
+                      prompt: Text(copy.composer(bot)).foregroundStyle(theme.faint),
+                      axis: .vertical)
+                .textFieldStyle(.plain)
+                .lineLimit(1...ChatComposerLayoutPolicy.maxEditorLines(
+                    isAccessibilitySize: dynamicTypeSize.isAccessibilitySize
+                ))
+                .font(composerFont)
+                .foregroundStyle(theme.ink)
+                .tint(theme.accent)
+                .focused($composerFocused)
+                .padding(.horizontal, 15)
+                .padding(.vertical, 11)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .background(composerFieldChrome)
+
+            HStack(alignment: .center, spacing: 8) {
                 HeaderIconButton(theme: theme, size: 40, action: onVoice) {
                     HStack(spacing: 3) {
                         micBar(height: 14, color: theme.accent)
                         micBar(height: 8, color: theme.accentFaint)
                     }
                 }
+                .frame(minWidth: ChatComposerLayoutPolicy.controlHitTarget,
+                       minHeight: ChatComposerLayoutPolicy.controlHitTarget)
+                .accessibilityLabel(copy.voiceLabel(theme.id))
                 attachButton
-                // Grows with the message instead of scrolling a one-line
-                // window: a long prompt is unreadable while you are still
-                // writing it. Caps at six lines, then scrolls internally so
-                // the transcript never loses the screen.
-                TextField("", text: $draft,
-                          prompt: Text(copy.composer(bot)).foregroundStyle(theme.faint),
-                          axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...6)
-                    .font(composerFont)
-                    .foregroundStyle(theme.ink)
-                    .tint(theme.accent)
-                    .focused($composerFocused)
-                    .padding(.horizontal, 15)
-                    .padding(.vertical, 11)
-                    .frame(minHeight: 42)
-                    .background(composerFieldChrome)
+                Spacer(minLength: 8)
                 sendOrStopButton
             }
+            .frame(minHeight: ChatComposerLayoutPolicy.controlHitTarget)
         }
         .padding(.horizontal, 14)
         .padding(.top, 8)
         .padding(.bottom, 10)
         // The strip appears and disappears per keystroke; without a transition
         // the field jumps under the thumb mid-word.
-        .animation(.easeOut(duration: 0.18), value: mentionSuggestions.map(\.botID))
+        .animation(ChatComposerLayoutPolicy.animation(reducedMotion: reducedMotion, duration: 0.18),
+                   value: mentionSuggestions.map(\.botID))
         // "/" as the first character opens the command palette; Cancel just
         // dismisses it and leaves the draft (and the keyboard) where they were.
         .onChange(of: draft) { _, new in
@@ -847,6 +877,8 @@ public struct ChatView: View {
                 .font(.system(size: 15, weight: theme.id == .ink ? .regular : .medium))
                 .foregroundStyle(attachmentCount > 0 ? theme.accent : theme.ink.opacity(0.55))
         }
+        .frame(minWidth: ChatComposerLayoutPolicy.controlHitTarget,
+               minHeight: ChatComposerLayoutPolicy.controlHitTarget)
         .overlay(alignment: .topTrailing) {
             if attachmentCount > 0 {
                 Text(verbatim: "\(attachmentCount)")
@@ -884,17 +916,18 @@ public struct ChatView: View {
 
     private var composerFont: Font {
         switch theme.id {
-        case .soft: theme.body(14.5)
-        case .control: theme.mono(13)
-        case .ink: theme.body(15)
+        case .soft: theme.body(softComposerSize)
+        case .control: theme.mono(controlComposerSize)
+        case .ink: theme.body(inkComposerSize)
         }
     }
 
     @ViewBuilder private var composerFieldChrome: some View {
         switch theme.id {
         case .soft:
-            Capsule().fill(theme.panel)
-                .overlay(Capsule().strokeBorder(theme.ink.opacity(0.09), lineWidth: 1))
+            RoundedRectangle(cornerRadius: 16, style: .continuous).fill(theme.panel)
+                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(theme.ink.opacity(0.09), lineWidth: 1))
         case .control:
             RoundedRectangle(cornerRadius: 8).fill(theme.panel)
                 .overlay(RoundedRectangle(cornerRadius: 8)
@@ -931,7 +964,15 @@ public struct ChatView: View {
     /// Attachments alone are a valid turn — the gateway supplies the implicit
     /// "what is this?" prompt for an image sent without words.
     private var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespaces).isEmpty || attachmentCount > 0
+        switch composerAction {
+        case .disabled, .stop: false
+        default: true
+        }
+    }
+
+    private var composerAction: ChatComposerAction {
+        ChatComposerActionPolicy.action(draft: draft, attachmentCount: attachmentCount,
+                                        isTurnRunning: turnRunning)
     }
 
     private var stopGlyphColor: Color {
@@ -950,7 +991,7 @@ public struct ChatView: View {
     /// steers or queues (the hint above the field says which), which is what
     /// you wanted when you typed. Reaching for the return key to get past a
     /// permanent stop button was the old behaviour.
-    private var showsStop: Bool { turnRunning && !canSend }
+    private var showsStop: Bool { composerAction == .stop }
 
     private var sendOrStopButton: some View {
         Button {
@@ -972,7 +1013,8 @@ public struct ChatView: View {
                         .foregroundStyle(theme.accentFg)
                 }
             }
-            .frame(width: 40, height: 40)
+            .frame(width: ChatComposerLayoutPolicy.controlHitTarget,
+                   height: ChatComposerLayoutPolicy.controlHitTarget)
             .background(sendBackground, in: sendShape)
             .overlay {
                 if showsStop, theme.id != .soft {
@@ -984,9 +1026,12 @@ public struct ChatView: View {
         .buttonStyle(.plain)
         .shadow(color: showsStop && theme.glowRadius > 0 ? theme.danger.opacity(0.45) : .clear,
                 radius: 8)
-        .animation(.easeOut(duration: 0.2), value: canSend)
-        .animation(.easeOut(duration: 0.2), value: turnRunning)
-        .animation(.easeOut(duration: 0.2), value: showsStop)
+        .animation(ChatComposerLayoutPolicy.animation(reducedMotion: reducedMotion, duration: 0.2),
+                   value: canSend)
+        .animation(ChatComposerLayoutPolicy.animation(reducedMotion: reducedMotion, duration: 0.2),
+                   value: turnRunning)
+        .animation(ChatComposerLayoutPolicy.animation(reducedMotion: reducedMotion, duration: 0.2),
+                   value: showsStop)
         .accessibilityLabel(showsStop ? copy.stopLabel(theme.id) : copy.sendLabel(theme.id))
     }
 
@@ -1028,6 +1073,22 @@ extension CopyPack {
         case .soft: "Send"
         case .control: "TRANSMIT"
         case .ink: "send"
+        }
+    }
+
+    func voiceLabel(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Start voice conversation"
+        case .control: "OPEN VOICE CHANNEL"
+        case .ink: "speak with it"
+        }
+    }
+
+    func workingLabel(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Working"
+        case .control: "WORKING"
+        case .ink: "at work"
         }
     }
 
@@ -1100,75 +1161,21 @@ extension CopyPack {
     }
 }
 
-// MARK: - Typing indicator
-
-private struct TypingDots: View {
-    var theme: ThemePack
-    var color: Color
-
-    @State private var bouncing = false
-
-    private var dotShape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: theme.id == .soft ? 3.5 : theme.id == .control ? 1 : 2)
-    }
-
-    var body: some View {
-        HStack(spacing: 5) {
-            ForEach(0..<3, id: \.self) { index in
-                dotShape
-                    .fill(color)
-                    .frame(width: 7, height: 7)
-                    .offset(y: bouncing ? -4 : 0)
-                    .opacity(bouncing ? 1 : 0.32)
-                    .animation(.easeInOut(duration: 0.6)
-                        .repeatForever(autoreverses: true)
-                        .delay(Double(index) * 0.15),
-                               value: bouncing)
-            }
-        }
-        .padding(chrome: theme)
-        .onAppear { bouncing = true }
-    }
-}
-
-private extension View {
-    /// typingCss — a bot bubble in soft/control, flat indented text in ink.
-    @ViewBuilder func padding(chrome theme: ThemePack) -> some View {
-        switch theme.id {
-        case .soft:
-            padding(.vertical, 14).padding(.horizontal, 16)
-                .background(theme.panel,
-                            in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 6,
-                                                       bottomTrailingRadius: 20, topTrailingRadius: 20))
-                .overlay(UnevenRoundedRectangle(topLeadingRadius: 20, bottomLeadingRadius: 6,
-                                                bottomTrailingRadius: 20, topTrailingRadius: 20)
-                    .strokeBorder(theme.ink.opacity(0.06), lineWidth: 1))
-        case .control:
-            padding(.vertical, 13).padding(.horizontal, 15)
-                .background(theme.panel,
-                            in: UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 3,
-                                                       bottomTrailingRadius: 10, topTrailingRadius: 10))
-                .overlay(UnevenRoundedRectangle(topLeadingRadius: 10, bottomLeadingRadius: 3,
-                                                bottomTrailingRadius: 10, topTrailingRadius: 10)
-                    .strokeBorder(theme.line, lineWidth: 1))
-        case .ink:
-            padding(.top, 8).padding(.bottom, 4).padding(.leading, 14)
-        }
-    }
-}
-
 // MARK: - Entrance
 
 /// rowU for chat messages — quick fade + rise.
 private struct ChatEntrance: ViewModifier {
     @State private var shown = false
+    @Environment(\.talariaReducedMotion) private var reducedMotion
 
     func body(content: Content) -> some View {
         content
             .opacity(shown ? 1 : 0)
             .offset(y: shown ? 0 : 12)
             .onAppear {
-                withAnimation(.easeOut(duration: 0.35)) { shown = true }
+                withAnimation(ChatComposerLayoutPolicy.animation(
+                    reducedMotion: reducedMotion, duration: 0.35
+                )) { shown = true }
             }
     }
 }
@@ -1184,11 +1191,12 @@ struct ThoughtBlock: View {
     var isLive: Bool
 
     @State private var expanded = false
+    @Environment(\.talariaReducedMotion) private var reducedMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(.easeOut(duration: 0.18)) { expanded.toggle() }
+                withAnimation(reducedMotion ? nil : .easeOut(duration: 0.18)) { expanded.toggle() }
             } label: {
                 HStack(spacing: 5) {
                     Text(isLive ? "thinking" : "Thought")
