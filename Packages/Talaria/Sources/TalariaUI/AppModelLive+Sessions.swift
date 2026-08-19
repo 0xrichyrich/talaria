@@ -98,14 +98,19 @@ extension AppModel {
             runtime.loadErrors[botID] = nil
             return
         }
-        guard let route = gatewayRoute(for: botID),
+        guard let lifecycle = profileLifecycleGenerationToken(for: botID),
+              let route = gatewayRoute(for: botID),
               let client = try? await routedClient(for: route) else {
-            runtime.loadErrors[botID] = theme.copy.sessUnreachable(theme.themeID)
+            if profileLifecycleGenerationToken(for: botID) != nil {
+                runtime.loadErrors[botID] = theme.copy.sessUnreachable(theme.themeID)
+            }
             return
         }
+        guard profileLifecycleAccepts(lifecycle) else { return }
         do {
             let rows = try await client.listSessions(limit: 200, profile: route.profile,
                                                      includeHidden: true)
+            guard profileLifecycleAccepts(lifecycle) else { return }
             var summaries: [SessionSummary] = []
             summaries.reserveCapacity(rows.count)
             for row in rows where !row.id.isEmpty {
@@ -131,6 +136,7 @@ extension AppModel {
             sessions[botID] = summaries
             runtime.loadErrors[botID] = nil
         } catch {
+            guard profileLifecycleAccepts(lifecycle) else { return }
             runtime.loadErrors[botID] = Self.sessionFailure(error, theme: theme)
         }
     }
@@ -157,13 +163,16 @@ extension AppModel {
             chat(for: botID).contextSegments = contextMeter
             return
         }
-        guard let route = gatewayRoute(for: botID),
+        guard let lifecycle = profileLifecycleGenerationToken(for: botID),
+              let route = gatewayRoute(for: botID),
               let client = try? await routedClient(for: route),
               let sid = chats[botID]?.sessionID else {
             chat(for: botID).contextSegments = []
             return
         }
+        guard profileLifecycleAccepts(lifecycle) else { return }
         guard let segments = try? await client.contextBreakdown(sid) else { return }
+        guard profileLifecycleAccepts(lifecycle) else { return }
         chat(for: botID).contextSegments = segments
         // The bot sheet's meter reads the global `contextMeter`; it only ever
         // shows the bot whose sheet is open, so mirroring is correct.
@@ -177,6 +186,8 @@ extension AppModel {
     /// session the user picked instead of the profile's most recent one.
     public func openStoredSession(_ id: String, botID: String) {
         guard !id.isEmpty else { return }
+        let lifecycle = mode == .live ? profileLifecycleGenerationToken(for: botID) : nil
+        if mode == .live, lifecycle == nil { return }
         openBotID = botID
         selectedTab = .home
         clearUnread(for: botID)
@@ -186,7 +197,7 @@ extension AppModel {
 
         let chat = chat(for: botID)
         let runtime = LiveRuntime.shared
-        guard mode == .live else { return }
+        guard mode == .live, let lifecycle else { return }
 
         // Unbind first: a send racing this must not land in the session we
         // are leaving, and an in-flight attach for the old session is stale.
@@ -215,13 +226,16 @@ extension AppModel {
                     throw GatewayRouteError.noRoute
                 }
                 let client = try await self.routedClient(for: route)
+                guard self.profileLifecycleAccepts(lifecycle) else { return }
                 await self.attachRoutedEventsIfNeeded(client: client,
                                                       gatewayID: route.gatewayID)
+                guard self.profileLifecycleAccepts(lifecycle) else { return }
                 // Full projection in the ack (deferHistory returns a bounded
                 // stub) — one round trip, authoritative rows, same tradeoff
                 // ensureSession makes.
                 let live = try await client.resumeSession(id, profile: route.profile,
                                                           deferHistory: false)
+                guard self.profileLifecycleAccepts(lifecycle) else { return }
                 guard !live.sessionID.isEmpty else {
                     throw GatewayError(code: -8, message: "session.resume returned no id")
                 }
@@ -234,8 +248,10 @@ extension AppModel {
                 if history.isEmpty, let stored = chat.storedSessionID,
                    let payload = try? await client.latestSessionMessages(storedID: stored,
                                                                          profile: route.profile) {
+                    guard self.profileLifecycleAccepts(lifecycle) else { return }
                     history = AppModel.chatMessages(fromTranscript: payload)
                 }
+                guard self.profileLifecycleAccepts(lifecycle) else { return }
                 chat.messages = history
 
                 if live.running {
@@ -250,6 +266,7 @@ extension AppModel {
                 self.replayPendingPrompts(live, sourceGatewayID: route.gatewayID)
                 await self.refreshContext(botID: botID)
             } catch {
+                guard self.profileLifecycleAccepts(lifecycle) else { return }
                 chat.messages.append(ChatMessage(
                     author: .system, text: Self.sessionFailure(error, theme: self.theme)))
                 // …and out loud (plugin.js:6782 `notifyError(err, 'Could not

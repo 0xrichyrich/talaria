@@ -722,16 +722,16 @@ final class SourceQualifiedRoutingTests: XCTestCase {
     }
 
     func testModelSettingsTargetPrefersExplicitGateway() {
-        XCTAssertEqual(ModelSettingsTargetFence.resolve(
+        XCTAssertEqual(GatewaySettingsTargetFence.resolve(
             selected: "homelab", available: ["primary", "homelab"],
             active: "primary", runtime: "primary"), "homelab")
-        XCTAssertEqual(ModelSettingsTargetFence.resolve(
+        XCTAssertEqual(GatewaySettingsTargetFence.resolve(
             selected: nil, available: ["primary"],
             active: "primary", runtime: "stale"), "primary")
-        XCTAssertEqual(ModelSettingsTargetFence.resolve(
+        XCTAssertEqual(GatewaySettingsTargetFence.resolve(
             selected: nil, available: [],
             active: nil, runtime: "reconnecting"), "reconnecting")
-        XCTAssertEqual(ModelSettingsTargetFence.resolve(
+        XCTAssertEqual(GatewaySettingsTargetFence.resolve(
             selected: "deleted", available: ["primary"],
             active: "primary", runtime: "primary"), "primary")
     }
@@ -739,13 +739,13 @@ final class SourceQualifiedRoutingTests: XCTestCase {
     func testModelSettingsRejectsLateResultAfterGatewayRoundTrip() {
         // A → B → A has the same apparent gateway id, but not the same
         // generation. The first A request must not paint over the second.
-        XCTAssertFalse(ModelSettingsTargetFence.accepts(
+        XCTAssertFalse(GatewaySettingsTargetFence.accepts(
             stateGatewayID: "primary", targetGatewayID: "primary",
             generation: 4, currentGeneration: 6))
-        XCTAssertFalse(ModelSettingsTargetFence.accepts(
+        XCTAssertFalse(GatewaySettingsTargetFence.accepts(
             stateGatewayID: "homelab", targetGatewayID: "primary",
             generation: 6, currentGeneration: 6))
-        XCTAssertTrue(ModelSettingsTargetFence.accepts(
+        XCTAssertTrue(GatewaySettingsTargetFence.accepts(
             stateGatewayID: "primary", targetGatewayID: "primary",
             generation: 6, currentGeneration: 6))
     }
@@ -754,12 +754,39 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         // Mutation errors use the same fence as successes. A failure from the
         // old gateway must not become the notice shown for the newly selected
         // gateway, even when the async operation itself throws.
-        XCTAssertFalse(ModelSettingsTargetFence.accepts(
+        XCTAssertFalse(GatewaySettingsTargetFence.accepts(
             stateGatewayID: "homelab", targetGatewayID: "primary",
             generation: 8, currentGeneration: 9))
-        XCTAssertFalse(ModelSettingsTargetFence.accepts(
+        XCTAssertFalse(GatewaySettingsTargetFence.accepts(
             stateGatewayID: "primary", targetGatewayID: "primary",
             generation: 8, currentGeneration: 9))
+    }
+
+    func testOperatorConfigParsesOnlySafeMobileControls() {
+        let parsed = GatewayOperatorConfig(.object([
+            "agent": .object(["max_turns": .number(750),
+                              "image_input_mode": .string("text")]),
+            "memory": .object(["memory_enabled": .bool(false),
+                               "user_profile_enabled": .bool(true),
+                               "write_approval": .bool(true)]),
+        ]))
+        XCTAssertEqual(parsed.maxTurns, 750)
+        XCTAssertEqual(parsed.imageInputMode, "text")
+        XCTAssertFalse(parsed.memoryEnabled)
+        XCTAssertTrue(parsed.userProfileEnabled)
+        XCTAssertTrue(parsed.memoryWriteApproval)
+    }
+
+    func testOperatorConfigFailsClosedToDocumentedDefaults() {
+        let parsed = GatewayOperatorConfig(.object([
+            "agent": .object(["max_turns": .number(0),
+                              "image_input_mode": .string("invented")]),
+        ]))
+        XCTAssertEqual(parsed.maxTurns, 1)
+        XCTAssertEqual(parsed.imageInputMode, "auto")
+        XCTAssertTrue(parsed.memoryEnabled)
+        XCTAssertTrue(parsed.userProfileEnabled)
+        XCTAssertFalse(parsed.memoryWriteApproval)
     }
 
     func testModelGatewayDetachScrubsOnlyOwningSource() {

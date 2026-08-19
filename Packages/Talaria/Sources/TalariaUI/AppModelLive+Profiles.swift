@@ -390,6 +390,7 @@ extension AppModel {
                                  enabledToolsets: enabledToolsets,
                                  uiMeta: uiMeta)
         let followApplied = try? await selectedClient.applyProfileEdit(name: id, follow)
+        activateProfileLifecycleRoute(gatewayID: targetGatewayID, profile: id)
         if targetGatewayID == LiveRuntime.shared.gatewayID { bots.append(bot) }
         await refreshProfileRoster(gatewayID: targetGatewayID)
         guard let followApplied, follow.wasFullyApplied(followApplied) else { return .partial }
@@ -416,6 +417,7 @@ extension AppModel {
         } catch {
             return false
         }
+        activateProfileLifecycleRoute(gatewayID: context.route.gatewayID, profile: newID)
         if context.route.gatewayID == LiveRuntime.shared.gatewayID {
             bots.append(clone)
         }
@@ -442,7 +444,9 @@ extension AppModel {
     /// known misses never re-hit the gateway.
     public func refreshAvatar(botID: String, force: Bool = false) async {
         guard mode == .live,
+              let lifecycle = profileLifecycleGenerationToken(for: botID),
               let context = try? await profileContext(for: botID) else { return }
+        guard profileLifecycleAccepts(lifecycle) else { return }
         let signals = RosterSignals.shared
         // `has_avatar` gates primary rows. Secondary roster projections do not
         // currently retain that flag, so a qualified row asks once and lets
@@ -462,6 +466,7 @@ extension AppModel {
             // absent. Leave the cache unresolved so a later repaint can retry.
             return
         }
+        guard profileLifecycleAccepts(lifecycle) else { return }
         guard let dataURL,
               let data = ProfileAssetStore.decode(dataURL: dataURL),
               // Desktop's own guard, same inputs and same verdict
@@ -479,10 +484,14 @@ extension AppModel {
             // `markAbsent`, not a bare return: this is a settled verdict about
             // bytes already seen, so the row keeps its live face for good
             // instead of re-fetching and re-rejecting the same asset every poll.
-            if store.isCurrent(epoch: cacheEpoch) { store.markAbsent(cacheID) }
+            if profileLifecycleAccepts(lifecycle), store.isCurrent(epoch: cacheEpoch) {
+                store.markAbsent(cacheID)
+            }
             return
         }
-        if store.isCurrent(epoch: cacheEpoch) { store.set(data, for: cacheID) }
+        if profileLifecycleAccepts(lifecycle), store.isCurrent(epoch: cacheEpoch) {
+            store.set(data, for: cacheID)
+        }
     }
 
     /// image.generate → profiles.set_asset. Returns nil on success, else why

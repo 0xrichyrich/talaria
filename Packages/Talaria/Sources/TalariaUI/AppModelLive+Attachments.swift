@@ -262,6 +262,11 @@ extension AppModel {
     ) async {
         // Demo mode has no gateway: the staged row *is* the feature.
         guard mode == .live else { return }
+        guard let lifecycle = profileLifecycleGenerationToken(for: botID) else {
+            chats[botID]?.attachments.removeAll { $0.id == pending.id }
+            AttachmentRuntime.shared.forget(pending.id)
+            return
+        }
         let runtime = AttachmentRuntime.shared
         runtime.uploading.insert(pending.id)
         defer { runtime.uploading.remove(pending.id) }
@@ -273,6 +278,7 @@ extension AppModel {
         }
         do {
             var sid = try await ensureSession(botID: botID, hydrate: false)
+            guard profileLifecycleAccepts(lifecycle) else { return }
             let staged: StagedAttachment
             do {
                 staged = try await attach(client, sid)
@@ -280,12 +286,16 @@ extension AppModel {
                 // Attach runs before prompt.submit, so a runtime sid reaped
                 // during the park window fails here first — where plain text
                 // would have recovered inside submit. Re-attach and retry once.
+                guard profileLifecycleAccepts(lifecycle) else { return }
                 chat(for: botID).sessionID = nil
                 sid = try await ensureSession(botID: botID, hydrate: false)
+                guard profileLifecycleAccepts(lifecycle) else { return }
                 staged = try await attach(client, sid)
             }
+            guard profileLifecycleAccepts(lifecycle) else { return }
             record(staged, for: pending, botID: botID)
         } catch {
+            guard profileLifecycleAccepts(lifecycle) else { return }
             dropStagedRow(pending.id, botID: botID)
             noteAttachmentFailure(error, kind: pending.kind, botID: botID)
         }

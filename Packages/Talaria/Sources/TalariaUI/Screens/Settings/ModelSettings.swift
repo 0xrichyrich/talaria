@@ -39,7 +39,7 @@ import TalariaTheme
 // over an invented shape would be worse than the honest pointer in the
 // section's footnote.
 
-struct ModelSettingsTargetFence {
+struct GatewaySettingsTargetFence {
     static func resolve(selected: String?, available: Set<String>,
                         active: String?, runtime: String?) -> String? {
         let validSelection = selected.flatMap { available.contains($0) ? $0 : nil }
@@ -123,7 +123,7 @@ public struct ModelSettingsSection: View {
     }
 
     private var targetGatewayID: String? {
-        ModelSettingsTargetFence.resolve(selected: selectedGatewayID,
+        GatewaySettingsTargetFence.resolve(selected: selectedGatewayID,
                                          available: Set(gatewayChoices.map(\.id)),
                                          active: model.activeGatewayID,
                                          runtime: LiveRuntime.shared.gatewayID)
@@ -446,9 +446,9 @@ public struct ModelSettingsSection: View {
     private func providerRow(_ provider: ModelProviderRow, isLast: Bool) -> some View {
         // `auth_type` decides which door a provider even has: only "api_key"
         // rows accept a pasted key — `model.save_key` answers 4003 for OAuth
-        // providers and says to run `hermes model`
-        // (methods_complete.py:507-513) — so an OAuth row shows that pointer
-        // instead of a field the gateway would refuse.
+        // providers (methods_complete.py:507-513). OAuth is managed by the
+        // typed, profile-scoped Provider accounts section below, so this row
+        // points there instead of offering a field the gateway would refuse.
         let acceptsKey = provider.authType == "api_key"
         let isEditing = keyTarget == provider.slug
         let busy = busyProvider == provider.slug
@@ -690,7 +690,7 @@ public struct ModelSettingsSection: View {
     }
 
     private func isCurrent(_ gatewayID: String?, generation: Int) -> Bool {
-        targetGatewayID == gatewayID && ModelSettingsTargetFence.accepts(
+        targetGatewayID == gatewayID && GatewaySettingsTargetFence.accepts(
             stateGatewayID: stateGatewayID, targetGatewayID: gatewayID,
             generation: generation, currentGeneration: loadGeneration)
     }
@@ -1140,9 +1140,9 @@ public extension CopyPack {
 
     func settingsOAuthProvider(_ t: ThemeID) -> String {
         switch t {
-        case .soft: "Signs in with OAuth — run `hermes model` on the gateway to connect it."
-        case .control: "OAUTH PROVIDER — CONNECT VIA `hermes model` ON THE HOST."
-        case .ink: "This house is entered by ceremony. Run `hermes model` where the gateway lives."
+        case .soft: "Signs in with OAuth — use Provider accounts below to connect this profile."
+        case .control: "OAUTH PROVIDER — CONNECT IN PROVIDER ACCOUNTS BELOW."
+        case .ink: "This house is entered by ceremony. Use Provider accounts below to swear it to this profile."
         }
     }
 
