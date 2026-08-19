@@ -168,6 +168,10 @@ public final class AppModel {
         composeQueue = []
         openBotID = nil
         selectedTab = .home
+        // A toast is an answer about a world that no longer exists once this
+        // returns — a demo pin confirming itself over a live roster, or over
+        // the honest empty one (Components/ToastBus.swift).
+        ToastBus.shared.clear()
     }
 
     // MARK: - Shared actions (mode-dispatched; live paths in AppModel+Live)

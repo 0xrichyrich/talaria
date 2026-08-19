@@ -650,6 +650,19 @@ extension AppModel {
         // The activity ledger is held in memory and written on every new row,
         // so dropping only the key would restore 200 entries on the next event.
         clearActivityJournal()
+        // Same trap for the unread watermarks: the store holds every gateway's
+        // marks in memory and persists on each ingest, so removing the key below
+        // without this would put the whole blob straight back on the next roster
+        // poll (AppModelLive+Unread.swift). Dropping them also resets `seeded`,
+        // which is what makes the roster come back as calm as a fresh install's
+        // instead of badging the backlog.
+        forgetUnreadWatermarks()
+        // This preference is observable process state as well as a defaults
+        // key. Removing only the key leaves the roster bell enabled until the
+        // next launch and lets a later write resurrect the deleted value.
+        ActivityToastPref.shared.forget()
+        // Cards mid-flight belong to the world being unmade.
+        clearToasts()
         let defaults = UserDefaults.standard
         for (key, _) in Self.talariaDefaults() { defaults.removeObject(forKey: key) }
 

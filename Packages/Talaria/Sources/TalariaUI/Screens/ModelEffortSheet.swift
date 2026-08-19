@@ -579,8 +579,9 @@ public struct ModelEffortSheet: View {
         let on = selectedEffort == effort
         return Button {
             Task {
-                await model.applyReasoningEffort(botID: botID, effort: effort,
-                                                 provider: current.provider, model: current.model)
+                await model.setReasoningEffortWithFeedback(
+                    botID: botID, effort: effort,
+                    provider: current.provider, model: current.model)
             }
         } label: {
             Text(ModelLabels.effortLabel(effort))
@@ -640,7 +641,9 @@ public struct ModelEffortSheet: View {
                 ThemedPrimaryButton(theme: theme, title: copy.modelsConfirmGo(theme.id),
                                     compact: true) {
                     Task {
-                        let result = await model.confirmPendingModel(botID: botID)
+                        // Narrated: the user has answered the guard, so this
+                        // switch is allowed an ending in the ledger too.
+                        let result = await model.confirmModelSwitchWithFeedback(botID: botID)
                         announce(result)
                     }
                 }
@@ -855,12 +858,16 @@ public struct ModelEffortSheet: View {
     }
 
     private func selectFamily(_ family: ModelFamily, in provider: ModelProviderRow) async {
-        let result = await model.selectModelFamily(botID: botID, provider: provider, family: family)
+        let result = await model.switchModelFamilyWithFeedback(
+            botID: botID, provider: provider, family: family)
         announce(result)
     }
 
     private func select(provider: String, model modelID: String) async {
-        let result = await model.selectModel(botID: botID, provider: provider, model: modelID)
+        // The wrapper adds the toast pair and the Activity row; `announce` keeps
+        // the in-sheet line, which is the one visible over a sheet.
+        let result = await model.switchModelWithFeedback(botID: botID, provider: provider,
+                                                         model: modelID)
         announce(result)
     }
 

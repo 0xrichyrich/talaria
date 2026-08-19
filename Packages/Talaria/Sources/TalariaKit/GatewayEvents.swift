@@ -264,6 +264,7 @@ public struct NotificationPayload: Sendable {
     public var kind: String
     public var ttlMilliseconds: Int?
     public var key: String?
+    public var id: String?
 
     public init(_ v: JSONValue?) {
         text = v?["text"]?.stringValue ?? ""
@@ -271,5 +272,6 @@ public struct NotificationPayload: Sendable {
         kind = v?["kind"]?.stringValue ?? ""
         ttlMilliseconds = v?["ttl_ms"]?.intValue
         key = v?["key"]?.stringValue
+        id = v?["id"]?.stringValue
     }
 }

@@ -27,6 +27,9 @@ public enum ProtocolChecks {
         try mentionRouting()
         try agentHandleRules()
         try rosterCosmeticsSurviveRefresh()
+        try unreadWatermarks()
+        try toastPairing()
+        try botModeNotices()
     }
 
     static func eventEnvelopeDecoding() throws {

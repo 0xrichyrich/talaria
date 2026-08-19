@@ -789,7 +789,7 @@ public struct RoutineEditorView: View {
         Task { @MainActor in
             defer { saving = false }
             do {
-                try await model.scheduleRoutine(
+                try await model.scheduleRoutineWithFeedback(
                     botID: botID, title: title, schedule: schedule, instruction: instruction,
                     repeatForever: repeatForever, continuity: continuity,
                     deliver: restAvailable ? deliver : [],
@@ -808,11 +808,12 @@ public struct RoutineEditorView: View {
         Task { @MainActor in
             defer { saving = false }
             do {
-                try await model.saveRoutine(job, botID: botID, title: title, schedule: schedule,
-                                            instruction: instruction,
-                                            deliver: runtime.deliveryTargets.isEmpty ? nil : deliver,
-                                            model: modelPin, provider: providerPin,
-                                            continuity: continuity)
+                try await model.saveRoutineWithFeedback(
+                    job, botID: botID, title: title, schedule: schedule,
+                    instruction: instruction,
+                    deliver: runtime.deliveryTargets.isEmpty ? nil : deliver,
+                    model: modelPin, provider: providerPin,
+                    continuity: continuity)
                 // The save landed; the draft is now the truth, so the reload
                 // below is free to reseed from the server's answer.
                 baseline = draft
@@ -860,11 +861,14 @@ public struct RoutineEditorView: View {
         busy = true; errorLine = nil
         Task { @MainActor in
             defer { busy = false }
-            do {
-                try await model.deleteRoutine(routine)
+            // Same wrapper the list uses: the editor pops on success, so the
+            // toast (and its ledger row) is what remains to say the routine is
+            // gone. The reason still lands inline for a failure that keeps the
+            // editor on screen.
+            if let reason = await model.deleteRoutineWithFeedback(routine) {
+                errorLine = reason
+            } else {
                 onBack()
-            } catch {
-                errorLine = AppModel.reason(error)
             }
         }
     }

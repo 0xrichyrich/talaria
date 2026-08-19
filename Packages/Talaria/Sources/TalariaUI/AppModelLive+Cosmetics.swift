@@ -83,6 +83,14 @@ public final class RosterSignals {
 
     /// Unix seconds of each bot's newest session activity.
     private(set) var lastActive: [String: Double] = [:]
+    /// The same row's `last_session.preview`, raw. Restated on every answer
+    /// alongside `lastActive` and read by exactly one caller: the opt-in
+    /// activity toast, which needs the words that go with the stamp that moved
+    /// (plugin.js:146). Kept apart from `Bot.preview` — that one is flattened
+    /// for a roster row (`stripPreviewMarkdown`) and can fall back to the
+    /// previous answer's text when this one is empty, neither of which is what
+    /// a notification about THIS delivery should say.
+    private(set) var previews: [String: String] = [:]
     /// `ui_meta["hermes-bots"].created`, ms epoch (plugin.js:5400).
     private(set) var created: [String: Double] = [:]
     /// `ui_meta["hermes-bots"].pinned` — a plain boolean that rides ui_meta to
@@ -107,15 +115,14 @@ public final class RosterSignals {
     /// which is what keeps a deliberately-chosen 160×160 photo displayable.
     private(set) var imageKind: [String: String] = [:]
 
-    /// The bot whose chat was opened last. Sticky, exactly as desktop's
-    /// `$selectedBot` is (plugin.js:129 + 3901): leaving a chat does not make
-    /// the conversation you were just in start badging you.
-    private(set) var selected: String?
-
-    /// Per-bot `last_active` watermark, seeded on the first poll so a cold
-    /// launch never marks the whole roster unread (plugin.js:92-94).
-    private var watermarks: [String: Double] = [:]
-    private var watermarksSeeded = false
+    // There is deliberately no `selected`, no `watermarks` and no
+    // `watermarksSeeded` here any more. This table kept a per-process copy of
+    // the unread high-water marks and its own sticky selection to spare from
+    // them, while the durable store kept a second copy under a second sparing
+    // rule (AppModelLive+Unread.swift). Two tables ingesting the same stamps and
+    // two functions writing the same badge is this repo's named bug class, and
+    // both being idempotent only made the disagreement invisible. `lastActive`
+    // below is the stamp; `UnreadWatermarkStore` is the memory of it.
 
     /// Rows whose entrance animation has already played. A refresh, a scroll
     /// back up, or a tab switch must not replay it (BOT-MODE-PARITY §4.2:
@@ -150,27 +157,25 @@ public final class RosterSignals {
         guard next != scope else { return }
         scope = next
         lastActive.removeAll()
+        previews.removeAll()
         created.removeAll()
         pinned.removeAll()
         hasAvatar.removeAll()
         imageKind.removeAll()
-        selected = nil
-        watermarks.removeAll()
-        watermarksSeeded = false
         entered.removeAll()
         writing.removeAll()
         lookUnsupportedNoticed = false
     }
 
-    /// Fold one roster answer in. Returns the bots whose activity moved past
-    /// their watermark — the unread signal, which is deliberately poll-derived
-    /// so it catches every delivery path: cron, CLI, another machine, a
-    /// bot-to-bot handoff, work finished while the phone was asleep.
-    func ingest(_ profiles: [HermesProfile]) -> [String] {
-        let seeding = !watermarksSeeded
-        watermarksSeeded = true
-
-        var moved: [String] = []
+    /// Fold one roster answer in: ranking, liveness, pins, `has_avatar`.
+    ///
+    /// The unread signal is deliberately poll-derived — it is the only model
+    /// that catches every delivery path (cron, CLI, another machine, a
+    /// bot-to-bot handoff, work finished while the phone was asleep) — but the
+    /// marks it is compared against are durable and live elsewhere. What this
+    /// leaves behind for them is `lastActive`, freshly restated for the whole
+    /// roster; `AppModel.unreadMoves(scope:)` does the diff.
+    func ingest(_ profiles: [HermesProfile]) {
         var seen = Set<String>()
         for profile in profiles {
             seen.insert(profile.name)
@@ -195,22 +200,20 @@ public final class RosterSignals {
                 }
             }
 
-            let ts = profile.lastSession?.lastActive ?? 0
-            lastActive[profile.name] = ts
-            let previous = watermarks[profile.name] ?? 0
-            // Monotonic, and written BEFORE the seeding guard so a clock that
-            // goes backwards can never lower it (plugin.js:120-122).
-            watermarks[profile.name] = max(previous, ts)
-            if !seeding, ts > previous { moved.append(profile.name) }
+            // A bot with no `last_session` at all reads 0 here, which is both
+            // "never active" for the liveness window and "can never badge" for
+            // the watermark diff downstream.
+            lastActive[profile.name] = profile.lastSession?.lastActive ?? 0
+            previews[profile.name] = profile.lastSession?.preview ?? ""
         }
 
         // A profile deleted elsewhere leaves no row to badge or rank.
         lastActive = lastActive.filter { seen.contains($0.key) }
+        previews = previews.filter { seen.contains($0.key) }
         created = created.filter { seen.contains($0.key) }
         imageKind = imageKind.filter { seen.contains($0.key) }
         pinned = pinned.intersection(seen)
         hasAvatar = hasAvatar.intersection(seen)
-        return moved
     }
 
     /// This profile's stored asset is a photo a human chose, so a 160×160 one
@@ -221,15 +224,6 @@ public final class RosterSignals {
     /// not reject a portrait uploaded seconds ago just because the next
     /// `profiles.list` answer has not landed yet.
     func noteImageKind(_ botID: String, _ kind: String) { imageKind[botID] = kind }
-
-    /// A chat was opened. Clears the way for its unread — desktop deletes the
-    /// key before any RPC runs (plugin.js:3915) — and keeps the selection so
-    /// the conversation the user just left does not badge them for their own
-    /// half of it.
-    func noteOpened(_ botID: String) {
-        selected = botID
-        acknowledge(botID)
-    }
 
     /// Desktop's `activityOf` (plugin.js:7641-7645): the newest of "this bot
     /// was created" and "this bot's last message", in ms. A freshly created bot
@@ -253,12 +247,6 @@ public final class RosterSignals {
     func lastActiveDate(_ botID: String) -> Date? {
         guard let ts = lastActive[botID], ts > 0 else { return nil }
         return Date(timeIntervalSince1970: ts)
-    }
-
-    /// Opening a bot's chat clears its unread; the watermark has to move with
-    /// it or the very next poll badges the same activity again.
-    func acknowledge(_ botID: String) {
-        watermarks[botID] = max(watermarks[botID] ?? 0, lastActive[botID] ?? 0)
     }
 
     func flush() {
@@ -329,20 +317,11 @@ extension AppModel {
         applyRosterAnswer(profiles, pinWrites: pinWrites)
     }
 
-    /// The unread half of the roster answer. Talaria counts unread where desktop
-    /// keeps a boolean, so a watermark move raises the count to at least one
-    /// rather than inflating it — a turn this app watched has already been
-    /// counted by the event path (AppModelLive.swift), and double-counting it
-    /// would make the badge lie. The bot on screen is never badged
-    /// (plugin.js:129).
-    func applyUnreadWatermark(_ moved: [String]) {
-        let signals = RosterSignals.shared
-        if let open = openBotID { signals.noteOpened(open) }
-        for botID in moved where botID != signals.selected {
-            guard let index = bots.firstIndex(where: { $0.id == botID }) else { continue }
-            if bots[index].unread == 0 { bots[index].unread = 1 }
-        }
-    }
+    // The unread half of the roster answer lives in AppModelLive+Unread.swift:
+    // `unreadMoves(scope:)` folds this answer's stamps into the durable marks
+    // and `applyUnreadWatermark(_:)` writes the badges. It used to be here, over
+    // a second watermark table kept by `RosterSignals` — see the note where that
+    // table used to be for why one of the two had to go.
 
     /// The roster, in desktop's order (plugin.js:7657-7666): pinned bots float
     /// to the top **as a group**, and inside each group recency rules. Presence
@@ -385,11 +364,9 @@ extension AppModel {
     // draw `BotPortraitView`, which shows a portrait when one has been fetched
     // AND passed the provenance guard, and the live vector face otherwise.
 
-    /// Every route into a chat should tell the signals table, so the bot you
-    /// are reading is never the bot that badges you.
-    public func noteChatOpened(_ botID: String) {
-        RosterSignals.shared.noteOpened(botID)
-    }
+    // `noteChatOpened(_:)` — the one door every route into a chat reports
+    // through — now lives beside the marks it advances
+    // (AppModelLive+Unread.swift).
 
     /// Desktop's `relativeTime(last_active)` register — "4m", "2h", "3d" reads
     /// better on a chat roster than a wall clock, and a never-chatted bot gets

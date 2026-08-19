@@ -165,6 +165,9 @@ extension AppModel {
             bots[idx].unread = 0
             bots[idx].mentionsYou = false
         }
+        // Same rule as `openChat`: this is a route into the bot's chat, so the
+        // durable mark moves with the badge it just cleared.
+        noteChatOpened(botID)
 
         let chat = chat(for: botID)
         let runtime = LiveRuntime.shared
@@ -221,6 +224,14 @@ extension AppModel {
             } catch {
                 chat.messages.append(ChatMessage(
                     author: .system, text: Self.sessionFailure(error, theme: self.theme)))
+                // …and out loud (plugin.js:6782 `notifyError(err, 'Could not
+                // open session')`). The system row above is the durable record,
+                // but this tap came from a sheet that has just dismissed onto an
+                // empty chat, and a blank screen with an explanation somewhere
+                // below the fold reads as the app having done nothing at all.
+                self.toast(kind: .failure,
+                           title: self.theme.copy.toastOpenSessionFailed(self.theme.themeID),
+                           message: Self.reason(error), botID: botID)
             }
         }
     }
