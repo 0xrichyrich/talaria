@@ -435,16 +435,18 @@ public extension AppModel {
     /// Save an edited routine — plugin.js:6177 `notifyError(err, 'Cronjob
     /// update failed')`, with the success half desktop leaves to its own
     /// re-render.
-    func saveRoutineWithFeedback(_ job: CronJobDetail, botID: String, title: String,
+    func saveRoutineWithFeedback(_ job: CronJobDetail, routineID: String,
+                                 botID: String, title: String,
                                  schedule: String, instruction: String, deliver: [String]?,
                                  model: String?, provider: String?,
                                  continuity: Bool?) async throws {
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let key = "routine-save:\(job.id)"
+        let key = "routine-save:\(routineID)"
         toast(kind: .info, title: theme.copy.toastSavingRoutine(clean, theme.themeID),
               botID: botID, key: key)
         do {
-            try await saveRoutine(job, botID: botID, title: clean, schedule: schedule,
+            try await saveRoutine(job, routineID: routineID, botID: botID,
+                                  title: clean, schedule: schedule,
                                   instruction: instruction, deliver: deliver, model: model,
                                   provider: provider, continuity: continuity)
             toast(kind: .success, title: theme.copy.toastRoutineSaved(clean, theme.themeID),

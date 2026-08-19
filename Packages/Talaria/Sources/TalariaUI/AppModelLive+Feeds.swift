@@ -462,18 +462,22 @@ public extension AppModel {
             runtime.cronJobs.removeValue(forKey: id)
             runtime.cronScope.removeValue(forKey: id)
             runtime.routineTargets.removeValue(forKey: id)
-            CronDetailRuntime.shared.quarantined.remove(id)
+            let detail = CronDetailRuntime.shared
+            detail.detail.removeValue(forKey: id)
+            detail.runs.removeValue(forKey: id)
+            detail.detailError.removeValue(forKey: id)
+            detail.quarantined.remove(id)
         }
+        CronDetailRuntime.shared.deliveryTargets.removeValue(forKey: gatewayID)
+        CronDetailRuntime.shared.deliveryLoaded.remove(gatewayID)
+        CronDetailRuntime.shared.restSupported.removeValue(forKey: gatewayID)
     }
 
-    /// Detail/history/create/edit/run still use the active gateway REST
-    /// context. Remote list rows expose only the socket-backed toggle until
-    /// the following REST-routing slice lands.
+    /// Every live row carries an exact gateway/job/profile destination. Full
+    /// management is therefore safe for remote rows too; individual actions
+    /// still fail closed if that gateway was removed or signed out.
     func routineHasFullManagement(_ routine: Routine) -> Bool {
-        guard let target = FeedsRuntime.shared.routineTargets[routine.id] else {
-            return mode != .live
-        }
-        return target.route.gatewayID == LiveRuntime.shared.gatewayID
+        mode != .live || FeedsRuntime.shared.routineTargets[routine.id] != nil
     }
 
     /// Live routine list. Reads the launch-profile cron store, then each bot's
@@ -731,12 +735,18 @@ public extension AppModel {
     }
 
     func deleteRoutine(_ routine: Routine) async throws {
-        guard routineHasFullManagement(routine) else { throw GatewayRouteError.noRoute }
-        guard mode == .live, let client else { return }
-        try await client.cronRemove(jobID: routine.id,
-                                    profile: FeedsRuntime.shared.cronScope[routine.id] ?? nil)
+        guard routineHasFullManagement(routine),
+              let target = FeedsRuntime.shared.routineTargets[routine.id]
+        else { throw GatewayRouteError.noRoute }
+        guard mode == .live else { return }
+        let client = try await routedClient(gatewayID: target.route.gatewayID)
+        try await client.cronRemove(jobID: target.route.jobID, profile: target.profile)
         routines.removeAll { $0.id == routine.id }
         FeedsRuntime.shared.cronJobs.removeValue(forKey: routine.id)
+        FeedsRuntime.shared.cronScope.removeValue(forKey: routine.id)
+        FeedsRuntime.shared.routineTargets.removeValue(forKey: routine.id)
+        CronDetailRuntime.shared.detail.removeValue(forKey: routine.id)
+        CronDetailRuntime.shared.runs.removeValue(forKey: routine.id)
         await refreshRoutinesLive(force: true)
     }
 
@@ -748,14 +758,16 @@ public extension AppModel {
     ///   agent run) so the caller can say "started" rather than "done".
     @discardableResult
     func runRoutineNow(_ routine: Routine) async throws -> Bool {
-        guard routineHasFullManagement(routine) else { throw GatewayRouteError.noRoute }
+        guard routineHasFullManagement(routine),
+              let target = FeedsRuntime.shared.routineTargets[routine.id]
+        else { throw GatewayRouteError.noRoute }
         guard mode == .live else { return false }
-        guard let (base, credential) = gatewayRESTContext() else {
+        guard let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
             throw GatewayError(code: -3, message: theme.copy.needsRESTNote(theme.themeID))
         }
         let finished = try await GatewayREST.triggerCronJob(
-            baseURL: base, credential: credential, jobID: routine.id,
-            profile: FeedsRuntime.shared.cronScope[routine.id] ?? nil)
+            baseURL: base, credential: credential, jobID: target.route.jobID,
+            profile: target.profile)
         recordActivity(kind: .routine, botID: routine.botID,
                        text: theme.copy.feedRoutineTriggered(theme.themeID) + " — " + routine.name,
                        subtext: routine.schedule)
@@ -767,8 +779,16 @@ public extension AppModel {
     /// client keeps its own credential private; the registry holds the same
     /// Keychain copy, refreshed on every connect.
     internal func gatewayRESTContext() -> (URL, GatewayCredential)? {
-        guard let base = LiveRuntime.shared.baseURL,
-              let gateway = ConnectionRegistry.shared.gateway(forURL: base),
+        guard let gatewayID = LiveRuntime.shared.gatewayID else { return nil }
+        return gatewayRESTContext(gatewayID: gatewayID)
+    }
+
+    /// REST authority for one exact gateway. A remote routine must never use
+    /// the primary base URL merely because its raw job id also exists there.
+    internal func gatewayRESTContext(gatewayID: String) -> (URL, GatewayCredential)? {
+        let registry = ConnectionRegistry.shared
+        guard let gateway = registry.saved.first(where: { $0.id == gatewayID }),
+              let base = gateway.baseURL,
               let credential = ConnectionRegistry.shared.credential(for: gateway) else { return nil }
         return (base, credential)
     }

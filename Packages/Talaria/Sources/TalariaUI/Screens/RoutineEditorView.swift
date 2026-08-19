@@ -79,7 +79,13 @@ public struct RoutineEditorView: View {
 
     /// Editing, history and pinning all ride the REST cron router; without it
     /// this screen is a reader with a toggle, which is still worth having.
-    private var restAvailable: Bool { model.cronRESTReady }
+    private var restAvailable: Bool {
+        model.cronRESTReady(routineID: routine?.id, botID: botID)
+    }
+
+    private var deliveryTargets: [CronDeliveryTarget] {
+        model.cronDeliveryTargets(routineID: routine?.id, botID: botID)
+    }
 
     private var isCreating: Bool { mode == .create }
 
@@ -167,12 +173,12 @@ public struct RoutineEditorView: View {
 
     private func load(initial: Bool) async {
         if isCreating {
-            await model.loadCronDeliveryTargets()
+            await model.loadCronDeliveryTargets(botID: botID)
             if initial { seedForCreate() }
             return
         }
         guard let routine else { return }
-        await model.loadCronDeliveryTargets()
+        await model.loadCronDeliveryTargets(routineID: routine.id)
         let detail = await model.loadRoutineDetail(routine.id)
         await model.loadRoutineRuns(routine.id)
         // A background refresh must never eat an in-progress edit; the first
@@ -494,7 +500,7 @@ public struct RoutineEditorView: View {
     // MARK: - Delivery
 
     @ViewBuilder private func deliveryBlock(editable: Bool) -> some View {
-        let targets = runtime.deliveryTargets
+        let targets = deliveryTargets
         if !targets.isEmpty {
             sectionLabel(copy.routineDeliverLabel(theme.id))
             FlowChips(items: offeredTargets) { id in
@@ -532,7 +538,7 @@ public struct RoutineEditorView: View {
     /// job was written must stay visible and selected — dropping it silently on
     /// the next save would re-route the job without anyone asking.
     private var offeredTargets: [String] {
-        var ids = runtime.deliveryTargets.map(\.id)
+        var ids = deliveryTargets.map(\.id)
         for saved in deliver where !ids.contains(saved) { ids.append(saved) }
         return ids
     }
@@ -809,9 +815,10 @@ public struct RoutineEditorView: View {
             defer { saving = false }
             do {
                 try await model.saveRoutineWithFeedback(
-                    job, botID: botID, title: title, schedule: schedule,
+                    job, routineID: routine?.id ?? job.id, botID: botID,
+                    title: title, schedule: schedule,
                     instruction: instruction,
-                    deliver: runtime.deliveryTargets.isEmpty ? nil : deliver,
+                    deliver: deliveryTargets.isEmpty ? nil : deliver,
                     model: modelPin, provider: providerPin,
                     continuity: continuity)
                 // The save landed; the draft is now the truth, so the reload
@@ -830,7 +837,8 @@ public struct RoutineEditorView: View {
         Task { @MainActor in
             defer { busy = false }
             do {
-                try await model.pinRoutineInference(job)
+                guard let routine else { return }
+                try await model.pinRoutineInference(job, routineID: routine.id)
                 noteLine = copy.routineSavedNote(theme.id)
                 await load(initial: false)
             } catch {

@@ -732,6 +732,7 @@ extension AppModel {
                         gatewayID: sourceGatewayID)
                     self.applySecondaryUnreadAnswers(gatewayID: sourceGatewayID)
                 } else if sourceGatewayID != nil, what == "cron.changed" {
+                    CronDetailRuntime.shared.changeTick &+= 1
                     await self.refreshRoutinesLive(force: true)
                 }
             }
