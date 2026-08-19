@@ -750,6 +750,18 @@ final class SourceQualifiedRoutingTests: XCTestCase {
             generation: 6, currentGeneration: 6))
     }
 
+    func testModelSettingsRejectsLateMutationErrorAfterGatewaySwitch() {
+        // Mutation errors use the same fence as successes. A failure from the
+        // old gateway must not become the notice shown for the newly selected
+        // gateway, even when the async operation itself throws.
+        XCTAssertFalse(ModelSettingsTargetFence.accepts(
+            stateGatewayID: "homelab", targetGatewayID: "primary",
+            generation: 8, currentGeneration: 9))
+        XCTAssertFalse(ModelSettingsTargetFence.accepts(
+            stateGatewayID: "primary", targetGatewayID: "primary",
+            generation: 8, currentGeneration: 9))
+    }
+
     func testModelGatewayDetachScrubsOnlyOwningSource() {
         let model = AppModel()
         LiveRuntime.shared.gatewayID = "primary"

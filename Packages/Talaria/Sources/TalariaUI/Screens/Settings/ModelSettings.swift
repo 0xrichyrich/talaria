@@ -793,8 +793,10 @@ public struct ModelSettingsSection: View {
             if !outcome.warning.isEmpty { lines.append(outcome.warning) }
             note(lines.joined(separator: "\n"), warning: !saved || !outcome.warning.isEmpty)
         } catch let error as GatewayError {
+            guard isCurrent(gatewayID, generation: generation) else { return }
             note(error.message, warning: true)
         } catch {
+            guard isCurrent(gatewayID, generation: generation) else { return }
             note(error.localizedDescription, warning: true)
         }
     }
