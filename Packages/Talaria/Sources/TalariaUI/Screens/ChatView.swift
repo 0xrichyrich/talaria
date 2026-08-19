@@ -43,6 +43,13 @@ public final class ApprovalOutcomes {
         outcomes[approval.id] = approved
     }
 
+    /// A response that did not reach its owning gateway is not an outcome.
+    /// Reopen the card so the user can retry and a pending sweep can merge it.
+    func reopen(_ approvalID: String) {
+        outcomes.removeValue(forKey: approvalID)
+        ApprovalBridges.shared.decided.removeValue(forKey: approvalID)
+    }
+
     /// Record + resolve in one step — the path every approve/deny control
     /// in this module should take.
     public func resolve(_ approval: Approval, approve: Bool, in model: AppModel) {

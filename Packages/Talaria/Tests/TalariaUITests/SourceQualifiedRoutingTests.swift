@@ -10,9 +10,14 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         runtime.gatewayID = nil
         runtime.sessionToBot.removeAll()
         runtime.routedSessionToBot.removeAll()
-        runtime.approvalSessions.removeAll()
-        runtime.routedApprovalSessions.removeAll()
+        runtime.approvalTargets.removeAll()
         MultiGatewayRuntime.shared.routedUnread.removeAll()
+        ApprovalBridges.shared.details.removeAll()
+        ApprovalBridges.shared.prompts.removeAll()
+        ApprovalBridges.shared.decided.removeAll()
+        ApprovalBridges.shared.sweptSessions.removeAll()
+        ApprovalBridges.shared.sweepFailures.removeAll()
+        ApprovalBridges.shared.sweepEpochs.removeAll()
         SessionsRuntime.shared.resetPrimaryScope()
         SessionsRuntime.shared.resetRoutedScope(gatewayID: "homelab")
         super.tearDown()
@@ -74,12 +79,20 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         let remote = GatewaySessionRoute(gatewayID: "homelab", sessionID: "bbbbbbbb")
         runtime.routedSessionToBot[remote] = "homelab::researcher"
         runtime.workingBotIDs = ["default", "homelab::researcher"]
+        runtime.approvalTargets["primary"] = target(
+            gatewayID: "primary", profile: "default", sessionID: "aaaaaaaa",
+            requestID: "primary-wire")
+        runtime.approvalTargets["remote"] = target(
+            gatewayID: "homelab", profile: "researcher", sessionID: "bbbbbbbb",
+            requestID: "remote-wire")
 
         runtime.resetSessionState()
 
         XCTAssertTrue(runtime.sessionToBot.isEmpty)
         XCTAssertEqual(runtime.routedSessionToBot[remote], "homelab::researcher")
         XCTAssertEqual(runtime.workingBotIDs, ["homelab::researcher"])
+        XCTAssertNil(runtime.approvalTargets["primary"])
+        XCTAssertEqual(runtime.approvalTargets["remote"]?.requestID, "remote-wire")
     }
 
     func testRemoteSessionTitleCannotPatchCollidingPrimaryStoredID() {
@@ -124,9 +137,12 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         runtime.routedSessionToBot[
             GatewaySessionRoute(gatewayID: "homelab", sessionID: "deadbeef")
         ] = "homelab::researcher"
-        runtime.approvalSessions["primary-approval"] = "deadbeef"
-        runtime.routedApprovalSessions["remote-approval"] = GatewaySessionRoute(
-            gatewayID: "homelab", sessionID: "deadbeef")
+        runtime.approvalTargets["primary-approval"] = target(
+            gatewayID: "primary", profile: "default", sessionID: "deadbeef",
+            requestID: "primary-wire")
+        runtime.approvalTargets["remote-approval"] = target(
+            gatewayID: "homelab", profile: "researcher", sessionID: "deadbeef",
+            requestID: "remote-wire")
         model.approvals = [
             approval(id: "primary-approval", botID: "default"),
             approval(id: "remote-approval", botID: "homelab::researcher"),
@@ -138,8 +154,9 @@ final class SourceQualifiedRoutingTests: XCTestCase {
             sourceGatewayID: "homelab")
 
         XCTAssertEqual(model.approvals.map(\.id), ["primary-approval"])
-        XCTAssertEqual(runtime.approvalSessions["primary-approval"], "deadbeef")
-        XCTAssertNil(runtime.routedApprovalSessions["remote-approval"])
+        XCTAssertEqual(runtime.approvalTargets["primary-approval"]?.session.sessionID,
+                       "deadbeef")
+        XCTAssertNil(runtime.approvalTargets["remote-approval"])
     }
 
     func testUnmappedRemoteApprovalCannotFallbackToPrimaryBot() {
@@ -153,16 +170,16 @@ final class SourceQualifiedRoutingTests: XCTestCase {
                      sourceGatewayID: "homelab")
 
         XCTAssertTrue(model.approvals.isEmpty)
-        XCTAssertNil(runtime.approvalSessions["orphaned"])
-        XCTAssertNil(runtime.routedApprovalSessions["orphaned"])
+        XCTAssertTrue(runtime.approvalTargets.isEmpty)
     }
 
     func testApprovalResponseRejectsMixedGatewayOwnership() {
         let model = AppModel()
         let runtime = LiveRuntime.shared
         runtime.gatewayID = "primary"
-        runtime.routedApprovalSessions["remote-approval"] = GatewaySessionRoute(
-            gatewayID: "homelab", sessionID: "deadbeef")
+        runtime.approvalTargets["remote-approval"] = target(
+            gatewayID: "homelab", profile: "researcher", sessionID: "deadbeef",
+            requestID: "wire-request")
         let item = approval(id: "remote-approval", botID: "default")
 
         let target = model.approvalResponseTarget(
@@ -176,12 +193,131 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         let runtime = LiveRuntime.shared
         runtime.gatewayID = "primary"
         let session = GatewaySessionRoute(gatewayID: "homelab", sessionID: "deadbeef")
-        runtime.routedApprovalSessions["remote-approval"] = session
+        runtime.approvalTargets["remote-approval"] = target(
+            gatewayID: "homelab", profile: "researcher", sessionID: "deadbeef",
+            requestID: "wire-request")
         let item = approval(id: "remote-approval", botID: "homelab::researcher")
         let bot = GatewayBotRoute(gatewayID: "homelab", profile: "researcher")
 
         XCTAssertEqual(model.approvalResponseTarget(for: item, botRoute: bot),
-                       ApprovalResponseTarget(bot: bot, session: session))
+                       ApprovalResponseTarget(bot: bot, session: session,
+                                              requestID: "wire-request"))
+    }
+
+    func testSameApprovalRequestIDRemainsDistinctAcrossGateways() {
+        let model = AppModel()
+        model.mode = .live
+        let runtime = LiveRuntime.shared
+        runtime.gatewayID = "primary"
+        runtime.sessionToBot["deadbeef"] = "default"
+        runtime.routedSessionToBot[
+            GatewaySessionRoute(gatewayID: "homelab", sessionID: "deadbeef")
+        ] = "homelab::default"
+
+        model.handle(event: approvalEvent(requestID: "same-request", sessionID: "deadbeef"),
+                     sourceGatewayID: "primary")
+        model.handle(event: approvalEvent(requestID: "same-request", sessionID: "deadbeef"),
+                     sourceGatewayID: "homelab")
+
+        XCTAssertEqual(model.approvals.count, 2)
+        XCTAssertEqual(Set(model.approvals.map(\.id)).count, 2)
+        XCTAssertEqual(Set(runtime.approvalTargets.values.map(\.requestID)), ["same-request"])
+        XCTAssertEqual(Set(runtime.approvalTargets.values.map(\.session.gatewayID)),
+                       ["primary", "homelab"])
+    }
+
+    func testCollidingBlockingPromptIDsDismissOnlyOwningGateway() {
+        let model = AppModel()
+        model.mode = .live
+        let runtime = LiveRuntime.shared
+        runtime.gatewayID = "primary"
+        runtime.sessionToBot["deadbeef"] = "default"
+        runtime.routedSessionToBot[
+            GatewaySessionRoute(gatewayID: "homelab", sessionID: "deadbeef")
+        ] = "homelab::default"
+        let event = GatewayEvent(type: "clarify.request", sessionID: "deadbeef",
+                                 payload: .object([
+                                    "request_id": .string("same-request"),
+                                    "question": .string("Continue?"),
+                                 ]))
+
+        model.handleBridgeEvent(event, sourceGatewayID: "primary")
+        model.handleBridgeEvent(event, sourceGatewayID: "homelab")
+
+        XCTAssertEqual(ApprovalBridges.shared.prompts.count, 2)
+        XCTAssertEqual(Set(ApprovalBridges.shared.prompts.map(\.id)).count, 2)
+        model.dismissBlockingPrompt("same-request")
+        XCTAssertEqual(ApprovalBridges.shared.prompts.count, 2,
+                       "a bare colliding request id must fail closed")
+        model.dismissBlockingPrompt("same-request", sourceGatewayID: "homelab")
+        XCTAssertEqual(ApprovalBridges.shared.prompts.map(\.gatewayID), ["primary"])
+    }
+
+    func testWireApprovalLookupUsesBotToDisambiguateGatewayCollision() {
+        let model = AppModel()
+        let runtime = LiveRuntime.shared
+        let primaryID = GatewayApprovalRoute(gatewayID: "primary",
+                                              requestID: "same-request").qualifiedID
+        let remoteID = GatewayApprovalRoute(gatewayID: "homelab",
+                                             requestID: "same-request").qualifiedID
+        runtime.approvalTargets[primaryID] = target(
+            gatewayID: "primary", profile: "default", sessionID: "aaaaaaaa",
+            requestID: "same-request")
+        runtime.approvalTargets[remoteID] = target(
+            gatewayID: "homelab", profile: "default", sessionID: "bbbbbbbb",
+            requestID: "same-request")
+        model.approvals = [
+            approval(id: primaryID, botID: "default"),
+            approval(id: remoteID, botID: "homelab::default"),
+        ]
+
+        XCTAssertNil(model.approval(matchingWireRequestID: "same-request", botID: nil))
+        XCTAssertEqual(model.approval(matchingWireRequestID: "same-request",
+                                      botID: "homelab::default")?.id, remoteID)
+    }
+
+    func testGatewayDetachDropsOnlyItsApprovalSurfaces() {
+        let model = AppModel()
+        let runtime = LiveRuntime.shared
+        let primaryID = GatewayApprovalRoute(gatewayID: "primary",
+                                              requestID: "primary").qualifiedID
+        let remoteID = GatewayApprovalRoute(gatewayID: "homelab",
+                                             requestID: "remote").qualifiedID
+        runtime.approvalTargets[primaryID] = target(
+            gatewayID: "primary", profile: "default", sessionID: "aaaaaaaa",
+            requestID: "primary")
+        runtime.approvalTargets[remoteID] = target(
+            gatewayID: "homelab", profile: "default", sessionID: "bbbbbbbb",
+            requestID: "remote")
+        model.approvals = [
+            approval(id: primaryID, botID: "default"),
+            approval(id: remoteID, botID: "homelab::default"),
+        ]
+        ApprovalBridges.shared.prompts = [
+            BlockingPrompt(kind: .sudo, gatewayID: "primary", requestID: "prompt",
+                           sessionID: "aaaaaaaa", botID: "default", question: ""),
+            BlockingPrompt(kind: .sudo, gatewayID: "homelab", requestID: "prompt",
+                           sessionID: "bbbbbbbb", botID: "homelab::default", question: ""),
+        ]
+
+        model.dropApprovalScope(gatewayID: "homelab")
+
+        XCTAssertEqual(model.approvals.map(\.id), [primaryID])
+        XCTAssertNotNil(runtime.approvalTargets[primaryID])
+        XCTAssertNil(runtime.approvalTargets[remoteID])
+        XCTAssertEqual(ApprovalBridges.shared.prompts.map(\.gatewayID), ["primary"])
+    }
+
+    func testFailedApprovalResponseReopensCardAndClearsFalseOutcome() {
+        let model = AppModel()
+        let item = approval(id: "retry", botID: "default")
+        ApprovalOutcomes.shared.record(item, approved: true)
+        ApprovalBridges.shared.decided[item.id] = .always
+
+        model.restoreFailedApproval(item)
+
+        XCTAssertEqual(model.approvals, [item])
+        XCTAssertNil(ApprovalOutcomes.shared.choice(for: item.id))
     }
 
     func testUnreadWatermarksKeepCollidingProfilesInSeparateGatewayScopes() {
@@ -300,6 +436,14 @@ final class SourceQualifiedRoutingTests: XCTestCase {
             "description": .string("Run command"),
             "choices": .array([.string("once"), .string("deny")]),
         ]))
+    }
+
+    private func target(gatewayID: String, profile: String, sessionID: String,
+                        requestID: String) -> ApprovalResponseTarget {
+        ApprovalResponseTarget(
+            bot: GatewayBotRoute(gatewayID: gatewayID, profile: profile),
+            session: GatewaySessionRoute(gatewayID: gatewayID, sessionID: sessionID),
+            requestID: requestID)
     }
 }
 #endif

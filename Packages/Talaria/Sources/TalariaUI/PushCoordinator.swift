@@ -275,12 +275,13 @@ public final class PushCoordinator: NSObject {
     }
 
     private func approval(matching info: [AnyHashable: Any], in model: AppModel) -> Approval? {
+        let botID = info[PushPayloadKey.bot] as? String
         if let requestID = info[PushPayloadKey.approvalRequestID] as? String,
-           let match = model.approvals.first(where: { $0.id == requestID }) {
+           let match = model.approval(matchingWireRequestID: requestID, botID: botID) {
             return match
         }
         // Fall back to the bot's oldest pending approval.
-        if let botID = info[PushPayloadKey.bot] as? String {
+        if let botID {
             return model.approvals.first { $0.botID == botID }
         }
         return nil

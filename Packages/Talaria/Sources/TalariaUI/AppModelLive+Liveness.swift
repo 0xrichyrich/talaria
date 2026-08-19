@@ -612,9 +612,12 @@ extension AppModel {
         // Approval cards bound to a dead runtime cannot be answered: the
         // request id resolves to no session, so both buttons would fail
         // silently. Leaving an unanswerable card up is worse than none.
-        let orphaned = runtime.approvalSessions.filter { $0.value == sid }.map(\.key)
+        guard let gatewayID = runtime.gatewayID else { return }
+        let dead = GatewaySessionRoute(gatewayID: gatewayID, sessionID: sid)
+        let orphaned = runtime.approvalTargets.filter { $0.value.session == dead }.map(\.key)
         guard !orphaned.isEmpty else { return }
-        for id in orphaned { runtime.approvalSessions.removeValue(forKey: id) }
+        for id in orphaned { runtime.approvalTargets.removeValue(forKey: id) }
+        for id in orphaned { ApprovalBridges.shared.details.removeValue(forKey: id) }
         approvals.removeAll { orphaned.contains($0.id) }
     }
 

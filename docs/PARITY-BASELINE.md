@@ -66,8 +66,8 @@ substantial Bot Mode support, not a 1:1 client. The largest correctness gaps
 are the remaining multi-connection management surfaces and group rooms:
 
 - Talaria retains authenticated clients for multiple gateways and routes chat,
-  events, sessions, approvals, and unread state by source. Routines,
-  capabilities, and several management mutations remain primary-only.
+  events, sessions, full approval recovery/prompts, and unread state by source.
+  Routines, capabilities, and several management mutations remain primary-only.
 - Talaria's in-flight room work models one group per bot; current Hermes uses
   multiple memberships and standalone rooms.
 - Foreign room members are not yet delivered through their owning connection.
@@ -109,7 +109,9 @@ Multi-connection implementation checkpoints:
       export/search and title events, with collision-safe caches.
 - [x] Source-qualified unread events, durable roster watermarks, badge clearing,
       and gateway-role transitions, including colliding profile names.
-- [ ] Source-qualified approval recovery, routines, capabilities, and mutations.
+- [x] Source-qualified approval request identity, pending replay,
+      acknowledgements, full-choice responses, and clarify/sudo/secret prompts.
+- [ ] Source-qualified routines, capabilities, and management mutations.
 
 ## Crash-recovery snapshot disposition
 

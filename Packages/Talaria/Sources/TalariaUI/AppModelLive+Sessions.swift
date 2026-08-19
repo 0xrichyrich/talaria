@@ -247,7 +247,7 @@ extension AppModel {
                 }
                 // Same replay every other resume path uses: the approval keeps
                 // its real choice set, and a parked clarify is recovered too.
-                self.replayPendingPrompts(live)
+                self.replayPendingPrompts(live, sourceGatewayID: route.gatewayID)
                 await self.refreshContext(botID: botID)
             } catch {
                 chat.messages.append(ChatMessage(

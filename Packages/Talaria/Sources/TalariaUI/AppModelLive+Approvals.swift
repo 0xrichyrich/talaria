@@ -35,8 +35,13 @@ public struct BlockingPrompt: Identifiable, Sendable, Equatable {
         case secret
     }
 
-    public var id: String { requestID }
+    public var id: String {
+        GatewayApprovalRoute(gatewayID: gatewayID, requestID: requestID).qualifiedID
+    }
     public var kind: Kind
+    /// Saved connection that owns this request. Prompt response RPCs do not
+    /// carry a session id, so choosing the correct client is the trust boundary.
+    public var gatewayID: String
     public var requestID: String
     /// Runtime sid the request arrived on.
     public var sessionID: String
@@ -50,10 +55,12 @@ public struct BlockingPrompt: Identifiable, Sendable, Equatable {
     /// secret: the env var the captured value is stored as.
     public var envVar: String?
 
-    public init(kind: Kind, requestID: String, sessionID: String, botID: String?,
+    public init(kind: Kind, gatewayID: String, requestID: String,
+                sessionID: String, botID: String?,
                 question: String, choices: [String] = [], multiSelect: Bool = false,
                 envVar: String? = nil) {
-        self.kind = kind; self.requestID = requestID; self.sessionID = sessionID
+        self.kind = kind; self.gatewayID = gatewayID
+        self.requestID = requestID; self.sessionID = sessionID
         self.botID = botID; self.question = question; self.choices = choices
         self.multiSelect = multiSelect; self.envVar = envVar
     }
@@ -66,7 +73,7 @@ public struct BlockingPrompt: Identifiable, Sendable, Equatable {
 /// Protocol-side book-keeping for the approval layer. `AppModel`'s stored
 /// properties live in AppModel.swift (another owner) and extensions cannot add
 /// storage, so — following LiveRuntime's precedent — this rides in a MainActor
-/// singleton. Talaria drives one gateway link per process.
+/// singleton. Every request-bearing entry retains its gateway identity.
 @MainActor
 @Observable
 public final class ApprovalBridges {
@@ -88,13 +95,17 @@ public final class ApprovalBridges {
 
     /// The client the bridge pump is bound to (weak: identity only).
     weak var attachedClient: GatewayClient?
+    var attachedGatewayID: String?
     var handlerID: UUID?
     var pump: Task<Void, Never>?
     var sweepTask: Task<Void, Never>?
     /// Sessions whose approval.pending backlog has been merged since the last
     /// (re)connect, and how many times a sweep failed for one.
-    var sweptSessions: Set<String> = []
-    var sweepFailures: [String: Int] = [:]
+    var sweptSessions: Set<GatewaySessionRoute> = []
+    var sweepFailures: [GatewaySessionRoute: Int] = [:]
+    /// Per-gateway generation fencing an approval.pending RPC that completes
+    /// after its client was detached or replaced.
+    var sweepEpochs: [String: Int] = [:]
     /// `LiveRuntime.generation` the sweep bookkeeping belongs to. The runtime
     /// bumps it on every connect and reconnect, which makes it the connection
     /// epoch — see `syncApprovalEpoch()`.
@@ -103,9 +114,21 @@ public final class ApprovalBridges {
     public init() {}
 
     /// A new socket means a new backlog: every session must be swept again.
-    func resetForNewConnection() {
-        sweptSessions.removeAll()
-        sweepFailures.removeAll()
+    func resetSweepScope(gatewayID: String) {
+        sweepEpochs[gatewayID, default: 0] &+= 1
+        sweptSessions = sweptSessions.filter { $0.gatewayID != gatewayID }
+        sweepFailures = sweepFailures.filter { $0.key.gatewayID != gatewayID }
+    }
+
+    func resetScope(gatewayID: String) {
+        let prefix = GatewayApprovalRoute.qualifiedPrefix(gatewayID: gatewayID)
+        details = details.filter { !$0.key.hasPrefix(prefix) }
+        prompts.removeAll { $0.gatewayID == gatewayID }
+        resetSweepScope(gatewayID: gatewayID)
+    }
+
+    func resetForNewPrimaryConnection(gatewayID: String?) {
+        if let gatewayID { resetSweepScope(gatewayID: gatewayID) }
         sweepTask?.cancel()
         sweepTask = nil
     }
@@ -131,11 +154,29 @@ extension ApprovalOutcomes {
         guard let approved = outcomes[approvalID] else { return nil }
         return approved ? .once : .deny
     }
+
 }
 
 // MARK: - AppModel
 
 extension AppModel {
+
+    /// Remove every pending surface owned by one gateway before its client or
+    /// routing tables disappear. Calling this after teardown loses the only
+    /// evidence that tells colliding request ids apart.
+    func dropApprovalScope(gatewayID: String) {
+        let runtime = LiveRuntime.shared
+        let stale = Set(runtime.approvalTargets.compactMap { key, target in
+            target.bot.gatewayID == gatewayID ? key : nil
+        })
+        let owners = Set(approvals.filter { stale.contains($0.id) }.map(\.botID))
+        approvals.removeAll { stale.contains($0.id) }
+        runtime.approvalTargets = runtime.approvalTargets.filter {
+            $0.value.bot.gatewayID != gatewayID
+        }
+        ApprovalBridges.shared.resetScope(gatewayID: gatewayID)
+        for owner in owners { recomputeApprovalStatus(for: owner) }
+    }
 
     // MARK: Bridge registration
 
@@ -148,18 +189,21 @@ extension AppModel {
     /// keeps its handler (the client's table survives `connect()`); one that
     /// dials a fresh client re-registers here.
     public func attachApprovalBridges() {
-        guard mode == .live, let client else { return }
+        guard mode == .live, let client, let gatewayID = LiveRuntime.shared.gatewayID else { return }
         let bridges = ApprovalBridges.shared
-        guard bridges.attachedClient !== client else {
+        guard bridges.attachedClient !== client || bridges.attachedGatewayID != gatewayID else {
             syncApprovalEpoch()
             return
         }
 
+        if let previous = bridges.attachedClient, let handlerID = bridges.handlerID {
+            Task { await previous.removeEventHandler(handlerID) }
+        }
         bridges.pump?.cancel()
-        bridges.resetForNewConnection()
-        bridges.details.removeAll()
-        bridges.prompts.removeAll()
+        bridges.resetScope(gatewayID: gatewayID)
+        bridges.resetForNewPrimaryConnection(gatewayID: gatewayID)
         bridges.attachedClient = client
+        bridges.attachedGatewayID = gatewayID
         bridges.handlerID = nil
 
         // Same funnel AppModelLive uses for its main pump: events leave the
@@ -167,10 +211,17 @@ extension AppModel {
         // wire order — an `.expire` must never land before its `.request`.
         let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
         bridges.pump = Task { @MainActor [weak self] in
-            for await event in stream { self?.handleBridgeEvent(event) }
+            for await event in stream {
+                self?.handleBridgeEvent(event, sourceGatewayID: gatewayID)
+            }
         }
         Task { @MainActor in
-            bridges.handlerID = await client.addEventHandler { continuation.yield($0) }
+            let handlerID = await client.addEventHandler { continuation.yield($0) }
+            if bridges.attachedClient === client, bridges.attachedGatewayID == gatewayID {
+                bridges.handlerID = handlerID
+            } else {
+                await client.removeEventHandler(handlerID)
+            }
         }
         syncApprovalEpoch()
     }
@@ -180,54 +231,62 @@ extension AppModel {
     /// so they are cleared rather than left dangling over an empty world.
     public func detachApprovalBridges() {
         let bridges = ApprovalBridges.shared
+        let gatewayID = bridges.attachedGatewayID
         if let client = bridges.attachedClient, let handlerID = bridges.handlerID {
             Task { await client.removeEventHandler(handlerID) }
         }
         bridges.pump?.cancel(); bridges.pump = nil
         bridges.sweepTask?.cancel(); bridges.sweepTask = nil
         bridges.attachedClient = nil
+        bridges.attachedGatewayID = nil
         bridges.handlerID = nil
-        bridges.details.removeAll()
-        bridges.prompts.removeAll()
-        bridges.sweptSessions.removeAll()
-        bridges.sweepFailures.removeAll()
+        if let gatewayID { bridges.resetScope(gatewayID: gatewayID) }
         bridges.sweptGeneration = nil
     }
 
     // MARK: Event routing
 
-    func handleBridgeEvent(_ event: GatewayEvent) {
+    func handleBridgeEvent(_ event: GatewayEvent, sourceGatewayID: String? = nil) {
         // Cheap enough to do per event, and this is the earliest reliable place
         // to notice a reconnect: `gateway.ready` cannot be used because the
         // transport consumes that frame itself while waiting for the socket to
         // come up (GatewayTransport.connect), so it never reaches a handler.
-        syncApprovalEpoch()
+        if sourceGatewayID == LiveRuntime.shared.gatewayID { syncApprovalEpoch() }
+
+        guard let gatewayID = sourceGatewayID ?? LiveRuntime.shared.gatewayID else { return }
 
         switch event.type {
         case "approval.request":
-            ingestApproval(ApprovalDetail(event.payload, sessionID: event.sessionID))
+            ingestApproval(ApprovalDetail(event.payload, sessionID: event.sessionID),
+                           sourceGatewayID: gatewayID)
 
         case "clarify.request":
             let request = ClarifyRequest(event.payload, sessionID: event.sessionID)
-            present(BlockingPrompt(kind: .clarify, requestID: request.requestID,
+            present(BlockingPrompt(kind: .clarify, gatewayID: gatewayID,
+                                   requestID: request.requestID,
                                    sessionID: event.sessionID,
-                                   botID: botID(forSession: event.sessionID),
+                                   botID: botID(forSession: event.sessionID,
+                                                sourceGatewayID: gatewayID),
                                    question: request.question,
                                    choices: request.choices,
                                    multiSelect: request.multiSelect))
 
         case "sudo.request":
             present(BlockingPrompt(kind: .sudo,
+                                   gatewayID: gatewayID,
                                    requestID: event.payload?["request_id"]?.stringValue ?? "",
                                    sessionID: event.sessionID,
-                                   botID: botID(forSession: event.sessionID),
+                                   botID: botID(forSession: event.sessionID,
+                                                sourceGatewayID: gatewayID),
                                    question: ""))
 
         case "secret.request":
             present(BlockingPrompt(kind: .secret,
+                                   gatewayID: gatewayID,
                                    requestID: event.payload?["request_id"]?.stringValue ?? "",
                                    sessionID: event.sessionID,
-                                   botID: botID(forSession: event.sessionID),
+                                   botID: botID(forSession: event.sessionID,
+                                                sourceGatewayID: gatewayID),
                                    question: event.payload?["prompt"]?.stringValue ?? "",
                                    envVar: event.payload?["env_var"]?.stringValue))
 
@@ -235,15 +294,16 @@ extension AppModel {
             // The tool gave up and returned empty; a late respond would be
             // answered {"status":"expired"} and change nothing.
             if let requestID = event.payload?["request_id"]?.stringValue {
-                dismissBlockingPrompt(requestID)
+                dismissBlockingPrompt(requestID, sourceGatewayID: gatewayID)
             }
 
         case "session.reclaimed":
             // The runtime session is gone; anything parked on it died with it.
             let sid = event.payload?["session_id"]?.stringValue ?? ""
             guard !sid.isEmpty else { return }
-            for prompt in ApprovalBridges.shared.prompts where prompt.sessionID == sid {
-                dismissBlockingPrompt(prompt.requestID)
+            for prompt in ApprovalBridges.shared.prompts
+                where prompt.gatewayID == gatewayID && prompt.sessionID == sid {
+                dismissBlockingPrompt(prompt.requestID, sourceGatewayID: gatewayID)
             }
 
         default:
@@ -253,7 +313,9 @@ extension AppModel {
         // Backstop for the reconnect replay: the first event a resumed session
         // emits (usually session.info) is the signal that its runtime sid is
         // bound again — which is exactly when approval.pending can be asked.
-        if !event.sessionID.isEmpty { sweepApprovalsIfNeeded(sessionID: event.sessionID) }
+        if !event.sessionID.isEmpty {
+            sweepApprovalsIfNeeded(sessionID: event.sessionID, sourceGatewayID: gatewayID)
+        }
     }
 
     /// Notice a new connection epoch and re-arm the replay. `LiveRuntime`
@@ -264,7 +326,7 @@ extension AppModel {
         let generation = LiveRuntime.shared.generation
         guard bridges.sweptGeneration != generation else { return }
         bridges.sweptGeneration = generation
-        bridges.resetForNewConnection()
+        bridges.resetForNewPrimaryConnection(gatewayID: LiveRuntime.shared.gatewayID)
 
         // The socket is up but the chats have not been re-resumed yet, and
         // approval.pending needs a bound runtime sid. Sweep twice: once after a
@@ -290,47 +352,73 @@ extension AppModel {
     /// skipped unless `force` is set, and a gateway without `approval.pending`
     /// degrades to the event-driven path instead of erroring.
     public func replayPendingApprovals(force: Bool = false) async {
-        guard mode == .live, let client else { return }
+        guard mode == .live else { return }
         syncApprovalEpoch()
         if force {
             let bridges = ApprovalBridges.shared
             bridges.sweptSessions.removeAll()
             bridges.sweepFailures.removeAll()
         }
-        for sessionID in Array(LiveRuntime.shared.sessionToBot.keys) {
-            await sweepApprovals(sessionID: sessionID, client: client)
+        let runtime = LiveRuntime.shared
+        if let client, let gatewayID = runtime.gatewayID {
+            for sessionID in Array(runtime.sessionToBot.keys) {
+                await sweepApprovals(
+                    GatewaySessionRoute(gatewayID: gatewayID, sessionID: sessionID),
+                    client: client)
+            }
+        }
+        for session in Array(runtime.routedSessionToBot.keys) {
+            guard let client = MultiGatewayRuntime.shared.routedEvents[session.gatewayID]?.client
+            else { continue }
+            await sweepApprovals(session, client: client)
         }
     }
 
-    private func sweepApprovalsIfNeeded(sessionID: String) {
+    private func sweepApprovalsIfNeeded(sessionID: String, sourceGatewayID: String) {
         let bridges = ApprovalBridges.shared
-        guard mode == .live, let client,
-              LiveRuntime.shared.sessionToBot[sessionID] != nil,
+        let runtime = LiveRuntime.shared
+        let route = GatewaySessionRoute(gatewayID: sourceGatewayID, sessionID: sessionID)
+        let ownerExists = sourceGatewayID == runtime.gatewayID
+            ? runtime.sessionToBot[sessionID] != nil
+            : runtime.routedSessionToBot[route] != nil
+        let owningClient = sourceGatewayID == runtime.gatewayID
+            ? client
+            : MultiGatewayRuntime.shared.routedEvents[sourceGatewayID]?.client
+        guard mode == .live, ownerExists, let owningClient,
               // Claim the session synchronously: a streaming turn fires dozens
               // of events per second and every one of them reaches here.
-              bridges.sweptSessions.insert(sessionID).inserted else { return }
-        Task { @MainActor in await self.performSweep(sessionID: sessionID, client: client) }
+              bridges.sweptSessions.insert(route).inserted else { return }
+        let epoch = bridges.sweepEpochs[sourceGatewayID, default: 0]
+        Task { @MainActor in
+            await self.performSweep(route, client: owningClient, epoch: epoch)
+        }
     }
 
-    private func sweepApprovals(sessionID: String, client: GatewayClient) async {
-        guard ApprovalBridges.shared.sweptSessions.insert(sessionID).inserted else { return }
-        await performSweep(sessionID: sessionID, client: client)
+    private func sweepApprovals(_ session: GatewaySessionRoute,
+                                client: GatewayClient) async {
+        guard ApprovalBridges.shared.sweptSessions.insert(session).inserted else { return }
+        let epoch = ApprovalBridges.shared.sweepEpochs[session.gatewayID, default: 0]
+        await performSweep(session, client: client, epoch: epoch)
     }
 
-    private func performSweep(sessionID: String, client: GatewayClient) async {
+    private func performSweep(_ session: GatewaySessionRoute, client: GatewayClient,
+                              epoch: Int) async {
         let bridges = ApprovalBridges.shared
         do {
-            for detail in try await client.pendingApprovalDetails(sessionID: sessionID) {
-                ingestApproval(detail)
+            let details = try await client.pendingApprovalDetails(sessionID: session.sessionID)
+            guard bridges.sweepEpochs[session.gatewayID, default: 0] == epoch else { return }
+            for detail in details {
+                ingestApproval(detail, sourceGatewayID: session.gatewayID)
             }
-            bridges.sweepFailures.removeValue(forKey: sessionID)
+            bridges.sweepFailures.removeValue(forKey: session)
         } catch {
+            guard bridges.sweepEpochs[session.gatewayID, default: 0] == epoch else { return }
             // A gateway that predates approval.pending, or a session that went
             // away mid-flight. Retry on the next event for this session, but
             // only twice — an unsupported method must not become an RPC storm.
-            let failures = (bridges.sweepFailures[sessionID] ?? 0) + 1
-            bridges.sweepFailures[sessionID] = failures
-            if failures < 3 { bridges.sweptSessions.remove(sessionID) }
+            let failures = (bridges.sweepFailures[session] ?? 0) + 1
+            bridges.sweepFailures[session] = failures
+            if failures < 3 { bridges.sweptSessions.remove(session) }
         }
     }
 
@@ -340,8 +428,10 @@ extension AppModel {
     /// block. The reconnect sweep finds the same request a moment later, so
     /// this only makes the card appear a round trip sooner — with its real
     /// choice set instead of the once/deny fallback.
-    public func ingestPendingApproval(_ request: ApprovalRequest) {
-        ingestApproval(ApprovalDetail(request: request, replayed: true))
+    public func ingestPendingApproval(_ request: ApprovalRequest,
+                                      sourceGatewayID: String? = nil) {
+        ingestApproval(ApprovalDetail(request: request, replayed: true),
+                       sourceGatewayID: sourceGatewayID)
     }
 
     /// Present the clarify `session.resume` replays in its `pending_clarify`
@@ -351,11 +441,15 @@ extension AppModel {
     ///
     /// `payload` is the raw `pending_clarify` object
     /// (`{question, choices, multi_select?, request_id}`).
-    public func ingestPendingClarify(_ payload: JSONValue, sessionID: String) {
+    public func ingestPendingClarify(_ payload: JSONValue, sessionID: String,
+                                     sourceGatewayID: String? = nil) {
+        guard let gatewayID = sourceGatewayID ?? LiveRuntime.shared.gatewayID else { return }
         let request = ClarifyRequest(payload, sessionID: sessionID)
-        present(BlockingPrompt(kind: .clarify, requestID: request.requestID,
+        present(BlockingPrompt(kind: .clarify, gatewayID: gatewayID,
+                               requestID: request.requestID,
                                sessionID: sessionID,
-                               botID: botID(forSession: sessionID),
+                               botID: botID(forSession: sessionID,
+                                            sourceGatewayID: gatewayID),
                                question: request.question,
                                choices: request.choices,
                                multiSelect: request.multiSelect))
@@ -370,50 +464,26 @@ extension AppModel {
     /// recovered by the reconnect sweep is indistinguishable from one that
     /// arrived live — both paths dedupe on request_id, so they can and do run
     /// over the same request.
-    func ingestApproval(_ detail: ApprovalDetail) {
+    func ingestApproval(_ detail: ApprovalDetail, sourceGatewayID: String? = nil) {
         let request = detail.request
-        guard !request.requestID.isEmpty,
-              // Never resurrect something already answered here: a sweep racing
-              // an in-flight approval.respond would otherwise put the card back
-              // seconds after the user cleared it.
-              ApprovalOutcomes.shared.choice(for: request.requestID) == nil else { return }
-        let runtime = LiveRuntime.shared
+        guard let gatewayID = sourceGatewayID ?? LiveRuntime.shared.gatewayID,
+              let approvalID = ingest(request, sourceGatewayID: gatewayID) else { return }
         let bridges = ApprovalBridges.shared
-        // Unattributable approvals fall to the gateway's default profile, which
-        // owns them the same way it owns un-namespaced cron jobs.
-        let owner = runtime.sessionToBot[request.sessionID]
-            ?? runtime.defaultBotID ?? bots.first?.id ?? "default"
-
-        bridges.details[request.requestID] = detail
-        runtime.approvalSessions[request.requestID] = request.sessionID
-
-        if !approvals.contains(where: { $0.id == request.requestID }) {
-            approvals.append(Approval(
-                id: request.requestID,
-                botID: owner,
-                kind: AppModel.approvalKind(for: request),
-                title: request.description.isEmpty ? request.command : request.description,
-                target: request.patternKey ?? runtime.baseURL?.host() ?? "",
-                subject: request.command,
-                body: request.command,
-                why: request.description,
-                // A replayed approval has been waiting an unknown while; only a
-                // live request can honestly claim "now".
-                age: detail.replayed ? "" : "now"))
+        bridges.details[approvalID] = detail
+        guard let approval = approvals.first(where: { $0.id == approvalID }) else { return }
+        if detail.replayed, let index = approvals.firstIndex(where: { $0.id == approvalID }) {
+            approvals[index].age = ""
         }
-        if let idx = bots.firstIndex(where: { $0.id == owner }) {
-            bots[idx].status = .approval
-        }
-        appendApprovalCard(requestID: request.requestID, botID: owner)
-        acknowledgeApproval(detail)
+        appendApprovalCard(approvalID: approvalID, botID: approval.botID)
+        acknowledgeApproval(detail, sourceGatewayID: gatewayID)
     }
 
     /// Desktop renders an approval as a tool card inside the thread, not only
     /// in a side list. The `.approvalRef` row is what InlineApprovalCard binds
     /// to; both surfaces then read the same `model.approvals` entry.
-    private func appendApprovalCard(requestID: String, botID: String) {
+    private func appendApprovalCard(approvalID: String, botID: String) {
         let chat = chat(for: botID)
-        let ref = MessageCard.approvalRef(requestID)
+        let ref = MessageCard.approvalRef(approvalID)
         guard !chat.messages.contains(where: { $0.card == ref }) else { return }
         chat.messages.append(ChatMessage(author: .bot, time: AppModel.clock(),
                                          text: "", card: ref))
@@ -422,11 +492,15 @@ extension AppModel {
     /// `approval.received` — tells the gateway a client has the card on screen
     /// so it can stop re-notifying. Fire-and-forget: an older gateway without
     /// the method just errors and the approval still answers normally.
-    private func acknowledgeApproval(_ detail: ApprovalDetail) {
-        guard mode == .live, let client, !detail.request.sessionID.isEmpty else { return }
+    private func acknowledgeApproval(_ detail: ApprovalDetail, sourceGatewayID: String) {
+        guard mode == .live, !detail.request.sessionID.isEmpty else { return }
         let sessionID = detail.request.sessionID
         let requestID = detail.request.requestID
-        Task { try? await client.acknowledgeApproval(sessionID: sessionID, requestID: requestID) }
+        Task { @MainActor in
+            guard let client = try? await routedClient(gatewayID: sourceGatewayID) else { return }
+            _ = try? await client.acknowledgeApproval(sessionID: sessionID,
+                                                      requestID: requestID)
+        }
     }
 
     // MARK: Answering an approval
@@ -470,16 +544,19 @@ extension AppModel {
 
     private func liveAnswerApproval(_ approval: Approval, choice: ApprovalChoice) {
         let runtime = LiveRuntime.shared
-        // The request → session binding was recorded on ingest; fall back to
-        // the bot's live session for an approval that predates the bridges.
-        let sessionID = runtime.approvalSessions.removeValue(forKey: approval.id)
-            ?? chats[approval.botID]?.sessionID
         recomputeApprovalStatus(for: approval.botID)
-        guard let client, let sessionID else { return }
+        guard let target = approvalResponseTarget(
+            for: approval, botRoute: gatewayRoute(for: approval.botID)) else {
+            restoreFailedApproval(approval)
+            return
+        }
         Task { @MainActor in
             do {
+                let client = try await self.routedClient(for: target.bot)
                 let resolved = try await client.answerApproval(
-                    sessionID: sessionID, choice: choice, requestID: approval.id)
+                    sessionID: target.session.sessionID, choice: choice,
+                    requestID: target.requestID)
+                runtime.approvalTargets.removeValue(forKey: approval.id)
                 ApprovalBridges.shared.details.removeValue(forKey: approval.id)
                 if resolved == 0 {
                     // Nothing was parked: the 300 s timeout already denied it,
@@ -493,14 +570,17 @@ extension AppModel {
                 // affordance anywhere in the app.
                 self.noteApproval(self.theme.copy.approvalSendFailed(self.theme.themeID),
                                   for: approval.botID)
-                if !self.approvals.contains(where: { $0.id == approval.id }) {
-                    self.approvals.append(approval)
-                    runtime.approvalSessions[approval.id] = sessionID
-                    ApprovalBridges.shared.decided.removeValue(forKey: approval.id)
-                    self.recomputeApprovalStatus(for: approval.botID)
-                }
+                self.restoreFailedApproval(approval)
             }
         }
+    }
+
+    func restoreFailedApproval(_ approval: Approval) {
+        ApprovalOutcomes.shared.reopen(approval.id)
+        if !approvals.contains(where: { $0.id == approval.id }) {
+            approvals.append(approval)
+        }
+        recomputeApprovalStatus(for: approval.botID)
     }
 
     private func noteApproval(_ text: String, for botID: String) {
@@ -527,17 +607,22 @@ extension AppModel {
     private func present(_ prompt: BlockingPrompt) {
         let bridges = ApprovalBridges.shared
         guard !prompt.requestID.isEmpty,
-              !bridges.prompts.contains(where: { $0.requestID == prompt.requestID }) else { return }
+              !bridges.prompts.contains(where: { $0.id == prompt.id }) else { return }
         bridges.prompts.append(prompt)
         if let botID = prompt.botID { recomputeApprovalStatus(for: botID) }
     }
 
     /// Drop a prompt without answering — `<kind>.expire` and session teardown
     /// both land here. The tool has already moved on.
-    public func dismissBlockingPrompt(_ requestID: String) {
+    public func dismissBlockingPrompt(_ requestID: String,
+                                      sourceGatewayID: String? = nil) {
         let bridges = ApprovalBridges.shared
-        guard let index = bridges.prompts.firstIndex(where: { $0.requestID == requestID })
-        else { return }
+        let matches = bridges.prompts.indices.filter { index in
+            bridges.prompts[index].requestID == requestID
+                && (sourceGatewayID == nil || bridges.prompts[index].gatewayID == sourceGatewayID)
+        }
+        // A bare request id is not enough to choose between gateways.
+        guard matches.count == 1, let index = matches.first else { return }
         let botID = bridges.prompts.remove(at: index).botID
         if let botID { recomputeApprovalStatus(for: botID) }
     }
@@ -560,11 +645,12 @@ extension AppModel {
 
     private func sendPromptAnswer(_ prompt: BlockingPrompt, answer: String,
                                   selections: [String]?) {
-        dismissBlockingPrompt(prompt.requestID)
-        guard mode == .live, let client else { return }
+        dismissBlockingPrompt(prompt.requestID, sourceGatewayID: prompt.gatewayID)
+        guard mode == .live else { return }
         let botID = prompt.botID
         Task { @MainActor in
             do {
+                let client = try await self.routedClient(gatewayID: prompt.gatewayID)
                 switch prompt.kind {
                 case .clarify:
                     if let selections {
