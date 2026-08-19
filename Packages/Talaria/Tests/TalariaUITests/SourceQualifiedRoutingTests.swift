@@ -26,6 +26,7 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         CronDetailRuntime.shared.changeTick = 0
         CapabilityRuntime.shared.states.removeAll()
         ModelPickerRuntime.shared.states.removeAll()
+        ApprovalPolicyRuntime.shared.reset()
         ProfileAssetStore.shared.flush()
         PetRuntime.shared.reset()
         SessionsRuntime.shared.resetPrimaryScope()
@@ -316,6 +317,100 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         XCTAssertNotNil(runtime.approvalTargets[primaryID])
         XCTAssertNil(runtime.approvalTargets[remoteID])
         XCTAssertEqual(ApprovalBridges.shared.prompts.map(\.gatewayID), ["primary"])
+    }
+
+    func testApprovalPolicyStoresRemainDistinctAcrossGateways() {
+        let model = AppModel()
+        model.mode = .live
+        LiveRuntime.shared.gatewayID = "primary"
+        let runtime = ApprovalPolicyRuntime.shared
+
+        runtime.selectedGatewayID = "primary"
+        let primary = model.approvalPolicy
+        primary.mode = .manual
+        primary.pairing = PairingSnapshot(
+            pending: [], approved: [PairedUser(platform: "telegram", userID: "one",
+                                               userName: "One", approvedAt: nil)])
+
+        runtime.selectedGatewayID = "homelab"
+        let remote = model.approvalPolicy
+        remote.mode = .smart
+        remote.pairing = PairingSnapshot(
+            pending: [], approved: [PairedUser(platform: "discord", userID: "two",
+                                               userName: "Two", approvedAt: nil)])
+
+        XCTAssertFalse(primary === remote)
+        XCTAssertEqual(primary.mode, .manual)
+        XCTAssertEqual(remote.mode, .smart)
+        XCTAssertEqual(primary.pairing.approved.map(\.userID), ["one"])
+        XCTAssertEqual(remote.pairing.approved.map(\.userID), ["two"])
+    }
+
+    func testApprovalPolicySelectionSurvivesPrimaryRoleTransition() {
+        let model = AppModel()
+        model.mode = .live
+        let runtime = ApprovalPolicyRuntime.shared
+        runtime.selectedGatewayID = "homelab"
+        let selected = model.approvalPolicy
+        selected.mode = .off
+
+        LiveRuntime.shared.gatewayID = "primary"
+        XCTAssertTrue(model.approvalPolicy === selected)
+        LiveRuntime.shared.gatewayID = "homelab"
+        XCTAssertTrue(model.approvalPolicy === selected)
+        XCTAssertEqual(model.approvalPolicy.mode, .off)
+    }
+
+    func testSelectedRemotePolicyListsOnlyItsSessionBypasses() {
+        let model = AppModel()
+        model.mode = .live
+        LiveRuntime.shared.gatewayID = "primary"
+        ApprovalPolicyRuntime.shared.selectedGatewayID = "homelab"
+        let primary = Bot.unlisted(id: "default")
+        let remote = Bot.unlisted(id: "homelab::researcher")
+        model.chat(for: primary.id).yolo = true
+        model.chat(for: remote.id).yolo = true
+
+        let visible = model.approvalSessionBypassBots(in: [primary, remote])
+
+        XCTAssertEqual(visible.map(\.id), ["homelab::researcher"])
+    }
+
+    func testApprovalPolicyDetachDropsOnlyOwningGateway() {
+        let model = AppModel()
+        model.mode = .live
+        let runtime = ApprovalPolicyRuntime.shared
+        runtime.selectedGatewayID = "primary"
+        let primary = model.approvalPolicy
+        primary.mode = .smart
+        runtime.selectedGatewayID = "homelab"
+        let remote = model.approvalPolicy
+        remote.mode = .off
+
+        model.dropApprovalPolicyScope(gatewayID: "homelab")
+
+        runtime.selectedGatewayID = "primary"
+        XCTAssertTrue(model.approvalPolicy === primary)
+        XCTAssertEqual(model.approvalPolicy.mode, .smart)
+        runtime.selectedGatewayID = "homelab"
+        XCTAssertFalse(model.approvalPolicy === remote)
+        XCTAssertEqual(model.approvalPolicy.mode, .manual)
+    }
+
+    func testPairingChangeDuringReadQueuesOneFollowUpRefresh() async {
+        let model = AppModel()
+        let store = model.approvalPolicy
+        store.isLoadingPairing = true
+
+        await model.loadPairing()
+
+        XCTAssertTrue(store.pairingRefreshPending)
+        store.isLoadingPairing = false
+        await model.loadPairing()
+        await Task.yield()
+        XCTAssertFalse(store.pairingRefreshPending)
+        XCTAssertTrue(store.hasLoadedPairing)
+        XCTAssertEqual(store.pairingSupport, .supported)
     }
 
     func testFailedApprovalResponseReopensCardAndClearsFalseOutcome() {

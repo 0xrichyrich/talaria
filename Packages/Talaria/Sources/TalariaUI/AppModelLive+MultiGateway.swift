@@ -156,6 +156,7 @@ public extension AppModel {
         dropRoutineScope(gatewayID: gatewayID)
         dropCapabilityScope(gatewayID: gatewayID)
         dropModelScope(gatewayID: gatewayID)
+        dropApprovalPolicyScope(gatewayID: gatewayID)
         ProfileAssetStore.shared.drop(gatewayID: gatewayID)
         dropPetScope(gatewayID: gatewayID)
         LiveRuntime.shared.resetRoutedState(gatewayID: gatewayID)

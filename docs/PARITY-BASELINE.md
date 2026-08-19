@@ -128,6 +128,9 @@ Multi-connection implementation checkpoints:
       generation/hatching, progress events, and detach cleanup.
 - [x] Source-qualified model catalogs, selection/confirmation, reasoning effort,
       fast mode, and picker-state detach cleanup.
+- [x] Source-qualified gateway-global approval mode, timeout, allowlist
+      revocation, bypass display, and messaging pairing administration with an
+      explicit gateway selector and per-source live refresh.
 - [ ] Source-qualified remaining management mutations.
 
 ## Crash-recovery snapshot disposition

@@ -24,14 +24,14 @@ import TalariaTheme
 // Shapes verified against the upstream checkout:
 //   tui_gateway/methods_config.py:269  — config.get key "approval_mode" |
 //                                        "approvals.mode" → {"value": …}
-//   tui_gateway/server.py:12014-12028  — config.set writes approvals.mode,
+//   tui_gateway/server.py:12106-12120  — config.set writes approvals.mode,
 //                                        validates against {manual,smart,off},
 //                                        re-emits session.info to every session
 //   tui_gateway/server.py:4310-4331    — _APPROVAL_MODES, _load_approval_mode
-//   tui_gateway/server.py:5465         — "v3: adds approvals.mode config RPCs";
+//   tui_gateway/server.py:5553         — "v3: adds approvals.mode config RPCs";
 //                                        get and set landed in one contract bump,
 //                                        so a successful get implies a live set
-//   tui_gateway/server.py:12030-12105  — config.set key "yolo": scope "session"
+//   tui_gateway/server.py:12122-12193  — config.set key "yolo": scope "session"
 //                                        flips one session, scope "global"
 //                                        writes approvals.mode off|manual
 //   tools/approval.py:2931-2957        — command_allowlist load/save
@@ -58,7 +58,7 @@ public enum ApprovalMode: String, CaseIterable, Sendable, Identifiable {
     /// unsure → you.
     case smart
     /// Nothing asks. This is the global bypass — the same state the desktop
-    /// status bar's shift-click zap writes (server.py:12058-12070).
+    /// status bar's shift-click zap writes (server.py:12149-12161).
     case off
 
     public var id: String { rawValue }
@@ -100,7 +100,7 @@ extension GatewayClient {
     /// live session, so the chat strips update themselves.
     ///
     /// Sent under the canonical dotted key: the branch accepts both spellings
-    /// (server.py:12014) and answers with `approvals.mode` either way.
+    /// (server.py:12106) and answers with `approvals.mode` either way.
     @discardableResult
     func setApprovalMode(_ mode: ApprovalMode) async throws -> ApprovalMode {
         let result = try await rpc("config.set", ["key": "approvals.mode",
@@ -157,15 +157,12 @@ extension GatewayClient {
 
 // MARK: - Store
 
-/// State for the approval-policy and pairing surfaces. `AppModel`'s stored
-/// properties live in AppModel.swift (another owner) and a Swift extension
-/// cannot add storage, so this rides a MainActor observable singleton — the
-/// same shape `LiveRuntime`, `ApprovalBridges` and `TalariaSettingsStore` use.
+/// State for one gateway's approval-policy and pairing surfaces. `AppModel`'s
+/// stored properties live in AppModel.swift (another owner), so the runtime
+/// below owns these observable stores by connection id.
 @MainActor
 @Observable
 public final class ApprovalPolicyStore {
-    public static let shared = ApprovalPolicyStore()
-
     /// Whether a gateway implements one of these surfaces. `.unknown` means
     /// "not probed yet" and renders as neither present nor missing.
     public enum Support: Sendable, Equatable { case unknown, supported, unsupported }
@@ -186,6 +183,10 @@ public final class ApprovalPolicyStore {
     public internal(set) var hasLoaded = false
     public internal(set) var isLoadingPairing = false
     public internal(set) var hasLoadedPairing = false
+    /// A `pairing.changed` event that lands while the REST snapshot is in
+    /// flight. Coalesced to one follow-up read so the older response cannot
+    /// become the settled UI state.
+    var pairingRefreshPending = false
     /// Keys of in-flight writes, so one row can spin without freezing the screen.
     public internal(set) var busy: Set<String> = []
     /// Themed lead + the gateway's own message. Cleared by the next success.
@@ -200,12 +201,6 @@ public final class ApprovalPolicyStore {
     /// it completes can cancel it instead of racing it.
     var watchRegistration: Task<Void, Never>?
 
-    /// Which world this state describes: the live gateway's base URL, or nil
-    /// for the demo world. Compared on every load so a policy read from one
-    /// gateway never renders as another's — including the support probes, which
-    /// decide whether a row exists at all.
-    var boundGateway: URL?
-
     public init() {}
 
     public func isBusy(_ key: String) -> Bool { busy.contains(key) }
@@ -217,7 +212,52 @@ public final class ApprovalPolicyStore {
         pairing = .empty; pairingSupport = .unknown
         isLoading = false; hasLoaded = false
         isLoadingPairing = false; hasLoadedPairing = false
+        pairingRefreshPending = false
         busy.removeAll(); notice = nil; pairingNotice = nil
+    }
+}
+
+/// Gateway-global policy is still gateway-*local*. Keeping one singleton here
+/// made the selected primary connection the accidental owner of every policy
+/// mutation even after the roster became a union. The runtime retains one
+/// observable store per connection id, just like model/capability state, while
+/// presenting only the explicitly selected gateway at a time.
+@MainActor
+@Observable
+final class ApprovalPolicyRuntime {
+    static let shared = ApprovalPolicyRuntime()
+    static let demoKey = "approval-policy-demo"
+
+    var stores: [String: ApprovalPolicyStore] = [:]
+    var selectedGatewayID: String?
+
+    func store(gatewayID: String?) -> ApprovalPolicyStore {
+        let key = gatewayID ?? Self.demoKey
+        if let existing = stores[key] { return existing }
+        let created = ApprovalPolicyStore()
+        stores[key] = created
+        return created
+    }
+
+    func drop(gatewayID: String) {
+        stores.removeValue(forKey: gatewayID)?.reset()
+        if selectedGatewayID == gatewayID { selectedGatewayID = nil }
+    }
+
+    func reset() {
+        for store in stores.values { store.reset() }
+        stores.removeAll()
+        selectedGatewayID = nil
+    }
+}
+
+public struct ApprovalPolicyGatewayChoice: Identifiable, Sendable, Equatable {
+    public var id: String
+    public var name: String
+    public var isActive: Bool
+
+    public init(id: String, name: String, isActive: Bool) {
+        self.id = id; self.name = name; self.isActive = isActive
     }
 }
 
@@ -225,13 +265,47 @@ public final class ApprovalPolicyStore {
 
 extension AppModel {
 
-    public var approvalPolicy: ApprovalPolicyStore { .shared }
+    var approvalPolicyRuntime: ApprovalPolicyRuntime { .shared }
+
+    /// The gateway whose gateway-global policy this screen controls. Selection
+    /// is explicit and never inferred from a profile name or a colliding
+    /// session id.
+    public var approvalPolicyGatewayID: String? {
+        approvalPolicyRuntime.selectedGatewayID ?? activeGatewayID ?? LiveRuntime.shared.gatewayID
+    }
+
+    public var approvalPolicy: ApprovalPolicyStore {
+        approvalPolicyRuntime.store(gatewayID: mode == .live ? approvalPolicyGatewayID : nil)
+    }
+
+    public var approvalPolicyGatewayChoices: [ApprovalPolicyGatewayChoice] {
+        guard mode == .live else { return [] }
+        let active = activeGatewayID ?? LiveRuntime.shared.gatewayID
+        return ConnectionRegistry.shared.saved.map {
+            ApprovalPolicyGatewayChoice(id: $0.id, name: $0.name, isActive: $0.id == active)
+        }
+    }
 
     /// Ask whoever owns the screen graph to push the approval-policy screen.
     /// Same shape as `requestSettings()` / `requestCapabilities(profile:)`, so
     /// a caller needs no binding and no knowledge that the screen exists.
-    public func requestApprovalPolicy() {
+    public func requestApprovalPolicy(gatewayID: String? = nil) {
+        approvalPolicyRuntime.selectedGatewayID = gatewayID ?? activeGatewayID
         NotificationCenter.default.post(name: .talariaOpenApprovalPolicy, object: nil)
+    }
+
+    /// Switch the management surface without switching the app's primary chat
+    /// world. The old pairing subscription is surrendered before the new
+    /// gateway is selected, so a late `pairing.changed` event cannot refresh
+    /// the wrong store.
+    public func selectApprovalPolicyGateway(_ gatewayID: String) async {
+        guard approvalPolicyGatewayChoices.contains(where: { $0.id == gatewayID }),
+              approvalPolicyRuntime.selectedGatewayID != gatewayID else { return }
+        detachPairingWatch()
+        approvalPolicyRuntime.selectedGatewayID = gatewayID
+        attachPairingWatch()
+        await loadApprovalPolicy()
+        await loadPairing()
     }
 
     // MARK: Load
@@ -240,8 +314,8 @@ extension AppModel {
     /// the `approvals.mode` RPC without the dashboard REST routes, and vice
     /// versa, and each missing half hides only its own rows.
     public func loadApprovalPolicy() async {
+        let gatewayID = approvalPolicyGatewayID
         let store = approvalPolicy
-        rebindPolicyStoreIfNeeded()
         guard !store.isLoading else { return }
         store.isLoading = true
         store.notice = nil
@@ -250,8 +324,16 @@ extension AppModel {
             store.hasLoaded = true
         }
 
-        guard mode == .live, let client else {
+        guard mode == .live else {
             Self.fillDemoPolicy(store)
+            return
+        }
+
+        let client: GatewayClient
+        do {
+            client = try await approvalPolicyClient(gatewayID: gatewayID)
+        } catch {
+            store.notice = policyNotice(Self.policyMessage(error))
             return
         }
 
@@ -267,7 +349,7 @@ extension AppModel {
             store.modeSupport = .supported
         } catch let error as GatewayError
             where error.code == GatewayClient.methodNotFound || error.code == 4002 {
-            // Pre-v3 gateway: no approvals.mode RPC pair at all (server.py:5465
+            // Pre-v3 gateway: no approvals.mode RPC pair at all (server.py:5553
             // bumped the contract for get and set together). The control
             // disappears rather than writing a key nothing reads.
             store.modeSupport = .unsupported
@@ -297,16 +379,18 @@ extension AppModel {
     /// once and rolls back if the gateway refuses, because a security control
     /// that silently shows the wrong state is worse than a slow one.
     public func setApprovalMode(_ next: ApprovalMode) async {
+        let gatewayID = approvalPolicyGatewayID
         let store = approvalPolicy
         guard store.mode != next else { return }
         let previous = store.mode
         store.mode = next
         store.notice = nil
 
-        guard mode == .live, let client else { return }
+        guard mode == .live else { return }
         store.busy.insert("mode")
         defer { store.busy.remove("mode") }
         do {
+            let client = try await approvalPolicyClient(gatewayID: gatewayID)
             store.mode = try await client.setApprovalMode(next)
         } catch {
             store.mode = previous
@@ -321,6 +405,7 @@ extension AppModel {
     /// tools/approval.py:3560-3614), so this is the window between a push
     /// landing and the agent giving up on you.
     public func setApprovalTimeout(_ seconds: Int) async {
+        let gatewayID = approvalPolicyGatewayID
         let store = approvalPolicy
         guard store.configSupport == .supported, store.config.timeoutSeconds != seconds else {
             return
@@ -329,10 +414,11 @@ extension AppModel {
         store.config.timeoutSeconds = seconds
         store.notice = nil
 
-        guard mode == .live, let client else { return }
+        guard mode == .live else { return }
         store.busy.insert("timeout")
         defer { store.busy.remove("timeout") }
         do {
+            let client = try await approvalPolicyClient(gatewayID: gatewayID)
             try await client.writeApprovalTimeout(seconds)
         } catch {
             store.config.timeoutSeconds = previous
@@ -346,6 +432,7 @@ extension AppModel {
     /// a grant added from desktop between our load and this tap survives —
     /// `PUT /api/config` assigns the whole list and would otherwise erase it.
     public func revokeAlwaysAllowed(_ pattern: String) async {
+        let gatewayID = approvalPolicyGatewayID
         let store = approvalPolicy
         guard store.configSupport == .supported else { return }
         let key = "allow:" + pattern
@@ -354,11 +441,12 @@ extension AppModel {
         store.notice = nil
         defer { store.busy.remove(key) }
 
-        guard mode == .live, let client else {
+        guard mode == .live else {
             store.config.allowlist.removeAll { $0 == pattern }
             return
         }
         do {
+            let client = try await approvalPolicyClient(gatewayID: gatewayID)
             let fresh = try await client.approvalConfig()
             let remaining = fresh.allowlist.filter { $0 != pattern }
             // Already gone (revoked from desktop, or the file was hand-edited):
@@ -377,20 +465,29 @@ extension AppModel {
 
     /// True when nothing asks: `approvals.mode: off` is the global bypass, and
     /// it covers the CLI, the TUI, cron and every session at once
-    /// (server.py:12036-12042).
+    /// (server.py:12128-12134).
     public var globalApprovalBypass: Bool {
         approvalPolicy.mode == .off && approvalPolicy.modeSupport != .unknown
     }
 
     /// Bots whose *session* reports the bypass. `session.info.yolo` is the
     /// EFFECTIVE flag — process `--yolo`, OR this session's toggle, OR
-    /// `approvals.mode: off` (server.py:5539-5554) — so while the global switch
+    /// `approvals.mode: off` (server.py:5627-5640) — so while the global switch
     /// is off every session reports true and listing them individually would
     /// invite you to turn off a per-session flag that was never on. In that
     /// state the list is empty and the screen names the global switch instead.
     public var sessionBypassBots: [Bot] {
+        approvalSessionBypassBots(in: unionRosterBots)
+    }
+
+    func approvalSessionBypassBots(in roster: [Bot]) -> [Bot] {
         guard !globalApprovalBypass else { return [] }
-        return bots.filter { chats[$0.id]?.yolo == true }
+        let target = approvalPolicyGatewayID
+        return roster.filter { bot in
+            guard chats[bot.id]?.yolo == true else { return false }
+            if let route = stateRoute(for: bot.id) { return route.gatewayID == target }
+            return target == activeGatewayID
+        }
     }
 
     /// Clear one session's YOLO — `config.set {key:"yolo", scope:"session"}`,
@@ -404,20 +501,28 @@ extension AppModel {
     /// Read the pairing store. A gateway with no dashboard routes answers 404,
     /// which marks the surface unsupported and takes the whole row away.
     public func loadPairing() async {
+        let gatewayID = approvalPolicyGatewayID
         let store = approvalPolicy
-        rebindPolicyStoreIfNeeded()
-        guard !store.isLoadingPairing else { return }
+        guard !store.isLoadingPairing else {
+            store.pairingRefreshPending = true
+            return
+        }
         store.isLoadingPairing = true
         defer {
             store.isLoadingPairing = false
             store.hasLoadedPairing = true
+            if store.pairingRefreshPending, approvalPolicyGatewayID == gatewayID {
+                store.pairingRefreshPending = false
+                Task { @MainActor [weak self] in await self?.loadPairing() }
+            }
         }
 
-        guard mode == .live, let client else {
+        guard mode == .live else {
             Self.fillDemoPairing(store)
             return
         }
         do {
+            let client = try await approvalPolicyClient(gatewayID: gatewayID)
             store.pairing = try await client.pairingSnapshot()
             store.pairingSupport = .supported
             store.pairingNotice = nil
@@ -436,6 +541,7 @@ extension AppModel {
     /// desktop row (app/messaging/index.tsx:354).
     @discardableResult
     public func approvePairing(_ request: PairingRequest) async -> Bool {
+        let gatewayID = approvalPolicyGatewayID
         let store = approvalPolicy
         guard request.isApprovable else { return false }
         let key = "pair:" + request.id
@@ -452,8 +558,9 @@ extension AppModel {
                                                       userName: request.userName,
                                                       approvedAt: Date().timeIntervalSince1970)])
 
-        guard mode == .live, let client else { return true }
+        guard mode == .live else { return true }
         do {
+            let client = try await approvalPolicyClient(gatewayID: gatewayID)
             _ = try await client.approvePairingRequest(platform: request.platform,
                                                        requestID: request.requestID)
             return true
@@ -467,6 +574,7 @@ extension AppModel {
     /// Take access away. Destructive, so the screen confirms before calling.
     @discardableResult
     public func revokePairing(_ user: PairedUser) async -> Bool {
+        let gatewayID = approvalPolicyGatewayID
         let store = approvalPolicy
         let key = "revoke:" + user.id
         guard !store.isBusy(key) else { return false }
@@ -478,8 +586,9 @@ extension AppModel {
         store.pairing = PairingSnapshot(pending: snapshot.pending,
                                         approved: snapshot.approved.filter { $0.id != user.id })
 
-        guard mode == .live, let client else { return true }
+        guard mode == .live else { return true }
         do {
+            let client = try await approvalPolicyClient(gatewayID: gatewayID)
             try await client.revokePairedUser(platform: user.platform, userID: user.userID)
             return true
         } catch PairingFailure.notFound {
@@ -495,36 +604,51 @@ extension AppModel {
 
     // MARK: Live refresh
 
-    /// Subscribe to `pairing.changed` (server.py:3753, a 2 s watch over every
+    /// Subscribe to `pairing.changed` (server.py:3841, a 2 s watch over every
     /// profile's pairing store) while the screen is on. It is the difference
     /// between seeing a colleague appear in the queue and having to know to
     /// pull down.
     public func attachPairingWatch() {
+        guard mode == .live, let gatewayID = approvalPolicyGatewayID else { return }
         let store = approvalPolicy
-        guard mode == .live, let client, store.watchedClient !== client else { return }
-        detachPairingWatch()
-        store.watchedClient = client
-
-        // Same funnel the approval bridges use: events leave the client actor
-        // through one stream so MainActor delivery keeps wire order.
-        let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
-        store.watchPump = Task { @MainActor [weak self] in
-            for await event in stream where event.type == "pairing.changed" {
-                await self?.loadPairing()
+        guard store.watchedClient == nil, store.watchRegistration == nil else { return }
+        store.watchRegistration = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let client: GatewayClient
+            do {
+                client = try await self.approvalPolicyClient(gatewayID: gatewayID)
+            } catch {
+                guard !Task.isCancelled,
+                      self.approvalPolicyGatewayID == gatewayID else { return }
+                store.watchRegistration = nil
+                store.pairingNotice = self.pairingNotice(for: error)
+                return
             }
-        }
-        store.watchRegistration = Task { @MainActor in
+            guard !Task.isCancelled,
+                  self.approvalPolicyGatewayID == gatewayID else { return }
+            store.watchedClient = client
+
+            // Same funnel the approval bridges use: events leave the client
+            // actor through one stream so MainActor delivery keeps wire order.
+            let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+            store.watchPump = Task { @MainActor [weak self] in
+                for await event in stream where event.type == "pairing.changed" {
+                    guard let self, self.approvalPolicyGatewayID == gatewayID else { return }
+                    await self.loadPairing()
+                }
+            }
             let handler = await client.addEventHandler { continuation.yield($0) }
             // Registering costs an actor hop, and a detach can land inside it —
-            // the screen closing, or `rebindPolicyStoreIfNeeded` firing from the
-            // first load. Assigning the id blindly would leave a live handler
-            // pumping into a cancelled stream for the life of the connection,
-            // with nothing holding its id to remove it by.
-            guard store.watchedClient === client else {
+            // the screen closing or a gateway selection changing. Assigning
+            // the id blindly would leave a handler pumping into a cancelled
+            // stream for the life of the connection.
+            guard !Task.isCancelled, store.watchedClient === client,
+                  self.approvalPolicyGatewayID == gatewayID else {
                 await client.removeEventHandler(handler)
                 return
             }
             store.watchHandler = handler
+            store.watchRegistration = nil
         }
     }
 
@@ -541,25 +665,17 @@ extension AppModel {
 
     // MARK: Internals
 
-    /// Drop everything the moment the world changes. The store is a process
-    /// singleton (extensions cannot add stored properties to AppModel), so
-    /// without this a gateway that HAS pairing leaves its row visible after a
-    /// switch to one that does not — the worst kind of stale, because the
-    /// support probes are what decide whether a control exists.
-    private func rebindPolicyStoreIfNeeded() {
-        let store = approvalPolicy
-        let current = mode == .live ? LiveRuntime.shared.baseURL : nil
-        guard store.boundGateway != current else { return }
-        // The screen arms the watch (presenter `onChange`) BEFORE its first load
-        // runs, and that first load is always a rebind because `boundGateway`
-        // starts nil. Detaching without putting it back therefore killed the
-        // `pairing.changed` subscription on every single open — the queue only
-        // ever updated on a manual pull.
-        let wasWatching = store.watchedClient != nil
-        detachPairingWatch()
-        store.reset()
-        store.boundGateway = current
-        if wasWatching { attachPairingWatch() }
+    private func approvalPolicyClient(gatewayID: String?) async throws -> GatewayClient {
+        if let gatewayID { return try await routedClient(gatewayID: gatewayID) }
+        if let client { return client }
+        throw GatewayRouteError.noRoute
+    }
+
+    /// A disconnected source cannot leave security state or a live event
+    /// handler behind. Other gateway stores remain intact.
+    func dropApprovalPolicyScope(gatewayID: String) {
+        if approvalPolicyGatewayID == gatewayID { detachPairingWatch() }
+        approvalPolicyRuntime.drop(gatewayID: gatewayID)
     }
 
     static func policyMessage(_ error: Error) -> String {
