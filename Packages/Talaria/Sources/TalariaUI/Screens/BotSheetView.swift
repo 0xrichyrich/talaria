@@ -157,7 +157,7 @@ public struct BotSheetView: View {
     /// its own: a gateway that cannot answer one of them just leaves that card
     /// on its themed empty state.
     private func hydrate() async {
-        async let choices = model.modelChoices()
+        async let choices = model.modelChoices(botID: botID)
         async let described = model.profileSnapshot(botID: botID)
         // session.list + session.context_breakdown live in AppModelLive+Sessions.
         await model.refreshSessions(botID: botID)

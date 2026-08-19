@@ -25,6 +25,7 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         CronDetailRuntime.shared.reset()
         CronDetailRuntime.shared.changeTick = 0
         CapabilityRuntime.shared.states.removeAll()
+        ProfileAssetStore.shared.flush()
         SessionsRuntime.shared.resetPrimaryScope()
         SessionsRuntime.shared.resetRoutedScope(gatewayID: "homelab")
         super.tearDown()
@@ -447,6 +448,55 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         XCTAssertTrue(remote.skills.isEmpty)
         XCTAssertTrue(remote.busy.isEmpty)
         XCTAssertFalse(remote.hasLoaded)
+    }
+
+    func testProfileRPCIdentityStripsOnlyTheQualifiedSource() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+
+        XCTAssertEqual(model.profileRoute(for: "default"),
+                       GatewayBotRoute(gatewayID: "primary", profile: "default"))
+        XCTAssertEqual(model.profileRoute(for: "homelab::default"),
+                       GatewayBotRoute(gatewayID: "homelab", profile: "default"))
+        XCTAssertEqual(model.cloneID(for: "homelab::default"), "default-2")
+    }
+
+    func testPortraitCacheKeepsCollidingProfilesInGatewayScopes() {
+        let store = ProfileAssetStore.shared
+        LiveRuntime.shared.gatewayID = "primary"
+        let primary = Data([0x01])
+        let remote = Data([0x02])
+
+        store.set(primary, for: "default")
+        store.set(remote, for: "homelab::default")
+
+        XCTAssertEqual(store.portrait(for: "default"), primary)
+        XCTAssertEqual(store.portrait(for: "homelab::default"), remote)
+        store.drop(gatewayID: "homelab")
+        XCTAssertEqual(store.portrait(for: "default"), primary)
+        XCTAssertNil(store.portrait(for: "homelab::default"))
+        store.set(remote, for: "homelab::default")
+        LiveRuntime.shared.gatewayID = "homelab"
+        XCTAssertEqual(store.portrait(for: "default"), remote)
+    }
+
+    func testProfileEditRequiresEveryIndependentSectionAcknowledgement() {
+        let edit = ProfileEdit(description: "Ops", soul: "Careful",
+                               model: "model-a", provider: "provider-a",
+                               disabledSkills: ["browser"], enabledToolsets: [],
+                               uiMeta: .object(["hermes-bots": .object([:])]))
+
+        XCTAssertEqual(edit.expectedAppliedSections,
+                       ["description", "soul", "model", "skills", "toolsets", "ui_meta"])
+        XCTAssertFalse(edit.wasFullyApplied([
+            "description": true, "soul": true, "model": true,
+            "skills": true, "toolsets": false, "ui_meta": true
+        ]))
+        XCTAssertTrue(edit.wasFullyApplied(Dictionary(
+            uniqueKeysWithValues: edit.expectedAppliedSections.map { ($0, true) })))
+        let invalidPin = ProfileEdit(model: "model-a")
+        XCTAssertFalse(invalidPin.isWireValid)
+        XCTAssertFalse(invalidPin.wasFullyApplied([:]))
     }
 
     func testRoutineGatewayDetachPreservesOtherGatewayRows() {

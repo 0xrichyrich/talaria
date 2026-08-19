@@ -272,18 +272,22 @@ public extension AppModel {
                   botID: sourceID, key: key)
             return nil
         }
+        let newRosterID: String
+        if let sourceRoute = profileRoute(for: sourceID),
+           sourceRoute.gatewayID != LiveRuntime.shared.gatewayID {
+            newRosterID = GatewayBotRoute(gatewayID: sourceRoute.gatewayID,
+                                          profile: newID).qualifiedID
+        } else {
+            newRosterID = newID
+        }
         // Filed under the CLONE, not the source: the act being reported is the
-        // new profile existing. That is only honest because `duplicateProfile`
-        // appends the clone to `bots` before it returns — so `identity(newID)`
-        // resolves a real row here and in the mirrored ledger entry, and the
-        // card wears the face the roster is about to draw rather than
-        // `Bot.unlisted`'s hash-derived stand-in. A future refactor that defers
-        // the append to the next `profiles.list` answer has to move this back to
-        // `sourceID` or the toast and its row stop looking like one event.
+        // new profile existing. Primary clones are already in `bots`; remote
+        // clones use the qualified id whose secondary-roster refresh just
+        // completed, so neither can collide with the other gateway's row.
         toast(kind: .success,
               title: theme.copy.toastDuplicated(newID, from: name, theme.themeID),
-              botID: newID, key: key)
-        return newID
+              botID: newRosterID, key: key)
+        return newRosterID
     }
 }
 
@@ -473,23 +477,37 @@ public extension AppModel {
     @discardableResult
     func createBotProfileWithFeedback(id: String, job: String, soul: String,
                                       model: ModelChoice?, disabledSkills: [String],
-                                      enabledToolsets: [String]?, uiMeta: JSONValue) async -> Bool {
+                                      enabledToolsets: [String]?, uiMeta: JSONValue,
+                                      gatewayID: String? = nil) async -> Bool {
         let key = "create:\(id)"
         toast(kind: .info, title: theme.copy.toastCreatingBot(id, theme.themeID), key: key)
-        let created = await createBotProfile(id: id, job: job, soul: soul, model: model,
-                                             disabledSkills: disabledSkills,
-                                             enabledToolsets: enabledToolsets, uiMeta: uiMeta)
-        guard created else {
+        let result = await createBotProfile(id: id, job: job, soul: soul, model: model,
+                                            disabledSkills: disabledSkills,
+                                            enabledToolsets: enabledToolsets, uiMeta: uiMeta,
+                                            gatewayID: gatewayID)
+        guard result != .failed else {
             toast(kind: .failure, title: theme.copy.toastBotCreateFailed(theme.themeID),
                   key: key)
             return false
         }
-        // Filed under the new profile now that it exists: `createBotProfile`
-        // appends the row before returning, so the card wears the face the
-        // roster is about to draw. Same dependency the duplicate path documents.
-        toast(kind: .success,
-              title: theme.copy.toastBotCreated(botName(id, theme.themeID), theme.themeID),
-              botID: id, key: key)
+        // Filed under the new profile now that it exists. Primary creation
+        // appends its rich row; remote creation refreshes the qualified thin
+        // row before returning.
+        let rosterID: String
+        if let gatewayID, gatewayID != LiveRuntime.shared.gatewayID {
+            rosterID = GatewayBotRoute(gatewayID: gatewayID, profile: id).qualifiedID
+        } else {
+            rosterID = id
+        }
+        if result == .partial {
+            toast(kind: .warning,
+                  title: theme.copy.toastBotCreatedPartial(id, theme.themeID),
+                  botID: rosterID, key: key)
+        } else {
+            toast(kind: .success,
+                  title: theme.copy.toastBotCreated(botName(id, theme.themeID), theme.themeID),
+                  botID: rosterID, key: key)
+        }
         return true
     }
 
@@ -1001,6 +1019,14 @@ public extension CopyPack {
         case .soft: BotModeStrings.agentCreated(name)
         case .control: "AGENT \(name.uppercased()) CREATED"
         case .ink: "\(name) has been written into the roll"
+        }
+    }
+
+    func toastBotCreatedPartial(_ name: String, _ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Created (name), but some setup did not land — open the profile to review it"
+        case .control: "(name.uppercased()) CREATED — SETUP PARTIAL; REVIEW PROFILE"
+        case .ink: "(name) exists, though part of its inscription must be reviewed"
         }
     }
 
