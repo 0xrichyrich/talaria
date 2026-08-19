@@ -75,3 +75,18 @@ public struct GatewayApprovalRoute: Codable, Hashable, Sendable {
         "approval:\(gatewayID.count):\(gatewayID)"
     }
 }
+
+/// A cron job id scoped to the gateway whose scheduler owns it.
+public struct GatewayRoutineRoute: Codable, Hashable, Sendable {
+    public var gatewayID: String
+    public var jobID: String
+
+    public init(gatewayID: String, jobID: String) {
+        self.gatewayID = gatewayID
+        self.jobID = jobID
+    }
+
+    public var qualifiedID: String {
+        "routine:\(gatewayID.count):\(gatewayID)\(jobID)"
+    }
+}

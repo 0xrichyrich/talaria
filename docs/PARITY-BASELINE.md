@@ -67,7 +67,8 @@ are the remaining multi-connection management surfaces and group rooms:
 
 - Talaria retains authenticated clients for multiple gateways and routes chat,
   events, sessions, full approval recovery/prompts, and unread state by source.
-  Routines, capabilities, and several management mutations remain primary-only.
+  Routine detail/history mutations, capabilities, and several management
+  mutations remain primary-only; remote routine listing and toggles are routed.
 - Talaria's in-flight room work models one group per bot; current Hermes uses
   multiple memberships and standalone rooms.
 - Foreign room members are not yet delivered through their owning connection.
@@ -111,7 +112,10 @@ Multi-connection implementation checkpoints:
       and gateway-role transitions, including colliding profile names.
 - [x] Source-qualified approval request identity, pending replay,
       acknowledgements, full-choice responses, and clarify/sudo/secret prompts.
-- [ ] Source-qualified routines, capabilities, and management mutations.
+- [x] Source-qualified routine roster, cron.changed refresh, safe legacy-job
+      quarantine, and pause/resume routing.
+- [ ] Source-qualified routine detail/history/create/edit/run/delete,
+      capabilities, and remaining management mutations.
 
 ## Crash-recovery snapshot disposition
 

@@ -51,6 +51,9 @@ final class FeedsRuntime {
     @ObservationIgnored var cronJobs: [String: CronJobRecord] = [:]
     /// routine id → the profile scope its RPCs must carry (nil = launch store).
     @ObservationIgnored var cronScope: [String: String?] = [:]
+    /// Routine UI id → exact gateway/job/profile destination. Primary rows
+    /// keep their raw ids for the existing detail surface; remote rows do not.
+    @ObservationIgnored var routineTargets: [String: RoutineTarget] = [:]
     /// True once a scoped list came back with the `scoped` marker.
     var cronPerProfile = false
     var routinesNote = ""
@@ -87,7 +90,8 @@ final class FeedsRuntime {
 
     /// Everything derived from one gateway; dropped when the link changes.
     func resetDerived() {
-        cronJobs.removeAll(); cronScope.removeAll(); cronPerProfile = false
+        cronJobs.removeAll(); cronScope.removeAll(); routineTargets.removeAll()
+        cronPerProfile = false
         routinesNote = ""; routinesError = nil; lastRoutinesRefresh = nil
         routinesLoaded = false
         artifactSessions.removeAll(); artifactsNote = ""; lastArtifactScan = nil
@@ -96,6 +100,12 @@ final class FeedsRuntime {
         inboxTask?.cancel(); inboxTask = nil
         routinesTask?.cancel(); routinesTask = nil
     }
+}
+
+struct RoutineTarget: Sendable, Equatable {
+    var route: GatewayRoutineRoute
+    var bot: GatewayBotRoute
+    var profile: String?
 }
 
 /// Where a derived row came from, so a tap can reopen the exact session.
@@ -429,7 +439,7 @@ public extension AppModel {
                            text: theme.copy.feedRoutineRan(theme.themeID) + " — " + routine.name,
                            subtext: status == "error" ? theme.copy.feedRoutineFailed(theme.themeID)
                                                       : theme.copy.feedRoutineOK(theme.themeID),
-                           key: "cron-run:\(job.id):\(Int(last.timeIntervalSince1970))",
+                           key: "cron-run:\(routine.id):\(Int(last.timeIntervalSince1970))",
                            at: last)
         }
     }
@@ -439,11 +449,39 @@ public extension AppModel {
 
 public extension AppModel {
 
+    func dropRoutineScope(gatewayID: String) {
+        let runtime = FeedsRuntime.shared
+        let stale = Set(runtime.routineTargets.compactMap { key, target in
+            target.route.gatewayID == gatewayID ? key : nil
+        })
+        routines.removeAll { routine in
+            stale.contains(routine.id)
+                || GatewayBotRoute(qualifiedID: routine.botID)?.gatewayID == gatewayID
+        }
+        for id in stale {
+            runtime.cronJobs.removeValue(forKey: id)
+            runtime.cronScope.removeValue(forKey: id)
+            runtime.routineTargets.removeValue(forKey: id)
+            CronDetailRuntime.shared.quarantined.remove(id)
+        }
+    }
+
+    /// Detail/history/create/edit/run still use the active gateway REST
+    /// context. Remote list rows expose only the socket-backed toggle until
+    /// the following REST-routing slice lands.
+    func routineHasFullManagement(_ routine: Routine) -> Bool {
+        guard let target = FeedsRuntime.shared.routineTargets[routine.id] else {
+            return mode != .live
+        }
+        return target.route.gatewayID == LiveRuntime.shared.gatewayID
+    }
+
     /// Live routine list. Reads the launch-profile cron store, then each bot's
     /// own store when the gateway honors `profile` scoping, and attributes
     /// anything unscoped by its "[bot:<name>] " prefix.
     func refreshRoutinesLive(force: Bool = false) async {
-        guard mode == .live, let client else { return }
+        guard mode == .live, let client, let primaryGatewayID = LiveRuntime.shared.gatewayID
+        else { return }
         let runtime = FeedsRuntime.shared
         // One list sweep at a time: a toggle, a cron.changed broadcast and a
         // screen appearing can all land within the same second. `force` skips
@@ -479,13 +517,28 @@ public extension AppModel {
             }
         }
 
-        runtime.cronJobs = jobs.mapValues(\.job)
-        runtime.cronScope = jobs.mapValues(\.scope)
+        runtime.cronJobs = runtime.cronJobs.filter {
+            runtime.routineTargets[$0.key]?.route.gatewayID != primaryGatewayID
+        }
+        runtime.cronScope = runtime.cronScope.filter {
+            runtime.routineTargets[$0.key]?.route.gatewayID != primaryGatewayID
+        }
+        runtime.routineTargets = runtime.routineTargets.filter {
+            $0.value.route.gatewayID != primaryGatewayID
+        }
+        for (jobID, entry) in jobs {
+            runtime.cronJobs[jobID] = entry.job
+            runtime.cronScope[jobID] = entry.scope
+            runtime.routineTargets[jobID] = RoutineTarget(
+                route: GatewayRoutineRoute(gatewayID: primaryGatewayID, jobID: jobID),
+                bot: GatewayBotRoute(gatewayID: primaryGatewayID, profile: entry.botID),
+                profile: entry.scope)
+        }
         runtime.cronPerProfile = scopedCount > 0
         runtime.routinesError = failed
         runtime.routinesLoaded = failed == nil
 
-        routines = jobs.values
+        let primaryRows = jobs.values
             .sorted { ($0.job.nextRun ?? .distantFuture) < ($1.job.nextRun ?? .distantFuture) }
             .map { entry in
                 Routine(id: entry.job.id, botID: entry.botID, name: entry.job.displayTitle,
@@ -494,10 +547,81 @@ public extension AppModel {
                         last: Self.lastRunLine(entry.job, theme: theme.themeID),
                         isOn: entry.job.isActive)
             }
+        routines.removeAll { GatewayBotRoute(qualifiedID: $0.botID) == nil }
+        routines.append(contentsOf: primaryRows)
+
+        await refreshSecondaryRoutines()
+        routines.sort { lhs, rhs in
+            let left = runtime.cronJobs[lhs.id]?.nextRun ?? .distantFuture
+            let right = runtime.cronJobs[rhs.id]?.nextRun ?? .distantFuture
+            return left < right
+        }
 
         runtime.routinesNote = theme.copy.routinesScopeNote(theme.themeID,
                                                             perProfile: runtime.cronPerProfile,
                                                             count: routines.count)
+    }
+
+    private func refreshSecondaryRoutines() async {
+        let feeds = FeedsRuntime.shared
+        let gatewayIDs = ConnectionRegistry.shared.saved.map(\.id)
+        for gatewayID in gatewayIDs {
+            guard gatewayID != LiveRuntime.shared.gatewayID else { continue }
+            // Roster enumeration already owns dialing/backoff. A routines
+            // refresh consumes only retained clients so opening this screen
+            // cannot serially wake every sleeping LAN machine.
+            guard let client = await ConnectionRegistry.shared.clientPool.client(for: gatewayID)
+            else { continue }
+            await attachRoutedEventsIfNeeded(client: client, gatewayID: gatewayID)
+            let profiles = (try? await client.listProfiles(includeSessions: false)) ?? []
+            guard let fallback = profiles.first(where: \.isDefault)?.name ?? profiles.first?.name
+            else { continue }
+            var jobs: [String: (job: CronJobRecord, botID: String, scope: String?)] = [:]
+            guard let launchListing = try? await client.cronJobs(
+                includeDisabled: true) else { continue }
+            for job in launchListing.jobs where !job.id.isEmpty {
+                jobs[job.id] = (job, job.taggedBotID ?? fallback, nil)
+            }
+            for profile in profiles.prefix(10) where profile.name != fallback {
+                guard let listing = try? await client.cronJobs(
+                    profile: profile.name, includeDisabled: true),
+                      listing.scopedProfile == profile.name else { continue }
+                for job in listing.jobs where !job.id.isEmpty {
+                    jobs[job.id] = (job, job.taggedBotID ?? profile.name, profile.name)
+                }
+            }
+
+            guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
+                  current.client === client else { continue }
+
+            let stale = Set(feeds.routineTargets.compactMap { key, target in
+                target.route.gatewayID == gatewayID ? key : nil
+            })
+            routines.removeAll { routine in
+                stale.contains(routine.id)
+                    || GatewayBotRoute(qualifiedID: routine.botID)?.gatewayID == gatewayID
+            }
+            for id in stale {
+                feeds.cronJobs.removeValue(forKey: id)
+                feeds.cronScope.removeValue(forKey: id)
+                feeds.routineTargets.removeValue(forKey: id)
+            }
+            for entry in jobs.values {
+                let route = GatewayRoutineRoute(gatewayID: gatewayID, jobID: entry.job.id)
+                let bot = GatewayBotRoute(gatewayID: gatewayID, profile: entry.botID)
+                let id = route.qualifiedID
+                feeds.cronJobs[id] = entry.job
+                feeds.cronScope[id] = entry.scope
+                feeds.routineTargets[id] = RoutineTarget(route: route, bot: bot,
+                                                         profile: entry.scope)
+                routines.append(Routine(
+                    id: id, botID: bot.qualifiedID, name: entry.job.displayTitle,
+                    schedule: entry.job.schedule,
+                    next: entry.job.nextRun.map { Self.relativeNext($0.timeIntervalSince1970) } ?? "",
+                    last: Self.lastRunLine(entry.job, theme: theme.themeID),
+                    isOn: entry.job.isActive))
+            }
+        }
     }
 
     /// "ran 07:00 · clean" / "—" before the first fire.
@@ -522,15 +646,16 @@ public extension AppModel {
         toast(kind: .info,
               title: theme.copy.toastRoutinePaused(routine.name, on: enabled, theme.themeID),
               botID: routine.botID, key: key)
-        guard mode == .live, let client else {
+        guard mode == .live, let target = FeedsRuntime.shared.routineTargets[routine.id] else {
             settleToast(key: key)
             return
         }
         Task { @MainActor in
             let runtime = FeedsRuntime.shared
             do {
-                try await client.cronSetPaused(jobID: routine.id, paused: !enabled,
-                                               profile: runtime.cronScope[routine.id] ?? nil)
+                let client = try await self.routedClient(gatewayID: target.route.gatewayID)
+                try await client.cronSetPaused(jobID: target.route.jobID, paused: !enabled,
+                                               profile: target.profile)
                 runtime.routinesError = nil
                 await refreshRoutinesLive(force: true)
                 settleToast(key: key)
@@ -558,6 +683,9 @@ public extension AppModel {
     /// form desktop writes.
     func createRoutine(botID: String, title: String, schedule: String, prompt: String,
                        repeatCount: Int? = nil, continuity: Bool = false) async throws {
+        guard GatewayBotRoute(qualifiedID: botID) == nil else {
+            throw GatewayRouteError.noRoute
+        }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTitle.isEmpty, !cleanPrompt.isEmpty else {
@@ -603,6 +731,7 @@ public extension AppModel {
     }
 
     func deleteRoutine(_ routine: Routine) async throws {
+        guard routineHasFullManagement(routine) else { throw GatewayRouteError.noRoute }
         guard mode == .live, let client else { return }
         try await client.cronRemove(jobID: routine.id,
                                     profile: FeedsRuntime.shared.cronScope[routine.id] ?? nil)
@@ -619,6 +748,7 @@ public extension AppModel {
     ///   agent run) so the caller can say "started" rather than "done".
     @discardableResult
     func runRoutineNow(_ routine: Routine) async throws -> Bool {
+        guard routineHasFullManagement(routine) else { throw GatewayRouteError.noRoute }
         guard mode == .live else { return false }
         guard let (base, credential) = gatewayRESTContext() else {
             throw GatewayError(code: -3, message: theme.copy.needsRESTNote(theme.themeID))

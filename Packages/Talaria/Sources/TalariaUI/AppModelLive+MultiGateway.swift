@@ -151,6 +151,7 @@ public extension AppModel {
             await subscription.client.removeEventHandler(subscription.handlerID)
         }
         dropApprovalScope(gatewayID: gatewayID)
+        dropRoutineScope(gatewayID: gatewayID)
         LiveRuntime.shared.resetRoutedState(gatewayID: gatewayID)
         CanonicalChatRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
         SessionsRuntime.shared.resetRoutedScope(gatewayID: gatewayID)

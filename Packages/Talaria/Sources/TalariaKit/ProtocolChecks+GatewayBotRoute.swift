@@ -27,5 +27,8 @@ extension ProtocolChecks {
                    "same approval request id remains distinct across gateways")
         try expect(localApproval.qualifiedID != remoteApproval.qualifiedID,
                    "approval UI identity retains source without changing wire id")
+        try expect(GatewayRoutineRoute(gatewayID: "mac", jobID: "same").qualifiedID
+            != GatewayRoutineRoute(gatewayID: "homelab", jobID: "same").qualifiedID,
+                   "same cron job id remains distinct across gateways")
     }
 }
