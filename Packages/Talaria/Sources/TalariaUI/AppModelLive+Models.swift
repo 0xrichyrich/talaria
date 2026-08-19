@@ -22,6 +22,8 @@ import TalariaKit
 // 3. `config.set` with no matching session falls back to the *persistent
 //    profile config* — so a control that means "this chat" never reaches the
 //    gateway without a session id behind it.
+// 4. A source-qualified bot owns its catalog and every session mutation. A
+//    remote picker never reads from or writes through the primary gateway.
 
 // MARK: - Per-model presets
 
@@ -249,6 +251,7 @@ public enum ModelSelectionResult: Sendable, Equatable {
 @MainActor
 @Observable
 public final class ModelPickerState {
+    @ObservationIgnored var target: GatewayBotRoute?
     public var catalog: ModelCatalog = .empty
     public var isLoading = false
     /// An explicit "Refresh Models" is in flight (drives the spinner).
@@ -277,12 +280,35 @@ public final class ModelPickerState {
         notice = nil
         noticeIsWarning = false
     }
+
+    func resetForDetach() {
+        catalog = .empty
+        isLoading = false
+        isRefreshing = false
+        hasLoaded = false
+        loadError = nil
+        notice = nil
+        noticeIsWarning = false
+        pendingConfirmation = nil
+        fastMode = false
+        busyRow = nil
+    }
 }
 
 @MainActor
 final class ModelPickerRuntime {
     static let shared = ModelPickerRuntime()
     var states: [String: ModelPickerState] = [:]
+
+    func drop(gatewayID: String) {
+        let keys = states.compactMap { key, state in
+            state.target?.gatewayID == gatewayID ? key : nil
+        }
+        for key in keys {
+            states[key]?.resetForDetach()
+            states.removeValue(forKey: key)
+        }
+    }
 }
 
 // MARK: - Model API
@@ -292,10 +318,38 @@ extension AppModel {
     /// The picker store for a bot, created on first use.
     public func modelPicker(for botID: String) -> ModelPickerState {
         let runtime = ModelPickerRuntime.shared
-        if let existing = runtime.states[botID] { return existing }
+        let target = stateRoute(for: botID)
+        let key = target?.qualifiedID ?? "model-demo:\(botID)"
+        if let existing = runtime.states[key] { return existing }
         let fresh = ModelPickerState()
-        runtime.states[botID] = fresh
+        fresh.target = target
+        runtime.states[key] = fresh
         return fresh
+    }
+
+    internal func dropModelScope(gatewayID: String) {
+        ModelPickerRuntime.shared.drop(gatewayID: gatewayID)
+    }
+
+    private func modelContext(botID: String, state: ModelPickerState) async throws
+        -> (route: GatewayBotRoute, client: GatewayClient)? {
+        guard let route = state.target,
+              stateRoute(for: botID) == route,
+              ModelPickerRuntime.shared.states[route.qualifiedID] === state else {
+            throw GatewayRouteError.noRoute
+        }
+        let client = try await routedClient(for: route)
+        await attachRoutedEventsIfNeeded(client: client, gatewayID: route.gatewayID,
+                                         preserveStateOnReplacement: true)
+        guard stateRoute(for: botID) == route,
+              ModelPickerRuntime.shared.states[route.qualifiedID] === state else { return nil }
+        return (route, client)
+    }
+
+    private func modelStateIsCurrent(_ state: ModelPickerState, botID: String,
+                                     route: GatewayBotRoute) -> Bool {
+        stateRoute(for: botID) == route
+            && ModelPickerRuntime.shared.states[route.qualifiedID] === state
     }
 
     /// Load (or refresh) the provider-grouped catalog for a bot's picker.
@@ -307,35 +361,46 @@ extension AppModel {
         // catalog and the second's completion would clear the first's flag.
         guard !state.isLoading, !state.isRefreshing else { return }
 
+        let initialTarget = state.target
         if refresh { state.isRefreshing = true } else { state.isLoading = true }
         defer {
-            state.isLoading = false
-            state.isRefreshing = false
-            state.hasLoaded = true
+            if initialTarget == nil
+                || initialTarget.map({ modelStateIsCurrent(state, botID: botID, route: $0) }) == true {
+                state.isLoading = false
+                state.isRefreshing = false
+                state.hasLoaded = true
+            }
         }
 
-        guard mode == .live, let client else {
+        guard mode == .live else {
             state.catalog = Self.demoCatalog(pinned: bot(botID)?.pinnedModel)
             state.loadError = nil
             return
         }
 
-        // The picker must open without forcing a session build: with no live
-        // session the gateway answers from disk config, which is the right
-        // catalog for a chat that hasn't started yet.
-        let sessionID = chats[botID]?.sessionID
         do {
-            let catalog = try await client.modelCatalog(sessionID: sessionID, refresh: refresh)
+            guard let context = try await modelContext(botID: botID, state: state) else { return }
+            // The picker must open without forcing a session build: with no live
+            // session the owning gateway answers from disk config, which is the
+            // right catalog for a chat that hasn't started yet.
+            let sessionID = chats[botID]?.sessionID
+            let catalog = try await context.client.modelCatalog(sessionID: sessionID,
+                                                                refresh: refresh)
+            guard modelStateIsCurrent(state, botID: botID, route: context.route) else { return }
             state.catalog = catalog
             state.loadError = nil
             // Keep the flat list the rest of the app reads in step.
             let ids = catalog.modelProviders.flatMap(\.models)
-            if !ids.isEmpty { models = ids }
+            if !ids.isEmpty, context.route.gatewayID == activeGatewayID { models = ids }
         } catch let error as GatewayError {
+            guard state.target.map({ modelStateIsCurrent(state, botID: botID, route: $0) }) == true
+            else { return }
             // A refresh failure must not blank a catalog we already have.
             if !state.catalog.hasSelectableModels { state.catalog = .empty }
             state.loadError = error.message
         } catch {
+            guard state.target.map({ modelStateIsCurrent(state, botID: botID, route: $0) }) == true
+            else { return }
             if !state.catalog.hasSelectableModels { state.catalog = .empty }
             state.loadError = error.localizedDescription
         }
@@ -382,10 +447,22 @@ extension AppModel {
         state.busyRow = "\(provider)::\(model)"
         defer { state.busyRow = nil }
 
-        guard mode == .live, let client else {
+        guard mode == .live else {
             pinModel(botID: botID, provider: provider, model: model)
             state.pendingConfirmation = nil
             return .applied(warning: "")
+        }
+
+        let context: (route: GatewayBotRoute, client: GatewayClient)
+        do {
+            guard let resolved = try await modelContext(botID: botID, state: state) else {
+                return .failed("the bot changed gateways while the model picker was open")
+            }
+            context = resolved
+        } catch {
+            let detail = (error as? GatewayError)?.message ?? error.localizedDescription
+            state.note(detail, warning: true)
+            return .failed(detail)
         }
 
         guard let sessionID = try? await ensureSession(botID: botID, hydrate: false) else {
@@ -393,14 +470,20 @@ extension AppModel {
             state.note(detail, warning: true)
             return .failed(detail)
         }
+        guard modelStateIsCurrent(state, botID: botID, route: context.route) else {
+            return .failed("the bot changed gateways while the model picker was open")
+        }
 
         do {
             // The provider travels with the id: a bare name resolves inside
             // whatever aggregator is current, which is how a self-hosted model
             // ends up being looked for on a subscription endpoint.
-            let outcome = try await client.applySessionModel(
+            let outcome = try await context.client.applySessionModel(
                 sessionID: sessionID, model: model, provider: provider,
                 confirmExpensive: confirmExpensive)
+            guard modelStateIsCurrent(state, botID: botID, route: context.route) else {
+                return .failed("the bot changed gateways while the model picker was open")
+            }
 
             if outcome.confirmRequired {
                 // NOTHING was applied. Park the message; the caller re-sends
@@ -418,9 +501,15 @@ extension AppModel {
             if outcome.deferred { return .deferred(model: resolved) }
             return .applied(warning: outcome.warning)
         } catch let error as GatewayError {
+            guard modelStateIsCurrent(state, botID: botID, route: context.route) else {
+                return .failed("the bot changed gateways while the model picker was open")
+            }
             state.note(error.message, warning: true)
             return .failed(error.message)
         } catch {
+            guard modelStateIsCurrent(state, botID: botID, route: context.route) else {
+                return .failed("the bot changed gateways while the model picker was open")
+            }
             state.note(error.localizedDescription, warning: true)
             return .failed(error.localizedDescription)
         }
@@ -459,15 +548,24 @@ extension AppModel {
             ModelPresetStore.shared.merge(provider: provider, model: model, effort: effort)
         }
 
-        guard mode == .live, let client,
-              let sessionID = try? await ensureSession(botID: botID, hydrate: false) else { return nil }
+        guard mode == .live else { return nil }
         do {
-            _ = try await client.applyReasoningEffort(sessionID: sessionID, value: effort)
+            guard let context = try await modelContext(botID: botID, state: state),
+                  let sessionID = try? await ensureSession(botID: botID, hydrate: false),
+                  modelStateIsCurrent(state, botID: botID, route: context.route) else {
+                throw GatewayRouteError.noRoute
+            }
+            _ = try await context.client.applyReasoningEffort(sessionID: sessionID, value: effort)
+            guard modelStateIsCurrent(state, botID: botID, route: context.route) else {
+                return "the bot changed gateways while the model picker was open"
+            }
             return nil
         } catch {
             chat.reasoningEffort = previous
             let reason = (error as? GatewayError)?.message ?? error.localizedDescription
-            state.note(reason, warning: true)
+            if state.target.map({ modelStateIsCurrent(state, botID: botID, route: $0) }) == true {
+                state.note(reason, warning: true)
+            }
             return reason
         }
     }
@@ -483,11 +581,20 @@ extension AppModel {
             ModelPresetStore.shared.merge(provider: provider, model: model, fast: enabled)
         }
 
-        guard mode == .live, let client,
-              let sessionID = try? await ensureSession(botID: botID, hydrate: false) else { return }
+        guard mode == .live else { return }
         do {
-            state.fastMode = try await client.applyFastMode(sessionID: sessionID, enabled: enabled)
+            guard let context = try await modelContext(botID: botID, state: state),
+                  let sessionID = try? await ensureSession(botID: botID, hydrate: false),
+                  modelStateIsCurrent(state, botID: botID, route: context.route) else {
+                throw GatewayRouteError.noRoute
+            }
+            let applied = try await context.client.applyFastMode(sessionID: sessionID,
+                                                                  enabled: enabled)
+            guard modelStateIsCurrent(state, botID: botID, route: context.route) else { return }
+            state.fastMode = applied
         } catch {
+            guard state.target.map({ modelStateIsCurrent(state, botID: botID, route: $0) }) == true
+            else { return }
             state.fastMode = previous
             state.note((error as? GatewayError)?.message ?? error.localizedDescription,
                        warning: true)

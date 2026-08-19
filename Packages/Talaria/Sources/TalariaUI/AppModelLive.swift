@@ -180,13 +180,14 @@ extension AppModel {
     /// Deliberate disconnect (Settings → Connections). No reconnect follows.
     public func disconnectGateway() async {
         let runtime = LiveRuntime.shared
+        let departingGatewayID = runtime.gatewayID
         runtime.generation += 1
         runtime.reconnectTask?.cancel(); runtime.reconnectTask = nil
         runtime.monitorTask?.cancel(); runtime.monitorTask = nil
         runtime.eventPump?.cancel(); runtime.eventPump = nil
-        if let gatewayID = runtime.gatewayID { dropApprovalScope(gatewayID: gatewayID) }
+        if let gatewayID = departingGatewayID { dropApprovalScope(gatewayID: gatewayID) }
         runtime.resetSessionState()
-        if let gatewayID = runtime.gatewayID {
+        if let gatewayID = departingGatewayID {
             await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gatewayID)
         } else if let client {
             await client.disconnect()
@@ -225,7 +226,7 @@ extension AppModel {
         // contract version — which is precisely the number a client uses to
         // decide which RPC shapes it may send.
         detachSettingsDiagnostics()
-        dropPerGatewayCaches()
+        dropPerGatewayCaches(gatewayID: departingGatewayID)
         connections = ConnectionRegistry.shared.rows
     }
 
@@ -236,11 +237,16 @@ extension AppModel {
     /// half the time — which is worse than one that never clears, because the
     /// bug only reproduces on one route.
     private func dropPerGatewayCaches() {
-        if let gatewayID = LiveRuntime.shared.gatewayID {
+        dropPerGatewayCaches(gatewayID: LiveRuntime.shared.gatewayID)
+    }
+
+    private func dropPerGatewayCaches(gatewayID: String?) {
+        if let gatewayID {
             // Skills/MCP/plugin state carries profile names that are only
             // meaningful inside this gateway. Keep foreign-source states, but
             // never let the departing primary survive a role switch.
             dropCapabilityScope(gatewayID: gatewayID)
+            dropModelScope(gatewayID: gatewayID)
         }
         // Cron detail: the `cron.changed` subscription, per-job records, run
         // histories, and the "this gateway has no cron REST router" verdict —
