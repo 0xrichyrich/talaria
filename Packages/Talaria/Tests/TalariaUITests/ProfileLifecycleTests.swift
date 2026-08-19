@@ -148,6 +148,53 @@ struct ProfileLifecycleTests {
         ProfileLifecycleTrafficAdmission.endLifecycle(gatewayID)
     }
 
+    @Test func retiredARecoveryCannotReplaceLaterBPrimaryOrInFlightSwitch() {
+        let retiredA = ProfileLifecycleRetirement(
+            wasActive: true, connectionGeneration: 41)
+        #expect(!ProfileLifecycleRecoveryPolicy.mayRestorePrimary(
+            retirement: retiredA, currentGeneration: 42,
+            currentGatewayID: "gateway-b", hasClient: true,
+            switchInProgress: false))
+        #expect(!ProfileLifecycleRecoveryPolicy.mayRestorePrimary(
+            retirement: retiredA, currentGeneration: 41,
+            currentGatewayID: nil, hasClient: false,
+            switchInProgress: true))
+    }
+
+    @Test func retiredPrimaryRecoveryIsAllowedOnlyWhileStillUnclaimed() {
+        let retiredA = ProfileLifecycleRetirement(
+            wasActive: true, connectionGeneration: 41)
+        #expect(ProfileLifecycleRecoveryPolicy.mayRestorePrimary(
+            retirement: retiredA, currentGeneration: 41,
+            currentGatewayID: nil, hasClient: false,
+            switchInProgress: false))
+        #expect(!ProfileLifecycleRecoveryPolicy.mayRestorePrimary(
+            retirement: retiredA, currentGeneration: 41,
+            currentGatewayID: "gateway-b", hasClient: true,
+            switchInProgress: false))
+    }
+
+    @Test func switchingBKeepsRetiredAReconciliationQualifiedDuringNilGatewayWindow() {
+        let retiredA = ProfileLifecycleRetirement(
+            wasActive: true, connectionGeneration: 41)
+        let mayRestore = ProfileLifecycleRecoveryPolicy.mayRestorePrimary(
+            retirement: retiredA, currentGeneration: 41,
+            currentGatewayID: nil, hasClient: true,
+            switchInProgress: true)
+        #expect(!mayRestore)
+
+        let target = ProfileLifecycleTarget(
+            rosterID: "worker",
+            route: GatewayBotRoute(gatewayID: "gateway-a", profile: "worker"))
+        let plan = ProfileLifecycleStatePlan(
+            target: target, canonicalNewName: "renamed",
+            currentPrimaryGatewayID: nil,
+            restorePrimaryIfUnclaimed: mayRestore)
+        #expect(plan.sourceIDs == ["gateway-a::worker"])
+        #expect(plan.destinationID == "gateway-a::renamed")
+        #expect(!plan.destinationIsPrimary)
+    }
+
     @Test @MainActor func clientReleasesOrdinaryLeaseOnTransportFailure() async throws {
         let gatewayID = "release-\(UUID().uuidString)"
         let client = GatewayClient(
