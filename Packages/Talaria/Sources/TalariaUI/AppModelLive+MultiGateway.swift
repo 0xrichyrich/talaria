@@ -97,11 +97,17 @@ public extension AppModel {
     /// is reused directly; secondary clients are connected and retained by the
     /// registry pool without changing the app's active gateway.
     func routedClient(for route: GatewayBotRoute) async throws -> GatewayClient {
-        if route.gatewayID == activeGatewayID, let client { return client }
+        try await routedClient(gatewayID: route.gatewayID)
+    }
+
+    /// Resolve a connection when the protocol request has no profile field
+    /// (sudo/secret responses are keyed only by request_id).
+    func routedClient(gatewayID: String) async throws -> GatewayClient {
+        if gatewayID == activeGatewayID, let client { return client }
         let registry = ConnectionRegistry.shared
-        guard let gateway = registry.saved.first(where: { $0.id == route.gatewayID }),
+        guard let gateway = registry.saved.first(where: { $0.id == gatewayID }),
               let baseURL = gateway.baseURL else {
-            throw GatewayRouteError.unknownGateway(route.gatewayID)
+            throw GatewayRouteError.unknownGateway(gatewayID)
         }
         guard let credential = registry.credential(for: gateway) else {
             throw GatewayRouteError.missingCredential(gateway.name)
@@ -127,12 +133,15 @@ public extension AppModel {
             for await event in stream {
                 guard let self else { return }
                 self.handle(event: event, sourceGatewayID: gatewayID)
+                self.handleBridgeEvent(event, sourceGatewayID: gatewayID)
                 self.routeToolEvent(event, sourceGatewayID: gatewayID)
                 self.routeSessionEvent(event, sourceGatewayID: gatewayID)
             }
         }
         runtime.routedEvents[gatewayID] = MultiGatewayRuntime.RoutedEvents(
             client: client, handlerID: handlerID, pump: pump)
+        ApprovalBridges.shared.resetSweepScope(gatewayID: gatewayID)
+        Task { @MainActor [weak self] in await self?.replayPendingApprovals() }
     }
 
     func detachRoutedEvents(gatewayID: String) async {
@@ -141,6 +150,7 @@ public extension AppModel {
             subscription.pump.cancel()
             await subscription.client.removeEventHandler(subscription.handlerID)
         }
+        dropApprovalScope(gatewayID: gatewayID)
         LiveRuntime.shared.resetRoutedState(gatewayID: gatewayID)
         CanonicalChatRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
         SessionsRuntime.shared.resetRoutedScope(gatewayID: gatewayID)

@@ -324,7 +324,7 @@ extension AppModel {
                                        client: client, clearWhenEmpty: rebinding)
             }
             replayInflight(live, botID: botID)
-            replayPendingPrompts(live)
+            replayPendingPrompts(live, sourceGatewayID: route.gatewayID)
             return .attached(sessionID: live.sessionID, storedID: stored)
         } catch let error as GatewayError where error.code == GatewayError.storedSessionGone {
             forget(target, botID: botID)

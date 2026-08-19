@@ -21,5 +21,11 @@ extension ProtocolChecks {
         try expect(GatewaySessionRoute(gatewayID: "mac", sessionID: "deadbeef")
             != GatewaySessionRoute(gatewayID: "homelab", sessionID: "deadbeef"),
                    "same runtime session id remains distinct across gateways")
+        let localApproval = GatewayApprovalRoute(gatewayID: "mac", requestID: "same")
+        let remoteApproval = GatewayApprovalRoute(gatewayID: "homelab", requestID: "same")
+        try expect(localApproval != remoteApproval,
+                   "same approval request id remains distinct across gateways")
+        try expect(localApproval.qualifiedID != remoteApproval.qualifiedID,
+                   "approval UI identity retains source without changing wire id")
     }
 }

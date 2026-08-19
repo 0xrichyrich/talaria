@@ -51,3 +51,27 @@ public struct GatewaySessionRoute: Codable, Hashable, Sendable {
         self.sessionID = sessionID
     }
 }
+
+/// A gateway-scoped approval request identity.
+///
+/// Hermes request ids are unique inside one gateway process, not across every
+/// gateway a phone can retain at once. `qualifiedID` is an opaque UI/state key;
+/// the original `requestID` is kept separately and is the only value sent back
+/// over the wire.
+public struct GatewayApprovalRoute: Codable, Hashable, Sendable {
+    public var gatewayID: String
+    public var requestID: String
+
+    public init(gatewayID: String, requestID: String) {
+        self.gatewayID = gatewayID
+        self.requestID = requestID
+    }
+
+    public var qualifiedID: String {
+        Self.qualifiedPrefix(gatewayID: gatewayID) + requestID
+    }
+
+    public static func qualifiedPrefix(gatewayID: String) -> String {
+        "approval:\(gatewayID.count):\(gatewayID)"
+    }
+}

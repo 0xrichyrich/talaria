@@ -32,9 +32,10 @@ final class LiveRuntime {
     var routedSessionToBot: [GatewaySessionRoute: String] = [:]
     /// Bots with a turn in flight (drives BotStatus.working).
     var workingBotIDs: Set<String> = []
-    /// approval request_id → runtime session id (for approval.respond).
-    var approvalSessions: [String: String] = [:]
-    var routedApprovalSessions: [String: GatewaySessionRoute] = [:]
+    /// Opaque approval UI id → independently verified wire destination.
+    /// The key is gateway-qualified because two retained Hermes processes may
+    /// issue the same request_id at the same time.
+    var approvalTargets: [String: ApprovalResponseTarget] = [:]
     /// bot id → durable stored-session key from profiles.list last_session.
     var lastSessionByBot: [String: String] = [:]
     /// The gateway's default profile — owner of un-namespaced cron jobs and
@@ -60,7 +61,11 @@ final class LiveRuntime {
         // Primary reconnects must not erase sessions that are still attached
         // through retained secondary clients.
         workingBotIDs = Set(workingBotIDs.filter { GatewayBotRoute(qualifiedID: $0) != nil })
-        approvalSessions.removeAll()
+        if let gatewayID {
+            approvalTargets = approvalTargets.filter { $0.value.bot.gatewayID != gatewayID }
+        } else {
+            approvalTargets.removeAll()
+        }
         let primaryTasks = attachTasks.filter { GatewayBotRoute(qualifiedID: $0.key) == nil }
         for task in primaryTasks.values { task.cancel() }
         for key in primaryTasks.keys { attachTasks.removeValue(forKey: key) }
@@ -68,7 +73,7 @@ final class LiveRuntime {
 
     func resetRoutedState(gatewayID: String) {
         routedSessionToBot = routedSessionToBot.filter { $0.key.gatewayID != gatewayID }
-        routedApprovalSessions = routedApprovalSessions.filter { $0.value.gatewayID != gatewayID }
+        approvalTargets = approvalTargets.filter { $0.value.bot.gatewayID != gatewayID }
         let prefix = gatewayID + GatewayBotRoute.separator
         workingBotIDs = Set(workingBotIDs.filter { !$0.hasPrefix(prefix) })
         let tasks = attachTasks.filter { $0.key.hasPrefix(prefix) }
@@ -83,6 +88,7 @@ final class LiveRuntime {
 struct ApprovalResponseTarget: Equatable {
     var bot: GatewayBotRoute
     var session: GatewaySessionRoute
+    var requestID: String
 }
 
 extension AppModel {
@@ -109,6 +115,7 @@ extension AppModel {
         runtime.reconnectTask?.cancel(); runtime.reconnectTask = nil
         runtime.monitorTask?.cancel(); runtime.monitorTask = nil
         runtime.eventPump?.cancel(); runtime.eventPump = nil
+        if let gatewayID = runtime.gatewayID { dropApprovalScope(gatewayID: gatewayID) }
         runtime.resetSessionState()
         // Session ids are per-gateway; a pin from the previous one resolves to
         // nothing (or worse, something else) here.
@@ -177,6 +184,7 @@ extension AppModel {
         runtime.reconnectTask?.cancel(); runtime.reconnectTask = nil
         runtime.monitorTask?.cancel(); runtime.monitorTask = nil
         runtime.eventPump?.cancel(); runtime.eventPump = nil
+        if let gatewayID = runtime.gatewayID { dropApprovalScope(gatewayID: gatewayID) }
         runtime.resetSessionState()
         if let gatewayID = runtime.gatewayID {
             await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gatewayID)
@@ -578,10 +586,13 @@ extension AppModel {
     /// clarify has no `*.pending` RPC at all, so this block is its only
     /// recovery channel. Routed through the approvals surface so a replayed
     /// approval arrives with its real choice set rather than once/deny.
-    func replayPendingPrompts(_ live: LiveSession) {
-        if let pending = live.pendingApproval { ingestPendingApproval(pending) }
+    func replayPendingPrompts(_ live: LiveSession, sourceGatewayID: String? = nil) {
+        if let pending = live.pendingApproval {
+            ingestPendingApproval(pending, sourceGatewayID: sourceGatewayID)
+        }
         if let clarify = live.pendingClarify, clarify != .null {
-            ingestPendingClarify(clarify, sessionID: live.sessionID)
+            ingestPendingClarify(clarify, sessionID: live.sessionID,
+                                 sourceGatewayID: sourceGatewayID)
         }
     }
 
@@ -760,11 +771,15 @@ extension AppModel {
 
     // MARK: - Approvals
 
-    private func ingest(_ request: ApprovalRequest, sourceGatewayID: String? = nil,
-                        owner explicitOwner: String? = nil) {
-        guard !request.requestID.isEmpty,
-              !approvals.contains(where: { $0.id == request.requestID }) else { return }
+    @discardableResult
+    func ingest(_ request: ApprovalRequest, sourceGatewayID: String? = nil,
+                owner explicitOwner: String? = nil) -> String? {
+        guard !request.requestID.isEmpty else { return nil }
         let runtime = LiveRuntime.shared
+        guard let gatewayID = sourceGatewayID ?? runtime.gatewayID else { return nil }
+        let approvalID = GatewayApprovalRoute(gatewayID: gatewayID,
+                                               requestID: request.requestID).qualifiedID
+        if ApprovalOutcomes.shared.choice(for: approvalID) != nil { return nil }
         let scopedOwner = explicitOwner ?? botID(forSession: request.sessionID,
                                                   sourceGatewayID: sourceGatewayID)
         let isRemote = sourceGatewayID != nil && sourceGatewayID != runtime.gatewayID
@@ -772,16 +787,17 @@ extension AppModel {
         // session we have not attached therefore has no trustworthy profile
         // owner. Never invent one from the primary roster: that would render
         // an answerable card whose response could be sent to another machine.
-        guard !isRemote || scopedOwner != nil else { return }
+        guard !isRemote || scopedOwner != nil else { return nil }
         let owner = scopedOwner ?? runtime.defaultBotID ?? bots.first?.id ?? "default"
-        if let sourceGatewayID, isRemote {
-            runtime.routedApprovalSessions[request.requestID] = GatewaySessionRoute(
-                gatewayID: sourceGatewayID, sessionID: request.sessionID)
-        } else {
-            runtime.approvalSessions[request.requestID] = request.sessionID
-        }
+        let botRoute = GatewayBotRoute(qualifiedID: owner)
+            ?? GatewayBotRoute(gatewayID: gatewayID, profile: owner)
+        runtime.approvalTargets[approvalID] = ApprovalResponseTarget(
+            bot: botRoute,
+            session: GatewaySessionRoute(gatewayID: gatewayID, sessionID: request.sessionID),
+            requestID: request.requestID)
+        if approvals.contains(where: { $0.id == approvalID }) { return approvalID }
         approvals.append(Approval(
-            id: request.requestID,
+            id: approvalID,
             botID: owner,
             kind: Self.approvalKind(for: request),
             title: request.description.isEmpty ? request.command : request.description,
@@ -793,23 +809,19 @@ extension AppModel {
         if let idx = bots.firstIndex(where: { $0.id == owner }) {
             bots[idx].status = .approval
         }
+        return approvalID
     }
 
     /// A finished turn can hold no approvals — drop the stale ones (they were
     /// answered elsewhere, timed out, or denied by an interrupt).
     private func pruneApprovals(sessionID: String, sourceGatewayID: String? = nil) {
         let runtime = LiveRuntime.shared
-        let stale: [String]
-        if let sourceGatewayID, sourceGatewayID != runtime.gatewayID {
-            stale = runtime.routedApprovalSessions.filter {
-                $0.value == GatewaySessionRoute(gatewayID: sourceGatewayID, sessionID: sessionID)
-            }.map(\.key)
-        } else {
-            stale = runtime.approvalSessions.filter { $0.value == sessionID }.map(\.key)
-        }
+        guard let gatewayID = sourceGatewayID ?? runtime.gatewayID else { return }
+        let session = GatewaySessionRoute(gatewayID: gatewayID, sessionID: sessionID)
+        let stale = runtime.approvalTargets.filter { $0.value.session == session }.map(\.key)
         guard !stale.isEmpty else { return }
-        for id in stale { runtime.approvalSessions.removeValue(forKey: id) }
-        for id in stale { runtime.routedApprovalSessions.removeValue(forKey: id) }
+        for id in stale { runtime.approvalTargets.removeValue(forKey: id) }
+        for id in stale { ApprovalBridges.shared.details.removeValue(forKey: id) }
         let owners = Set(approvals.filter { stale.contains($0.id) }.map(\.botID))
         approvals.removeAll { stale.contains($0.id) }
         for owner in owners { recomputeStatus(for: owner) }
@@ -831,19 +843,29 @@ extension AppModel {
                                 botRoute: GatewayBotRoute?) -> ApprovalResponseTarget? {
         guard let botRoute else { return nil }
         let runtime = LiveRuntime.shared
-        if let session = runtime.routedApprovalSessions[approval.id] {
-            guard session.gatewayID == botRoute.gatewayID else { return nil }
-            return ApprovalResponseTarget(bot: botRoute, session: session)
+        if let target = runtime.approvalTargets[approval.id] {
+            guard target.bot == botRoute, target.session.gatewayID == botRoute.gatewayID else {
+                return nil
+            }
+            return target
         }
-        guard botRoute.gatewayID == runtime.gatewayID else { return nil }
-        if let sessionID = runtime.approvalSessions[approval.id]
-            ?? chats[approval.botID]?.sessionID {
-            return ApprovalResponseTarget(
-                bot: botRoute,
-                session: GatewaySessionRoute(gatewayID: botRoute.gatewayID,
-                                             sessionID: sessionID))
-        }
+        // Demo/legacy primary cards have no live target. A live card must never
+        // synthesize a destination from a chat after source qualification.
         return nil
+    }
+
+    /// Match a gateway wire request id without confusing it for the app's
+    /// source-qualified approval id. A bot hint disambiguates the normal push
+    /// payload; without one, collisions fail closed instead of picking first.
+    func approval(matchingWireRequestID requestID: String, botID: String?) -> Approval? {
+        let candidates = approvals.filter { approval in
+            guard let target = LiveRuntime.shared.approvalTargets[approval.id] else {
+                return approval.id == requestID // demo/solo compatibility
+            }
+            guard target.requestID == requestID else { return false }
+            return botID == nil || approval.botID == botID
+        }
+        return candidates.count == 1 ? candidates[0] : nil
     }
 
     // MARK: - Live actions (called from AppModel's mode dispatch)
@@ -877,17 +899,20 @@ extension AppModel {
         Task { @MainActor in
             guard let target = approvalResponseTarget(
                 for: approval, botRoute: gatewayRoute(for: approval.botID)),
-                  let client = try? await routedClient(for: target.bot) else { return }
+                  let client = try? await routedClient(for: target.bot) else {
+                restoreFailedApproval(approval)
+                return
+            }
             let runtime = LiveRuntime.shared
             do {
                 try await client.respondToApproval(sessionID: target.session.sessionID,
                                                    choice: approve ? .once : .deny,
-                                                   requestID: approval.id)
-                runtime.routedApprovalSessions.removeValue(forKey: approval.id)
-                runtime.approvalSessions.removeValue(forKey: approval.id)
+                                                   requestID: target.requestID)
+                runtime.approvalTargets.removeValue(forKey: approval.id)
             } catch {
                 // The request-to-session binding remains available for an
                 // explicit retry/recovery path; never retarget after failure.
+                restoreFailedApproval(approval)
             }
             recomputeStatus(for: approval.botID)
         }
