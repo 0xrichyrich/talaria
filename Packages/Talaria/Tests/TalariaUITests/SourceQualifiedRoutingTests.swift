@@ -25,6 +25,7 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         CronDetailRuntime.shared.reset()
         CronDetailRuntime.shared.changeTick = 0
         CapabilityRuntime.shared.states.removeAll()
+        ModelPickerRuntime.shared.states.removeAll()
         ProfileAssetStore.shared.flush()
         PetRuntime.shared.reset()
         SessionsRuntime.shared.resetPrimaryScope()
@@ -591,6 +592,59 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         XCTAssertNil(runtime.runTasks["homelab"])
         XCTAssertNil(runtime.runIDs["homelab"])
         XCTAssertNil(runtime.generatingProfiles["homelab"])
+    }
+
+    func testCollidingModelPickersKeepDistinctGatewayState() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let primary = model.modelPicker(for: "default")
+        let remote = model.modelPicker(for: "homelab::default")
+
+        XCTAssertFalse(primary === remote)
+        XCTAssertEqual(primary.target, GatewayBotRoute(gatewayID: "primary", profile: "default"))
+        XCTAssertEqual(remote.target, GatewayBotRoute(gatewayID: "homelab", profile: "default"))
+        primary.catalog.model = "primary-model"
+        remote.catalog.model = "remote-model"
+        XCTAssertEqual(primary.catalog.model, "primary-model")
+        XCTAssertEqual(remote.catalog.model, "remote-model")
+    }
+
+    func testModelPickerFollowsGatewayRoleWithoutCollision() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let originalPrimary = model.modelPicker(for: "default")
+        originalPrimary.catalog.model = "primary-model"
+
+        LiveRuntime.shared.gatewayID = "homelab"
+        let formerPrimaryAsRemote = model.modelPicker(for: "primary::default")
+        let newPrimary = model.modelPicker(for: "default")
+
+        XCTAssertTrue(formerPrimaryAsRemote === originalPrimary)
+        XCTAssertEqual(formerPrimaryAsRemote.catalog.model, "primary-model")
+        XCTAssertFalse(newPrimary === originalPrimary)
+        XCTAssertEqual(newPrimary.target,
+                       GatewayBotRoute(gatewayID: "homelab", profile: "default"))
+    }
+
+    func testModelGatewayDetachScrubsOnlyOwningSource() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let primary = model.modelPicker(for: "default")
+        let remote = model.modelPicker(for: "homelab::default")
+        primary.pendingConfirmation = PendingModelConfirmation(
+            provider: "primary-provider", model: "primary-model", message: "primary")
+        remote.pendingConfirmation = PendingModelConfirmation(
+            provider: "remote-provider", model: "remote-model", message: "remote")
+
+        model.dropModelScope(gatewayID: "homelab")
+
+        XCTAssertTrue(model.modelPicker(for: "default") === primary)
+        XCTAssertFalse(model.modelPicker(for: "homelab::default") === remote)
+        XCTAssertEqual(primary.pendingConfirmation?.provider, "primary-provider")
+        XCTAssertNil(remote.pendingConfirmation)
+        XCTAssertFalse(remote.hasLoaded)
+        XCTAssertNil(remote.loadError)
+        XCTAssertNil(remote.busyRow)
     }
 
     func testRoutineGatewayDetachPreservesOtherGatewayRows() {

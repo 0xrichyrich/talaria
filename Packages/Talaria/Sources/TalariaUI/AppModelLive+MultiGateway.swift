@@ -126,7 +126,7 @@ public extension AppModel {
         let runtime = MultiGatewayRuntime.shared
         if let existing = runtime.routedEvents[gatewayID],
            ObjectIdentifier(existing.client) == ObjectIdentifier(client) { return }
-        if preserveStateOnReplacement {
+        if preserveStateOnReplacement || runtime.routedEvents[gatewayID] == nil {
             await removeRoutedEventSubscription(gatewayID: gatewayID)
         } else {
             await detachRoutedEvents(gatewayID: gatewayID)
@@ -155,6 +155,7 @@ public extension AppModel {
         dropApprovalScope(gatewayID: gatewayID)
         dropRoutineScope(gatewayID: gatewayID)
         dropCapabilityScope(gatewayID: gatewayID)
+        dropModelScope(gatewayID: gatewayID)
         ProfileAssetStore.shared.drop(gatewayID: gatewayID)
         dropPetScope(gatewayID: gatewayID)
         LiveRuntime.shared.resetRoutedState(gatewayID: gatewayID)

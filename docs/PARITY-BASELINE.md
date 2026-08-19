@@ -126,6 +126,8 @@ Multi-connection implementation checkpoints:
       cosmetics, and portrait asset state/mutations.
 - [x] Source-qualified pet state, bitmap/thumbnail caches, gallery mutations,
       generation/hatching, progress events, and detach cleanup.
+- [x] Source-qualified model catalogs, selection/confirmation, reasoning effort,
+      fast mode, and picker-state detach cleanup.
 - [ ] Source-qualified remaining management mutations.
 
 ## Crash-recovery snapshot disposition
