@@ -11,18 +11,12 @@ import TalariaKit
 // carrying a device label, and the duplicate-name rule mints `@name-device`
 // handles once across all sources (electron/connection-registry.ts:330-372).
 //
-// WHAT IS REAL HERE, PRECISELY. Talaria drives ONE gateway socket. There is no
-// multiplexing: a foreign row is a cached picture of another machine, taken by
-// a short-lived probe socket (ConnectionRegistry.enumerateSecondaryRosters) and
-// kept on disk so an asleep homelab still lists its bots. Opening one does not
-// message it in place — it SWITCHES this phone to that gateway, flushing the
-// outgoing world through `switchGateway` and then landing in the bot's
-// canonical forever-chat through the single chat-open door.
-//
-// That divergence from desktop is deliberate and is the honest shape for a
-// phone: desktop can route a message over a second connection while staying
-// put ("Gateway stays on this device", plugin.js:3904-3908) because its main
-// process holds every connection open. Talaria holds one, so it says so.
+// WHAT IS REAL HERE, PRECISELY. `GatewayClientPool` now keeps authenticated
+// secondary connections alive and coalesces dials. The union roster no longer
+// relies on throwaway probe sockets. Opening a foreign row still switches the
+// primary AppModel world in this slice; moving chat/session/event state to the
+// source-qualified route is the next integration step. This file must not
+// claim Desktop parity until that switch is removed.
 
 /// Book-keeping for the union roster. `AppModel`'s stored properties live in
 /// AppModel.swift (another owner); extensions cannot add storage, so the
@@ -40,6 +34,20 @@ final class MultiGatewayRuntime {
 
 public extension AppModel {
 
+    enum GatewayRouteError: LocalizedError {
+        case noRoute
+        case unknownGateway(String)
+        case missingCredential(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .noRoute: return "The bot has no gateway route."
+            case .unknownGateway(let id): return "Gateway \(id) is no longer registered."
+            case .missingCredential(let name): return "Sign in to \(name) to continue."
+            }
+        }
+    }
+
     // MARK: - The active source
 
     /// Saved-gateway id of the live link, or nil when nothing is connected.
@@ -54,6 +62,30 @@ public extension AppModel {
     var activeConnectionLabel: String? {
         guard let base = LiveRuntime.shared.baseURL else { return nil }
         return ConnectionRegistry.shared.gateway(forURL: base)?.name
+    }
+
+    /// Resolve a roster identity without guessing which machine owns a bare
+    /// profile name.
+    func gatewayRoute(for rosterID: String) -> GatewayBotRoute? {
+        GatewayBotRoute.resolve(rosterID: rosterID, activeGatewayID: activeGatewayID)
+    }
+
+    /// Obtain the client that owns a source-qualified bot. The primary client
+    /// is reused directly; secondary clients are connected and retained by the
+    /// registry pool without changing the app's active gateway.
+    func routedClient(for route: GatewayBotRoute) async throws -> GatewayClient {
+        if route.gatewayID == activeGatewayID, let client { return client }
+        let registry = ConnectionRegistry.shared
+        guard let gateway = registry.saved.first(where: { $0.id == route.gatewayID }),
+              let baseURL = gateway.baseURL else {
+            throw GatewayRouteError.unknownGateway(route.gatewayID)
+        }
+        guard let credential = registry.credential(for: gateway) else {
+            throw GatewayRouteError.missingCredential(gateway.name)
+        }
+        return try await registry.clientPool.connect(gatewayID: gateway.id,
+                                                     baseURL: baseURL,
+                                                     credential: credential)
     }
 
     // MARK: - The union roster

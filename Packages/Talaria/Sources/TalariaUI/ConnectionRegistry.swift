@@ -17,10 +17,10 @@ import TalariaKit
 // `buildAgentRoster` flattens them, applying the duplicate `@name-device` rule
 // once across all of them (electron/connection-registry.ts:330-372). Talaria
 // binds one gateway at a time, so the union is assembled here instead: each
-// saved gateway that is not the live one gets a SHORT-LIVED probe socket, its
-// `profiles.list` answer is cached, and the socket is closed again. Nothing is
-// multiplexed — a foreign row is a picture of another machine, and opening it
-// switches this phone to that gateway.
+// saved gateway is reached through `clientPool`; its `profiles.list` answer is
+// cached and the authenticated connection remains available for source-routed
+// bot and room operations. The AppModel primary connection still owns global
+// navigation until those surfaces finish moving to source-qualified state.
 
 /// One saved gateway — metadata only, never credentials.
 public struct SavedGateway: Codable, Identifiable, Sendable, Equatable {
@@ -100,7 +100,7 @@ public struct SecondaryRoster: Codable, Sendable, Equatable {
 /// connections can both expose `default`, and a bare-name key makes a list
 /// repeat whole blocks of rows on every repaint.
 public struct ForeignRosterEntry: Sendable, Equatable, Identifiable {
-    public var id: String { "\(gatewayID)::\(profile)" }
+    public var id: String { GatewayBotRoute(gatewayID: gatewayID, profile: profile).qualifiedID }
     public var gatewayID: String
     public var connectionLabel: String
     public var connectionKind: ConnectionKind
@@ -186,6 +186,7 @@ public final class ConnectionRegistry {
 
     private let keychain: KeychainStore
     private let defaults: UserDefaults
+    @ObservationIgnored public let clientPool: GatewayClientPool
     /// Short-timeout session so a sleeping LAN box fails fast, not in 60 s.
     private let probeSession: URLSession
     @ObservationIgnored private var probeTask: Task<Void, Never>?
@@ -195,9 +196,11 @@ public final class ConnectionRegistry {
     /// to answer is not re-dialled on every probe tick.
     @ObservationIgnored private var lastEnumerationAttempt: [String: Date] = [:]
 
-    public init(defaults: UserDefaults = .standard, keychain: KeychainStore = KeychainStore()) {
+    public init(defaults: UserDefaults = .standard, keychain: KeychainStore = KeychainStore(),
+                clientPool: GatewayClientPool = GatewayClientPool()) {
         self.defaults = defaults
         self.keychain = keychain
+        self.clientPool = clientPool
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 5
         config.timeoutIntervalForResource = 8
@@ -437,11 +440,10 @@ public final class ConnectionRegistry {
             return
         }
 
-        let client = GatewayClient(baseURL: base, credential: credential)
-        defer { Task { await client.disconnect() } }
         do {
             let profiles = try await Self.withTimeout(seconds: 12) {
-                try await client.connect()
+                let client = try await self.clientPool.connect(
+                    gatewayID: gateway.id, baseURL: base, credential: credential)
                 // include_sessions gives the preview + last_active in the same
                 // round trip (methods_profiles.py:22-31); a foreign row is only
                 // worth painting if it can say when that machine last spoke.
@@ -455,15 +457,18 @@ public final class ConnectionRegistry {
                                                            freshness: .fresh)
             noteBotCountForSecondary(rows.count, gatewayID: gateway.id)
         } catch let error as GatewayError where error.code == GatewayClient.methodNotFound {
+            await clientPool.disconnect(gatewayID: gateway.id)
             // A gateway too old for profiles.list has no roster to contribute.
             // Hide the surface rather than showing an error nobody can act on.
             mark(gateway.id, .unsupported)
         } catch AuthError.sessionExpired {
+            await clientPool.disconnect(gatewayID: gateway.id)
             // The credential is gone/rejected; ConnectionSupervisor owns the
             // re-auth prompt for the LIVE gateway, and a secondary simply
             // reads as needing sign-in until the user switches to it.
             mark(gateway.id, .needsSignIn)
         } catch {
+            await clientPool.disconnect(gatewayID: gateway.id)
             mark(gateway.id, .stale)
         }
     }

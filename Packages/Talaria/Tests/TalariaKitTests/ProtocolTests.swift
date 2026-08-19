@@ -15,6 +15,7 @@ final class ProtocolXCTests: XCTestCase {
     func testTokenSetRefreshWindow() throws { try ProtocolChecks.tokenSetRefreshWindow() }
     func testDemoDataIntegrity() throws { try ProtocolChecks.demoDataIntegrity() }
     func testLiveSessionParsing() throws { try ProtocolChecks.liveSessionParsing() }
+    func testGatewayBotRouting() throws { try ProtocolChecks.gatewayBotRouting() }
     func testPreferredSessionParsing() throws { try ProtocolChecks.preferredSessionParsing() }
     func testRosterSearchSemantics() throws { try ProtocolChecks.rosterSearchSemantics() }
     func testMentionRouting() throws { try ProtocolChecks.mentionRouting() }

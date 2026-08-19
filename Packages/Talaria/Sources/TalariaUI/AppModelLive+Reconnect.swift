@@ -548,6 +548,8 @@ extension AppModel {
         if isActiveGateway(gateway) {
             await disconnectGateway()
             flushWorldForGatewaySwitch()
+        } else {
+            await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gateway.id)
         }
         ConnectionSupervisor.shared.keychain.delete(for: base)
         if ConnectionSupervisor.shared.reauthGateway?.absoluteString == base.absoluteString {
@@ -561,6 +563,8 @@ extension AppModel {
         if isActiveGateway(gateway) {
             await disconnectGateway()
             flushWorldForGatewaySwitch()
+        } else {
+            await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gateway.id)
         }
         let supervisor = ConnectionSupervisor.shared
         if let base = gateway.baseURL,
