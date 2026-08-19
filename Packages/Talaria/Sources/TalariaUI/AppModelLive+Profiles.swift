@@ -34,21 +34,30 @@ public final class ProfileAssetStore {
     /// until something invalidates them (a set_asset, or a reconnect).
     private var absent: Set<String> = []
     private var inflight: Set<String> = []
+    /// Invalidates async cache completions after any gateway scope is removed.
+    private var epoch = 0
 
     /// profiles.set_asset ceiling is 2 MB; stay under it with headroom for
     /// the base64 expansion the gateway decodes.
     static let maxAssetBytes = 1_400_000
 
-    /// Cache keys carry the gateway they came from: two gateways can both
-    /// serve a profile called "inbox", and one must never wear the other's
-    /// face after a connection switch.
+    /// Cache keys carry the stable gateway id, not the current base URL: two
+    /// retained gateways can both serve `inbox`, and remote portraits remain
+    /// valid without switching either gateway into the primary role.
     private func key(_ botID: String) -> String {
-        (LiveRuntime.shared.baseURL?.absoluteString ?? "demo") + "|" + botID
+        if let route = GatewayBotRoute(qualifiedID: botID) {
+            return "portrait:\(route.gatewayID.count):\(route.gatewayID)\(route.profile)"
+        }
+        let gatewayID = LiveRuntime.shared.gatewayID ?? "demo"
+        return "portrait:\(gatewayID.count):\(gatewayID)\(botID)"
     }
 
     public func portrait(for botID: String) -> Data? { portraits[key(botID)] }
 
     public func hasPortrait(_ botID: String) -> Bool { portraits[key(botID)] != nil }
+
+    func captureEpoch() -> Int { epoch }
+    func isCurrent(epoch captured: Int) -> Bool { captured == epoch }
 
     /// This profile's asset question is already settled — bytes held, or a
     /// verdict recorded that they are not displayable. Lets the roster answer
@@ -87,9 +96,18 @@ public final class ProfileAssetStore {
     /// Drop everything — for a sign-out, where even the previous gateway's
     /// cached faces should not linger in memory.
     public func flush() {
+        epoch &+= 1
         portraits.removeAll()
         absent.removeAll()
         inflight.removeAll()
+    }
+
+    func drop(gatewayID: String) {
+        epoch &+= 1
+        let prefix = "portrait:\(gatewayID.count):\(gatewayID)"
+        portraits = portraits.filter { !$0.key.hasPrefix(prefix) }
+        absent = Set(absent.filter { !$0.hasPrefix(prefix) })
+        inflight = Set(inflight.filter { !$0.hasPrefix(prefix) })
     }
 
     // MARK: Data URLs
@@ -156,7 +174,41 @@ public enum PortraitFailure: Sendable, Equatable {
     case failed(String)
 }
 
+public enum ProfileCreationResult: Sendable, Equatable {
+    case complete
+    /// profiles.create succeeded, but one or more independent configure
+    /// sections did not acknowledge. The profile exists and must not be
+    /// retried as a create.
+    case partial
+    case failed
+}
+
 extension AppModel {
+
+    // MARK: - Source routing
+
+    /// Resolve a roster id to the gateway/profile pair Hermes RPCs accept.
+    /// UI ids stay qualified; only the raw profile crosses the wire.
+    internal func profileRoute(for rosterID: String) -> GatewayBotRoute? {
+        stateRoute(for: rosterID)
+    }
+
+    internal func profileContext(for rosterID: String) async throws
+        -> (route: GatewayBotRoute, client: GatewayClient) {
+        guard let route = profileRoute(for: rosterID) else {
+            throw GatewayRouteError.noRoute
+        }
+        return (route, try await routedClient(for: route))
+    }
+
+    /// Refresh only the roster that owns a profile mutation.
+    internal func refreshProfileRoster(gatewayID: String) async {
+        if gatewayID == LiveRuntime.shared.gatewayID {
+            try? await refreshRoster()
+        } else {
+            await ConnectionRegistry.shared.refreshSecondaryRoster(gatewayID: gatewayID)
+        }
+    }
 
     // MARK: - Editor snapshot (profiles.describe)
 
@@ -164,8 +216,9 @@ extension AppModel {
     /// gateway could not be read — callers MUST then refuse to write soul,
     /// skills or toolsets, since they have nothing true to diff against.
     public func profileSnapshot(botID: String) async -> ProfileSnapshot? {
-        guard mode == .live, let client else { return demoSnapshot(botID: botID) }
-        return try? await client.profileSnapshot(botID)
+        guard mode == .live else { return demoSnapshot(botID: botID) }
+        guard let context = try? await profileContext(for: botID) else { return nil }
+        return try? await context.client.profileSnapshot(context.route.profile)
     }
 
     /// Demo mode mirrors the same shape so both sheets take one code path.
@@ -186,24 +239,42 @@ extension AppModel {
 
     // MARK: - Model catalog
 
-    /// Models offered by the gateway, each carrying the provider slug that
-    /// profiles.configure requires alongside the model id. Falls back to the
-    /// flat availableModels() list (provider unknown) so the picker still
-    /// renders; a choice with no provider is not written as a pin.
-    public func modelChoices() async -> [ModelChoice] {
-        guard mode == .live, let client else {
+    /// Models offered by the owning gateway, each carrying the provider slug
+    /// profiles.configure requires alongside the model id. Only the primary
+    /// global picker may use its flat provider-unknown fallback; a remote
+    /// profile never borrows catalog state from another gateway.
+    public func modelChoices(botID: String? = nil,
+                             gatewayID: String? = nil) async -> [ModelChoice] {
+        guard mode == .live else {
             return (models.isEmpty ? DemoData.models : models)
                 .map { ModelChoice(model: $0, provider: "demo", providerName: "demo") }
         }
-        if let catalog = try? await client.modelChoices(), !catalog.isEmpty {
-            models = catalog.map(\.model)
+        let selectedClient: GatewayClient
+        if let botID {
+            guard let context = try? await profileContext(for: botID) else { return [] }
+            selectedClient = context.client
+        } else if let gatewayID, gatewayID != LiveRuntime.shared.gatewayID {
+            guard let routed = try? await routedClient(gatewayID: gatewayID) else { return [] }
+            selectedClient = routed
+        } else {
+            guard let client else { return [] }
+            selectedClient = client
+        }
+        if let catalog = try? await selectedClient.modelChoices(), !catalog.isEmpty {
+            if (botID == nil && gatewayID == nil)
+                || profileRoute(for: botID ?? "")?.gatewayID == activeGatewayID {
+                models = catalog.map(\.model)
+            }
             return catalog
         }
         // Second try through the chat picker's harvester. Its own last resort
         // is the demo list, which must never be offered as a real pin against
         // a live gateway — an empty row plus the themed "no models" line is
         // the honest answer.
-        let flat = await availableModels()
+        // The primary picker retains its typed-catalog fallback. A foreign
+        // gateway must not borrow that fallback from the primary connection:
+        // without provider slugs those rows cannot be written safely anyway.
+        let flat = botID == nil && gatewayID == nil ? await availableModels() : []
         guard flat != DemoData.models else { return [] }
         return flat.map { ModelChoice(model: $0, provider: "") }
     }
@@ -214,17 +285,25 @@ extension AppModel {
     /// the local roster row. Returns false when the gateway rejected it.
     @discardableResult
     public func saveProfileEdit(botID: String, edit: ProfileEdit) async -> Bool {
-        guard mode == .live, let client else {
+        guard edit.isWireValid else { return false }
+        guard mode == .live else {
             applyEditLocally(botID: botID, edit: edit)
             return true
         }
+        guard let context = try? await profileContext(for: botID) else { return false }
+        let applied: [String: Bool]
         do {
-            try await client.applyProfileEdit(name: botID, edit)
+            applied = try await context.client.applyProfileEdit(
+                name: context.route.profile, edit)
         } catch {
             return false
         }
+        guard edit.wasFullyApplied(applied) else {
+            await refreshProfileRoster(gatewayID: context.route.gatewayID)
+            return false
+        }
         applyEditLocally(botID: botID, edit: edit)
-        try? await refreshRoster()
+        await refreshProfileRoster(gatewayID: context.route.gatewayID)
         return true
     }
 
@@ -262,7 +341,8 @@ extension AppModel {
     /// the sheet keeps the user's typing instead of dismissing on a lie.
     public func createBotProfile(id: String, job: String, soul: String,
                                  model: ModelChoice?, disabledSkills: [String],
-                                 enabledToolsets: [String]?, uiMeta: JSONValue) async -> Bool {
+                                 enabledToolsets: [String]?, uiMeta: JSONValue,
+                                 gatewayID: String? = nil) async -> ProfileCreationResult {
         // The same resolution the roster answer will run on this profile a
         // moment from now. It used to read Talaria's mirror alone and fall back
         // to a fixed circle/teal — so a new bot flashed a face nothing else in
@@ -278,30 +358,42 @@ extension AppModel {
                       description: job.isEmpty ? nil : job,
                       pinnedModel: model?.model)
 
-        guard mode == .live, let client else {
+        guard mode == .live else {
             bots.append(bot)
-            return true
+            return .complete
+        }
+        let targetGatewayID = gatewayID ?? LiveRuntime.shared.gatewayID
+        guard let targetGatewayID else { return .failed }
+        let selectedClient: GatewayClient
+        if targetGatewayID == LiveRuntime.shared.gatewayID, let client {
+            selectedClient = client
+        } else {
+            guard let routed = try? await routedClient(gatewayID: targetGatewayID) else {
+                return .failed
+            }
+            selectedClient = routed
         }
 
         // A model pin needs both halves; sending model alone is a silent
         // no-op server-side, so drop it rather than pretend it took.
         let pin = (model?.provider.isEmpty == false) ? model : nil
         do {
-            try await client.createProfile(name: id,
-                                           description: job.isEmpty ? nil : job,
-                                           soul: soul.isEmpty ? nil : soul,
-                                           model: pin?.model,
-                                           provider: pin?.provider)
+            try await selectedClient.createProfile(name: id,
+                                                   description: job.isEmpty ? nil : job,
+                                                   soul: soul.isEmpty ? nil : soul,
+                                                   model: pin?.model,
+                                                   provider: pin?.provider)
         } catch {
-            return false
+            return .failed
         }
         let follow = ProfileEdit(disabledSkills: disabledSkills.isEmpty ? nil : disabledSkills,
                                  enabledToolsets: enabledToolsets,
                                  uiMeta: uiMeta)
-        _ = try? await client.applyProfileEdit(name: id, follow)
-        bots.append(bot)
-        try? await refreshRoster()
-        return true
+        let followApplied = try? await selectedClient.applyProfileEdit(name: id, follow)
+        if targetGatewayID == LiveRuntime.shared.gatewayID { bots.append(bot) }
+        await refreshProfileRoster(gatewayID: targetGatewayID)
+        guard let followApplied, follow.wasFullyApplied(followApplied) else { return .partial }
+        return .complete
     }
 
     /// Desktop "Duplicate": profiles.create {clone_from, clone_all:true} —
@@ -313,25 +405,34 @@ extension AppModel {
                         status: .idle, preview: "Cloned — config, skills, memory copied.",
                         previewTime: "new", unread: 0, description: source.description,
                         pinnedModel: source.pinnedModel)
-        guard mode == .live, let client else {
+        guard mode == .live else {
             bots.append(clone)
             return true
         }
+        guard let context = try? await profileContext(for: sourceID) else { return false }
         do {
-            try await client.createProfile(name: newID, cloneFrom: sourceID)
+            try await context.client.createProfile(name: newID,
+                                                   cloneFrom: context.route.profile)
         } catch {
             return false
         }
-        bots.append(clone)
-        try? await refreshRoster()
+        if context.route.gatewayID == LiveRuntime.shared.gatewayID {
+            bots.append(clone)
+        }
+        await refreshProfileRoster(gatewayID: context.route.gatewayID)
         return true
     }
 
     /// First free "<id>-N" sibling, matching desktop's duplicate naming.
     public func cloneID(for base: String) -> String {
+        let route = profileRoute(for: base)
+        let rawBase = route?.profile ?? base
         var suffix = 2
-        while bots.contains(where: { $0.id == "\(base)-\(suffix)" }) { suffix += 1 }
-        return "\(base)-\(suffix)"
+        while unionRosterBots.contains(where: {
+            let row = profileRoute(for: $0.id)
+            return row?.gatewayID == route?.gatewayID && row?.profile == "\(rawBase)-\(suffix)"
+        }) { suffix += 1 }
+        return "\(rawBase)-\(suffix)"
     }
 
     // MARK: - Avatar portraits
@@ -340,18 +441,28 @@ extension AppModel {
     /// whether a profile HAS a portrait. Cheap and idempotent: cached hits and
     /// known misses never re-hit the gateway.
     public func refreshAvatar(botID: String, force: Bool = false) async {
-        guard mode == .live, let client else { return }
+        guard mode == .live,
+              let context = try? await profileContext(for: botID) else { return }
         let signals = RosterSignals.shared
-        // `has_avatar` off the roster row is the fetch gate — the gateway has
-        // already said whether an asset exists, so a shape-only roster costs
-        // zero `profiles.get_asset` calls instead of one per row on every cold
-        // start. A sheet that opens before any roster answer landed (`force`)
-        // still asks.
-        guard force || signals.hasAvatar.contains(botID) else { return }
+        // `has_avatar` gates primary rows. Secondary roster projections do not
+        // currently retain that flag, so a qualified row asks once and lets
+        // the source-qualified absent cache suppress every later request.
+        let isRemote = GatewayBotRoute(qualifiedID: botID) != nil
+        guard force || isRemote || signals.hasAvatar.contains(botID) else { return }
         let store = ProfileAssetStore.shared
-        guard store.beginFetch(botID, force: force) else { return }
-        defer { store.endFetch(botID) }
-        guard let dataURL = try? await client.profileAvatar(name: botID),
+        let cacheID = context.route.qualifiedID
+        let cacheEpoch = store.captureEpoch()
+        guard store.beginFetch(cacheID, force: force) else { return }
+        defer { store.endFetch(cacheID) }
+        let dataURL: String?
+        do {
+            dataURL = try await context.client.profileAvatar(name: context.route.profile)
+        } catch {
+            // A transport/provider failure is not evidence that the asset is
+            // absent. Leave the cache unresolved so a later repaint can retry.
+            return
+        }
+        guard let dataURL,
               let data = ProfileAssetStore.decode(dataURL: dataURL),
               // Desktop's own guard, same inputs and same verdict
               // (plugin.js:411-417): "A 160px raster of the vector face is only
@@ -368,19 +479,24 @@ extension AppModel {
             // `markAbsent`, not a bare return: this is a settled verdict about
             // bytes already seen, so the row keeps its live face for good
             // instead of re-fetching and re-rejecting the same asset every poll.
-            store.markAbsent(botID)
+            if store.isCurrent(epoch: cacheEpoch) { store.markAbsent(cacheID) }
             return
         }
-        store.set(data, for: botID)
+        if store.isCurrent(epoch: cacheEpoch) { store.set(data, for: cacheID) }
     }
 
     /// image.generate → profiles.set_asset. Returns nil on success, else why
     /// it failed so the sheet can say it in the user's theme.
     public func generateAvatarPortrait(botID: String, prompt: String) async -> PortraitFailure? {
-        guard mode == .live, let client else { return .notLive }
+        guard mode == .live else { return .notLive }
+        guard let context = try? await profileContext(for: botID) else {
+            return .failed(GatewayRouteError.noRoute.localizedDescription)
+        }
+        let cacheID = context.route.qualifiedID
+        let cacheEpoch = ProfileAssetStore.shared.captureEpoch()
         let generated: GeneratedPortrait
         do {
-            generated = try await client.generatePortrait(prompt: prompt)
+            generated = try await context.client.generatePortrait(prompt: prompt)
         } catch let error as GatewayError {
             return .failed(error.message)
         } catch {
@@ -389,29 +505,54 @@ extension AppModel {
         guard generated.available else { return .unavailable }
         if let message = generated.error, !message.isEmpty { return .failed(message) }
         guard let raw = generated.dataURL else { return .noBytes }
+        guard ProfileAssetStore.shared.isCurrent(epoch: cacheEpoch) else {
+            return .failed(GatewayRouteError.noRoute.localizedDescription)
+        }
         guard let payload = ProfileAssetStore.assetDataURL(from: raw),
               let bytes = ProfileAssetStore.decode(dataURL: payload) else { return .tooLarge }
         do {
-            try await client.setProfileAvatar(name: botID, dataURL: payload)
+            try await context.client.setProfileAvatar(name: context.route.profile,
+                                                      dataURL: payload)
         } catch let error as GatewayError {
             return .failed(error.message)
         } catch {
             return .failed(error.localizedDescription)
         }
-        ProfileAssetStore.shared.set(bytes, for: botID)
+        if ProfileAssetStore.shared.isCurrent(epoch: cacheEpoch) {
+            ProfileAssetStore.shared.set(bytes, for: cacheID)
+        }
         return nil
     }
 
     /// Drop the custom portrait; the geometric avatar takes over again.
-    public func clearAvatarPortrait(botID: String) async {
-        guard mode == .live, let client else { return }
-        try? await client.clearProfileAvatar(name: botID)
-        ProfileAssetStore.shared.markAbsent(botID)
+    public func clearAvatarPortrait(botID: String) async -> PortraitFailure? {
+        guard mode == .live else { return .notLive }
+        guard let context = try? await profileContext(for: botID) else {
+            return .failed(GatewayRouteError.noRoute.localizedDescription)
+        }
+        let cacheID = context.route.qualifiedID
+        let cacheEpoch = ProfileAssetStore.shared.captureEpoch()
+        do {
+            try await context.client.clearProfileAvatar(name: context.route.profile)
+        } catch let error as GatewayError {
+            return .failed(error.message)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+        if ProfileAssetStore.shared.isCurrent(epoch: cacheEpoch) {
+            ProfileAssetStore.shared.markAbsent(cacheID)
+        }
+        return nil
     }
 
     /// Is portrait generation worth offering on this gateway?
-    public func portraitGenerationAvailable() async -> Bool {
-        guard mode == .live, let client else { return false }
+    public func portraitGenerationAvailable(botID: String? = nil) async -> Bool {
+        guard mode == .live else { return false }
+        if let botID {
+            guard let context = try? await profileContext(for: botID) else { return false }
+            return await context.client.imageGenerationAvailable()
+        }
+        guard let client else { return false }
         return await client.imageGenerationAvailable()
     }
 

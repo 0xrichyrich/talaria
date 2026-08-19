@@ -360,7 +360,7 @@ public struct AvatarPicker: View {
     }
 
     private func probe() async {
-        let available = await model.portraitGenerationAvailable()
+        let available = await model.portraitGenerationAvailable(botID: botID)
         imagen = available
     }
 
@@ -376,7 +376,7 @@ public struct AvatarPicker: View {
                                       job: seedJob, soul: seedSoul,
                                       shape: shape, hue: hue)
             : AppModel.portraitPrompt(describe: typed)
-        switch await model.makePortrait(prompt: prompt) {
+        switch await model.makePortrait(prompt: prompt, botID: botID) {
         case .image(let bytes):
             draft.image = bytes
             draft.clearsImage = false

@@ -42,6 +42,9 @@ public struct CreateBotView: View {
     private enum Load: Equatable { case loading, loaded, failed }
 
     @State private var name: String
+    /// Gateway that will own a new profile. Edits derive this from the
+    /// source-qualified bot and cannot change it mid-sheet.
+    @State private var selectedGatewayID: String?
     /// The user-set display title — desktop's Edit Profile "Title" field,
     /// stored in ui_meta["hermes-bots"].title and read back by
     /// `Bot.displayTitle`. Blank means "keep the derived name", which is why
@@ -83,7 +86,11 @@ public struct CreateBotView: View {
     public init(model: AppModel, editing: Bot? = nil) {
         self.model = model
         self.editing = editing
-        _name = State(initialValue: editing?.id ?? "")
+        _name = State(initialValue: editing?.profileName ?? "")
+        _selectedGatewayID = State(initialValue:
+            editing.flatMap { GatewayBotRoute(qualifiedID: $0.id)?.gatewayID }
+                ?? LiveRuntime.shared.gatewayID
+                ?? ConnectionRegistry.shared.saved.first?.id)
         _title = State(initialValue: editing?.title ?? "")
         _job = State(initialValue: editing?.job ?? "")
         // Soul stays EMPTY until profiles.describe answers with the real
@@ -100,6 +107,17 @@ public struct CreateBotView: View {
 
     private var isEditing: Bool { editing != nil }
 
+    /// Freeze an edit to the gateway that owned the row when the sheet opened.
+    /// Active roster ids are bare, so using `editing.id` after a gateway role
+    /// change could otherwise retarget an in-flight save to the new primary.
+    private var editingRosterID: String? {
+        guard let editing else { return nil }
+        if GatewayBotRoute(qualifiedID: editing.id) != nil { return editing.id }
+        guard let gatewayID = selectedGatewayID else { return editing.id }
+        return GatewayBotRoute(gatewayID: gatewayID,
+                               profile: editing.profileName).qualifiedID
+    }
+
     /// Who a generated portrait is of — the name being typed right now, not
     /// the one the profile was saved under, so a rename and a new face can be
     /// decided in the same sitting.
@@ -112,9 +130,27 @@ public struct CreateBotView: View {
     private var canCreate: Bool {
         guard !name.isEmpty, !saving else { return false }
         // A new profile id must be free; edits keep their id.
-        guard isEditing || model.bot(name) == nil else { return false }
+        guard isEditing || model.bot(creationRosterID) == nil else { return false }
         // Never let an edit save race the prefill it diffs against.
         return !isEditing || load != .loading
+    }
+
+    private var creationRosterID: String {
+        creationRosterID(gatewayID: selectedGatewayID)
+    }
+
+    private func creationRosterID(gatewayID: String?) -> String {
+        guard let gatewayID,
+              gatewayID != LiveRuntime.shared.gatewayID else { return name }
+        return GatewayBotRoute(gatewayID: gatewayID, profile: name).qualifiedID
+    }
+
+    private var creationGateways: [SavedGateway] {
+        ConnectionRegistry.shared.saved.filter {
+            $0.baseURL != nil
+                && ($0.id == LiveRuntime.shared.gatewayID
+                    || ConnectionRegistry.shared.credential(for: $0) != nil)
+        }
     }
 
     // MARK: - Body
@@ -125,7 +161,7 @@ public struct CreateBotView: View {
             ScrollView {
                 VStack(spacing: 14) {
                     avatarPreview
-                    AvatarPicker(model: model, botID: editing?.id,
+                    AvatarPicker(model: model, botID: editingRosterID,
                                  name: promptName, job: job, soul: soul,
                                  shape: $shape, hue: $hue, draft: $avatar)
                     if !isEditing {
@@ -169,7 +205,7 @@ public struct CreateBotView: View {
         }
         .background(theme.bg.ignoresSafeArea())
         .presentationBackground(theme.bg)
-        .task { await prefill() }
+        .task(id: selectedGatewayID) { await prefill() }
     }
 
     // MARK: - Prefill (profiles.describe + model.options)
@@ -178,24 +214,35 @@ public struct CreateBotView: View {
     /// the gateway's default profile purely for a skills catalog — a new
     /// profile is born with the same bundled skills.
     private func prefill() async {
-        guard load == .loading else { return }
+        let targetAtStart = selectedGatewayID
+        load = .loading
+        baseline = nil
+        skillRows = []
+        disabledSkills = []
+        toolsetRows = []
+        enabledToolsets = []
+        mcpRows = []
 
-        async let catalogTask = model.modelChoices()
+        async let catalogTask = model.modelChoices(
+            botID: editingRosterID,
+            gatewayID: isEditing ? nil : selectedGatewayID)
 
         let snapshot: ProfileSnapshot?
         if let editing {
             // The stored portrait has to be in the cache before the picker can
             // offer to remove it, and before the preview can show what this
             // bot's face actually is today. Idempotent and cached.
-            await model.refreshAvatar(botID: editing.id)
-            snapshot = await model.profileSnapshot(botID: editing.id)
-        } else if let seed = LiveRuntime.shared.defaultBotID ?? model.bots.first?.id {
+            await model.refreshAvatar(botID: editingRosterID ?? editing.id)
+            snapshot = await model.profileSnapshot(botID: editingRosterID ?? editing.id)
+        } else if let seed = creationSeedProfileID {
             snapshot = await model.profileSnapshot(botID: seed)
         } else {
             snapshot = nil
         }
 
-        modelChoices = await catalogTask
+        let choices = await catalogTask
+        guard selectedGatewayID == targetAtStart, !Task.isCancelled else { return }
+        modelChoices = choices
 
         if isEditing {
             guard let snapshot else {
@@ -222,6 +269,16 @@ public struct CreateBotView: View {
             pinnedModel = modelChoices.first(where: \.isCurrent) ?? modelChoices.first
         }
         load = .loaded
+    }
+
+    private var creationSeedProfileID: String? {
+        guard let gatewayID = selectedGatewayID,
+              gatewayID != LiveRuntime.shared.gatewayID else {
+            return LiveRuntime.shared.defaultBotID ?? model.bots.first?.id
+        }
+        guard let profile = ConnectionRegistry.shared.secondaryRosters[gatewayID]?
+            .profiles.first?.name else { return nil }
+        return GatewayBotRoute(gatewayID: gatewayID, profile: profile).qualifiedID
     }
 
     /// Match the profile's pin against the live catalog so the chip row
@@ -317,7 +374,8 @@ public struct CreateBotView: View {
     private var previewImage: Image? {
         if let staged = avatar.image { return ProfileAssetStore.image(from: staged) }
         guard !avatar.clearsImage, let editing,
-              let data = ProfileAssetStore.shared.portrait(for: editing.id) else { return nil }
+              let data = ProfileAssetStore.shared.portrait(
+                for: editingRosterID ?? editing.id) else { return nil }
         return ProfileAssetStore.image(from: data)
     }
 
@@ -338,6 +396,19 @@ public struct CreateBotView: View {
 
     private var formGroup: some View {
         VStack(spacing: 0) {
+            if !isEditing, creationGateways.count > 1 {
+                Picker(CopyPack.profileGateway(theme.id), selection: $selectedGatewayID) {
+                    ForEach(creationGateways) { gateway in
+                        Text(gateway.name).tag(Optional(gateway.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(theme.accent)
+                .disabled(saving)
+                .padding(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
+
+                Rectangle().fill(theme.line).frame(height: 1)
+            }
             HStack(spacing: 5) {
                 Text("@")
                     .font(style.atFont)
@@ -613,6 +684,8 @@ public struct CreateBotView: View {
     /// look, in both vocabularies, with the `created` stamp that floats a
     /// brand-new bot to the top of the roster (plugin.js:5399-5401).
     private func create() async -> Bool {
+        let targetGatewayID = selectedGatewayID
+        let targetRosterID = creationRosterID(gatewayID: targetGatewayID)
         let created = await model.createBotProfileWithFeedback(
             id: name,
             job: job.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -620,11 +693,12 @@ public struct CreateBotView: View {
             model: pinTouched ? pinnedModel : nil,
             disabledSkills: Array(disabledSkills).sorted(),
             enabledToolsets: nil,
-            uiMeta: model.newBotUIMeta(shape: shape, hue: hue, title: title))
+            uiMeta: model.newBotUIMeta(shape: shape, hue: hue, title: title),
+            gatewayID: targetGatewayID)
         guard created else { return false }
         // A portrait staged before the profile existed can only be written now
         // that it does — the asset store is keyed by profile name.
-        await commitAvatar(botID: name)
+        await commitAvatar(botID: targetRosterID)
         return true
     }
 
@@ -663,7 +737,8 @@ public struct CreateBotView: View {
         }
 
         if !edit.isEmpty {
-            guard await model.saveProfileEditWithFeedback(botID: editing.id, edit: edit) else {
+            guard await model.saveProfileEditWithFeedback(
+                botID: editingRosterID ?? editing.id, edit: edit) else {
                 return false
             }
         }
@@ -677,7 +752,9 @@ public struct CreateBotView: View {
             // the three outcomes it returns are the same ones this switch has
             // always handled, and `.unsupported` retracts its own card so the
             // once-per-gateway notice below stays the only thing said.
-            switch await model.saveBotLookWithFeedback(botID: editing.id, shape: shape,
+            switch await model.saveBotLookWithFeedback(
+                                                       botID: editingRosterID ?? editing.id,
+                                                       shape: shape,
                                                        hue: hue, title: title) {
             case .persisted:
                 break
@@ -694,7 +771,7 @@ public struct CreateBotView: View {
                 return false
             }
         }
-        await commitAvatar(botID: editing.id)
+        await commitAvatar(botID: editingRosterID ?? editing.id)
         return true
     }
 
@@ -716,6 +793,14 @@ public struct CreateBotView: View {
 // MARK: - Editor copy (the three voices)
 
 extension CopyPack {
+
+    static func profileGateway(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Create on"
+        case .control: "TARGET GATEWAY"
+        case .ink: "House this familiar on"
+        }
+    }
 
     static func editorLoading(_ t: ThemeID) -> String {
         switch t {
@@ -763,9 +848,12 @@ extension CopyPack {
 
     static func editorSaveFailed(_ t: ThemeID) -> String {
         switch t {
-        case .soft: "The gateway refused the save — nothing was changed. Try again when it answers."
-        case .control: "SAVE REJECTED BY GATEWAY — NO CHANGES WRITTEN."
-        case .ink: "The gateway would not take the inscription. Nothing was altered."
+        case .soft:
+            "The gateway did not confirm every change. Reload the profile before retrying; some sections may already have landed."
+        case .control:
+            "SAVE NOT FULLY ACKNOWLEDGED — RELOAD BEFORE RETRY; PARTIAL SECTIONS MAY HAVE LANDED."
+        case .ink:
+            "The gateway did not seal every amendment. Read the entry anew before writing again; part may already be inscribed."
         }
     }
 

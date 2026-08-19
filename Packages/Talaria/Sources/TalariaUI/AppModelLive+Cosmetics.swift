@@ -492,7 +492,8 @@ extension AppModel {
     /// below decides what survives. `nil` in the patch deletes a key.
     private func writeBotModeMeta(botID: String, patch: [String: JSONValue?],
                                   alsoTalaria: (AvatarShape, AvatarHue)?) async -> CosmeticsWrite {
-        guard mode == .live, let client else { return .persisted }
+        guard mode == .live else { return .persisted }
+        guard let context = try? await profileContext(for: botID) else { return .failed }
         let signals = RosterSignals.shared
         signals.writing.insert(botID)
         defer { signals.writing.remove(botID) }
@@ -503,8 +504,10 @@ extension AppModel {
         let pinWrites = CanonicalChatRuntime.shared.writeCount
         var block: [String: JSONValue] = [:]
         do {
-            let profiles = try await client.listProfiles(includeSessions: false)
-            guard let row = profiles.first(where: { $0.name == botID }) else { return .failed }
+            let profiles = try await context.client.listProfiles(includeSessions: false)
+            guard let row = profiles.first(where: { $0.name == context.route.profile }) else {
+                return .failed
+            }
             block = row.uiMeta?["hermes-bots"]?.objectValue ?? [:]
         } catch {
             return .failed
@@ -535,9 +538,12 @@ extension AppModel {
         }
 
         do {
-            let applied = try await client.applyProfileEdit(
-                name: botID, ProfileEdit(uiMeta: .object(uiMeta)))
-            if applied["ui_meta"] == true { return .persisted }
+            let applied = try await context.client.applyProfileEdit(
+                name: context.route.profile, ProfileEdit(uiMeta: .object(uiMeta)))
+            if applied["ui_meta"] == true {
+                await refreshProfileRoster(gatewayID: context.route.gatewayID)
+                return .persisted
+            }
             // No `applied` contract at all is the documented older-gateway
             // shape, not a refusal (plugin.js:250-262).
             return applied.isEmpty ? .unsupported : .failed
@@ -592,11 +598,21 @@ extension AppModel {
 
     /// Generate a portrait WITHOUT writing it — the staged half of the flow.
     /// Returns the decoded bytes so the sheet can preview them, or why not.
-    public func makePortrait(prompt: String) async -> PortraitAttempt {
-        guard mode == .live, let client else { return .failure(.notLive) }
+    public func makePortrait(prompt: String, botID: String? = nil) async -> PortraitAttempt {
+        guard mode == .live else { return .failure(.notLive) }
+        let selectedClient: GatewayClient
+        if let botID {
+            guard let context = try? await profileContext(for: botID) else {
+                return .failure(.failed(GatewayRouteError.noRoute.localizedDescription))
+            }
+            selectedClient = context.client
+        } else {
+            guard let client else { return .failure(.notLive) }
+            selectedClient = client
+        }
         let generated: GeneratedPortrait
         do {
-            generated = try await client.generatePortrait(prompt: prompt)
+            generated = try await selectedClient.generatePortrait(prompt: prompt)
         } catch let error as GatewayError {
             return .failure(.failed(error.message))
         } catch {
@@ -620,25 +636,33 @@ extension AppModel {
     public func commitAvatarDraft(botID: String, draft: AvatarDraft) async -> PortraitFailure? {
         guard !draft.isEmpty else { return nil }
         if draft.clearsImage, draft.image == nil {
-            await clearAvatarPortrait(botID: botID)
+            if let failure = await clearAvatarPortrait(botID: botID) { return failure }
             await stampImageKind(botID: botID, photo: false)
             return nil
         }
         guard let bytes = draft.image else { return nil }
-        guard mode == .live, let client else {
+        guard mode == .live else {
             // Demo mode has no asset store; the cache alone carries the face.
             ProfileAssetStore.shared.set(bytes, for: botID)
             return nil
         }
+        guard let context = try? await profileContext(for: botID) else {
+            return .failed(GatewayRouteError.noRoute.localizedDescription)
+        }
+        let cacheID = context.route.qualifiedID
+        let cacheEpoch = ProfileAssetStore.shared.captureEpoch()
         guard let payload = Self.assetDataURL(for: bytes) else { return .tooLarge }
         do {
-            try await client.setProfileAvatar(name: botID, dataURL: payload)
+            try await context.client.setProfileAvatar(name: context.route.profile,
+                                                      dataURL: payload)
         } catch let error as GatewayError {
             return .failed(error.message)
         } catch {
             return .failed(error.localizedDescription)
         }
-        ProfileAssetStore.shared.set(bytes, for: botID)
+        if ProfileAssetStore.shared.isCurrent(epoch: cacheEpoch) {
+            ProfileAssetStore.shared.set(bytes, for: cacheID)
+        }
         await stampImageKind(botID: botID, photo: true)
         return nil
     }

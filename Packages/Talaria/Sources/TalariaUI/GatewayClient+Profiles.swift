@@ -152,6 +152,28 @@ public struct ProfileEdit: Sendable, Equatable {
             && enabledToolsets == nil && uiMeta == nil
     }
 
+    public var isWireValid: Bool {
+        model == nil || provider?.isEmpty == false
+    }
+
+    /// Per-section acknowledgements profiles.configure must return for this
+    /// exact dirty diff. The gateway applies sections independently, so an RPC
+    /// success is not itself a successful editor save.
+    public var expectedAppliedSections: Set<String> {
+        var sections = Set<String>()
+        if description != nil { sections.insert("description") }
+        if soul != nil { sections.insert("soul") }
+        if model != nil, provider?.isEmpty == false { sections.insert("model") }
+        if disabledSkills != nil { sections.insert("skills") }
+        if enabledToolsets != nil { sections.insert("toolsets") }
+        if uiMeta != nil { sections.insert("ui_meta") }
+        return sections
+    }
+
+    public func wasFullyApplied(_ applied: [String: Bool]) -> Bool {
+        isWireValid && expectedAppliedSections.allSatisfy { applied[$0] == true }
+    }
+
     /// profiles.configure params. The model pin is dropped unless a provider
     /// rides with it — the gateway would ignore a lone model silently.
     public func params(name: String) -> JSONValue {

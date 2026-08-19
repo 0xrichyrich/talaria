@@ -153,6 +153,7 @@ public extension AppModel {
         dropApprovalScope(gatewayID: gatewayID)
         dropRoutineScope(gatewayID: gatewayID)
         dropCapabilityScope(gatewayID: gatewayID)
+        ProfileAssetStore.shared.drop(gatewayID: gatewayID)
         LiveRuntime.shared.resetRoutedState(gatewayID: gatewayID)
         CanonicalChatRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
         SessionsRuntime.shared.resetRoutedScope(gatewayID: gatewayID)

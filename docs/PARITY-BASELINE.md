@@ -69,7 +69,8 @@ are the remaining multi-connection management surfaces and group rooms:
   events, sessions, full approval recovery/prompts, and unread state by source.
   Routine listing, detail/history, create/edit/run/delete, and toggles are also
   routed. Skills, toolsets, plugins, and MCP/OAuth management are routed too;
-  several other management mutations remain primary-only.
+  profile read/edit/create/duplicate, model catalogs, looks, and portraits are
+  routed too; several other management mutations remain primary-only.
 - Talaria's in-flight room work models one group per bot; current Hermes uses
   multiple memberships and standalone rooms.
 - Foreign room members are not yet delivered through their owning connection.
@@ -119,6 +120,8 @@ Multi-connection implementation checkpoints:
       gateway-scoped REST credentials, caches, delivery targets, and transcripts.
 - [x] Source-qualified capability state and skills/toolsets/plugins/MCP/OAuth
       mutations, including gateway detach and role-transition fencing.
+- [x] Source-qualified profile read/edit/create/duplicate, model catalogs,
+      cosmetics, and portrait asset state/mutations.
 - [ ] Source-qualified remaining management mutations.
 
 ## Crash-recovery snapshot disposition
