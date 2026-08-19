@@ -266,6 +266,6 @@ Two app-process observers sit beside the screens, both driven purely by
   registration (device token exposed async for the relay handshake), and
   deep-link routing back into `AppModel`. The wire contract with the
   `relay/talaria-push` gateway plugin is the design's push shape
-  (`{kind, bot, title, body, approval_request_id, session_id}` +
-  `mutable-content: 1`); the `TalariaNotificationService` extension will
-  decorate/decrypt those payloads and shares the same userInfo keys.
+  (`{kind, gateway_id, bot, title, body, approval_request_id, session_id}` +
+  `mutable-content: 1`); the `TalariaNotificationService` extension decorates
+  those cleartext payloads and shares the same userInfo keys.

@@ -63,7 +63,7 @@ Requirements: **Xcode 16+** on macOS, and [XcodeGen](https://github.com/yonaskol
 
 ```sh
 brew install xcodegen
-git clone https://github.com/0xrichyrich/talaria.git && cd talaria
+git clone https://github.com/Skynet-Ventures/talaria.git && cd talaria
 make ios
 ```
 
@@ -135,7 +135,7 @@ completions) and fully offline **on-device models** (MLX, in the optional
 | `Packages/Talaria/` | The Swift package: `TalariaKit` (gateway protocol client, auth, models, demo data), `TalariaTheme` (the three theme packs + avatar language), `TalariaUI` (screens + `AppModel` state tree + live wiring), `talaria-verify` (protocol checks). No third-party dependencies. |
 | `Packages/TalariaLocal/` | Optional on-device inference (MLX + Hugging Face hub), deliberately quarantined in its own package so the main app stays dependency-free unless the user opts in. |
 | `ios/` | XcodeGen app shell: `project.yml` (app + `TalariaWidgets` Live-Activity extension + `TalariaNotificationService` extension), resources (app icon, bundled fonts). `Talaria.xcodeproj` is generated, never committed. |
-| `relay/` | Gateway-side APNs push-relay plugin (`talaria-push`): approvals as actionable critical alerts, routine/mention/long-task pushes. *In progress — config, device registry, and the APNs HTTP/2 client have landed; event fan-out and the sidecar are next.* |
+| `relay/` | Gateway-side APNs push-relay plugin (`talaria-push`): approvals as actionable Time Sensitive alerts plus routine, mention, long-task, and gateway pushes. Includes the device registry, APNs HTTP/2 fan-out, dashboard plugin, and standalone sidecar. |
 | `docs/` | Engineering docs, starting with [ARCHITECTURE.md](docs/ARCHITECTURE.md). |
 
 Contributions map to rows in [PARITY.md](PARITY.md) — see
@@ -154,5 +154,4 @@ changes belong upstream.
 
 ## Source
 
-Public home: <https://github.com/0xrichyrich/talaria> (source of truth), synced
-into Cursor Origin at <https://cursor.com/codebase/richyrich/talaria>
+Public home and source of truth: <https://github.com/Skynet-Ventures/talaria>
