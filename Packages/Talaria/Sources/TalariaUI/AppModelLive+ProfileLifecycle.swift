@@ -168,6 +168,27 @@ struct ProfileLifecycleGenerationToken: Equatable, Sendable {
     var generation: UInt64
 }
 
+struct ProfileLifecycleRetirement: Equatable {
+    var wasActive: Bool
+    var connectionGeneration: Int?
+}
+
+enum ProfileLifecycleRecoveryPolicy {
+    static func mayRestorePrimary(
+        retirement: ProfileLifecycleRetirement,
+        currentGeneration: Int,
+        currentGatewayID: String?,
+        hasClient: Bool,
+        switchInProgress: Bool
+    ) -> Bool {
+        retirement.wasActive
+            && retirement.connectionGeneration == currentGeneration
+            && currentGatewayID == nil
+            && !hasClient
+            && !switchInProgress
+    }
+}
+
 private struct ProfileLifecyclePreservedState {
     var portrait: Data?
     var unread: Int
@@ -250,10 +271,10 @@ extension AppModel {
             // uncertain mutation response.
             ProfileLifecycleRuntime.shared.block(target.route)
         }
-        let wasActive = changesDirectory
+        let retirement = changesDirectory
             ? await retireProfileLifecycleClient(target.route.gatewayID, baseURL: baseURL,
                                                   credential: credential)
-            : false
+            : ProfileLifecycleRetirement(wasActive: false, connectionGeneration: nil)
 
         let result: ProfileRenameResult
         do {
@@ -269,7 +290,7 @@ extension AppModel {
             }
             return await resolveAmbiguousRename(
                 target, requested: cleanName, originalError: error.message,
-                baseURL: baseURL, credential: credential, wasActive: wasActive,
+                baseURL: baseURL, credential: credential, retirement: retirement,
                 preserved: preserved, exclusive: exclusive)
         } catch {
             guard changesDirectory else {
@@ -279,7 +300,7 @@ extension AppModel {
             }
             return await resolveAmbiguousRename(
                 target, requested: cleanName, originalError: error.localizedDescription,
-                baseURL: baseURL, credential: credential, wasActive: wasActive,
+                baseURL: baseURL, credential: credential, retirement: retirement,
                 preserved: preserved, exclusive: exclusive)
         }
 
@@ -307,17 +328,20 @@ extension AppModel {
             return await resolveAmbiguousRename(
                 target, requested: cleanName,
                 originalError: "Hermes did not return a valid changed canonical profile name.",
-                baseURL: baseURL, credential: credential, wasActive: wasActive,
+                baseURL: baseURL, credential: credential, retirement: retirement,
                 preserved: preserved, exclusive: exclusive)
         }
         reconcileProfileRoute(target, canonicalNewName: canonical,
                               scope: baseURL, preserved: preserved,
-                              restorePrimaryIfUnclaimed: wasActive)
+                              restorePrimaryIfUnclaimed:
+                                  mayRestoreRetiredPrimary(retirement))
         let recoveryLease = exclusive.finishAuthoritativeReconciliation()
         await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
-                                            wasActive: wasActive, baseURL: baseURL,
+                                            retirement: retirement, baseURL: baseURL,
                                             credential: credential)
-        if !wasActive { await refreshProfileRoster(gatewayID: target.route.gatewayID) }
+        if !retirement.wasActive {
+            await refreshProfileRoster(gatewayID: target.route.gatewayID)
+        }
         await recoveryLease.release()
         return .renamed(canonicalName: canonical, displayName: result.displayName)
     }
@@ -348,9 +372,9 @@ extension AppModel {
         let preserved = captureProfileLifecycleState(target)
         parkProfileLifecycleState(target)
         abortProfileRuntime(target)
-        let wasActive = await retireProfileLifecycleClient(target.route.gatewayID,
-                                                           baseURL: baseURL,
-                                                           credential: credential)
+        let retirement = await retireProfileLifecycleClient(target.route.gatewayID,
+                                                             baseURL: baseURL,
+                                                             credential: credential)
 
         do {
             try await GatewayREST.deleteProfile(baseURL: baseURL, credential: credential,
@@ -358,30 +382,34 @@ extension AppModel {
         } catch let error as GatewayError {
             return await resolveAmbiguousDelete(
                 target, originalError: error.message, baseURL: baseURL,
-                credential: credential, wasActive: wasActive,
+                credential: credential, retirement: retirement,
                 preserved: preserved, exclusive: exclusive)
         } catch {
             return await resolveAmbiguousDelete(
                 target, originalError: error.localizedDescription, baseURL: baseURL,
-                credential: credential, wasActive: wasActive,
+                credential: credential, retirement: retirement,
                 preserved: preserved, exclusive: exclusive)
         }
 
         reconcileProfileRoute(target, canonicalNewName: nil,
                               scope: baseURL, preserved: preserved,
-                              restorePrimaryIfUnclaimed: wasActive)
+                              restorePrimaryIfUnclaimed:
+                                  mayRestoreRetiredPrimary(retirement))
         let recoveryLease = exclusive.finishAuthoritativeReconciliation()
         await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
-                                            wasActive: wasActive, baseURL: baseURL,
+                                            retirement: retirement, baseURL: baseURL,
                                             credential: credential)
-        if !wasActive { await refreshProfileRoster(gatewayID: target.route.gatewayID) }
+        if !retirement.wasActive {
+            await refreshProfileRoster(gatewayID: target.route.gatewayID)
+        }
         await recoveryLease.release()
         return .deleted
     }
 
     private func resolveAmbiguousRename(
         _ target: ProfileLifecycleTarget, requested: String, originalError: String,
-        baseURL: URL, credential: GatewayCredential, wasActive: Bool,
+        baseURL: URL, credential: GatewayCredential,
+        retirement: ProfileLifecycleRetirement,
         preserved: ProfileLifecyclePreservedState,
         exclusive: ProfileLifecycleExclusiveLease
     ) async -> ProfileLifecycleOutcome {
@@ -394,20 +422,24 @@ extension AppModel {
         case .committed:
             reconcileProfileRoute(target, canonicalNewName: requested, scope: baseURL,
                                   preserved: preserved,
-                                  restorePrimaryIfUnclaimed: wasActive)
+                                  restorePrimaryIfUnclaimed:
+                                      mayRestoreRetiredPrimary(retirement))
             let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
-                                                wasActive: wasActive, baseURL: baseURL,
+                                                retirement: retirement, baseURL: baseURL,
                                                 credential: credential)
-            if !wasActive { await refreshProfileRoster(gatewayID: target.route.gatewayID) }
+            if !retirement.wasActive {
+                await refreshProfileRoster(gatewayID: target.route.gatewayID)
+            }
             await recoveryLease.release()
             return .renamed(canonicalName: requested, displayName: nil)
         case .notCommitted:
-            restoreParkedProfileLifecycleStateIfNeeded(target, wasActive: wasActive)
+            restoreParkedProfileLifecycleStateIfNeeded(
+                target, wasActive: mayRestoreRetiredPrimary(retirement))
             ProfileLifecycleRuntime.shared.restore(target.route)
             let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
-                                                wasActive: wasActive, baseURL: baseURL,
+                                                retirement: retirement, baseURL: baseURL,
                                                 credential: credential)
             await recoveryLease.release()
             return .refused(originalError)
@@ -448,7 +480,8 @@ extension AppModel {
 
     private func resolveAmbiguousDelete(
         _ target: ProfileLifecycleTarget, originalError: String,
-        baseURL: URL, credential: GatewayCredential, wasActive: Bool,
+        baseURL: URL, credential: GatewayCredential,
+        retirement: ProfileLifecycleRetirement,
         preserved: ProfileLifecyclePreservedState,
         exclusive: ProfileLifecycleExclusiveLease
     ) async -> ProfileLifecycleOutcome {
@@ -460,20 +493,24 @@ extension AppModel {
         case .committed:
             reconcileProfileRoute(target, canonicalNewName: nil, scope: baseURL,
                                   preserved: preserved,
-                                  restorePrimaryIfUnclaimed: wasActive)
+                                  restorePrimaryIfUnclaimed:
+                                      mayRestoreRetiredPrimary(retirement))
             let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
-                                                wasActive: wasActive, baseURL: baseURL,
+                                                retirement: retirement, baseURL: baseURL,
                                                 credential: credential)
-            if !wasActive { await refreshProfileRoster(gatewayID: target.route.gatewayID) }
+            if !retirement.wasActive {
+                await refreshProfileRoster(gatewayID: target.route.gatewayID)
+            }
             await recoveryLease.release()
             return .deleted
         case .notCommitted:
-            restoreParkedProfileLifecycleStateIfNeeded(target, wasActive: wasActive)
+            restoreParkedProfileLifecycleStateIfNeeded(
+                target, wasActive: mayRestoreRetiredPrimary(retirement))
             ProfileLifecycleRuntime.shared.restore(target.route)
             let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
-                                                wasActive: wasActive, baseURL: baseURL,
+                                                retirement: retirement, baseURL: baseURL,
                                                 credential: credential)
             await recoveryLease.release()
             return .refused(originalError)
@@ -590,38 +627,76 @@ extension AppModel {
     /// directory. A pooled secondary has no automatic reconnect; a primary is
     /// deliberately disconnected, which cancels its supervisor before REST.
     private func retireProfileLifecycleClient(_ gatewayID: String, baseURL: URL,
-                                              credential: GatewayCredential) async -> Bool {
+                                              credential: GatewayCredential) async
+        -> ProfileLifecycleRetirement {
         let wasActive = gatewayID == LiveRuntime.shared.gatewayID && client != nil
         if wasActive {
             await disconnectGateway()
         }
+        let retirementGeneration = wasActive ? LiveRuntime.shared.generation : nil
         // Leave an intentionally disconnected sentinel in the pool. Every
         // routed lookup receives it and fails closed instead of opening a new
         // socket while the old profile directory is between names.
         let sentinel = GatewayClient(baseURL: baseURL, credential: credential)
         await ConnectionRegistry.shared.clientPool.adopt(sentinel, for: gatewayID)
-        return wasActive
+        return ProfileLifecycleRetirement(
+            wasActive: wasActive, connectionGeneration: retirementGeneration)
     }
 
     /// Rehome a formerly active gateway onto its surviving/default backend.
     /// A failed reconnect intentionally leaves it disconnected; no old-profile
     /// socket remains able to recreate the directory just mutated.
-    private func releaseProfileLifecycleFence(gatewayID: String, wasActive: Bool,
+    private func releaseProfileLifecycleFence(gatewayID: String,
+                                              retirement: ProfileLifecycleRetirement,
                                               baseURL: URL,
                                               credential: GatewayCredential) async {
-        if !wasActive {
+        let runtime = LiveRuntime.shared
+        let supervisor = ConnectionSupervisor.shared
+        guard mayRestoreRetiredPrimary(retirement) else {
             // Remove the disconnected sentinel. The owner-roster refresh is
             // the only operation allowed to redial after a successful change;
             // failures remain disconnected until ordinary demand retries.
             await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gatewayID)
             return
         }
+
+        // Claim the same switch mutex used by Connections before dialing.
+        // This claim is synchronous with the ownership/generation checks, so
+        // a user-selected gateway cannot interleave with recovery.
+        supervisor.isReconnecting = true
+        defer { supervisor.isReconnecting = false }
+        let attemptedGeneration = runtime.generation + 1
         do {
             try await connectGateway(baseURL: baseURL, credential: credential)
         } catch {
-            client = nil
-            isOffline = true
+            // `connectGateway` may have installed its attempted client before
+            // throwing. Clear only that exact unclaimed attempt; never a later
+            // user-selected gateway.
+            if runtime.generation == attemptedGeneration,
+               runtime.baseURL?.absoluteString == baseURL.absoluteString,
+               (runtime.gatewayID == nil || runtime.gatewayID == gatewayID) {
+                // The supervisor mutex still excludes a user switch here, so
+                // the ordinary teardown can scrub a partially registered A
+                // (including failures after roster refresh began).
+                await disconnectGateway()
+                isOffline = true
+            }
         }
+    }
+
+    /// Re-evaluate ownership at the exact reconciliation/recovery point. The
+    /// pre-REST fact that A used to be primary is insufficient because a B
+    /// switch temporarily has no gateway id while its client is connecting.
+    private func mayRestoreRetiredPrimary(
+        _ retirement: ProfileLifecycleRetirement
+    ) -> Bool {
+        let runtime = LiveRuntime.shared
+        return ProfileLifecycleRecoveryPolicy.mayRestorePrimary(
+            retirement: retirement,
+            currentGeneration: runtime.generation,
+            currentGatewayID: runtime.gatewayID,
+            hasClient: client != nil,
+            switchInProgress: ConnectionSupervisor.shared.isReconnecting)
     }
 
     // MARK: - State reconciliation
