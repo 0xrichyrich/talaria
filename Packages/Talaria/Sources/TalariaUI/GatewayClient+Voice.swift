@@ -12,16 +12,16 @@ import TalariaKit
 //
 // Verified upstream contract (hermes-agent-upstream):
 //   POST /api/audio/transcribe {data_url, mime_type} [?profile=]
-//        → {ok, transcript, provider}                (web_server.py:4891)
+//        → {ok, transcript, provider}                (web_server.py:4974)
 //        `data_url` must be `data:<audio/…>;base64,…`; 25 MB cap; a *successful*
 //        empty transcript means "no speech detected" and the caller is expected
 //        to re-listen rather than surface an error (web_server.py:4966-4975).
 //   POST /api/audio/speak {text} [?profile=]
-//        → {ok, data_url, mime_type, provider}       (web_server.py:5098)
+//        → {ok, data_url, mime_type, provider}       (web_server.py:5181)
 //   voice.toggle {action:"status"}
 //        → {enabled, record_key, tts, available, audio_available,
-//           stt_available, details}                  (server.py:14740)
-//   voice.tts {text} → speaks on the HOST            (server.py:15008)
+//           stt_available, details}                  (server.py:14862)
+//   voice.tts {text} → speaks on the HOST            (server.py:15130)
 //
 // Both REST calls are profile-scoped exactly like desktop (hermes.ts:1894-1928):
 // STT/TTS provider config and API keys resolve from the addressed profile, so a
@@ -90,6 +90,30 @@ public struct VoiceCapabilities: Sendable, Equatable {
     }
 }
 
+/// Profile-scoped transcription readiness from GET /api/config. The gateway's
+/// `voice.toggle status` probe is process/default-profile scoped, while the
+/// phone audio endpoint resolves the selected profile. Unknown remains distinct
+/// from disabled so a failed config read never becomes a false green light.
+public struct ProfileSTTReadiness: Sendable, Equatable {
+    public var enabled: Bool
+    public var provider: String
+    public var probed: Bool
+
+    public init(config: JSONValue) {
+        let stt = config["stt"]
+        // Hermes defaults stt.enabled to true. GET /api/config returns merged
+        // config, but retain that upstream default for older gateways that omit
+        // the leaf while still returning a valid stt section.
+        enabled = stt?["enabled"]?.boolValue ?? true
+        provider = stt?["provider"]?.stringValue ?? ""
+        probed = true
+    }
+
+    private init() { enabled = false; provider = ""; probed = false }
+    public static let unknown = ProfileSTTReadiness()
+    public var canTranscribe: Bool { probed && enabled && !provider.isEmpty }
+}
+
 extension GatewayClient {
 
     // MARK: - Capability probe
@@ -103,6 +127,18 @@ extension GatewayClient {
         } catch {
             return .unknown
         }
+    }
+
+    /// Read the selected profile's actual STT gate. This intentionally does not
+    /// borrow the process-wide voice.toggle status response.
+    public func profileSTTReadiness(profile: String? = nil) async -> ProfileSTTReadiness {
+        var query: [URLQueryItem] = []
+        if let profile, !profile.isEmpty {
+            query = [URLQueryItem(name: "profile", value: profile)]
+        }
+        guard let config = try? await restJSON(path: "api/config", query: query, timeout: 20)
+        else { return .unknown }
+        return ProfileSTTReadiness(config: config)
     }
 
     // MARK: - Speech → text

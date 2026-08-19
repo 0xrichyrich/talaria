@@ -5,7 +5,7 @@ import Intents
 // gateway relay. The relay sends `mutable-content: 1` with a data payload
 // mirroring the design DB's PUSHES shape:
 //
-//     { kind, bot, title, body, approval_request_id, session_id }
+//     { kind, gateway_id, bot, title, body, approval_request_id, session_id }
 //
 // where `kind` is one of approval | routine | mention | task | gateway.
 // This extension:

@@ -54,7 +54,11 @@ class APNsResult:
 
     @property
     def retryable(self) -> bool:
-        return self.status in (429, 500, 502, 503) or self.status == 0
+        return (
+            self.status in (429, 500, 502, 503)
+            or self.status == 0
+            or (self.status == 403 and self.reason == "ExpiredProviderToken")
+        )
 
 
 class APNsClient:
@@ -84,34 +88,40 @@ class APNsClient:
             if self._jwt and now - self._jwt_minted_at < _JWT_TTL_S:
                 return self._jwt
 
-            from cryptography.hazmat.primitives import hashes
-            from cryptography.hazmat.primitives.asymmetric import ec, utils
-
-            header = {"alg": "ES256", "kid": self._settings.key_id, "typ": "JWT"}
-            claims = {"iss": self._settings.team_id, "iat": int(now)}
-            signing_input = (
-                _b64url(json.dumps(header, separators=(",", ":")).encode())
-                + "."
-                + _b64url(json.dumps(claims, separators=(",", ":")).encode())
-            ).encode("ascii")
-
-            key = self._load_key()
-            der_sig = key.sign(signing_input, ec.ECDSA(hashes.SHA256()))
-            # JOSE wants the raw r||s pair (2x32 bytes), not the DER envelope.
-            r, s = utils.decode_dss_signature(der_sig)
-            raw = r.to_bytes(32, "big") + s.to_bytes(32, "big")
-
-            self._jwt = signing_input.decode("ascii") + "." + _b64url(raw)
+            self._jwt = self._mint_provider_token(now)
             self._jwt_minted_at = now
             return self._jwt
+
+    def _mint_provider_token(self, now: float) -> str:
+        """Mint one ES256 provider token. Split for deterministic transport
+        tests; production still reaches the same signer through the cache."""
+
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec, utils
+
+        header = {"alg": "ES256", "kid": self._settings.key_id, "typ": "JWT"}
+        claims = {"iss": self._settings.team_id, "iat": int(now)}
+        signing_input = (
+            _b64url(json.dumps(header, separators=(",", ":")).encode())
+            + "."
+            + _b64url(json.dumps(claims, separators=(",", ":")).encode())
+        ).encode("ascii")
+
+        key = self._load_key()
+        der_sig = key.sign(signing_input, ec.ECDSA(hashes.SHA256()))
+        # JOSE wants the raw r||s pair (2x32 bytes), not the DER envelope.
+        r, s = utils.decode_dss_signature(der_sig)
+        raw = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+        return signing_input.decode("ascii") + "." + _b64url(raw)
 
     # -- transport ---------------------------------------------------------
 
     def _client(self, base_url: str):
-        import httpx
-
         client = self._clients.get(base_url)
         if client is None:
+            import httpx
+
             client = httpx.Client(
                 base_url=base_url,
                 http2=True,

@@ -79,6 +79,18 @@ INTERRUPTION_LEVELS = {
 }
 
 _DEFAULT_DEDUPE_S = 20.0
+DEFAULT_TEST_KIND = "mention"
+
+# Never leave an actionable approval in APNs after Hermes' normal blocking
+# timeout. Other notifications also receive finite relevance windows so a
+# phone coming online days later does not present stale operational state.
+_EXPIRATION_TTL_S = {
+    "approval": 5 * 60,
+    "gateway": 10 * 60,
+    "mention": 60 * 60,
+    "long_task": 24 * 60 * 60,
+    "routine": 24 * 60 * 60,
+}
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -118,6 +130,12 @@ class PushEvent:
     dedupe_key: Optional[str] = None
     dedupe_window_s: float = _DEFAULT_DEDUPE_S
     extra: Dict[str, Any] = field(default_factory=dict)
+    expiration: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.expiration is None:
+            ttl = _EXPIRATION_TTL_S.get(self.kind, 60 * 60)
+            self.expiration = int(time.time()) + ttl
 
     def apns_payload(self) -> Dict[str, Any]:
         aps: Dict[str, Any] = {
@@ -129,6 +147,7 @@ class PushEvent:
             "thread-id": self.bot or "hermes",
             "category": CATEGORIES.get(self.kind, "TALARIA_EVENT"),
             "interruption-level": INTERRUPTION_LEVELS.get(self.kind, "active"),
+            "mutable-content": 1,
         }
         payload: Dict[str, Any] = {
             "aps": aps,
@@ -145,6 +164,29 @@ class PushEvent:
             if key not in payload:
                 payload[key] = value
         return payload
+
+
+def payload_for_device(event: PushEvent, device: Dict[str, Any]) -> Dict[str, Any]:
+    """Bind one logical event to one app registration's source identity."""
+    payload = event.apns_payload()
+    gateway_id = str(device.get("gateway_id") or "").strip()
+    if gateway_id:
+        payload["gateway_id"] = gateway_id
+    return payload
+
+
+def synthetic_test_event(kind: str) -> PushEvent:
+    """Build a display-only test that can never authorize a live action."""
+    return PushEvent(
+        kind=kind,
+        bot="talaria-test",
+        title="Talaria test push",
+        body=f"Relay is working — this is a {kind!r}-shaped test notification.",
+        session_id="",
+        approval_request_id="",
+        collapse_id="talaria-test",
+        dedupe_key=None,
+    )
 
 
 class PushDispatcher:
@@ -267,9 +309,12 @@ class PushDispatcher:
             )
             return
         client = self._get_client()
-        payload = event.apns_payload()
         for dev in devices:
             token = dev["device_token"]
+            # Stamp the registration's source per device. Without it two
+            # gateways that both expose `default` are indistinguishable on the
+            # phone, and an actionable approval can reach the wrong machine.
+            payload = payload_for_device(event, dev)
             result = client.send(
                 token,
                 payload,
@@ -277,6 +322,7 @@ class PushDispatcher:
                 push_type="alert",
                 priority=10,
                 collapse_id=event.collapse_id,
+                expiration=event.expiration,
             )
             if result.should_unregister:
                 # 410 Unregistered / 400 BadDeviceToken — token is dead.
@@ -295,13 +341,26 @@ class PushDispatcher:
             elif result.retryable:
                 # One bounded retry after a short pause; APNs hiccups are
                 # usually transient, and approvals are time-boxed upstream.
-                time.sleep(1.0)
+                # ExpiredProviderToken cleared the JWT cache in APNsClient;
+                # remint and retry immediately. Back-pressure/server failures
+                # retain the one-second bound.
+                if not (result.status == 403 and result.reason == "ExpiredProviderToken"):
+                    time.sleep(1.0)
                 retry = client.send(
                     token, payload,
                     environment=dev.get("environment"),
                     collapse_id=event.collapse_id,
+                    expiration=event.expiration,
                 )
+                if retry.should_unregister:
+                    store.remove(token)
+                    continue
                 store.mark_result(token, retry.ok)
+                if not retry.ok:
+                    logger.warning(
+                        "talaria-push: retry failed for …%s (%s %s)",
+                        token[-8:], retry.status, retry.reason,
+                    )
 
 
 _dispatcher: Optional[PushDispatcher] = None

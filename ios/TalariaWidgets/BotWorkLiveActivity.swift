@@ -32,8 +32,14 @@ private let themeStorageKey = "talaria-theme"
 private let appGroupID = "group.bot.talaria.ios"
 
 private func widgetThemeID() -> ThemeID {
+    #if DEBUG
+    // Developer installs intentionally omit App Groups so automatic signing
+    // works for any personal team. The extension stays on its local fallback.
+    let stored = UserDefaults.standard.string(forKey: themeStorageKey)
+    #else
     let stored = UserDefaults(suiteName: appGroupID)?.string(forKey: themeStorageKey)
         ?? UserDefaults.standard.string(forKey: themeStorageKey)
+    #endif
     return stored.flatMap(ThemeID.init(rawValue:)) ?? .soft
 }
 

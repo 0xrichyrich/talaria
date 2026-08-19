@@ -52,8 +52,6 @@ public struct NotificationSettingsSection: View {
 
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
-    private var client: GatewayClient? { model.client }
-
     @State private var relay: PushRelayStatus?
     @State private var device: PushDeviceRecord?
     @State private var probed = false
@@ -61,11 +59,17 @@ public struct NotificationSettingsSection: View {
     @State private var busy = false
     @State private var notice: String?
     @State private var noticeIsWarning = false
+    @State private var selectedGatewayID: String?
+    @State private var stateGatewayID: String?
+    @State private var generation = 0
+    @State private var filterAdmission = PushFilterMutationAdmission()
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 22) {
+            if gatewayChoices.count > 1 { gatewayPickerSection }
             SettingsSection(theme: theme, title: copy.notifySec) {
-                NotificationsCard(model: model)
+                NotificationsCard(model: model, gatewayID: targetGatewayID)
+                    .id(targetGatewayID)
             }
 
             if let relay { kindsSection(relay) }
@@ -86,7 +90,48 @@ public struct NotificationSettingsSection: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .task { await load() }
+        .task(id: targetGatewayID) {
+            prepareForGateway(targetGatewayID)
+            await load(gatewayID: targetGatewayID)
+        }
+    }
+
+    private var gatewayChoices: [SavedGateway] {
+        model.mode == .live ? ConnectionRegistry.shared.saved : []
+    }
+
+    private var targetGatewayID: String? {
+        GatewaySettingsTargetFence.resolve(selected: selectedGatewayID,
+                                           available: Set(gatewayChoices.map(\.id)),
+                                           active: model.activeGatewayID,
+                                           runtime: LiveRuntime.shared.gatewayID)
+    }
+
+    private var gatewayBots: [Bot] {
+        let target = targetGatewayID
+        return model.unionRosterBots.filter { bot in
+            if let route = model.profileRoute(for: bot.id) { return route.gatewayID == target }
+            return target == model.activeGatewayID
+        }
+    }
+
+    private var gatewayPickerSection: some View {
+        SettingsSection(theme: theme, title: copy.settingsNotifyTargetGateway(theme.id),
+                        footnote: copy.settingsNotifyTargetGatewayNote(theme.id)) {
+            SettingsGroup(theme: theme) {
+                Picker(copy.settingsNotifyTargetGateway(theme.id), selection: Binding(
+                    get: { targetGatewayID }, set: { selectedGatewayID = $0 })) {
+                    ForEach(gatewayChoices) { gateway in
+                        Text(gateway.name + (gateway.id == model.activeGatewayID
+                                             ? copy.settingsModelGatewayActive(theme.id) : ""))
+                            .tag(Optional(gateway.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(theme.accent)
+                .padding(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
+            }
+        }
     }
 
     // MARK: - What pushes (read-only)
@@ -170,24 +215,24 @@ public struct NotificationSettingsSection: View {
                                   title: copy.settingsAllBots(theme.id),
                                   subtitle: copy.settingsAllBotsSub(theme.id),
                                   isOn: allowsEveryBot,
-                                  isLast: allowsEveryBot || model.bots.isEmpty) {
+                                  isLast: allowsEveryBot || gatewayBots.isEmpty) {
                     // Turning the master switch OFF has to name somebody: an
                     // empty list is how the relay spells "everyone", so
                     // restricting starts from the full roster and the user
                     // unchecks from there. With no roster to name, the switch
                     // has no off state at all and stays disabled.
-                    Task { await applyFilter(allowsEveryBot ? model.bots.map(\.id) : []) }
+                    startFilterMutation(allowsEveryBot ? gatewayBots.map(wireProfile) : [])
                 }
-                .disabled(busy || (allowsEveryBot && model.bots.isEmpty))
+                .disabled(busy || (allowsEveryBot && gatewayBots.isEmpty))
 
                 if !allowsEveryBot {
-                    ForEach(Array(model.bots.enumerated()), id: \.element.id) { index, bot in
+                    ForEach(Array(gatewayBots.enumerated()), id: \.element.id) { index, bot in
                         SettingsToggleRow(theme: theme,
                                           title: bot.displayTitle,
                                           subtitle: "@\(bot.handle)",
-                                          isOn: allows(bot.id),
-                                          isLast: index == model.bots.count - 1) {
-                            Task { await toggle(bot.id) }
+                                          isOn: allows(wireProfile(bot)),
+                                          isLast: index == gatewayBots.count - 1) {
+                            startToggle(wireProfile(bot))
                         }
                     }
                 }
@@ -217,26 +262,68 @@ public struct NotificationSettingsSection: View {
     }
 
     private var strandedProfiles: [String] {
-        let known = Set(model.bots.map(\.id))
+        let known = Set(gatewayBots.map(wireProfile))
         return filter.filter { !known.contains($0) }
+    }
+
+    private func wireProfile(_ bot: Bot) -> String {
+        model.profileRoute(for: bot.id)?.profile ?? bot.id
     }
 
     // MARK: - Actions
 
-    private func load() async {
-        guard !isLoading else { return }
+    private func prepareForGateway(_ gatewayID: String?) {
+        guard stateGatewayID != gatewayID else { return }
+        generation &+= 1
+        stateGatewayID = gatewayID
+        relay = nil
+        device = nil
+        probed = false
+        isLoading = false
+        busy = false
+        filterAdmission.release()
+        notice = nil
+    }
+
+    private func gatewayClient(for gatewayID: String?) async throws -> GatewayClient {
+        if let gatewayID { return try await model.routedClient(gatewayID: gatewayID) }
+        if let client = model.client { return client }
+        throw AppModel.GatewayRouteError.noRoute
+    }
+
+    private func isCurrent(_ gatewayID: String?, generation captured: Int) -> Bool {
+        targetGatewayID == gatewayID && GatewaySettingsTargetFence.accepts(
+            stateGatewayID: stateGatewayID, targetGatewayID: gatewayID,
+            generation: captured, currentGeneration: generation)
+    }
+
+    private func load(gatewayID: String? = nil) async {
+        let gatewayID = gatewayID ?? targetGatewayID
+        guard stateGatewayID == gatewayID, !isLoading else { return }
+        generation &+= 1
+        let captured = generation
         isLoading = true
         defer {
-            isLoading = false
-            probed = true
+            if isCurrent(gatewayID, generation: captured) {
+                isLoading = false
+                probed = true
+            }
         }
-        guard model.mode == .live, let client else {
+        guard model.mode == .live else {
             relay = nil
             device = nil
             return
         }
-        relay = await client.pushRelay()
-        guard relay != nil else {
+        guard let client = try? await gatewayClient(for: gatewayID) else {
+            guard isCurrent(gatewayID, generation: captured) else { return }
+            relay = nil
+            device = nil
+            return
+        }
+        let nextRelay = await client.pushRelay()
+        guard isCurrent(gatewayID, generation: captured) else { return }
+        relay = nextRelay
+        guard nextRelay != nil else {
             device = nil
             return
         }
@@ -245,7 +332,9 @@ public struct NotificationSettingsSection: View {
         // NotificationsCard above is the surface that fixes that, so this half
         // simply stays hidden rather than showing an inert list.
         if let token = PushCoordinator.shared.deviceTokenHex {
-            device = await client.pushDevice(tokenHex: token)
+            let nextDevice = await client.pushDevice(tokenHex: token)
+            guard isCurrent(gatewayID, generation: captured) else { return }
+            device = nextDevice
         } else {
             device = nil
         }
@@ -254,7 +343,12 @@ public struct NotificationSettingsSection: View {
         #endif
     }
 
-    private func toggle(_ botID: String) async {
+    /// Claim the UI synchronously, before creating an async task. Two taps in
+    /// one run-loop turn can otherwise derive absolute writes from the same
+    /// filter and the later queued write silently loses the first edit.
+    private func startToggle(_ botID: String) {
+        guard filterAdmission.claim() else { return }
+        busy = true
         var next = filter
         if let index = next.firstIndex(of: botID) {
             next.remove(at: index)
@@ -263,34 +357,70 @@ public struct NotificationSettingsSection: View {
             // bot they left rather than silently re-opening the floodgates.
             if next.isEmpty {
                 note(copy.settingsFilterNeedsOne(theme.id), warning: true)
+                busy = false
+                filterAdmission.release()
                 return
             }
         } else {
             next.append(botID)
         }
-        await applyFilter(next)
+        startFilterMutation(next, alreadyAdmitted: true)
     }
 
-    private func applyFilter(_ next: [String]) async {
-        guard let client, let current = device else { return }
+    private func startFilterMutation(_ next: [String], alreadyAdmitted: Bool = false) {
+        guard alreadyAdmitted || filterAdmission.claim() else { return }
+        guard stateGatewayID == targetGatewayID, let current = device else {
+            filterAdmission.release()
+            busy = false
+            return
+        }
         busy = true
         notice = nil
-        defer { busy = false }
-        let previous = current.profileFilter
         device?.profileFilter = next
-        do {
-            try await client.registerPushDevice(tokenHex: current.tokenHex,
-                                                environment: current.environment,
-                                                profileFilter: next)
+        Task { await applyFilter(next, replacing: current) }
+    }
+
+    private func applyFilter(_ next: [String], replacing current: PushDeviceRecord) async {
+        guard stateGatewayID == targetGatewayID else { return }
+        let gatewayID = stateGatewayID
+        let captured = generation
+        guard let client = try? await gatewayClient(for: gatewayID) else {
+            if isCurrent(gatewayID, generation: captured) {
+                device = current
+                busy = false
+                filterAdmission.release()
+            }
+            return
+        }
+        guard isCurrent(gatewayID, generation: captured) else { return }
+        defer {
+            if isCurrent(gatewayID, generation: captured) {
+                busy = false
+                filterAdmission.release()
+            }
+        }
+        let previous = current.profileFilter
+        let queueKey = gatewayID ?? model.activeGatewayID ?? "primary"
+        let failure = await PushDeviceMutationQueue.shared.run(gatewayID: queueKey) {
+            do {
+                try await client.registerPushDevice(tokenHex: current.tokenHex,
+                                                    environment: current.environment,
+                                                    gatewayID: queueKey,
+                                                    profileFilter: next)
+                return nil
+            } catch {
+                return (error as? GatewayError)?.message ?? error.localizedDescription
+            }
+        }
+        if failure == nil {
+            guard isCurrent(gatewayID, generation: captured) else { return }
             note(next.isEmpty ? copy.settingsFilterCleared(theme.id)
                               : copy.settingsFilterSaved(theme.id, count: next.count),
                  warning: false)
-        } catch let error as GatewayError {
+        } else {
+            guard isCurrent(gatewayID, generation: captured) else { return }
             device?.profileFilter = previous
-            note(error.message, warning: true)
-        } catch {
-            device?.profileFilter = previous
-            note(error.localizedDescription, warning: true)
+            note(failure ?? "Push registration failed.", warning: true)
         }
     }
 
@@ -305,6 +435,22 @@ public struct NotificationSettingsSection: View {
 /// Voice for the notifications section. Every sentence here is a claim about
 /// what will actually reach the phone, so none of them are decorative.
 public extension CopyPack {
+
+    func settingsNotifyTargetGateway(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Notification gateway"
+        case .control: "PUSH SOURCE"
+        case .ink: "the house sending word"
+        }
+    }
+
+    func settingsNotifyTargetGatewayNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Each gateway has its own relay and bot filter. Choose the machine this phone should inspect or change."
+        case .control: "RELAY STATUS + DEVICE FILTERS ARE GATEWAY-LOCAL. SELECT THE SOURCE."
+        case .ink: "Each house keeps its own messenger and guest list; choose which one you mean."
+        }
+    }
 
     func settingsKindsSection(_ t: ThemeID) -> String {
         switch t {

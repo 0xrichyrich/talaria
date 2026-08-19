@@ -24,21 +24,16 @@ import UIKit
 //
 // So the rows are grouped by *whose hardware they touch*, and each group says
 // so. The capability probe underneath is `voice.toggle {action:"status"}`
-// (tui_gateway/server.py:14740), already typed in GatewayClient+Voice.swift and
+// (tui_gateway/server.py:14862), already typed in GatewayClient+Voice.swift and
 // reused here rather than re-parsed.
 //
 // What is deliberately not offered:
 //   · Wake word — `wake.start {client_capture:true}` wants a continuous PCM
 //     feed over `wake.feed`, which iOS cannot sustain outside the foreground
 //     (AppModelLive+Voice.swift documents the same call).
-//   · TTS provider switching — `tts.provider` is a 10-way choice where each
-//     option drags its own field set (PARITY.md:626, ~28 keys). The provider is
-//     shown; changing it stays on desktop.
-//   · A voice list for providers whose catalog is a desktop-side table (edge,
-//     openai, gemini). Only ElevenLabs publishes one over the gateway
-//     (GET /api/audio/elevenlabs/voices, hermes_cli/web_server.py:5014), so
-//     only ElevenLabs gets a picker; the rest show their configured voice and
-//     point at desktop.
+// Provider choices come from profile-scoped GET /api/config/schema rather than
+// a frozen app list. ElevenLabs gets its live catalog; providers without a
+// catalog expose their configured voice as an editable value.
 
 public struct VoiceSettingsSection: View {
     private let model: AppModel
@@ -49,7 +44,6 @@ public struct VoiceSettingsSection: View {
 
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
-    private var client: GatewayClient? { model.client }
     private var voice: VoiceRuntime { model.voice }
 
     /// Owns nothing but the permission state here — `start()` is never called,
@@ -58,15 +52,25 @@ public struct VoiceSettingsSection: View {
     @State private var capabilities: VoiceCapabilities = .unknown
     @State private var host: HostVoiceState?
     @State private var voices: TTSVoiceCatalog = .unknown
+    @State private var providerOptions: VoiceProviderOptions = .empty
+    @State private var draftTTSProvider = ""
+    @State private var draftSTTProvider = ""
+    @State private var draftVoice = ""
     @State private var isProbing = false
     @State private var busy = false
     @State private var notice: String?
     @State private var noticeIsWarning = false
     @State private var isPickingVoice = false
+    @State private var selectedGatewayID: String?
+    @State private var selectedProfile: String?
+    @State private var stateScopeKey: String?
+    @State private var generation = 0
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             deviceSection
+            if gatewayChoices.count > 1 { gatewayPickerSection }
+            if !profileChoices.isEmpty { profilePickerSection }
             gatewaySection
             if showsHostSection { hostSection }
             if let notice {
@@ -79,7 +83,81 @@ public struct VoiceSettingsSection: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .task { await probe() }
+        .task(id: scopeKey) {
+            let key = scopeKey
+            prepareForScope(key)
+            await probe(scopeKey: key)
+        }
+    }
+
+    private var gatewayChoices: [SavedGateway] {
+        model.mode == .live ? ConnectionRegistry.shared.saved : []
+    }
+
+    private var targetGatewayID: String? {
+        GatewaySettingsTargetFence.resolve(selected: selectedGatewayID,
+                                           available: Set(gatewayChoices.map(\.id)),
+                                           active: model.activeGatewayID,
+                                           runtime: LiveRuntime.shared.gatewayID)
+    }
+
+    private var profileChoices: [Bot] {
+        let gatewayID = targetGatewayID
+        return model.unionRosterBots.filter { bot in
+            guard let route = model.profileRoute(for: bot.id) else {
+                return gatewayID == model.activeGatewayID
+            }
+            return route.gatewayID == gatewayID
+        }
+    }
+
+    private var targetProfile: String? {
+        let profiles = Set(profileChoices.map { model.profileRoute(for: $0.id)?.profile ?? $0.id })
+        return selectedProfile.flatMap { profiles.contains($0) ? $0 : nil }
+    }
+
+    private var scopeKey: String {
+        "\(targetGatewayID ?? "demo")\u{1f}\(targetProfile ?? "__gateway__")"
+    }
+
+    private var gatewayPickerSection: some View {
+        SettingsSection(theme: theme, title: copy.settingsVoiceTargetGateway(theme.id),
+                        footnote: copy.settingsVoiceTargetGatewayNote(theme.id)) {
+            SettingsGroup(theme: theme) {
+                Picker(copy.settingsVoiceTargetGateway(theme.id), selection: Binding(
+                    get: { targetGatewayID }, set: {
+                        selectedGatewayID = $0
+                        selectedProfile = nil
+                    })) {
+                    ForEach(gatewayChoices) { gateway in
+                        Text(gateway.name + (gateway.id == model.activeGatewayID
+                                             ? copy.settingsModelGatewayActive(theme.id) : ""))
+                            .tag(Optional(gateway.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(theme.accent)
+                .padding(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
+            }
+        }
+    }
+
+    private var profilePickerSection: some View {
+        SettingsSection(theme: theme, title: copy.settingsVoiceTargetProfile(theme.id),
+                        footnote: copy.settingsVoiceTargetProfileNote(theme.id)) {
+            SettingsGroup(theme: theme) {
+                Picker(copy.settingsVoiceTargetProfile(theme.id), selection: $selectedProfile) {
+                    Text(copy.settingsOperatorGatewayDefault(theme.id)).tag(String?.none)
+                    ForEach(profileChoices) { bot in
+                        Text(bot.displayTitle)
+                            .tag(Optional(model.profileRoute(for: bot.id)?.profile ?? bot.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(theme.accent)
+                .padding(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
+            }
+        }
     }
 
     // MARK: - This device
@@ -137,17 +215,30 @@ public struct VoiceSettingsSection: View {
                             title: copy.settingsSTT(theme.id),
                             subtitle: sttSubtitle,
                             value: sttValue, valueTone: sttTone)
+                providerPickerRow(title: copy.settingsSTTProvider(theme.id),
+                                  value: draftSTTProvider,
+                                  options: providerOptions.stt,
+                                  kind: .stt)
+                providerPickerRow(title: copy.settingsTTSProvider(theme.id),
+                                  value: draftTTSProvider,
+                                  options: providerOptions.tts,
+                                  kind: .tts)
 
-                SettingsRow(theme: theme,
-                            title: copy.settingsTTSProvider(theme.id),
-                            subtitle: copy.settingsTTSProviderSub(theme.id),
-                            value: ttsProviderValue,
-                            isLast: !offersVoicePicker && !hasReadableVoice)
-
-                if hasReadableVoice && !offersVoicePicker {
-                    SettingsRow(theme: theme, title: copy.settingsVoiceName(theme.id),
-                                subtitle: copy.settingsVoiceDesktopOnly(theme.id),
-                                value: voices.currentVoice, isLast: true)
+                if !offersVoicePicker, voices.voiceKeyPath != nil {
+                    TextField(copy.settingsVoiceName(theme.id), text: $draftVoice)
+                        .textFieldStyle(.plain)
+                        .font(theme.mono(11))
+                        .padding(.horizontal, 12)
+                        .frame(height: 40)
+                        .modifier(SettingsRowChrome(theme: theme, isLast: false))
+                    SettingsActionRow(theme: theme,
+                                      title: copy.settingsSaveVoice(theme.id),
+                                      isBusy: busy,
+                                      isLast: true) {
+                        Task { await saveTypedVoice() }
+                    }
+                    .disabled(draftVoice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || draftVoice == voices.currentVoice)
                 }
 
                 if offersVoicePicker {
@@ -219,6 +310,29 @@ public struct VoiceSettingsSection: View {
                                             : voices.currentVoice)
     }
 
+    private enum ProviderKind: Equatable { case tts, stt }
+
+    private func providerPickerRow(title: String, value: String, options: [String],
+                                   kind: ProviderKind) -> some View {
+        HStack(spacing: 10) {
+            Text(title).font(SettingsType.rowTitle(theme)).foregroundStyle(theme.ink)
+            Spacer(minLength: 8)
+            if options.isEmpty {
+                Text(value.isEmpty ? copy.settingsUnknown(theme.id) : value)
+                    .font(SettingsType.rowValue(theme)).foregroundStyle(theme.sub)
+            } else {
+                Picker(title, selection: Binding(
+                    get: { value },
+                    set: { next in Task { await setProvider(kind, to: next) } })) {
+                    ForEach(options, id: \.self) { Text($0).tag($0) }
+                }
+                .labelsHidden().pickerStyle(.menu).tint(theme.accent)
+            }
+        }
+        .modifier(SettingsRowChrome(theme: theme, isLast: false))
+        .disabled(busy)
+    }
+
     private func voiceRow(_ option: TTSVoiceOption, isLast: Bool) -> some View {
         let isCurrent = option.id == voices.currentVoice
         return Button {
@@ -246,7 +360,7 @@ public struct VoiceSettingsSection: View {
     // MARK: - The gateway host's own speakers
 
     /// Only meaningful when the gateway machine actually has a sound device.
-    /// `audio_available` is upstream's own probe of that (server.py:14766), and
+    /// `audio_available` is upstream's own probe of that (server.py:14887), and
     /// it is false on every headless box — where these two switches would be
     /// controls over nothing.
     private var showsHostSection: Bool {
@@ -263,6 +377,7 @@ public struct VoiceSettingsSection: View {
                                   isOn: hostEnabled) {
                     Task { await setHostVoice(!hostEnabled) }
                 }
+                .disabled(busy)
                 SettingsToggleRow(theme: theme,
                                   title: copy.settingsHostTTS(theme.id),
                                   subtitle: copy.settingsHostTTSSub(theme.id),
@@ -281,10 +396,42 @@ public struct VoiceSettingsSection: View {
 
     // MARK: - Actions
 
-    private func probe(force: Bool = false) async {
-        guard !isProbing else { return }
+    private func prepareForScope(_ key: String) {
+        guard stateScopeKey != key else { return }
+        generation &+= 1
+        stateScopeKey = key
+        capabilities = .unknown
+        host = nil
+        voices = .unknown
+        providerOptions = .empty
+        draftTTSProvider = ""
+        draftSTTProvider = ""
+        draftVoice = ""
+        isProbing = false
+        busy = false
+        notice = nil
+        isPickingVoice = false
+    }
+
+    private func gatewayClient(for gatewayID: String?) async throws -> GatewayClient {
+        if let gatewayID { return try await model.routedClient(gatewayID: gatewayID) }
+        if let client = model.client { return client }
+        throw AppModel.GatewayRouteError.noRoute
+    }
+
+    private func isCurrent(_ key: String, generation captured: Int) -> Bool {
+        stateScopeKey == key && scopeKey == key && generation == captured
+    }
+
+    private func probe(force: Bool = false, scopeKey requestedKey: String? = nil) async {
+        let key = requestedKey ?? scopeKey
+        guard stateScopeKey == key, !isProbing else { return }
+        generation &+= 1
+        let captured = generation
+        let gatewayID = targetGatewayID
+        let profile = targetProfile
         isProbing = true
-        defer { isProbing = false }
+        defer { if isCurrent(key, generation: captured) { isProbing = false } }
 
         // AudioRecorder samples the permission in its initializer and exposes
         // no re-read; `ensurePermission()` would PROMPT, which a settings
@@ -294,47 +441,140 @@ public struct VoiceSettingsSection: View {
         // new state instead of the stale one.
         recorder = AudioRecorder()
 
-        guard model.mode == .live, client != nil else {
+        guard model.mode == .live else {
             capabilities = .unknown
             voices = .unknown
             return
         }
-        capabilities = await model.refreshVoiceCapabilities()
+        guard let client = try? await gatewayClient(for: gatewayID) else {
+            guard isCurrent(key, generation: captured) else { return }
+            capabilities = .unknown
+            voices = .unknown
+            return
+        }
+        var nextCapabilities = await client.voiceCapabilities()
+        guard isCurrent(key, generation: captured) else { return }
         if force { host = nil }
         // The config read is a separate hop and a gateway may have no voice
         // configuration at all; `.unknown` renders as "unknown", never as an
         // error the user cannot act on.
-        voices = await client?.voiceCatalog() ?? .unknown
+        let nextVoices = await client.voiceCatalog(profile: profile)
+        guard isCurrent(key, generation: captured) else { return }
+        let sttReadiness = await client.profileSTTReadiness(profile: profile)
+        guard isCurrent(key, generation: captured) else { return }
+        if sttReadiness.probed {
+            nextCapabilities.speechToText = sttReadiness.canTranscribe
+            nextCapabilities.probed = true
+        } else {
+            nextCapabilities.probed = false
+        }
+        let nextOptions = await client.voiceProviderOptions(profile: profile)
+        guard isCurrent(key, generation: captured) else { return }
+        capabilities = nextCapabilities
+        voices = nextVoices
+        providerOptions = nextOptions
+        draftTTSProvider = nextVoices.provider
+        draftSTTProvider = nextVoices.sttProvider
+        draftVoice = nextVoices.currentVoice
     }
 
     private func selectVoice(_ option: TTSVoiceOption) async {
-        guard let client, let path = voices.voiceKeyPath else { return }
+        guard stateScopeKey == scopeKey, let path = voices.voiceKeyPath else { return }
+        let key = scopeKey
+        let gatewayID = targetGatewayID
+        let profile = targetProfile
+        let captured = generation
+        guard let client = try? await gatewayClient(for: gatewayID) else { return }
+        guard isCurrent(key, generation: captured) else { return }
         busy = true
-        defer { busy = false }
+        defer { if isCurrent(key, generation: captured) { busy = false } }
         let previous = voices.currentVoice
         voices.currentVoice = option.id
         do {
-            try await client.setGatewayConfigValue(path: path, value: .string(option.id))
+            try await client.setGatewayConfigValue(path: path, value: .string(option.id),
+                                                   profile: profile)
+            guard isCurrent(key, generation: captured) else { return }
+            draftVoice = option.id
             isPickingVoice = false
             note(copy.settingsVoiceSaved(theme.id, voice: option.name), warning: false)
         } catch let error as GatewayError {
+            guard isCurrent(key, generation: captured) else { return }
             voices.currentVoice = previous
             note(error.message, warning: true)
         } catch {
+            guard isCurrent(key, generation: captured) else { return }
             voices.currentVoice = previous
             note(error.localizedDescription, warning: true)
         }
     }
 
-    private func setHostVoice(_ enabled: Bool) async {
-        guard let client else { return }
+    private func saveTypedVoice() async {
+        guard stateScopeKey == scopeKey, let path = voices.voiceKeyPath else { return }
+        let value = draftVoice.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        let key = scopeKey
+        let gatewayID = targetGatewayID
+        let profile = targetProfile
+        let captured = generation
+        guard let client = try? await gatewayClient(for: gatewayID),
+              isCurrent(key, generation: captured) else { return }
         busy = true
-        defer { busy = false }
+        defer { if isCurrent(key, generation: captured) { busy = false } }
         do {
-            host = try await client.setHostVoiceMode(enabled: enabled)
+            try await client.setGatewayConfigValue(path: path, value: .string(value),
+                                                   profile: profile)
+            guard isCurrent(key, generation: captured) else { return }
+            voices.currentVoice = value
+            note(copy.settingsVoiceSaved(theme.id, voice: value), warning: false)
+        } catch {
+            guard isCurrent(key, generation: captured) else { return }
+            draftVoice = voices.currentVoice
+            note((error as? GatewayError)?.message ?? error.localizedDescription, warning: true)
+        }
+    }
+
+    private func setProvider(_ kind: ProviderKind, to value: String) async {
+        guard stateScopeKey == scopeKey, !value.isEmpty else { return }
+        let key = scopeKey
+        let gatewayID = targetGatewayID
+        let profile = targetProfile
+        let captured = generation
+        let path = [kind == .tts ? "tts" : "stt", "provider"]
+        guard let client = try? await gatewayClient(for: gatewayID),
+              isCurrent(key, generation: captured) else { return }
+        busy = true
+        do {
+            try await client.setGatewayConfigValue(path: path, value: .string(value),
+                                                   profile: profile)
+            guard isCurrent(key, generation: captured) else { return }
+            if kind == .tts { draftTTSProvider = value } else { draftSTTProvider = value }
+            busy = false
+            await probe(force: true, scopeKey: key)
+        } catch {
+            guard isCurrent(key, generation: captured) else { return }
+            busy = false
+            note((error as? GatewayError)?.message ?? error.localizedDescription, warning: true)
+        }
+    }
+
+    private func setHostVoice(_ enabled: Bool) async {
+        guard stateScopeKey == scopeKey else { return }
+        let key = scopeKey
+        let gatewayID = targetGatewayID
+        let captured = generation
+        guard let client = try? await gatewayClient(for: gatewayID) else { return }
+        guard isCurrent(key, generation: captured) else { return }
+        busy = true
+        defer { if isCurrent(key, generation: captured) { busy = false } }
+        do {
+            let next = try await client.setHostVoiceMode(enabled: enabled)
+            guard isCurrent(key, generation: captured) else { return }
+            host = next
         } catch let error as GatewayError {
+            guard isCurrent(key, generation: captured) else { return }
             note(error.message, warning: true)
         } catch {
+            guard isCurrent(key, generation: captured) else { return }
             note(error.localizedDescription, warning: true)
         }
     }
@@ -343,14 +583,23 @@ public struct VoiceSettingsSection: View {
     /// the host currently has — so this only fires when the reported state
     /// actually differs from what was asked for.
     private func setHostTTS(_ wanted: Bool) async {
-        guard let client, hostTTS != wanted else { return }
+        guard stateScopeKey == scopeKey, hostTTS != wanted else { return }
+        let key = scopeKey
+        let gatewayID = targetGatewayID
+        let captured = generation
+        guard let client = try? await gatewayClient(for: gatewayID) else { return }
+        guard isCurrent(key, generation: captured) else { return }
         busy = true
-        defer { busy = false }
+        defer { if isCurrent(key, generation: captured) { busy = false } }
         do {
-            host = try await client.toggleHostTTS()
+            let next = try await client.toggleHostTTS()
+            guard isCurrent(key, generation: captured) else { return }
+            host = next
         } catch let error as GatewayError {
+            guard isCurrent(key, generation: captured) else { return }
             note(error.message, warning: true)
         } catch {
+            guard isCurrent(key, generation: captured) else { return }
             note(error.localizedDescription, warning: true)
         }
     }
@@ -373,6 +622,38 @@ public struct VoiceSettingsSection: View {
 /// Voice for the voice section. Gateway text — the `details` provider matrix,
 /// an RPC error — passes through verbatim.
 public extension CopyPack {
+
+    func settingsVoiceTargetGateway(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Voice gateway"
+        case .control: "VOICE SOURCE"
+        case .ink: "the house whose voice this is"
+        }
+    }
+
+    func settingsVoiceTargetGatewayNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Voice providers, selectable voices and host speakers belong to one gateway. This does not switch your open chat."
+        case .control: "PROVIDER + HOST AUDIO STATE IS GATEWAY-LOCAL. CHAT ROUTE IS UNCHANGED."
+        case .ink: "Choose the house whose ears and speakers you mean; the room already open does not move."
+        }
+    }
+
+    func settingsVoiceTargetProfile(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Voice profile"
+        case .control: "VOICE PROFILE"
+        case .ink: "whose voice is being shaped"
+        }
+    }
+
+    func settingsVoiceTargetProfileNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Provider and voice settings can override the gateway default for one agent."
+        case .control: "PROFILE-SCOPED STT/TTS CONFIG. HOST AUDIO REMAINS GATEWAY-WIDE."
+        case .ink: "Choose the house rule, or give one resident a voice of their own."
+        }
+    }
 
     func settingsVoiceDeviceSection(_ t: ThemeID) -> String {
         switch t {
@@ -526,11 +807,19 @@ public extension CopyPack {
         }
     }
 
+    func settingsSTTProvider(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Transcription provider"
+        case .control: "STT PROVIDER"
+        case .ink: "the scribe used"
+        }
+    }
+
     func settingsTTSProviderSub(_ t: ThemeID) -> String {
         switch t {
-        case .soft: "Change the provider on desktop — each one brings its own settings."
-        case .control: "tts.provider — 10 OPTIONS, EACH WITH ITS OWN FIELD SET. DESKTOP."
-        case .ink: "Which throat is used is decided at the desk."
+        case .soft: "Provider choices are discovered from this gateway and profile."
+        case .control: "DYNAMIC tts.provider OPTIONS FROM /api/config/schema."
+        case .ink: "The gateway names every voice-maker it can use here."
         }
     }
 
@@ -544,9 +833,9 @@ public extension CopyPack {
 
     func settingsVoiceDesktopOnly(_ t: ThemeID) -> String {
         switch t {
-        case .soft: "This provider’s voice list isn’t published by the gateway — pick one on desktop."
-        case .control: "NO VOICE CATALOG OVER THE API FOR THIS PROVIDER."
-        case .ink: "This provider names no voices aloud. Choose at the desk."
+        case .soft: "This provider does not publish a catalog; enter its documented voice identifier."
+        case .control: "NO CATALOG — EDIT THE PROVIDER VOICE ID DIRECTLY."
+        case .ink: "It offers no list, but you may write the voice it knows."
         }
     }
 
@@ -563,6 +852,14 @@ public extension CopyPack {
         case .soft: "Now speaking as \(voice)."
         case .control: "VOICE → \(voice.uppercased())."
         case .ink: "It will speak as \(voice)."
+        }
+    }
+
+    func settingsSaveVoice(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Save voice"
+        case .control: "SAVE VOICE ID"
+        case .ink: "keep this voice"
         }
     }
 

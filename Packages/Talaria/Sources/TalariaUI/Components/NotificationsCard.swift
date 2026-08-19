@@ -14,9 +14,11 @@ import UIKit
 /// link in the chain: iOS permission → APNs token → gateway relay plugin.
 public struct NotificationsCard: View {
     private let model: AppModel
+    private let gatewayID: String?
 
-    public init(model: AppModel) {
+    public init(model: AppModel, gatewayID: String? = nil) {
         self.model = model
+        self.gatewayID = gatewayID
     }
 
     private var theme: ThemePack { model.theme.pack }
@@ -28,6 +30,8 @@ public struct NotificationsCard: View {
         case notEnabled
         /// Authorized on device, but the gateway relay has no registration.
         case unregistered
+        /// iOS accepted authorization but APNs device registration failed.
+        case registrationFailed(String)
         case ready(devices: Int)
         case noRelay
     }
@@ -67,7 +71,7 @@ public struct NotificationsCard: View {
                 switch stage {
                 case .notEnabled, .unknown:
                     action("Enable notifications", primary: true) { await enable() }
-                case .unregistered:
+                case .unregistered, .registrationFailed:
                     action("Register this device", primary: true) { await enable() }
                 case .ready:
                     action("Send test push", primary: false) { await test() }
@@ -85,6 +89,9 @@ public struct NotificationsCard: View {
         .overlay(RoundedRectangle(cornerRadius: theme.cardRadius)
             .stroke(stage.isProblem ? theme.warn.opacity(0.45) : theme.line, lineWidth: 1))
         .task { await refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: .talariaPushRegistrationChanged)) {
+            _ in Task { await refresh() }
+        }
     }
 
     // MARK: - Pieces
@@ -92,7 +99,7 @@ public struct NotificationsCard: View {
     private var dotColor: Color {
         switch stage {
         case .ready: theme.ok
-        case .denied, .noRelay: theme.danger
+        case .denied, .noRelay, .registrationFailed: theme.danger
         case .unknown: theme.faint
         default: theme.warn
         }
@@ -104,6 +111,7 @@ public struct NotificationsCard: View {
         case .denied: "Notifications blocked"
         case .noRelay: "Relay not installed"
         case .unregistered: "Almost there"
+        case .registrationFailed: "APNs registration failed"
         default: "Notifications off"
         }
     }
@@ -118,6 +126,8 @@ public struct NotificationsCard: View {
             return "This gateway has no talaria-push relay plugin, so it can't send pushes. Install app/relay on the gateway host, then recheck."
         case .unregistered:
             return "Notifications are allowed on this device but the gateway hasn't registered it yet."
+        case .registrationFailed(let message):
+            return "iOS could not register this device with APNs: \(message)"
         default:
             return copy.pushNote
         }
@@ -148,6 +158,11 @@ public struct NotificationsCard: View {
 
     // MARK: - Actions
 
+    private func targetClient() async -> GatewayClient? {
+        if let gatewayID { return try? await model.routedClient(gatewayID: gatewayID) }
+        return model.client
+    }
+
     private func refresh() async {
         #if os(iOS)
         let status = await PushCoordinator.shared.authorizationStatus()
@@ -161,7 +176,11 @@ public struct NotificationsCard: View {
         default:
             break
         }
-        guard let client = model.client else {
+        if let failure = PushCoordinator.shared.registrationFailure {
+            stage = .registrationFailed(failure.message)
+            return
+        }
+        guard let client = await targetClient() else {
             stage = .unregistered
             return
         }
@@ -176,8 +195,12 @@ public struct NotificationsCard: View {
             // `await` cannot live in a `??` autoclosure, so the fallback is spelled out.
             devices = await client.pushRelayDevices().count
         }
-        let token = PushCoordinator.shared.deviceTokenHex
-        stage = (devices > 0 && token != nil) ? .ready(devices: devices) : .unregistered
+        guard let token = PushCoordinator.shared.deviceTokenHex else {
+            stage = .unregistered
+            return
+        }
+        stage = await client.pushDevice(tokenHex: token) == nil
+            ? .unregistered : .ready(devices: devices)
         #else
         stage = .noRelay
         #endif
@@ -201,10 +224,12 @@ public struct NotificationsCard: View {
             PushCoordinator.shared.registerForRemoteNotifications()
         }
         // The APNs round trip resolves the token, then the relay handshake.
-        PushCoordinator.shared.registerWithRelayIfConnected()
+        PushCoordinator.shared.registerWithRelay(gatewayID: gatewayID)
         try? await Task.sleep(for: .seconds(2))
         await refresh()
-        if case .unregistered = stage {
+        if case .registrationFailed(let failure) = stage {
+            message = "APNs failed: \(failure). Tap Register this device to retry."
+        } else if case .unregistered = stage {
             message = "Waiting on APNs — pull down again in a moment."
         }
         #endif
@@ -214,7 +239,7 @@ public struct NotificationsCard: View {
         #if os(iOS)
         busy = true
         defer { busy = false }
-        guard let client = model.client else { return }
+        guard let client = await targetClient() else { return }
         do {
             try await client.sendTestPush(tokenHex: PushCoordinator.shared.deviceTokenHex)
             message = "Test push sent — it should arrive in a second."

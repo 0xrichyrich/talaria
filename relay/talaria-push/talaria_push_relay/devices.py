@@ -16,6 +16,7 @@ Schema (version 1)::
           "device_token": str,        # APNs token, lowercase hex
           "platform": "ios",
           "environment": "dev"|"prod",  # APNs sandbox vs production
+          "gateway_id": str|null,       # app's stable saved-connection id
           "profile_filter": [str],    # [] = all bots
           "created_at": float,        # unix epoch
           "updated_at": float,
@@ -173,6 +174,7 @@ class DeviceStore:
         device_token: str,
         platform: str = "ios",
         environment: str = "dev",
+        gateway_id: Optional[str] = None,
         profile_filter: Any = None,
     ) -> Dict[str, Any]:
         token = normalize_token(device_token)
@@ -183,6 +185,9 @@ class DeviceStore:
         if environment not in ("dev", "prod"):
             raise DeviceValidationError("environment must be 'dev' or 'prod'")
         flt = _normalize_profile_filter(profile_filter)
+        gateway_id = (gateway_id or "").strip()
+        if len(gateway_id) > 128:
+            raise DeviceValidationError("gateway_id: too long")
 
         now = time.time()
         with _local_lock, _file_lock(self._path):
@@ -192,6 +197,9 @@ class DeviceStore:
                 "device_token": token,
                 "platform": platform,
                 "environment": environment,
+                # Older clients do not send gateway_id. Preserve an existing
+                # source tag instead of making later pushes ambiguous again.
+                "gateway_id": gateway_id or existing.get("gateway_id") or None,
                 "profile_filter": flt,
                 "created_at": existing.get("created_at", now),
                 "updated_at": now,

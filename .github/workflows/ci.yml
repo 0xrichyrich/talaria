@@ -19,6 +19,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Validate pinned Hermes authority manifest
         run: python3 scripts/check_hermes_upstream.py
 
@@ -37,6 +41,11 @@ jobs:
         working-directory: Packages/Talaria
         run: swift run talaria-verify
 
+      - name: Push relay source-routing tests
+        run: |
+          python3 -m pip install -e relay
+          python3 -m unittest discover -s relay/tests -p 'test_*.py'
+
   release-gates:
     name: release-gates
     runs-on: macos-15
@@ -50,12 +59,42 @@ jobs:
         working-directory: ios
         run: xcodegen generate
 
-      - name: Build for iOS Simulator (unsigned)
+      - name: Assert Debug and Release entitlement mapping
+        working-directory: ios
+        run: |
+          xcodebuild -project Talaria.xcodeproj -target Talaria -configuration Debug -showBuildSettings \
+            | grep -q 'CODE_SIGN_ENTITLEMENTS = Talaria/Support/Talaria-dev.entitlements'
+          xcodebuild -project Talaria.xcodeproj -target Talaria -configuration Release -showBuildSettings \
+            | grep -q 'CODE_SIGN_ENTITLEMENTS = Talaria/Support/Talaria.entitlements'
+          xcodebuild -project Talaria.xcodeproj -target TalariaWidgets -configuration Release -showBuildSettings \
+            | grep -q 'CODE_SIGN_ENTITLEMENTS = Talaria/Support/TalariaWidgets.entitlements'
+          plutil -lint Talaria/Support/Info.plist Talaria/Support/Talaria-dev.entitlements \
+            Talaria/Support/Talaria.entitlements Talaria/Support/TalariaWidgets.entitlements
+          test "$(/usr/libexec/PlistBuddy -c 'Print :aps-environment' Talaria/Support/Talaria-dev.entitlements)" = development
+          test "$(/usr/libexec/PlistBuddy -c 'Print :aps-environment' Talaria/Support/Talaria.entitlements)" = production
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.usernotifications.communication' Talaria/Support/Talaria-dev.entitlements)" = true
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.usernotifications.communication' Talaria/Support/Talaria.entitlements)" = true
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups:0' Talaria/Support/TalariaWidgets.entitlements)" = group.bot.talaria.ios
+          /usr/libexec/PlistBuddy -c 'Print :NSUserActivityTypes:0' Talaria/Support/Info.plist | grep -qx INSendMessageIntent
+
+      - name: Build Debug for iOS Simulator (unsigned)
         working-directory: ios
         run: |
           xcodebuild build \
             -project Talaria.xcodeproj \
             -scheme Talaria \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Build Release for iOS Simulator (unsigned)
+        working-directory: ios
+        run: |
+          xcodebuild build \
+            -project Talaria.xcodeproj \
+            -scheme Talaria \
+            -configuration Release \
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO
@@ -71,4 +110,6 @@ jobs:
       # approvals must never cross that boundary.
       - name: Source-qualified isolation regressions
         working-directory: Packages/Talaria
-        run: swift test --filter SourceQualifiedRoutingTests
+        run: |
+          swift test --filter SourceQualifiedRoutingTests
+          swift test --filter PushDeviceMutationQueueTests

@@ -96,6 +96,10 @@ class DeviceRegistration(BaseModel):
     device_token: str = Field(..., description="Hex APNs device token")
     platform: str = Field("ios")
     environment: str = Field("dev", description="'dev' (sandbox) or 'prod'")
+    gateway_id: Optional[str] = Field(
+        None,
+        description="Talaria's stable saved-connection id for source-qualified routing",
+    )
     profile_filter: Optional[Union[str, List[str]]] = Field(
         None,
         description=(
@@ -113,7 +117,10 @@ class TestPush(BaseModel):
     device_token: Optional[str] = Field(
         None, description="Limit the test to one registered token"
     )
-    kind: str = Field("approval", description=f"One of {ALL_EVENT_KINDS}")
+    # A synthetic test has no authoritative Hermes session/request to approve.
+    # Default to a non-actionable category; callers may still explicitly ask
+    # for an approval-shaped display test, whose buttons intentionally fail closed.
+    kind: str = Field(push_mod.DEFAULT_TEST_KIND, description=f"One of {ALL_EVENT_KINDS}")
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +135,7 @@ async def register_device(body: DeviceRegistration):
             device_token=body.device_token,
             platform=body.platform,
             environment=body.environment,
+            gateway_id=body.gateway_id,
             profile_filter=body.profile_filter,
         )
     except DeviceValidationError as exc:
@@ -202,7 +210,7 @@ async def send_test_push(body: TestPush):
             status_code=409,
             detail=f"APNs not configured; missing {', '.join(settings.missing())}",
         )
-    kind = body.kind if body.kind in ALL_EVENT_KINDS else "approval"
+    kind = body.kind if body.kind in ALL_EVENT_KINDS else push_mod.DEFAULT_TEST_KIND
     store = get_store()
     devices = store.list()
     if body.device_token:
@@ -213,23 +221,16 @@ async def send_test_push(body: TestPush):
     if not devices:
         raise HTTPException(status_code=404, detail="no matching registered device")
 
-    event = push_mod.PushEvent(
-        kind=kind,
-        bot="talaria-test",
-        title="Talaria test push",
-        body=f"Relay is working — this is a {kind!r}-shaped test notification.",
-        session_id="test",
-        collapse_id="talaria-test",
-        dedupe_key=None,  # tests should never be dedupe-suppressed
-    )
-    payload = event.apns_payload()
+    event = push_mod.synthetic_test_event(kind)
     client = push_mod.get_dispatcher()._get_client()
     results = []
     for dev in devices:
+        payload = push_mod.payload_for_device(event, dev)
         result = client.send(
             dev["device_token"], payload,
             environment=dev.get("environment"),
             collapse_id="talaria-test",
+            expiration=event.expiration,
         )
         if result.should_unregister:
             store.remove(dev["device_token"])

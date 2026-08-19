@@ -72,14 +72,23 @@ public struct VoiceView: View {
         }
         .transition(.move(edge: .bottom).combined(with: .opacity))
         .onAppear { session.begin(model: model, botID: botID) }
-        .onDisappear { session.end() }
+        .onDisappear {
+            session.end(model: model)
+        }
         // A stop phrase heard by a host-side listener ends the turn here too.
         .onChange(of: model.voice.stopPhrases) { _, _ in dismissToChat() }
         // Barge-in: the host says the user spoke over the reply — cut playback.
         .onChange(of: model.voice.interruptions) { _, _ in session.interrupt() }
         // The loop polls the link too, but it can be parked inside a wait the
         // recorder owns; this is what unblocks it the instant the socket goes.
-        .onChange(of: model.voiceLink) { _, link in session.linkChanged(to: link) }
+        .onChange(of: model.voiceLink) { _, link in
+            // The synchronous primary-link signal is relevant only to a bot
+            // owned by that primary gateway. Foreign voice is watched by the
+            // session's source-qualified pool monitor below.
+            if model.profileRoute(for: botID)?.gatewayID == model.activeGatewayID {
+                session.linkChanged(to: link)
+            }
+        }
     }
 
     // MARK: Background (the voiceBgCss token, derived from pack colors)
@@ -381,7 +390,7 @@ public struct VoiceView: View {
     // MARK: Routing
 
     private func dismissToChat() {
-        session.end()
+        session.end(model: model)
         isPresented = false
     }
 }
@@ -439,8 +448,10 @@ final class VoiceSession {
     let player = VoicePlayer()
 
     @ObservationIgnored private var loop: Task<Void, Never>?
+    @ObservationIgnored private var linkMonitor: Task<Void, Never>?
     @ObservationIgnored private var segment: CheckedContinuation<SegmentEnd?, Never>?
     @ObservationIgnored private var started = false
+    @ObservationIgnored private var voiceLease: UUID?
 
     // MARK: Lifecycle
 
@@ -454,20 +465,43 @@ final class VoiceSession {
             phase = .demo
             return
         }
-        model.attachVoiceRouter()
         model.voice.resetConversation()
         loop = Task { [weak self] in
+            let lease = await model.acquireVoiceRouter(for: botID)
+            guard !Task.isCancelled else {
+                if let lease { model.releaseVoiceRouter(lease) }
+                return
+            }
+            self?.voiceLease = lease
             await self?.run(model: model, botID: botID)
+        }
+        linkMonitor = Task { [weak self] in
+            var previous = VoiceLinkState.up
+            while !Task.isCancelled {
+                let next = await model.voiceLink(for: botID)
+                if next != previous { self?.linkChanged(to: next) }
+                previous = next
+                if next == .needsSignIn { break }
+                // A foreign offline gateway may require a real pooled redial;
+                // do not hammer DNS/auth every animation tick while it sleeps.
+                try? await Task.sleep(for: next == .up ? .milliseconds(250) : .seconds(1))
+            }
         }
     }
 
-    func end() {
+    func end(model: AppModel) {
         loop?.cancel()
         loop = nil
+        linkMonitor?.cancel()
+        linkMonitor = nil
         finishSegment(nil)
         recorder.cancel()
         player.stop()
         VoiceAudioSession.deactivate()
+        if let voiceLease {
+            model.releaseVoiceRouter(voiceLease)
+            self.voiceLease = nil
+        }
         started = false
         phase = .starting
         line = nil
@@ -601,8 +635,8 @@ final class VoiceSession {
         // permission check are redone against the socket that will actually
         // carry the conversation.
         while !Task.isCancelled {
-            guard await awaitLink(model) else { return }
-            guard await prepare(model) else { return }
+            guard await awaitLink(model, botID: botID) else { return }
+            guard await prepare(model, botID: botID) else { return }
 
             var linkAlive = true
             while !Task.isCancelled, linkAlive {
@@ -612,11 +646,12 @@ final class VoiceSession {
                 // lands while muted comes back through `prepare`, which leaves
                 // it on `.starting`.
                 if isMuted { phase = .muted }
-                while isMuted, !Task.isCancelled, model.voiceLink == .up {
+                while isMuted, !Task.isCancelled,
+                      await model.voiceLink(for: botID) == .up {
                     try? await Task.sleep(for: .milliseconds(120))
                 }
                 guard !Task.isCancelled else { return }
-                guard model.voiceLink == .up else { break }
+                guard await model.voiceLink(for: botID) == .up else { break }
 
                 switch await listenAndAnswer(model: model, botID: botID) {
                 case .next: continue
@@ -630,17 +665,17 @@ final class VoiceSession {
     /// Park until the gateway link is usable. Returns false when the
     /// conversation is over — cancelled, or the link cannot come back without
     /// the user.
-    private func awaitLink(_ model: AppModel) async -> Bool {
-        guard model.voiceLink != .up else { return true }
+    private func awaitLink(_ model: AppModel, botID: String) async -> Bool {
+        guard await model.voiceLink(for: botID) != .up else { return true }
         // Whatever this device was holding, it is holding it for nothing now.
         releaseAudio()
         while !Task.isCancelled {
-            switch model.voiceLink {
+            switch await model.voiceLink(for: botID) {
             case .up: return true
             case .reconnecting: phase = .linkLost
             case .needsSignIn: phase = .linkGone; return false
             }
-            try? await Task.sleep(for: .milliseconds(250))
+            try? await Task.sleep(for: .seconds(1))
         }
         return false
     }
@@ -648,15 +683,15 @@ final class VoiceSession {
     /// Capability probe + microphone, run once per link. Returns false only on
     /// a dead end the user has to resolve; a link that drops mid-probe returns
     /// true so the outer lap parks on it again instead of giving up.
-    private func prepare(_ model: AppModel) async -> Bool {
+    private func prepare(_ model: AppModel, botID: String) async -> Bool {
         phase = .starting
         // Probe first: a gateway with no STT provider can never hear us, and
         // asking for the microphone before saying so would be rude. Re-probed
         // per link because the answer belongs to the socket that gave it — and
         // the round trip doubles as proof the new socket really answers.
-        let capabilities = await model.refreshVoiceCapabilities()
+        let capabilities = await model.voiceCapabilities(for: botID)
         guard !Task.isCancelled else { return false }
-        guard model.voiceLink == .up else { return true }
+        guard await model.voiceLink(for: botID) == .up else { return true }
         guard capabilities.canTranscribe else {
             phase = .unavailable
             return false
@@ -684,7 +719,7 @@ final class VoiceSession {
         let ending = await awaitSegment()
         guard !Task.isCancelled else { return .stop }
         // The wait may have been cut short by the link itself (linkChanged).
-        guard model.voiceLink == .up else {
+        guard await model.voiceLink(for: botID) == .up else {
             recorder.cancel()
             return .linkLost
         }
@@ -707,7 +742,7 @@ final class VoiceSession {
             // A failure whose real cause is the socket is recoverable and the
             // words are worth re-listening for; anything else is the gateway
             // refusing, and repeating it would only churn the provider.
-            guard model.voiceLink == .up else { return .linkLost }
+            guard await model.voiceLink(for: botID) == .up else { return .linkLost }
             phase = .gatewayFailed(Self.reason(for: error))
             return .stop
         }
@@ -721,17 +756,17 @@ final class VoiceSession {
         guard !Task.isCancelled else { return .stop }
         // awaitReply gives up the moment the link does, so a nil reply here can
         // mean "socket went" as easily as "nothing came back".
-        guard model.voiceLink == .up else { return .linkLost }
+        guard await model.voiceLink(for: botID) == .up else { return .linkLost }
         guard let reply, !reply.isEmpty else { return .next }
         line = reply
 
         if model.voice.autoSpeak, !isMuted {
             if let audio = await model.synthesizeReply(reply, for: botID) {
                 guard !Task.isCancelled else { return .stop }
-                guard model.voiceLink == .up else { return .linkLost }
+                guard await model.voiceLink(for: botID) == .up else { return .linkLost }
                 phase = .speaking
                 await player.play(audio)
-            } else if model.voiceLink != .up {
+            } else if await model.voiceLink(for: botID) != .up {
                 return .linkLost
             } else if let failure = model.voice.speechFailure {
                 // No TTS provider: say so once, keep the conversation going in
