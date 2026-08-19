@@ -237,8 +237,24 @@ extension AppModel {
     /// A retained secondary client does not own the primary reconnect loop.
     /// Replace a dead pooled socket on demand while preserving its routed UI
     /// state, then let the pool coalesce concurrent voice/session retries.
+    /// Capture lifecycle authority before examining a pooled socket. Always use
+    /// the qualified id: a primary profile may become secondary while an await
+    /// is in flight, but its source-qualified lifecycle generation is stable.
+    internal func voiceReconnectLifecycleToken(for route: GatewayBotRoute)
+        -> ProfileLifecycleGenerationToken? {
+        guard profileLifecycleAllowsGatewayTraffic(route.gatewayID) else { return nil }
+        return profileLifecycleGenerationToken(for: route.qualifiedID)
+    }
+
     private func voiceClient(for route: GatewayBotRoute) async throws -> GatewayClient {
+        guard let lifecycle = voiceReconnectLifecycleToken(for: route) else {
+            throw GatewayRouteError.noRoute
+        }
         let client = try await routedClient(for: route)
+        guard profileLifecycleAllowsGatewayTraffic(route.gatewayID),
+              profileLifecycleAccepts(lifecycle) else {
+            throw GatewayRouteError.noRoute
+        }
         guard route.gatewayID != activeGatewayID, !(await client.isConnected) else { return client }
         let voiceRuntime = VoiceRuntime.shared
         let observedHandlerGeneration = voiceRuntime.handlerGeneration
@@ -246,9 +262,21 @@ extension AppModel {
             && !voiceRuntime.attaching
         let pool = ConnectionRegistry.shared.clientPool
         await pool.disconnect(gatewayID: route.gatewayID)
+        guard profileLifecycleAllowsGatewayTraffic(route.gatewayID),
+              profileLifecycleAccepts(lifecycle) else {
+            throw GatewayRouteError.noRoute
+        }
         let replacement = try await routedClient(for: route)
+        guard profileLifecycleAllowsGatewayTraffic(route.gatewayID),
+              profileLifecycleAccepts(lifecycle) else {
+            throw GatewayRouteError.noRoute
+        }
         await attachRoutedEventsIfNeeded(client: replacement, gatewayID: route.gatewayID,
                                          preserveStateOnReplacement: true)
+        guard profileLifecycleAllowsGatewayTraffic(route.gatewayID),
+              profileLifecycleAccepts(lifecycle) else {
+            throw GatewayRouteError.noRoute
+        }
         if shouldMigrateVoiceHandler,
            voiceRuntime.handlerGeneration == observedHandlerGeneration,
            voiceRuntime.handlerClient === client,

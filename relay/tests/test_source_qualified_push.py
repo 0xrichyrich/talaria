@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "talaria-push"))
 from talaria_push_relay.devices import DeviceStore, DeviceValidationError
 from talaria_push_relay.apns import APNsResult
 from talaria_push_relay.apns import APNsClient
+from talaria_push_relay import events
 from talaria_push_relay.push import (
     DEFAULT_TEST_KIND,
     PushDispatcher,
@@ -43,7 +44,51 @@ class _Client:
         return self.results.pop(0)
 
 
+class _Dispatcher:
+    def __init__(self):
+        self.events = []
+
+    def notify(self, event):
+        self.events.append(event)
+
+
 class SourceQualifiedPushTests(unittest.TestCase):
+    def test_approval_hook_uses_durable_session_key_when_runtime_id_also_exists(self):
+        dispatcher = _Dispatcher()
+        with patch.object(events, "current_bot", return_value="worker"), \
+             patch.object(events, "_approval_surfaces", return_value={"gateway"}), \
+             patch.object(events.push_mod, "get_dispatcher", return_value=dispatcher):
+            events.on_pre_approval_request(
+                surface="gateway",
+                session_key="durable-session-key",
+                session_id="ephemeral-runtime-id",
+                description="Approve command",
+                command="echo safe",
+                pattern_key="shell",
+            )
+
+        self.assertEqual(len(dispatcher.events), 1)
+        event = dispatcher.events[0]
+        self.assertEqual(event.kind, "approval")
+        self.assertEqual(event.session_id, "durable-session-key")
+        self.assertNotEqual(event.session_id, "ephemeral-runtime-id")
+
+    def test_approval_hook_without_durable_key_is_non_actionable(self):
+        dispatcher = _Dispatcher()
+        with patch.object(events, "current_bot", return_value="worker"), \
+             patch.object(events, "_approval_surfaces", return_value={"gateway"}), \
+             patch.object(events.push_mod, "get_dispatcher", return_value=dispatcher):
+            events.on_pre_approval_request(
+                surface="gateway",
+                session_key="   ",
+                session_id="ephemeral-runtime-id",
+                description="Approve command",
+                command="echo unsafe",
+                pattern_key="shell",
+            )
+
+        self.assertEqual(dispatcher.events, [])
+
     def test_synthetic_test_push_defaults_to_non_actionable_kind(self):
         self.assertEqual(DEFAULT_TEST_KIND, "mention")
 

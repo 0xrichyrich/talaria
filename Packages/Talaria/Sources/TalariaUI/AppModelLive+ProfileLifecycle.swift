@@ -21,6 +21,14 @@ enum ProfileLifecyclePostcondition: Equatable {
     static func delete(names: Set<String>, source: String) -> Self {
         names.contains(source) ? .notCommitted : .committed
     }
+
+    static func displayRename(inventory: [String: ProfileInventoryEntry],
+                              source: String, requested: String) -> Self {
+        guard let entry = inventory[source], let displayName = entry.displayName else {
+            return .indeterminate
+        }
+        return displayName == requested ? .committed : .notCommitted
+    }
 }
 
 @MainActor
@@ -79,6 +87,15 @@ extension AppModel {
             && runtime.routeGenerations[token.route, default: 0] == token.generation
     }
 
+    /// Gateway-wide admission check for runtimes such as voice whose stream
+    /// can outlive one profile route. Both an active mutation and an unresolved
+    /// postcondition must stop new traffic until lifecycle authority returns.
+    internal func profileLifecycleAllowsGatewayTraffic(_ gatewayID: String) -> Bool {
+        let runtime = ProfileLifecycleRuntime.shared
+        return !runtime.gatewaysInFlight.contains(gatewayID)
+            && !runtime.heldGateways.contains(gatewayID)
+    }
+
     /// A successful explicit create/recreate makes a formerly deleted identity
     /// authoritative again. Never infer this from a possibly stale roster.
     internal func activateProfileLifecycleRoute(gatewayID: String, profile: String) {
@@ -123,6 +140,11 @@ extension AppModel {
         if changesDirectory {
             parkProfileLifecycleState(target)
             abortProfileRuntime(target)
+        } else {
+            // A default rename changes presentation metadata only, but late
+            // profile-owned completions still must not publish across an
+            // uncertain mutation response.
+            ProfileLifecycleRuntime.shared.block(target.route)
         }
         let wasActive = changesDirectory
             ? await retireProfileLifecycleClient(target.route.gatewayID, baseURL: baseURL,
@@ -136,13 +158,21 @@ extension AppModel {
                                                          profile: target.route.profile,
                                                          newName: cleanName)
         } catch let error as GatewayError {
-            guard changesDirectory else { return .refused(error.message) }
+            guard changesDirectory else {
+                return await resolveAmbiguousDefaultDisplayRename(
+                    target, requested: cleanName, originalError: error.message,
+                    baseURL: baseURL, credential: credential)
+            }
             return await resolveAmbiguousRename(
                 target, requested: cleanName, originalError: error.message,
                 baseURL: baseURL, credential: credential, wasActive: wasActive,
                 preserved: preserved)
         } catch {
-            guard changesDirectory else { return .refused(error.localizedDescription) }
+            guard changesDirectory else {
+                return await resolveAmbiguousDefaultDisplayRename(
+                    target, requested: cleanName, originalError: error.localizedDescription,
+                    baseURL: baseURL, credential: credential)
+            }
             return await resolveAmbiguousRename(
                 target, requested: cleanName, originalError: error.localizedDescription,
                 baseURL: baseURL, credential: credential, wasActive: wasActive,
@@ -153,9 +183,13 @@ extension AppModel {
         guard !canonical.isEmpty else { return .refused("Hermes returned an empty profile name.") }
         // `default` is presentation-only and must keep the same canonical route.
         if !changesDirectory {
-            guard canonical == target.route.profile else {
-                return .refused("Hermes changed the canonical default-profile identity.")
+            guard canonical == target.route.profile, result.displayName == cleanName else {
+                return await resolveAmbiguousDefaultDisplayRename(
+                    target, requested: cleanName,
+                    originalError: "Hermes returned an inconsistent default-profile rename result.",
+                    baseURL: baseURL, credential: credential)
             }
+            ProfileLifecycleRuntime.shared.restore(target.route)
             await refreshProfileRoster(gatewayID: target.route.gatewayID)
             return .renamed(canonicalName: canonical, displayName: result.displayName)
         }
@@ -261,6 +295,30 @@ extension AppModel {
         case .indeterminate:
             holdIndeterminateLifecycle(target)
             return .refused("\(originalError) The profile result is uncertain, so this gateway remains fenced and queued work for that profile was quarantined.")
+        }
+    }
+
+    private func resolveAmbiguousDefaultDisplayRename(
+        _ target: ProfileLifecycleTarget, requested: String, originalError: String,
+        baseURL: URL, credential: GatewayCredential
+    ) async -> ProfileLifecycleOutcome {
+        let inventory = try? await GatewayREST.profileInventory(
+            baseURL: baseURL, credential: credential)
+        let verdict = inventory.map {
+            ProfileLifecyclePostcondition.displayRename(
+                inventory: $0, source: target.route.profile, requested: requested)
+        } ?? .indeterminate
+        switch verdict {
+        case .committed:
+            ProfileLifecycleRuntime.shared.restore(target.route)
+            await refreshProfileRoster(gatewayID: target.route.gatewayID)
+            return .renamed(canonicalName: target.route.profile, displayName: requested)
+        case .notCommitted:
+            ProfileLifecycleRuntime.shared.restore(target.route)
+            return .refused(originalError)
+        case .indeterminate:
+            ProfileLifecycleRuntime.shared.heldGateways.insert(target.route.gatewayID)
+            return .refused("\(originalError) The default profile's display name is uncertain, so profile-owned work on this route remains fenced until the gateway is verified and Talaria restarts.")
         }
     }
 

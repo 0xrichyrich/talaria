@@ -39,8 +39,14 @@ struct ProfileLifecycleTests {
     }
 
     @Test func authoritativeInventoryRejectsAnyMalformedOrConflictingRow() throws {
-        let valid: JSONValue = ["profiles": [["name": "default"], ["name": "worker"]]]
+        let valid: JSONValue = ["profiles": [
+            ["name": "default", "display_name": "Hermes Prime"],
+            ["name": "worker"],
+        ]]
         #expect(try GatewayREST.decodeProfileNames(valid) == ["default", "worker"])
+        let inventory = try GatewayREST.decodeProfileInventory(valid)
+        #expect(inventory["default"]?.displayName == "Hermes Prime")
+        #expect(inventory["worker"]?.displayName == nil)
 
         let invalid: [JSONValue] = [
             ["profiles": [["name": "default"], [:]]],
@@ -125,6 +131,30 @@ struct ProfileLifecycleTests {
             names: ["default"], source: "old") == .committed)
         #expect(ProfileLifecyclePostcondition.delete(
             names: ["default", "old"], source: "old") == .notCommitted)
+    }
+
+    @Test func lostDefaultRenameResponseUsesAuthoritativeDisplayNamePostcondition() {
+        let committed = [
+            "default": ProfileInventoryEntry(name: "default", displayName: "Hermes Prime"),
+        ]
+        #expect(ProfileLifecyclePostcondition.displayRename(
+            inventory: committed, source: "default", requested: "Hermes Prime") == .committed)
+
+        let notCommitted = [
+            "default": ProfileInventoryEntry(name: "default", displayName: "Hermes"),
+        ]
+        #expect(ProfileLifecyclePostcondition.displayRename(
+            inventory: notCommitted, source: "default", requested: "Hermes Prime") == .notCommitted)
+
+        // Hermes' directory-scan fallback omits display_name. Presence of the
+        // canonical default row alone cannot resolve a lost PATCH response.
+        let fallback = [
+            "default": ProfileInventoryEntry(name: "default", displayName: nil),
+        ]
+        #expect(ProfileLifecyclePostcondition.displayRename(
+            inventory: fallback, source: "default", requested: "Hermes Prime") == .indeterminate)
+        #expect(ProfileLifecyclePostcondition.displayRename(
+            inventory: [:], source: "default", requested: "Hermes Prime") == .indeterminate)
     }
 
     @Test func completionFenceRejectsLateOrForeignResults() {
