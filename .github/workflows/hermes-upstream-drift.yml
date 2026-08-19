@@ -1,0 +1,18 @@
+name: Hermes upstream drift
+
+on:
+  schedule:
+    - cron: "17 15 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parity-pin:
+    name: Compare parity pin with Hermes HEAD
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate manifest and check upstream
+        run: python3 scripts/check_hermes_upstream.py --remote

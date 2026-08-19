@@ -9,6 +9,10 @@ Hermes Desktop's Bot Mode, streams the same sessions over the same
 `/api/ws` JSON-RPC surface, and puts approvals, routines, and voice in your
 pocket.
 
+Parity claims are pinned to an exact Hermes revision and use behavior-based
+completion rules. See the [current parity baseline](docs/PARITY-BASELINE.md);
+older percentages in the granular audits are historical until regenerated.
+
 > **Status:** early but runnable. The protocol client, auth stack, connections
 > registry, theme engine, live-mode state wiring, the Live Activity / push
 > pipelines, and all twelve screens from the design prototype (Roster, Chat,
