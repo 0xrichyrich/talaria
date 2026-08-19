@@ -220,11 +220,28 @@ public struct CronJob: Sendable, Identifiable {
 
 /// One gateway connection: transport lifecycle + typed RPCs.
 public actor GatewayClient {
+    public struct TrafficLease: Sendable {
+        private let releaseOperation: @Sendable () async -> Void
+
+        public init(release: @escaping @Sendable () async -> Void) {
+            releaseOperation = release
+        }
+
+        public func release() async { await releaseOperation() }
+    }
+
+    public typealias TrafficAdmission = @Sendable () async -> TrafficLease?
+
+    /// Local fail-closed rejection before any WebSocket or HTTP request can
+    /// reach a gateway whose profile namespace is being mutated.
+    public static let trafficFenced = -32_900
+
     public let baseURL: URL
     private let auth: GatewayAuthClient
     private var credential: GatewayCredential
     private var transport: GatewayTransport?
     private let keychain: KeychainStore
+    private var trafficAdmission: TrafficAdmission?
 
     /// Re-published stream of all events from the current transport.
     public private(set) var eventsTask: Task<Void, Never>?
@@ -248,6 +265,26 @@ public actor GatewayClient {
 
     public func removeEventHandler(_ id: UUID) {
         eventHandlers.removeValue(forKey: id)
+    }
+
+    /// Install the owning app's source-qualified lifecycle admission. The
+    /// check lives on the client rather than only in route resolution so a
+    /// mutation that begins after a caller obtains this actor still wins the
+    /// final race immediately before transport use.
+    public func setTrafficAdmission(_ admission: TrafficAdmission?) {
+        trafficAdmission = admission
+    }
+
+    public func acquireTrafficLease() async throws -> TrafficLease? {
+        if let trafficAdmission, let lease = await trafficAdmission() {
+            return lease
+        }
+        if trafficAdmission != nil {
+            throw GatewayError(
+                code: Self.trafficFenced,
+                message: "Gateway traffic is paused while a profile change is being resolved.")
+        }
+        return nil
     }
 
     // MARK: - Connection lifecycle
@@ -310,8 +347,16 @@ public actor GatewayClient {
     @discardableResult
     public func rpc(_ method: String, _ params: JSONValue? = nil,
                     timeout: TimeInterval = 120) async throws -> JSONValue {
-        guard let transport else { throw GatewayError(code: -3, message: "not connected") }
-        return try await transport.request(method, params: params, timeout: timeout)
+        let lease = try await acquireTrafficLease()
+        do {
+            guard let transport else { throw GatewayError(code: -3, message: "not connected") }
+            let result = try await transport.request(method, params: params, timeout: timeout)
+            await lease?.release()
+            return result
+        } catch {
+            await lease?.release()
+            throw error
+        }
     }
 
     // MARK: - Status
@@ -627,26 +672,33 @@ public actor GatewayClient {
                          query: [URLQueryItem] = [], body: Data? = nil,
                          contentType: String = "application/json",
                          timeout: TimeInterval = 30) async throws -> Data {
-        var comps = URLComponents(url: baseURL.appending(path: path),
-                                  resolvingAgainstBaseURL: false)
-        if !query.isEmpty { comps?.queryItems = query }
-        guard let url = comps?.url else {
-            throw GatewayError(code: -11, message: "bad REST path: \(path)")
+        let lease = try await acquireTrafficLease()
+        do {
+            var comps = URLComponents(url: baseURL.appending(path: path),
+                                      resolvingAgainstBaseURL: false)
+            if !query.isEmpty { comps?.queryItems = query }
+            guard let url = comps?.url else {
+                throw GatewayError(code: -11, message: "bad REST path: \(path)")
+            }
+            var req = URLRequest(url: url, timeoutInterval: timeout)
+            req.httpMethod = method
+            if let body {
+                req.httpBody = body
+                req.setValue(contentType, forHTTPHeaderField: "Content-Type")
+            }
+            auth.apply(credential: credential, to: &req)
+            let (data, response) = try await URLSession.shared.data(for: req)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(code) else {
+                let detail = (try? JSONDecoder().decode(JSONValue.self, from: data))?["detail"]?.stringValue
+                throw GatewayError(code: code, message: detail ?? "HTTP \(code) for \(path)")
+            }
+            await lease?.release()
+            return data
+        } catch {
+            await lease?.release()
+            throw error
         }
-        var req = URLRequest(url: url, timeoutInterval: timeout)
-        req.httpMethod = method
-        if let body {
-            req.httpBody = body
-            req.setValue(contentType, forHTTPHeaderField: "Content-Type")
-        }
-        auth.apply(credential: credential, to: &req)
-        let (data, response) = try await URLSession.shared.data(for: req)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(code) else {
-            let detail = (try? JSONDecoder().decode(JSONValue.self, from: data))?["detail"]?.stringValue
-            throw GatewayError(code: code, message: detail ?? "HTTP \(code) for \(path)")
-        }
-        return data
     }
 
     /// `restData` decoded as JSON.

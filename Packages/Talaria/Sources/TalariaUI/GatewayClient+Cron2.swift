@@ -430,35 +430,27 @@ public extension GatewayREST {
                                  path: String, method: String, profile: String?,
                                  body: JSONValue?, timeout: TimeInterval,
                                  query: [URLQueryItem] = []) async throws -> JSONValue {
-        var comps = URLComponents(url: baseURL.appending(path: path), resolvingAgainstBaseURL: false)
         var items = query
         if let profile, !profile.isEmpty {
             items.append(URLQueryItem(name: "profile", value: profile))
         }
-        if !items.isEmpty { comps?.queryItems = items }
-        guard let url = comps?.url else {
-            throw GatewayError(code: -9, message: "bad cron URL")
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = method
-        req.timeoutInterval = timeout
-        if let body {
-            req.httpBody = try JSONEncoder().encode(body)
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        }
-        GatewayAuthClient(baseURL: baseURL).apply(credential: credential, to: &req)
-        let (data, response) = try await URLSession.shared.data(for: req)
-        let decoded = try? JSONDecoder().decode(JSONValue.self, from: data)
-        if let code = (response as? HTTPURLResponse)?.statusCode, !(200..<300).contains(code) {
-            let detail = decoded?["detail"]?.stringValue ?? ""
+        let encodedBody = try body.map { try JSONEncoder().encode($0) }
+        let data: Data
+        do {
+            data = try await GatewayREST.restData(
+                baseURL: baseURL, credential: credential, path: path,
+                query: items, method: method, body: encodedBody,
+                timeout: timeout, what: "cron request")
+        } catch let error as GatewayError {
             // FastAPI's unrouted-path body is exactly {"detail":"Not Found"};
             // the cron handlers' own 404 says "Job not found". Only the former
             // means this gateway has no cron REST surface at all.
-            if code == 404, detail == "Not Found" {
+            if error.code == 404, error.message == "Not Found" {
                 throw GatewayError(code: cronRESTUnavailable, message: "cron REST surface unavailable")
             }
-            throw GatewayError(code: code, message: detail.isEmpty ? "cron request failed (HTTP \(code))" : detail)
+            throw error
         }
+        let decoded = try? JSONDecoder().decode(JSONValue.self, from: data)
         guard let decoded else {
             throw GatewayError(code: -9, message: "cron response was not JSON")
         }
