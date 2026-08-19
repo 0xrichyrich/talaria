@@ -8,6 +8,7 @@ final class SourceQualifiedRoutingTests: XCTestCase {
     override func tearDown() {
         let runtime = LiveRuntime.shared
         runtime.gatewayID = nil
+        runtime.defaultBotID = nil
         runtime.sessionToBot.removeAll()
         runtime.routedSessionToBot.removeAll()
         runtime.approvalTargets.removeAll()
@@ -21,7 +22,8 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         FeedsRuntime.shared.cronJobs.removeAll()
         FeedsRuntime.shared.cronScope.removeAll()
         FeedsRuntime.shared.routineTargets.removeAll()
-        CronDetailRuntime.shared.quarantined.removeAll()
+        CronDetailRuntime.shared.reset()
+        CronDetailRuntime.shared.changeTick = 0
         SessionsRuntime.shared.resetPrimaryScope()
         SessionsRuntime.shared.resetRoutedScope(gatewayID: "homelab")
         super.tearDown()
@@ -339,8 +341,62 @@ final class SourceQualifiedRoutingTests: XCTestCase {
             bot: GatewayBotRoute(gatewayID: "homelab", profile: "default"), profile: "default")
 
         XCTAssertTrue(model.routineHasFullManagement(primary))
-        XCTAssertFalse(model.routineHasFullManagement(remote))
-        XCTAssertEqual(FeedsRuntime.shared.routineTargets[remote.id]?.route.jobID, "same")
+        XCTAssertTrue(model.routineHasFullManagement(remote))
+        XCTAssertEqual(model.routineTarget(primary.id)?.route,
+                       GatewayRoutineRoute(gatewayID: "primary", jobID: "same"))
+        XCTAssertEqual(model.routineTarget(remote.id)?.route,
+                       GatewayRoutineRoute(gatewayID: "homelab", jobID: "same"))
+        XCTAssertEqual(model.cronScope(primary.id), nil)
+        XCTAssertEqual(model.cronScope(remote.id), "default")
+        XCTAssertEqual(model.routineGatewayID(routineID: primary.id), "primary")
+        XCTAssertEqual(model.routineGatewayID(routineID: remote.id), "homelab")
+        XCTAssertEqual(model.routineGatewayID(botID: "default"), "primary")
+        XCTAssertEqual(model.routineGatewayID(botID: "homelab::default"), "homelab")
+    }
+
+    func testRoutineRESTCapabilityAndDeliveryCachesAreGatewayScoped() {
+        let model = AppModel()
+        model.mode = .live
+        LiveRuntime.shared.gatewayID = "primary"
+        let primary = routine(id: "same", botID: "default")
+        let remoteID = GatewayRoutineRoute(gatewayID: "homelab", jobID: "same").qualifiedID
+        let remote = routine(id: remoteID, botID: "homelab::default")
+        FeedsRuntime.shared.routineTargets[primary.id] = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "primary", jobID: "same"),
+            bot: GatewayBotRoute(gatewayID: "primary", profile: "default"), profile: nil)
+        FeedsRuntime.shared.routineTargets[remote.id] = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "homelab", jobID: "same"),
+            bot: GatewayBotRoute(gatewayID: "homelab", profile: "default"), profile: nil)
+        let runtime = CronDetailRuntime.shared
+        runtime.restSupported["primary"] = false
+        runtime.restSupported["homelab"] = true
+        runtime.deliveryTargets["primary"] = [CronDeliveryTarget(["id": "local"])]
+        runtime.deliveryTargets["homelab"] = [CronDeliveryTarget(["id": "telegram"])]
+
+        XCTAssertEqual(model.cronDeliveryTargets(routineID: primary.id).map(\.id), ["local"])
+        XCTAssertEqual(model.cronDeliveryTargets(routineID: remote.id).map(\.id), ["telegram"])
+        XCTAssertEqual(runtime.restSupported[model.routineGatewayID(routineID: primary.id)!], false)
+        XCTAssertEqual(runtime.restSupported[model.routineGatewayID(routineID: remote.id)!], true)
+    }
+
+    func testRoutineRunTranscriptKeepsOwningGateway() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        LiveRuntime.shared.defaultBotID = "default"
+        let primaryID = "same"
+        let remoteID = GatewayRoutineRoute(gatewayID: "homelab", jobID: "same").qualifiedID
+        FeedsRuntime.shared.routineTargets[primaryID] = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "primary", jobID: "same"),
+            bot: GatewayBotRoute(gatewayID: "primary", profile: "default"), profile: nil)
+        FeedsRuntime.shared.routineTargets[remoteID] = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "homelab", jobID: "same"),
+            bot: GatewayBotRoute(gatewayID: "homelab", profile: "default"), profile: nil)
+        let run = CronRun(["id": "cron_same_1", "profile": "default"])
+
+        XCTAssertEqual(model.routineRunBotID(run, routineID: primaryID,
+                                             fallbackBotID: "default"), "default")
+        XCTAssertEqual(model.routineRunBotID(run, routineID: remoteID,
+                                             fallbackBotID: "default"), "homelab::default")
     }
 
     func testRoutineGatewayDetachPreservesOtherGatewayRows() {
@@ -356,12 +412,24 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         FeedsRuntime.shared.routineTargets[remote.id] = RoutineTarget(
             route: GatewayRoutineRoute(gatewayID: "homelab", jobID: "remote-job"),
             bot: GatewayBotRoute(gatewayID: "homelab", profile: "default"), profile: nil)
+        CronDetailRuntime.shared.detail[primary.id] = CronJobDetail(["id": "primary-job"])
+        CronDetailRuntime.shared.detail[remote.id] = CronJobDetail(["id": "remote-job"])
+        CronDetailRuntime.shared.deliveryTargets["primary"] = [CronDeliveryTarget(["id": "local"])]
+        CronDetailRuntime.shared.deliveryTargets["homelab"] = [CronDeliveryTarget(["id": "telegram"])]
+        CronDetailRuntime.shared.restSupported["primary"] = true
+        CronDetailRuntime.shared.restSupported["homelab"] = true
 
         model.dropRoutineScope(gatewayID: "homelab")
 
         XCTAssertEqual(model.routines, [primary])
         XCTAssertNotNil(FeedsRuntime.shared.routineTargets[primary.id])
         XCTAssertNil(FeedsRuntime.shared.routineTargets[remote.id])
+        XCTAssertNotNil(CronDetailRuntime.shared.detail[primary.id])
+        XCTAssertNil(CronDetailRuntime.shared.detail[remote.id])
+        XCTAssertNotNil(CronDetailRuntime.shared.deliveryTargets["primary"])
+        XCTAssertNil(CronDetailRuntime.shared.deliveryTargets["homelab"])
+        XCTAssertEqual(CronDetailRuntime.shared.restSupported["primary"], true)
+        XCTAssertNil(CronDetailRuntime.shared.restSupported["homelab"])
     }
 
     func testUnreadWatermarksKeepCollidingProfilesInSeparateGatewayScopes() {

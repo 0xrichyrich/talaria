@@ -121,9 +121,7 @@ public struct RoutinesView: View {
                         emptyLine
                     }
 
-                    if GatewayBotRoute(qualifiedID: botID) == nil {
-                        newRoutineRow
-                    }
+                    newRoutineRow
 
                     if !others.isEmpty {
                         Text(copy.otherBots)
@@ -179,10 +177,7 @@ public struct RoutinesView: View {
     private func open(_ routine: Routine) {
         actionError = nil
         actionNote = nil
-        guard model.routineHasFullManagement(routine) else {
-            actionNote = "Switching this remote routine is available now; full remote history and editing are the next delivery slice."
-            return
-        }
+        guard model.routineHasFullManagement(routine) else { return }
         withAnimation(.easeOut(duration: 0.32)) { editing = routine }
     }
 

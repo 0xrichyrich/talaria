@@ -27,28 +27,27 @@ import TalariaTheme
 // MARK: - Runtime (side table)
 
 /// Per-job detail the routines list does not carry. Separate from
-/// `FeedsRuntime` (another owner's file) and keyed by job id so a detail screen
-/// survives the list refresh underneath it.
+/// `FeedsRuntime` (another owner's file) and keyed by source-qualified routine
+/// id so colliding raw job ids cannot share detail or history.
 @MainActor
 @Observable
 public final class CronDetailRuntime {
     public static let shared = CronDetailRuntime()
 
-    /// job id → the raw stored record.
+    /// Source-qualified routine id → the raw stored record.
     public var detail: [String: CronJobDetail] = [:]
-    /// job id → its run sessions, newest first.
+    /// Source-qualified routine id → its run sessions, newest first.
     public var runs: [String: [CronRun]] = [:]
-    /// Delivery routes this gateway can actually offer.
-    public var deliveryTargets: [CronDeliveryTarget] = []
+    /// Gateway id → delivery routes that source can actually offer.
+    public var deliveryTargets: [String: [CronDeliveryTarget]] = [:]
 
-    /// nil until the first REST call answers. False once a gateway proved it
-    /// has no cron REST router — the editing and history surfaces then hide
-    /// rather than showing an error nobody can act on.
-    public var restSupported: Bool?
+    /// Gateway id → whether its REST cron router exists. Missing means
+    /// unknown; false hides only that source's REST-backed controls.
+    public var restSupported: [String: Bool] = [:]
 
     public var loadingDetail: Set<String> = []
     public var loadingRuns: Set<String> = []
-    /// job id → the last failure worth showing on that job's screen.
+    /// Source-qualified routine id → the last failure worth showing.
     public var detailError: [String: String] = [:]
 
     /// Bumped on every `cron.changed` broadcast. Open screens observe it and
@@ -66,7 +65,7 @@ public final class CronDetailRuntime {
     /// and leave `cron.changed` unsubscribed on the new link. A weak reference
     /// goes nil when the old client dies, which is exactly the answer wanted.
     @ObservationIgnored weak var routedClient: GatewayClient?
-    @ObservationIgnored var deliveryLoaded = false
+    @ObservationIgnored var deliveryLoaded: Set<String> = []
     /// Legacy delegated jobs already force-paused on this link, so the
     /// migration runs once per job instead of on every list refresh.
     @ObservationIgnored var quarantined: Set<String> = []
@@ -75,7 +74,7 @@ public final class CronDetailRuntime {
     func reset() {
         detail.removeAll(); runs.removeAll(); deliveryTargets.removeAll()
         detailError.removeAll(); loadingDetail.removeAll(); loadingRuns.removeAll()
-        deliveryLoaded = false; restSupported = nil; quarantined.removeAll()
+        deliveryLoaded.removeAll(); restSupported.removeAll(); quarantined.removeAll()
     }
 }
 
@@ -195,69 +194,105 @@ public extension AppModel {
 public extension AppModel {
 
     /// The profile scope a job's calls must carry (nil = the launch store).
-    func cronScope(_ jobID: String) -> String? {
-        FeedsRuntime.shared.cronScope[jobID] ?? nil
+    func cronScope(_ routineID: String) -> String? {
+        FeedsRuntime.shared.routineTargets[routineID]?.profile
+            ?? FeedsRuntime.shared.cronScope[routineID] ?? nil
+    }
+
+    internal func routineTarget(_ routineID: String) -> RoutineTarget? {
+        FeedsRuntime.shared.routineTargets[routineID]
+    }
+
+    func routineGatewayID(routineID: String? = nil, botID: String? = nil) -> String? {
+        if let routineID, let target = routineTarget(routineID) {
+            return target.route.gatewayID
+        }
+        if let botID, let route = GatewayBotRoute(qualifiedID: botID) {
+            return route.gatewayID
+        }
+        return LiveRuntime.shared.gatewayID
     }
 
     /// True when the cron REST router is reachable — a live link, an HTTP
     /// credential, and no gateway that has already answered "no such route".
     /// Everything past list/toggle/delete depends on it, so the surfaces that
     /// need it check this before rendering rather than after failing.
-    var cronRESTReady: Bool {
-        mode == .live && CronDetailRuntime.shared.restSupported != false
-            && gatewayRESTContext() != nil
+    func cronRESTReady(routineID: String? = nil, botID: String? = nil) -> Bool {
+        guard mode == .live,
+              let gatewayID = routineGatewayID(routineID: routineID, botID: botID)
+        else { return false }
+        return CronDetailRuntime.shared.restSupported[gatewayID] != false
+            && gatewayRESTContext(gatewayID: gatewayID) != nil
+    }
+
+    func cronDeliveryTargets(routineID: String? = nil, botID: String? = nil)
+        -> [CronDeliveryTarget] {
+        guard let gatewayID = routineGatewayID(routineID: routineID, botID: botID) else { return [] }
+        return CronDetailRuntime.shared.deliveryTargets[gatewayID] ?? []
     }
 
     /// Load the raw job record. Returns nil when the gateway has no cron REST
     /// surface, which is a hide-the-section signal, not an error.
     @discardableResult
-    func loadRoutineDetail(_ jobID: String) async -> CronJobDetail? {
+    func loadRoutineDetail(_ routineID: String) async -> CronJobDetail? {
         let runtime = CronDetailRuntime.shared
-        guard mode == .live, runtime.restSupported != false,
-              let (base, credential) = gatewayRESTContext(), !jobID.isEmpty
+        guard mode == .live, let target = routineTarget(routineID),
+              runtime.restSupported[target.route.gatewayID] != false,
+              let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID),
+              !target.route.jobID.isEmpty
         else { return nil }
-        guard !runtime.loadingDetail.contains(jobID) else { return runtime.detail[jobID] }
-        runtime.loadingDetail.insert(jobID)
-        defer { runtime.loadingDetail.remove(jobID) }
+        guard !runtime.loadingDetail.contains(routineID) else { return runtime.detail[routineID] }
+        runtime.loadingDetail.insert(routineID)
+        defer { runtime.loadingDetail.remove(routineID) }
         do {
             let job = try await GatewayREST.cronJob(baseURL: base, credential: credential,
-                                                    jobID: jobID, profile: cronScope(jobID))
-            runtime.restSupported = true
-            runtime.detail[jobID] = job
-            runtime.detailError[jobID] = nil
+                                                    jobID: target.route.jobID,
+                                                    profile: target.profile)
+            guard routineTarget(routineID) == target else { return nil }
+            runtime.restSupported[target.route.gatewayID] = true
+            runtime.detail[routineID] = job
+            runtime.detailError[routineID] = nil
             return job
         } catch let error as GatewayError where error.code == GatewayREST.cronRESTUnavailable {
-            runtime.restSupported = false
+            guard routineTarget(routineID) == target else { return nil }
+            runtime.restSupported[target.route.gatewayID] = false
             return nil
         } catch let error as GatewayError where error.code == 404 {
+            guard routineTarget(routineID) == target else { return nil }
             // The job is gone (a finite one-shot deletes itself after its last
             // run). Drop the stale cache rather than reporting a failure.
-            runtime.detail[jobID] = nil
-            runtime.detailError[jobID] = nil
+            runtime.detail[routineID] = nil
+            runtime.detailError[routineID] = nil
             return nil
         } catch {
-            runtime.detailError[jobID] = Self.reason(error)
-            return runtime.detail[jobID]
+            guard routineTarget(routineID) == target else { return nil }
+            runtime.detailError[routineID] = Self.reason(error)
+            return runtime.detail[routineID]
         }
     }
 
     /// Load this job's run sessions, newest first.
-    func loadRoutineRuns(_ jobID: String, limit: Int = 20) async {
+    func loadRoutineRuns(_ routineID: String, limit: Int = 20) async {
         let runtime = CronDetailRuntime.shared
-        guard mode == .live, runtime.restSupported != false,
-              let (base, credential) = gatewayRESTContext(), !jobID.isEmpty
+        guard mode == .live, let target = routineTarget(routineID),
+              runtime.restSupported[target.route.gatewayID] != false,
+              let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID),
+              !target.route.jobID.isEmpty
         else { return }
-        guard !runtime.loadingRuns.contains(jobID) else { return }
-        runtime.loadingRuns.insert(jobID)
-        defer { runtime.loadingRuns.remove(jobID) }
+        guard !runtime.loadingRuns.contains(routineID) else { return }
+        runtime.loadingRuns.insert(routineID)
+        defer { runtime.loadingRuns.remove(routineID) }
         do {
             let rows = try await GatewayREST.cronJobRuns(baseURL: base, credential: credential,
-                                                         jobID: jobID, profile: cronScope(jobID),
+                                                         jobID: target.route.jobID,
+                                                         profile: target.profile,
                                                          limit: limit)
-            runtime.restSupported = true
-            runtime.runs[jobID] = rows
+            guard routineTarget(routineID) == target else { return }
+            runtime.restSupported[target.route.gatewayID] = true
+            runtime.runs[routineID] = rows
         } catch let error as GatewayError where error.code == GatewayREST.cronRESTUnavailable {
-            runtime.restSupported = false
+            guard routineTarget(routineID) == target else { return }
+            runtime.restSupported[target.route.gatewayID] = false
         } catch {
             // Deliberately leaves the cache untouched. "It hasn't run yet" is a
             // CLAIM, and a read that failed cannot make it — the section stays
@@ -267,18 +302,23 @@ public extension AppModel {
 
     /// Delivery routes this gateway offers. Loaded once per link — the list is
     /// derived from configured platforms, which do not change mid-session.
-    func loadCronDeliveryTargets() async {
+    func loadCronDeliveryTargets(routineID: String? = nil, botID: String? = nil) async {
         let runtime = CronDetailRuntime.shared
-        guard mode == .live, !runtime.deliveryLoaded, runtime.restSupported != false,
-              let (base, credential) = gatewayRESTContext() else { return }
-        runtime.deliveryLoaded = true
+        guard mode == .live,
+              let gatewayID = routineGatewayID(routineID: routineID, botID: botID),
+              !runtime.deliveryLoaded.contains(gatewayID),
+              runtime.restSupported[gatewayID] != false,
+              let (base, credential) = gatewayRESTContext(gatewayID: gatewayID) else { return }
+        runtime.deliveryLoaded.insert(gatewayID)
         do {
-            runtime.deliveryTargets = try await GatewayREST.cronDeliveryTargets(
+            let targets = try await GatewayREST.cronDeliveryTargets(
                 baseURL: base, credential: credential)
+            guard gatewayRESTContext(gatewayID: gatewayID) != nil else { return }
+            runtime.deliveryTargets[gatewayID] = targets
         } catch {
             // No targets discovered = the picker stays hidden and every job
             // keeps whatever route it already has.
-            runtime.deliveryLoaded = false
+            runtime.deliveryLoaded.remove(gatewayID)
         }
     }
 
@@ -288,11 +328,22 @@ public extension AppModel {
     /// on the row; a delegated routine's cron session lives in the launch
     /// store even though the work landed in the delegate's history.
     func openRoutineRun(_ run: CronRun, jobID: String, fallbackBotID: String) {
+        guard let owner = routineRunBotID(run, routineID: jobID,
+                                          fallbackBotID: fallbackBotID) else { return }
+        openStoredSession(run.id, botID: owner)
+    }
+
+    internal func routineRunBotID(_ run: CronRun, routineID: String,
+                                  fallbackBotID: String) -> String? {
         // Precedence: the profile the server stamped on the row, then the scope
         // the job's own RPCs use, then the launch profile. `run.id` is a
         // SESSION id, never a job id, so it must not be used as a scope key.
-        let owner = run.profile ?? cronScope(jobID) ?? LiveRuntime.shared.defaultBotID ?? fallbackBotID
-        openStoredSession(run.id, botID: owner)
+        let owner = run.profile ?? cronScope(routineID)
+            ?? LiveRuntime.shared.defaultBotID ?? fallbackBotID
+        guard let target = routineTarget(routineID) else { return nil }
+        return target.route.gatewayID == LiveRuntime.shared.gatewayID
+            ? owner
+            : GatewayBotRoute(gatewayID: target.route.gatewayID, profile: owner).qualifiedID
     }
 }
 
@@ -317,9 +368,6 @@ public extension AppModel {
                          repeatForever: Bool = true, continuity: Bool = false,
                          deliver: [String] = [], model: String? = nil,
                          provider: String? = nil) async throws {
-        guard GatewayBotRoute(qualifiedID: botID) == nil else {
-            throw GatewayRouteError.noRoute
-        }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanInstruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTitle.isEmpty, !cleanInstruction.isEmpty else {
@@ -333,14 +381,17 @@ public extension AppModel {
         guard let normalized = HermesSchedule.normalize(schedule) else {
             throw GatewayError(code: -1, message: theme.copy.scheduleHelp(theme.themeID))
         }
-        guard mode == .live, let client else {
+        guard mode == .live,
+              let gatewayID = routineGatewayID(botID: botID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
         }
+        let botProfile = GatewayBotRoute(qualifiedID: botID)?.profile ?? botID
+        let client = try await routedClient(gatewayID: gatewayID)
 
         let jobID = try await client.cronAdd(
-            name: Self.namespacedTitle(botID: botID, title: cleanTitle),
+            name: Self.namespacedTitle(botID: botProfile, title: cleanTitle),
             schedule: normalized,
-            prompt: Self.delegatedPrompt(botID: botID, title: cleanTitle,
+            prompt: Self.delegatedPrompt(botID: botProfile, title: cleanTitle,
                                          instruction: cleanInstruction),
             repeatCount: repeatForever ? nil : 1,
             continuity: continuity)
@@ -355,20 +406,23 @@ public extension AppModel {
         if let provider, !provider.isEmpty { extras["provider"] = .string(provider) }
 
         guard !extras.isEmpty, !jobID.isEmpty,
-              let (base, credential) = gatewayRESTContext(),
-              CronDetailRuntime.shared.restSupported != false else {
+              let (base, credential) = gatewayRESTContext(gatewayID: gatewayID),
+              CronDetailRuntime.shared.restSupported[gatewayID] != false else {
             await refreshRoutinesLive(force: true)
             return
         }
         do {
             let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
-                                                            jobID: jobID, profile: cronScope(jobID),
+                                                            jobID: jobID, profile: nil,
                                                             updates: extras)
-            CronDetailRuntime.shared.detail[jobID] = saved
+            let routineID = gatewayID == LiveRuntime.shared.gatewayID
+                ? jobID
+                : GatewayRoutineRoute(gatewayID: gatewayID, jobID: jobID).qualifiedID
+            CronDetailRuntime.shared.detail[routineID] = saved
             await refreshRoutinesLive(force: true)
         } catch {
             if let gateway = error as? GatewayError, gateway.code == GatewayREST.cronRESTUnavailable {
-                CronDetailRuntime.shared.restSupported = false
+                CronDetailRuntime.shared.restSupported[gatewayID] = false
             }
             // The routine exists and WILL fire; only the route/pin did not
             // land. Say exactly that — the alternative, deleting a job the
@@ -383,13 +437,12 @@ public extension AppModel {
     /// field cannot be cleared by a partial write.
     ///
     /// - Parameter model/provider: `.some("")` clears a pin, `nil` leaves it.
-    func saveRoutine(_ job: CronJobDetail, botID: String, title: String, schedule: String,
+    func saveRoutine(_ job: CronJobDetail, routineID: String, botID: String,
+                     title: String, schedule: String,
                      instruction: String, deliver: [String]?, model: String?,
                      provider: String?, continuity: Bool?) async throws {
-        guard GatewayBotRoute(qualifiedID: botID) == nil else {
-            throw GatewayRouteError.noRoute
-        }
-        guard mode == .live, let (base, credential) = gatewayRESTContext() else {
+        guard mode == .live, let target = routineTarget(routineID),
+              let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
         }
         var updates: [String: JSONValue] = [:]
@@ -420,7 +473,7 @@ public extension AppModel {
             guard !cleanInstruction.isEmpty else {
                 throw GatewayError(code: -1, message: theme.copy.routineNeedsBoth(theme.themeID))
             }
-            let rewritten = Self.delegatedPrompt(botID: botID, title: cleanTitle,
+            let rewritten = Self.delegatedPrompt(botID: target.bot.profile, title: cleanTitle,
                                                  instruction: cleanInstruction)
             if rewritten != job.prompt { updates["prompt"] = .string(rewritten) }
         }
@@ -452,12 +505,16 @@ public extension AppModel {
         guard !updates.isEmpty else { return }
         do {
             let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
-                                                            jobID: job.id, profile: cronScope(job.id),
+                                                            jobID: target.route.jobID,
+                                                            profile: target.profile,
                                                             updates: updates)
-            CronDetailRuntime.shared.detail[job.id] = saved
-            CronDetailRuntime.shared.detailError[job.id] = nil
+            guard routineTarget(routineID) == target else { return }
+            CronDetailRuntime.shared.detail[routineID] = saved
+            CronDetailRuntime.shared.detailError[routineID] = nil
         } catch let error as GatewayError where error.code == GatewayREST.cronRESTUnavailable {
-            CronDetailRuntime.shared.restSupported = false
+            if routineTarget(routineID) == target {
+                CronDetailRuntime.shared.restSupported[target.route.gatewayID] = false
+            }
             throw error
         }
         await refreshRoutinesLive(force: true)
@@ -470,8 +527,9 @@ public extension AppModel {
     /// <id> --provider <p> --model <m>`). Pinning the SNAPSHOT — not the
     /// gateway's current default — restores the behaviour the routine was
     /// created with, which is what "keep the original values" means there.
-    func pinRoutineInference(_ job: CronJobDetail) async throws {
-        guard mode == .live, let (base, credential) = gatewayRESTContext() else {
+    func pinRoutineInference(_ job: CronJobDetail, routineID: String) async throws {
+        guard mode == .live, let target = routineTarget(routineID),
+              let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
         }
         var updates: [String: JSONValue] = [:]
@@ -483,10 +541,12 @@ public extension AppModel {
         }
         guard !updates.isEmpty else { return }
         let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
-                                                        jobID: job.id, profile: cronScope(job.id),
+                                                        jobID: target.route.jobID,
+                                                        profile: target.profile,
                                                         updates: updates)
-        CronDetailRuntime.shared.detail[job.id] = saved
-        CronDetailRuntime.shared.detailError[job.id] = nil
+        guard routineTarget(routineID) == target else { return }
+        CronDetailRuntime.shared.detail[routineID] = saved
+        CronDetailRuntime.shared.detailError[routineID] = nil
         await refreshRoutinesLive(force: true)
     }
 }
