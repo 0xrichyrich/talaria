@@ -41,12 +41,27 @@ final class SessionsRuntime {
     /// Debounce for the `sessions.changed` broadcast.
     var refreshTask: Task<Void, Never>?
 
-    func reset() {
-        titles.removeAll()
-        previews.removeAll()
-        loadErrors.removeAll()
+    static func key(botID: String, sessionID: String) -> String {
+        botID + "\u{0}" + sessionID
+    }
+
+    private static func botID(from key: String) -> String {
+        String(key.prefix { $0 != "\u{0}" })
+    }
+
+    func resetPrimaryScope() {
+        titles = titles.filter { GatewayBotRoute(qualifiedID: Self.botID(from: $0.key)) != nil }
+        previews = previews.filter { GatewayBotRoute(qualifiedID: Self.botID(from: $0.key)) != nil }
+        loadErrors = loadErrors.filter { GatewayBotRoute(qualifiedID: $0.key) != nil }
         refreshTask?.cancel()
         refreshTask = nil
+    }
+
+    func resetRoutedScope(gatewayID: String) {
+        let prefix = gatewayID + GatewayBotRoute.separator
+        titles = titles.filter { !Self.botID(from: $0.key).hasPrefix(prefix) }
+        previews = previews.filter { !Self.botID(from: $0.key).hasPrefix(prefix) }
+        loadErrors = loadErrors.filter { !$0.key.hasPrefix(prefix) }
     }
 }
 
@@ -83,25 +98,26 @@ extension AppModel {
             runtime.loadErrors[botID] = nil
             return
         }
-        guard let client, !isOffline else {
+        guard let route = gatewayRoute(for: botID),
+              let client = try? await routedClient(for: route) else {
             runtime.loadErrors[botID] = theme.copy.sessUnreachable(theme.themeID)
             return
         }
         do {
-            let rows = try await client.listSessions(limit: 200, profile: botID,
+            let rows = try await client.listSessions(limit: 200, profile: route.profile,
                                                      includeHidden: true)
             var summaries: [SessionSummary] = []
             summaries.reserveCapacity(rows.count)
             for row in rows where !row.id.isEmpty {
                 let preview = (row.preview ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 if preview.isEmpty {
-                    runtime.previews[row.id] = nil
+                    runtime.previews[SessionsRuntime.key(botID: botID, sessionID: row.id)] = nil
                 } else {
-                    runtime.previews[row.id] = preview
+                    runtime.previews[SessionsRuntime.key(botID: botID, sessionID: row.id)] = preview
                 }
                 // The event overlay wins: an auto-title that landed since the
                 // list was built is newer than the row we just fetched.
-                let title = runtime.titles[row.id]
+                let title = runtime.titles[SessionsRuntime.key(botID: botID, sessionID: row.id)]
                     ?? (row.title.isEmpty
                         ? GatewayClient.fallbackTitle(id: row.id, preview: preview)
                         : row.title)
@@ -126,8 +142,8 @@ extension AppModel {
 
     /// The stored session's first transcript line, when session.list carried
     /// one. Session rows show it under the title.
-    public func sessionPreview(_ sessionID: String) -> String? {
-        SessionsRuntime.shared.previews[sessionID]
+    public func sessionPreview(_ sessionID: String, botID: String) -> String? {
+        SessionsRuntime.shared.previews[SessionsRuntime.key(botID: botID, sessionID: sessionID)]
     }
 
     // MARK: - Context breakdown
@@ -179,7 +195,14 @@ extension AppModel {
         // are leaving, and an in-flight attach for the old session is stale.
         runtime.attachTasks[botID]?.cancel()
         runtime.attachTasks[botID] = nil
-        if let old = chat.sessionID { runtime.sessionToBot.removeValue(forKey: old) }
+        if let old = chat.sessionID, let route = gatewayRoute(for: botID) {
+            if route.gatewayID == runtime.gatewayID {
+                runtime.sessionToBot.removeValue(forKey: old)
+            } else {
+                runtime.routedSessionToBot.removeValue(forKey: GatewaySessionRoute(
+                    gatewayID: route.gatewayID, sessionID: old))
+            }
+        }
         chat.sessionID = nil
         chat.storedSessionID = id
         chat.isTyping = false
@@ -189,25 +212,31 @@ extension AppModel {
         // The durable key is also what a reconnect resumes from.
         runtime.lastSessionByBot[botID] = id
 
-        guard !isOffline, let client else { return }
         Task { @MainActor in
             do {
+                guard let route = self.gatewayRoute(for: botID) else {
+                    throw GatewayRouteError.noRoute
+                }
+                let client = try await self.routedClient(for: route)
+                await self.attachRoutedEventsIfNeeded(client: client,
+                                                      gatewayID: route.gatewayID)
                 // Full projection in the ack (deferHistory returns a bounded
                 // stub) — one round trip, authoritative rows, same tradeoff
                 // ensureSession makes.
-                let live = try await client.resumeSession(id, profile: botID, deferHistory: false)
+                let live = try await client.resumeSession(id, profile: route.profile,
+                                                          deferHistory: false)
                 guard !live.sessionID.isEmpty else {
                     throw GatewayError(code: -8, message: "session.resume returned no id")
                 }
                 chat.sessionID = live.sessionID
                 chat.storedSessionID = live.storedSessionID.isEmpty ? id : live.storedSessionID
-                runtime.sessionToBot[live.sessionID] = botID
+                self.bindSession(live, botID: botID, sourceGatewayID: route.gatewayID)
                 runtime.lastSessionByBot[botID] = chat.storedSessionID ?? id
 
                 var history = AppModel.chatMessages(fromTranscript: .array(live.messages))
                 if history.isEmpty, let stored = chat.storedSessionID,
                    let payload = try? await client.latestSessionMessages(storedID: stored,
-                                                                         profile: botID) {
+                                                                         profile: route.profile) {
                     history = AppModel.chatMessages(fromTranscript: payload)
                 }
                 chat.messages = history
@@ -248,9 +277,12 @@ extension AppModel {
             dropSessionRow(id, botID: botID)
             return nil
         }
-        guard let client, !isOffline else { return theme.copy.sessUnreachable(theme.themeID) }
+        guard let route = gatewayRoute(for: botID),
+              let client = try? await routedClient(for: route) else {
+            return theme.copy.sessUnreachable(theme.themeID)
+        }
         do {
-            try await client.deleteSession(id, profile: botID)
+            try await client.deleteSession(id, profile: route.profile)
         } catch let error as GatewayError where error.code == 4023 {
             return theme.copy.sessDeleteLive(theme.themeID)
         } catch let error as GatewayError where error.code == 4007 {
@@ -276,13 +308,16 @@ extension AppModel {
             applyTitle(clean, to: id, botID: botID)
             return nil
         }
-        guard let client, !isOffline else { return theme.copy.sessUnreachable(theme.themeID) }
+        guard let route = gatewayRoute(for: botID),
+              let client = try? await routedClient(for: route) else {
+            return theme.copy.sessUnreachable(theme.themeID)
+        }
         let chat = chats[botID]
         do {
             if let sid = chat?.sessionID, chat?.storedSessionID == id {
                 try await client.setSessionTitle(sessionID: sid, title: clean)
             } else {
-                try await client.renameStoredSession(id, title: clean, profile: botID)
+                try await client.renameStoredSession(id, title: clean, profile: route.profile)
             }
         } catch {
             return Self.sessionFailure(error, theme: theme)
@@ -299,7 +334,8 @@ extension AppModel {
     /// them.
     public func branchSession(botID: String) async -> SessionActionOutcome {
         guard let sid = await liveSessionID(botID: botID) else { return needsLiveSession }
-        guard let client else { return needsLiveSession }
+        guard let route = gatewayRoute(for: botID),
+              let client = try? await routedClient(for: route) else { return needsLiveSession }
         do {
             let branch = try await client.branchSession(sid)
             await refreshSessions(botID: botID)
@@ -317,7 +353,8 @@ extension AppModel {
     /// compacted transcript replaces the local one, matching desktop.
     public func compressSession(botID: String) async -> SessionActionOutcome {
         guard let sid = await liveSessionID(botID: botID) else { return needsLiveSession }
-        guard let client else { return needsLiveSession }
+        guard let route = gatewayRoute(for: botID),
+              let client = try? await routedClient(for: route) else { return needsLiveSession }
         do {
             let result = try await client.compressSession(sid)
             if !result.messages.isEmpty {
@@ -342,7 +379,8 @@ extension AppModel {
     /// phone. The path is the whole result, so it is what we show.
     public func exportSession(botID: String) async -> SessionActionOutcome {
         guard let sid = await liveSessionID(botID: botID) else { return needsLiveSession }
-        guard let client else { return needsLiveSession }
+        guard let route = gatewayRoute(for: botID),
+              let client = try? await routedClient(for: route) else { return needsLiveSession }
         do {
             let path = try await client.saveSession(sid)
             return SessionActionOutcome(ok: true,
@@ -358,7 +396,7 @@ extension AppModel {
     /// this process holds live. These are explicit user actions, so minting
     /// one when the chat was never opened is the right call.
     private func liveSessionID(botID: String) async -> String? {
-        guard mode == .live, !isOffline, client != nil else { return nil }
+        guard mode == .live, gatewayRoute(for: botID) != nil else { return nil }
         if let sid = chats[botID]?.sessionID { return sid }
         return try? await ensureSession(botID: botID, hydrate: false)
     }
@@ -376,17 +414,23 @@ extension AppModel {
     public func searchSessions(_ query: String) async -> [SessionSearchHit] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else { return [] }
-        guard mode == .live, !isOffline, let client else { return demoSearch(trimmed) }
-        let profiles = bots.map(\.id)
-        guard !profiles.isEmpty else { return [] }
+        guard mode == .live else { return demoSearch(trimmed) }
+        var targets: [(botID: String, profile: String, client: GatewayClient)] = []
+        for bot in unionRosterBots {
+            guard let route = gatewayRoute(for: bot.id),
+                  let client = try? await routedClient(for: route) else { continue }
+            targets.append((bot.id, route.profile, client))
+        }
+        guard !targets.isEmpty else { return [] }
         var merged: [SessionSearchHit] = []
         await withTaskGroup(of: [SessionSearchHit].self) { group in
-            for profile in profiles {
+            for target in targets {
                 group.addTask {
-                    ((try? await client.searchSessions(query: trimmed, profile: profile, limit: 8))
+                    ((try? await target.client.searchSessions(query: trimmed,
+                                                              profile: target.profile, limit: 8))
                         ?? []).map { hit in
                             var tagged = hit
-                            tagged.botID = profile
+                            tagged.botID = target.botID
                             return tagged
                         }
                 }
@@ -395,7 +439,7 @@ extension AppModel {
         }
         var seen = Set<String>()
         return merged
-            .filter { seen.insert($0.id).inserted }
+            .filter { seen.insert(SessionsRuntime.key(botID: $0.botID, sessionID: $0.id)).inserted }
             .sorted { $0.lastActive > $1.lastActive }
     }
 
@@ -404,10 +448,13 @@ extension AppModel {
     public func searchSessions(_ query: String, botID: String) async -> [SessionSearchHit] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else { return [] }
-        guard mode == .live, !isOffline, let client else {
+        guard mode == .live else {
             return demoSearch(trimmed).filter { $0.botID == botID }
         }
-        guard let hits = try? await client.searchSessions(query: trimmed, profile: botID, limit: 20)
+        guard let route = gatewayRoute(for: botID),
+              let client = try? await routedClient(for: route),
+              let hits = try? await client.searchSessions(query: trimmed,
+                                                           profile: route.profile, limit: 20)
         else { return [] }
         return hits.map { hit in
             var tagged = hit
@@ -436,30 +483,34 @@ extension AppModel {
     /// `session_id` is the DURABLE key (the envelope's is the runtime sid —
     /// ws-protocol.md §5.3). Patches every list showing that row and keeps an
     /// overlay so a later refresh cannot regress to the untitled row.
-    public func applySessionTitle(_ event: GatewayEvent) {
+    public func applySessionTitle(_ event: GatewayEvent, sourceGatewayID: String? = nil) {
         guard event.type == "session.title" else { return }
         let stored = event.payload?["session_id"]?.stringValue ?? ""
         let title = (event.payload?["title"]?.stringValue ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !stored.isEmpty, !title.isEmpty else { return }
-        SessionsRuntime.shared.titles[stored] = title
+        let owner = botID(forSession: event.sessionID, sourceGatewayID: sourceGatewayID)
+            ?? chats.first(where: { botID, chat in
+                guard chat.storedSessionID == stored else { return false }
+                guard let sourceGatewayID else { return true }
+                return gatewayRoute(for: botID)?.gatewayID == sourceGatewayID
+            })?.key
+        guard let owner else { return }
+        SessionsRuntime.shared.titles[SessionsRuntime.key(botID: owner, sessionID: stored)] = title
 
         var patched = false
-        for (botID, chat) in chats {
-            guard let idx = chat.storedSessions.firstIndex(where: { $0.id == stored }) else { continue }
+        if let chat = chats[owner],
+           let idx = chat.storedSessions.firstIndex(where: { $0.id == stored }) {
             chat.storedSessions[idx].title = title
-            if var list = sessions[botID], let row = list.firstIndex(where: { $0.id == stored }) {
+            if var list = sessions[owner], let row = list.firstIndex(where: { $0.id == stored }) {
                 list[row].title = title
-                sessions[botID] = list
+                sessions[owner] = list
             }
             patched = true
         }
         guard !patched else { return }
         // A first-turn auto-title arrives before any list holds that row. Pull
         // the owning bot's list so the freshly named session shows up.
-        let owner = botID(forSession: event.sessionID)
-            ?? chats.first { $0.value.storedSessionID == stored }?.key
-        guard let owner else { return }
         Task { @MainActor in await self.refreshSessions(botID: owner) }
     }
 
@@ -491,7 +542,7 @@ extension AppModel {
         let runtime = SessionsRuntime.shared
         runtime.routerTask?.cancel()
         runtime.routerTask = nil
-        runtime.reset()
+        runtime.resetPrimaryScope()
         if let id = runtime.handlerID, let target = runtime.attachedClient {
             Task { await target.removeEventHandler(id) }
         }
@@ -499,15 +550,18 @@ extension AppModel {
         runtime.attachedClient = nil
     }
 
-    private func routeSessionEvent(_ event: GatewayEvent) {
+    func routeSessionEvent(_ event: GatewayEvent, sourceGatewayID: String? = nil) {
         switch event.type {
         case "session.title":
-            applySessionTitle(event)
+            applySessionTitle(event, sourceGatewayID: sourceGatewayID)
         case "sessions.changed":
             // Global broadcast, already floored at 2 s server-side. Only the
             // open bot's list is on screen, so refresh that one — and debounce
             // it, because a busy turn can trip the broadcast repeatedly.
             guard let botID = openBotID else { return }
+            if let sourceGatewayID, gatewayRoute(for: botID)?.gatewayID != sourceGatewayID {
+                return
+            }
             let runtime = SessionsRuntime.shared
             runtime.refreshTask?.cancel()
             runtime.refreshTask = Task { @MainActor [weak self] in
@@ -524,15 +578,24 @@ extension AppModel {
 
     private func dropSessionRow(_ id: String, botID: String) {
         let runtime = SessionsRuntime.shared
-        runtime.titles[id] = nil
-        runtime.previews[id] = nil
+        let key = SessionsRuntime.key(botID: botID, sessionID: id)
+        runtime.titles[key] = nil
+        runtime.previews[key] = nil
         if let chat = chats[botID] {
             chat.storedSessions.removeAll { $0.id == id }
             // The deleted row was this chat's binding: forget it so the next
             // open creates a fresh session instead of resuming a dead key.
             if chat.storedSessionID == id {
                 chat.storedSessionID = nil
-                if let sid = chat.sessionID { LiveRuntime.shared.sessionToBot.removeValue(forKey: sid) }
+                if let sid = chat.sessionID, let route = gatewayRoute(for: botID) {
+                    if route.gatewayID == LiveRuntime.shared.gatewayID {
+                        LiveRuntime.shared.sessionToBot.removeValue(forKey: sid)
+                    } else {
+                        LiveRuntime.shared.routedSessionToBot.removeValue(
+                            forKey: GatewaySessionRoute(gatewayID: route.gatewayID,
+                                                        sessionID: sid))
+                    }
+                }
                 chat.sessionID = nil
                 chat.messages = []
                 chat.isTyping = false
@@ -545,7 +608,7 @@ extension AppModel {
     }
 
     private func applyTitle(_ title: String, to id: String, botID: String) {
-        SessionsRuntime.shared.titles[id] = title
+        SessionsRuntime.shared.titles[SessionsRuntime.key(botID: botID, sessionID: id)] = title
         if let chat = chats[botID], let idx = chat.storedSessions.firstIndex(where: { $0.id == id }) {
             chat.storedSessions[idx].title = title
         }

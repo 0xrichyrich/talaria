@@ -83,7 +83,7 @@ public struct SessionsSheet: View {
         let stored = model.chats[botID]?.storedSessions ?? []
         let needle = trimmedQuery
         let rows: [Row] = stored.compactMap { session in
-            let preview = model.sessionPreview(session.id) ?? ""
+            let preview = model.sessionPreview(session.id, botID: botID) ?? ""
             guard needle.isEmpty
                     || session.title.lowercased().contains(needle)
                     || preview.lowercased().contains(needle) else { return nil }

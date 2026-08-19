@@ -12,6 +12,8 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         runtime.routedSessionToBot.removeAll()
         runtime.approvalSessions.removeAll()
         runtime.routedApprovalSessions.removeAll()
+        SessionsRuntime.shared.resetPrimaryScope()
+        SessionsRuntime.shared.resetRoutedScope(gatewayID: "homelab")
         super.tearDown()
     }
 
@@ -77,6 +79,39 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         XCTAssertTrue(runtime.sessionToBot.isEmpty)
         XCTAssertEqual(runtime.routedSessionToBot[remote], "homelab::researcher")
         XCTAssertEqual(runtime.workingBotIDs, ["homelab::researcher"])
+    }
+
+    func testRemoteSessionTitleCannotPatchCollidingPrimaryStoredID() {
+        let model = AppModel()
+        model.mode = .live
+        let runtime = LiveRuntime.shared
+        runtime.gatewayID = "primary"
+        runtime.sessionToBot["deadbeef"] = "default"
+        runtime.routedSessionToBot[
+            GatewaySessionRoute(gatewayID: "homelab", sessionID: "deadbeef")
+        ] = "homelab::researcher"
+        model.chat(for: "default").storedSessions = [
+            SessionSummary(id: "same-row", title: "Primary", when: "now", messageCount: 1),
+        ]
+        model.chat(for: "homelab::researcher").storedSessions = [
+            SessionSummary(id: "same-row", title: "Remote", when: "now", messageCount: 1),
+        ]
+
+        let event = GatewayEvent(type: "session.title", sessionID: "deadbeef",
+                                 payload: .object([
+                                    "session_id": .string("same-row"),
+                                    "title": .string("Remote renamed"),
+                                 ]))
+        model.applySessionTitle(event, sourceGatewayID: "homelab")
+
+        XCTAssertEqual(model.chat(for: "default").storedSessions[0].title, "Primary")
+        XCTAssertEqual(model.chat(for: "homelab::researcher").storedSessions[0].title,
+                       "Remote renamed")
+        XCTAssertNil(SessionsRuntime.shared.titles[
+            SessionsRuntime.key(botID: "default", sessionID: "same-row")])
+        XCTAssertEqual(SessionsRuntime.shared.titles[
+            SessionsRuntime.key(botID: "homelab::researcher", sessionID: "same-row")],
+                       "Remote renamed")
     }
 }
 #endif

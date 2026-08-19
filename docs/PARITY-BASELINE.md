@@ -104,7 +104,8 @@ Multi-connection implementation checkpoints:
       session routing, including colliding short session ids.
 - [x] Open, send, steer, stop, react, and change session controls for foreign
       bots without changing the primary connection.
-- [ ] Source-qualified stored-session browsing and lifecycle actions.
+- [x] Source-qualified stored-session list/open/rename/delete/branch/compress/
+      export/search and title events, with collision-safe caches.
 - [ ] Source-qualified approvals, unread state, routines, capabilities, and mutations.
 
 ## Crash-recovery snapshot disposition

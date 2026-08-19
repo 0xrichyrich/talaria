@@ -113,6 +113,7 @@ public extension AppModel {
                 guard let self else { return }
                 self.handle(event: event, sourceGatewayID: gatewayID)
                 self.routeToolEvent(event, sourceGatewayID: gatewayID)
+                self.routeSessionEvent(event, sourceGatewayID: gatewayID)
             }
         }
         runtime.routedEvents[gatewayID] = MultiGatewayRuntime.RoutedEvents(
@@ -127,6 +128,7 @@ public extension AppModel {
         }
         LiveRuntime.shared.resetRoutedState(gatewayID: gatewayID)
         CanonicalChatRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
+        SessionsRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
     }
 
     // MARK: - The union roster
