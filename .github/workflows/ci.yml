@@ -46,6 +46,9 @@ jobs:
       - name: swift build
         run: swift build
 
+      - name: Swift tests
+        run: swift test
+
       - name: Protocol checks
         run: swift run talaria-verify
 
