@@ -25,5 +25,6 @@ let package = Package(
         .target(name: "TalariaUI", dependencies: ["TalariaKit", "TalariaTheme"]),
         .executableTarget(name: "TalariaVerify", dependencies: ["TalariaKit"]),
         .testTarget(name: "TalariaKitTests", dependencies: ["TalariaKit"]),
+        .testTarget(name: "TalariaUITests", dependencies: ["TalariaUI", "TalariaKit"]),
     ]
 )

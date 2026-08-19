@@ -95,6 +95,15 @@ written.
 - [ ] Certify the complete matrix against the pinned gateway and document only
       the remaining true platform exceptions.
 
+Multi-connection implementation checkpoints:
+
+- [x] Canonical source-qualified bot identity with fail-closed bare-name resolution.
+- [x] Coalescing, retryable authenticated client pool shared by primary and
+      secondary roster connections.
+- [ ] Source-qualified chat/session state and event routing.
+- [ ] Open and message foreign bots without changing the primary connection.
+- [ ] Source-qualified approvals, unread state, routines, capabilities, and mutations.
+
 ## Crash-recovery snapshot disposition
 
 Commit `3139626a73b2e41bce0c3ef6e5dfa15b0817f5c6` is recovery material, not an

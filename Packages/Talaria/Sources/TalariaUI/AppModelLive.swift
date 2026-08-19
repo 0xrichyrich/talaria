@@ -41,6 +41,9 @@ final class LiveRuntime {
     /// Normalized base URL of the connected gateway (mirror of the client's,
     /// readable without hopping onto its actor).
     var baseURL: URL?
+    /// Saved-connection id of the primary client. Secondary clients use the
+    /// same id key in `GatewayClientPool`.
+    var gatewayID: String?
 
     /// Bumped on every (re)connect + teardown; stale monitors check it.
     var generation = 0
@@ -91,7 +94,13 @@ extension AppModel {
         // the old socket closes, so the pairing watch can still surrender its
         // handler to the client that owns it.
         dropPerGatewayCaches()
-        if let old = client { await old.disconnect() }
+        let registry = ConnectionRegistry.shared
+        if let oldGatewayID = runtime.gatewayID {
+            await registry.clientPool.disconnect(gatewayID: oldGatewayID)
+        } else if let old = client {
+            await old.disconnect()
+        }
+        runtime.gatewayID = nil
 
         let client = GatewayClient(baseURL: baseURL, credential: credential)
         self.client = client
@@ -119,8 +128,15 @@ extension AppModel {
         mode = .live
         isOffline = false
 
-        let registry = ConnectionRegistry.shared
-        registry.upsert(urlString: baseURL.absoluteString, credential: credential)
+        guard let savedGateway = registry.upsert(urlString: baseURL.absoluteString,
+                                                 credential: credential) else {
+            await client.disconnect()
+            self.client = nil
+            runtime.baseURL = nil
+            throw AuthError.protocolError("connected gateway could not be registered")
+        }
+        runtime.gatewayID = savedGateway.id
+        await registry.clientPool.adopt(client, for: savedGateway.id)
         registry.noteState(.connected, forURL: baseURL)
 
         startDisconnectMonitor(for: client)
@@ -144,11 +160,16 @@ extension AppModel {
         runtime.monitorTask?.cancel(); runtime.monitorTask = nil
         runtime.eventPump?.cancel(); runtime.eventPump = nil
         runtime.resetSessionState()
-        if let client { await client.disconnect() }
+        if let gatewayID = runtime.gatewayID {
+            await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gatewayID)
+        } else if let client {
+            await client.disconnect()
+        }
         if let base = runtime.baseURL {
             ConnectionRegistry.shared.noteState(.offline, forURL: base)
         }
         runtime.baseURL = nil
+        runtime.gatewayID = nil
         // No gateway, no scope: with the key cleared the store records nothing
         // until a connection names one again, so a disconnected app can never
         // write a mark into the departed gateway's bucket.
