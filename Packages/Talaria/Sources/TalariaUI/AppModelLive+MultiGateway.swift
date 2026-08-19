@@ -120,12 +120,17 @@ public extension AppModel {
     /// Subscribe once to a secondary gateway and retain source information on
     /// every event. An AsyncStream pump preserves the order in which the
     /// GatewayClient fan-out delivered deltas.
-    func attachRoutedEventsIfNeeded(client: GatewayClient, gatewayID: String) async {
+    func attachRoutedEventsIfNeeded(client: GatewayClient, gatewayID: String,
+                                    preserveStateOnReplacement: Bool = false) async {
         guard gatewayID != activeGatewayID else { return }
         let runtime = MultiGatewayRuntime.shared
         if let existing = runtime.routedEvents[gatewayID],
            ObjectIdentifier(existing.client) == ObjectIdentifier(client) { return }
-        await detachRoutedEvents(gatewayID: gatewayID)
+        if preserveStateOnReplacement, runtime.routedEvents[gatewayID] == nil {
+            await removeRoutedEventSubscription(gatewayID: gatewayID)
+        } else {
+            await detachRoutedEvents(gatewayID: gatewayID)
+        }
 
         let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
         let handlerID = await client.addEventHandler { continuation.yield($0) }
@@ -136,6 +141,7 @@ public extension AppModel {
                 self.handleBridgeEvent(event, sourceGatewayID: gatewayID)
                 self.routeToolEvent(event, sourceGatewayID: gatewayID)
                 self.routeSessionEvent(event, sourceGatewayID: gatewayID)
+                self.routePetEvent(event, sourceGatewayID: gatewayID)
             }
         }
         runtime.routedEvents[gatewayID] = MultiGatewayRuntime.RoutedEvents(
@@ -145,18 +151,23 @@ public extension AppModel {
     }
 
     func detachRoutedEvents(gatewayID: String) async {
+        await removeRoutedEventSubscription(gatewayID: gatewayID)
+        dropApprovalScope(gatewayID: gatewayID)
+        dropRoutineScope(gatewayID: gatewayID)
+        dropCapabilityScope(gatewayID: gatewayID)
+        ProfileAssetStore.shared.drop(gatewayID: gatewayID)
+        dropPetScope(gatewayID: gatewayID)
+        LiveRuntime.shared.resetRoutedState(gatewayID: gatewayID)
+        CanonicalChatRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
+        SessionsRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
+    }
+
+    private func removeRoutedEventSubscription(gatewayID: String) async {
         if let subscription = MultiGatewayRuntime.shared.routedEvents.removeValue(
             forKey: gatewayID) {
             subscription.pump.cancel()
             await subscription.client.removeEventHandler(subscription.handlerID)
         }
-        dropApprovalScope(gatewayID: gatewayID)
-        dropRoutineScope(gatewayID: gatewayID)
-        dropCapabilityScope(gatewayID: gatewayID)
-        ProfileAssetStore.shared.drop(gatewayID: gatewayID)
-        LiveRuntime.shared.resetRoutedState(gatewayID: gatewayID)
-        CanonicalChatRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
-        SessionsRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
     }
 
     // MARK: - The union roster

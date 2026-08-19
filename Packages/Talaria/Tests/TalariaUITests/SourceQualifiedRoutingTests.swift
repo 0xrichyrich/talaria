@@ -26,6 +26,7 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         CronDetailRuntime.shared.changeTick = 0
         CapabilityRuntime.shared.states.removeAll()
         ProfileAssetStore.shared.flush()
+        PetRuntime.shared.reset()
         SessionsRuntime.shared.resetPrimaryScope()
         SessionsRuntime.shared.resetRoutedScope(gatewayID: "homelab")
         super.tearDown()
@@ -497,6 +498,74 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         let invalidPin = ProfileEdit(model: "model-a")
         XCTAssertFalse(invalidPin.isWireValid)
         XCTAssertFalse(invalidPin.wasFullyApplied([:]))
+    }
+
+    func testCollidingPetProfilesKeepDistinctGatewayState() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let primary = model.pets(for: "default")
+        let remote = model.pets(for: "homelab::default")
+
+        XCTAssertFalse(primary === remote)
+        XCTAssertEqual(primary.target, PetTarget(gatewayID: "primary", profile: "default"))
+        XCTAssertEqual(remote.target, PetTarget(gatewayID: "homelab", profile: "default"))
+        XCTAssertNotEqual(primary.target?.stateKey, remote.target?.stateKey)
+    }
+
+    func testPetUnsupportedCapabilityIsScopedToItsGateway() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        PetRuntime.shared.unsupportedGateways.insert("homelab")
+
+        XCTAssertTrue(model.pets(for: "default").supported)
+        XCTAssertFalse(model.pets(for: "homelab::default").supported)
+    }
+
+    func testPetGatewayDetachScrubsOnlyOwningSource() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let primary = model.pets(for: "default")
+        let remote = model.pets(for: "homelab::default")
+        primary.hasLoaded = true
+        remote.hasLoaded = true
+        remote.notice = "private remote failure"
+        remote.busy.insert("select:fox")
+        let primaryKey = primary.target!.stateKey
+        let remoteKey = remote.target!.stateKey
+        PetRuntime.shared.loadIDs[primaryKey] = UUID()
+        PetRuntime.shared.loadIDs[remoteKey] = UUID()
+        PetRuntime.shared.refreshTasks["primary"] = Task {}
+        PetRuntime.shared.refreshTasks["homelab"] = Task {}
+
+        model.dropPetScope(gatewayID: "homelab")
+
+        XCTAssertTrue(PetRuntime.shared.states[primaryKey] === primary)
+        XCTAssertNil(PetRuntime.shared.states[remoteKey])
+        XCTAssertTrue(primary.hasLoaded)
+        XCTAssertFalse(remote.hasLoaded)
+        XCTAssertNil(remote.notice)
+        XCTAssertTrue(remote.busy.isEmpty)
+        XCTAssertNotNil(PetRuntime.shared.loadIDs[primaryKey])
+        XCTAssertNil(PetRuntime.shared.loadIDs[remoteKey])
+        XCTAssertNotNil(PetRuntime.shared.refreshTasks["primary"])
+        XCTAssertNil(PetRuntime.shared.refreshTasks["homelab"])
+    }
+
+    func testPetGenerationProgressRequiresOwningGateway() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let remote = model.pets(for: "homelab::default")
+        remote.generation.phase = .drafting
+        PetRuntime.shared.generatingProfile = remote.target!.stateKey
+        let event = GatewayEvent(type: "pet.generate.progress", sessionID: "",
+                                 payload: .object(["token": .string("remote-token"),
+                                                   "count": .number(4)]))
+
+        model.routePetEvent(event, sourceGatewayID: "primary")
+        XCTAssertTrue(remote.generation.token.isEmpty)
+        model.routePetEvent(event, sourceGatewayID: "homelab")
+        XCTAssertEqual(remote.generation.token, "remote-token")
+        XCTAssertEqual(remote.generation.expectedDrafts, 4)
     }
 
     func testRoutineGatewayDetachPreservesOtherGatewayRows() {

@@ -42,6 +42,16 @@ import TalariaTheme
 
 // MARK: - Per-profile state
 
+struct PetTarget: Hashable, Sendable {
+    var gatewayID: String
+    var profile: String?
+
+    var stateKey: String {
+        if let profile { return "pet:\(gatewayID.count):\(gatewayID)\(profile)" }
+        return "pet-launch:\(gatewayID.count):\(gatewayID)"
+    }
+}
+
 /// One profile's pet surface: the active mascot, the picker's gallery, and the
 /// generate → hatch flow. `AppModel`'s stored properties live in AppModel.swift
 /// (another owner) and extensions cannot add storage, so these hang off a
@@ -51,6 +61,7 @@ import TalariaTheme
 public final class PetSurfaceState {
     /// Profile (bot id) this pet belongs to. Empty = the gateway's launch profile.
     public internal(set) var profile: String = ""
+    @ObservationIgnored var target: PetTarget?
 
     /// False once the gateway has answered -32601 for the pet surface: it is
     /// older than pets, and nothing pet-shaped is ever shown again.
@@ -148,6 +159,18 @@ public final class PetSurfaceState {
         hatchedPet = nil
         hatchedSheet = nil
     }
+
+    func resetForDetach() {
+        clearActive()
+        gallery = PetGallerySnapshot()
+        thumbnails.removeAll()
+        generation = PetGenerationState()
+        clearHatched()
+        isLoading = false
+        hasLoaded = false
+        notice = nil
+        busy.removeAll()
+    }
 }
 
 // MARK: - Runtime (side table)
@@ -160,10 +183,10 @@ final class PetRuntime {
 
     var states: [String: PetSurfaceState] = [:]
 
-    /// The gateway answered -32601 once: no profile asks again.
-    var unsupported = false
+    /// Gateways that answered -32601 once: only that source stops probing.
+    var unsupportedGateways: Set<String> = []
 
-    /// Decoded atlases keyed "<gateway>|<revision>". Two gateways can both
+    /// Decoded atlases keyed by a length-prefixed gateway id plus revision. Two gateways can both
     /// serve a pet whose revision string ("<mtime_ns>:<size>") happens to
     /// match, and one must never wear the other's sprite.
     private var sheets: [String: PetSpriteSheet] = [:]
@@ -174,37 +197,43 @@ final class PetRuntime {
     static let sheetCacheLimit = 3
 
     weak var attachedClient: GatewayClient?
+    var attachedGatewayID: String?
     var handlerID: UUID?
     var routerTask: Task<Void, Never>?
-    /// Debounce for the `pet.changed` broadcast.
-    var refreshTask: Task<Void, Never>?
+    /// Debounce for each gateway's `pet.changed` broadcast. One noisy source
+    /// must not cancel another source's refresh.
+    var refreshTasks: [String: Task<Void, Never>] = [:]
     /// Per-profile refreshes, so a roster of six working bots collapses onto
     /// one call each rather than one per row repaint.
     var loads: [String: Task<Void, Never>] = [:]
+    /// Generation token for each load slot. A cancelled task from an old
+    /// connection must not clear a replacement connection's in-flight load.
+    var loadIDs: [String: UUID] = [:]
 
     /// The profile whose generate/hatch run owns the progress events. The
     /// generation RPCs are gateway-global, so only one run exists at a time.
     var generatingProfile: String?
     var runTask: Task<Void, Never>?
+    var runID: UUID?
     /// The user pressed Stop: the RPC's "cancelled" error is an outcome, not a
     /// failure, and must not raise a notice.
     var cancelled = false
 
-    private func key(_ revision: String) -> String {
-        (LiveRuntime.shared.baseURL?.absoluteString ?? "local") + "|" + revision
+    private func key(gatewayID: String, revision: String) -> String {
+        "pet-sheet:\(gatewayID.count):\(gatewayID)\(revision)"
     }
 
-    func sheet(revision: String) -> PetSpriteSheet? {
+    func sheet(gatewayID: String, revision: String) -> PetSpriteSheet? {
         guard !revision.isEmpty else { return nil }
-        let id = key(revision)
+        let id = key(gatewayID: gatewayID, revision: revision)
         guard let hit = sheets[id] else { return nil }
         touch(id)
         return hit
     }
 
-    func store(_ sheet: PetSpriteSheet) {
+    func store(_ sheet: PetSpriteSheet, gatewayID: String) {
         guard !sheet.revision.isEmpty else { return }
-        let id = key(sheet.revision)
+        let id = key(gatewayID: gatewayID, revision: sheet.revision)
         sheets[id] = sheet
         touch(id)
         while recency.count > Self.sheetCacheLimit, let oldest = recency.first {
@@ -224,13 +253,43 @@ final class PetRuntime {
         states.removeAll()
         sheets.removeAll()
         recency.removeAll()
-        unsupported = false
+        unsupportedGateways.removeAll()
         generatingProfile = nil
+        attachedGatewayID = nil
         cancelled = false
-        refreshTask?.cancel(); refreshTask = nil
+        for task in refreshTasks.values { task.cancel() }
+        refreshTasks.removeAll()
         runTask?.cancel(); runTask = nil
+        runID = nil
         for task in loads.values { task.cancel() }
         loads.removeAll()
+        loadIDs.removeAll()
+    }
+
+    func drop(gatewayID: String) {
+        let stateKeys = states.compactMap { key, state in
+            state.target?.gatewayID == gatewayID ? key : nil
+        }
+        if let generatingProfile, stateKeys.contains(generatingProfile) {
+            runTask?.cancel()
+            runTask = nil
+            runID = nil
+            self.generatingProfile = nil
+            cancelled = true
+        }
+        for key in stateKeys {
+            states[key]?.resetForDetach()
+            states.removeValue(forKey: key)
+            loads[key]?.cancel()
+            loads.removeValue(forKey: key)
+            loadIDs.removeValue(forKey: key)
+        }
+        refreshTasks[gatewayID]?.cancel()
+        refreshTasks.removeValue(forKey: gatewayID)
+        let sheetPrefix = "pet-sheet:\(gatewayID.count):\(gatewayID)"
+        sheets = sheets.filter { !$0.key.hasPrefix(sheetPrefix) }
+        recency.removeAll { $0.hasPrefix(sheetPrefix) }
+        unsupportedGateways.remove(gatewayID)
     }
 }
 
@@ -238,14 +297,64 @@ final class PetRuntime {
 
 extension AppModel {
 
+    internal func petTarget(profileID: String?) -> PetTarget? {
+        if let profileID, let route = GatewayBotRoute(qualifiedID: profileID) {
+            return PetTarget(gatewayID: route.gatewayID, profile: route.profile)
+        }
+        guard let gatewayID = LiveRuntime.shared.gatewayID else { return nil }
+        let profile = profileID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return PetTarget(gatewayID: gatewayID,
+                         profile: profile?.isEmpty == false ? profile : nil)
+    }
+
+    private func petContext(profileID: String?, state: PetSurfaceState) async
+        -> (target: PetTarget, client: GatewayClient)? {
+        guard let target = state.target,
+              petTarget(profileID: profileID) == target,
+              PetRuntime.shared.states[target.stateKey] === state,
+              !PetRuntime.shared.unsupportedGateways.contains(target.gatewayID) else {
+            return nil
+        }
+        guard let client = try? await routedClient(gatewayID: target.gatewayID) else {
+            return nil
+        }
+        await attachRoutedEventsIfNeeded(client: client, gatewayID: target.gatewayID,
+                                         preserveStateOnReplacement: true)
+        guard petStateIsCurrent(state, profileID: profileID, target: target) else {
+            return nil
+        }
+        return (target, client)
+    }
+
+    private func petStateIsCurrent(_ state: PetSurfaceState, profileID: String?,
+                                   target: PetTarget) -> Bool {
+        petTarget(profileID: profileID) == target
+            && PetRuntime.shared.states[target.stateKey] === state
+    }
+
+    private func petProfileID(for target: PetTarget) -> String? {
+        target.profile.map {
+            GatewayBotRoute(gatewayID: target.gatewayID, profile: $0).qualifiedID
+        }
+    }
+
+    internal func dropPetScope(gatewayID: String) {
+        PetRuntime.shared.drop(gatewayID: gatewayID)
+    }
+
     /// The (memoized) pet store for a profile. Pass nil for the gateway's
     /// launch profile.
     public func pets(for profile: String?) -> PetSurfaceState {
-        let key = profile ?? ""
+        let target = petTarget(profileID: profile)
+        let key = target?.stateKey ?? "pet-demo:\(profile ?? "")"
         if let existing = PetRuntime.shared.states[key] { return existing }
         let fresh = PetSurfaceState()
-        fresh.profile = key
-        if PetRuntime.shared.unsupported { fresh.supported = false }
+        fresh.profile = target?.profile ?? profile ?? ""
+        fresh.target = target
+        if let target,
+           PetRuntime.shared.unsupportedGateways.contains(target.gatewayID) {
+            fresh.supported = false
+        }
         PetRuntime.shared.states[key] = fresh
         return fresh
     }
@@ -264,9 +373,9 @@ extension AppModel {
     /// `pet.changed` broadcast keeps it fresh after that.
     public func ensurePet(for botID: String) async {
         let state = pets(for: botID)
-        guard mode == .live, state.supported, !PetRuntime.shared.unsupported,
-              !state.hasLoaded else { return }
-        await refreshPet(profile: botID)
+        guard mode == .live, state.supported, !state.hasLoaded else { return }
+        guard let target = state.target else { return }
+        await refreshPet(profile: petProfileID(for: target))
     }
 
     /// Which animation row a bot's live state maps to (`derive_pet_state`).
@@ -283,16 +392,20 @@ extension AppModel {
     /// main pump in AppModelLive drops all three. Idempotent per client; call
     /// after every connect.
     public func attachPetEventRouter() {
-        guard mode == .live, let client else { return }
+        guard mode == .live, let client,
+              let gatewayID = LiveRuntime.shared.gatewayID else { return }
         let runtime = PetRuntime.shared
         if runtime.routerTask != nil, runtime.attachedClient === client { return }
         detachPetEventRouter()
         runtime.attachedClient = client
+        runtime.attachedGatewayID = gatewayID
         // One AsyncStream so MainActor delivery preserves wire order: a draft
         // must never land before the token-only event that keys it.
         let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
         runtime.routerTask = Task { @MainActor [weak self] in
-            for await event in stream { self?.routePetEvent(event) }
+            for await event in stream {
+                self?.routePetEvent(event, sourceGatewayID: gatewayID)
+            }
         }
         Task {
             let id = await client.addEventHandler { continuation.yield($0) }
@@ -310,10 +423,13 @@ extension AppModel {
         }
         runtime.handlerID = nil
         runtime.attachedClient = nil
-        runtime.reset()
+        if let gatewayID = runtime.attachedGatewayID {
+            runtime.drop(gatewayID: gatewayID)
+        }
+        runtime.attachedGatewayID = nil
     }
 
-    private func routePetEvent(_ event: GatewayEvent) {
+    internal func routePetEvent(_ event: GatewayEvent, sourceGatewayID: String) {
         switch event.type {
         case "pet.changed":
             // The payload is meta-shaped but speaks for the gateway's launch
@@ -321,20 +437,29 @@ extension AppModel {
             // pet is on screen re-reads its own cheap meta. Debounced — the
             // watcher floors it at 2 s but a select + scale lands twice.
             let runtime = PetRuntime.shared
-            runtime.refreshTask?.cancel()
-            runtime.refreshTask = Task { @MainActor [weak self] in
+            runtime.refreshTasks[sourceGatewayID]?.cancel()
+            runtime.refreshTasks[sourceGatewayID] = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(400))
                 guard !Task.isCancelled, let self else { return }
-                for (key, state) in PetRuntime.shared.states where state.hasLoaded {
-                    await self.refreshPet(profile: key.isEmpty ? nil : key)
+                let targets = PetRuntime.shared.states.values.compactMap { state -> PetTarget? in
+                    guard state.hasLoaded,
+                          state.target?.gatewayID == sourceGatewayID else { return nil }
+                    return state.target
+                }
+                for target in targets {
+                    let profileID = target.profile.map {
+                        GatewayBotRoute(gatewayID: sourceGatewayID, profile: $0).qualifiedID
+                    }
+                    await self.refreshPet(profile: profileID)
                 }
             }
 
         case "pet.generate.progress":
-            ingestDraft(event.payload)
+            ingestDraft(event.payload, sourceGatewayID: sourceGatewayID)
 
         case "pet.hatch.progress":
-            generatingSurface?.generation.progress = PetHatchProgress(event.payload)
+            generatingSurface(sourceGatewayID: sourceGatewayID)?
+                .generation.progress = PetHatchProgress(event.payload)
 
         default:
             break
@@ -343,16 +468,18 @@ extension AppModel {
 
     /// The surface that started the in-flight run, if it is still hatching or
     /// drafting. Progress for a run nobody is watching is dropped.
-    private var generatingSurface: PetSurfaceState? {
+    private func generatingSurface(sourceGatewayID: String) -> PetSurfaceState? {
         guard let key = PetRuntime.shared.generatingProfile,
-              let state = PetRuntime.shared.states[key], state.generation.isBusy else { return nil }
+              let state = PetRuntime.shared.states[key],
+              state.target?.gatewayID == sourceGatewayID,
+              state.generation.isBusy else { return nil }
         return state
     }
 
     /// One `pet.generate.progress` beat: `{token, count}` on its own for the
     /// init event, then `{token, index, dataUri, count}` per draft.
-    private func ingestDraft(_ payload: JSONValue?) {
-        guard let state = generatingSurface else { return }
+    private func ingestDraft(_ payload: JSONValue?, sourceGatewayID: String) {
+        guard let state = generatingSurface(sourceGatewayID: sourceGatewayID) else { return }
         if let token = payload?["token"]?.stringValue, !token.isEmpty {
             state.generation.token = token
         }
@@ -379,13 +506,16 @@ extension AppModel {
     /// the picker, since that is where it gets switched back on).
     public func probePets(profile: String?) async {
         let state = pets(for: profile)
-        await refreshPet(profile: profile)
-        guard state.supported else { return }
+        guard let target = state.target else { return }
+        let pinnedProfile = petProfileID(for: target)
+        await refreshPet(profile: pinnedProfile)
+        guard petStateIsCurrent(state, profileID: profile, target: target),
+              state.supported else { return }
         if !state.enabled, state.gallery.pets.isEmpty {
-            await loadPetGallery(profile: profile, localOnly: true)
+            await loadPetGallery(profile: pinnedProfile, localOnly: true)
         }
         if !state.generation.available {
-            await refreshPetGenerateStatus(profile: profile)
+            await refreshPetGenerateStatus(profile: pinnedProfile)
         }
     }
 
@@ -399,42 +529,57 @@ extension AppModel {
     /// revision we hold so the gateway can answer `spritesheetUnchanged`
     /// rather than shipping megabytes.
     public func refreshPet(profile: String?) async {
-        let key = profile ?? ""
+        let state = pets(for: profile)
+        let key = state.target?.stateKey ?? "pet-demo:\(profile ?? "")"
         if let inflight = PetRuntime.shared.loads[key] {
             await inflight.value
             return
         }
+        let loadID = UUID()
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.performPetRefresh(profile: profile)
         }
+        PetRuntime.shared.loadIDs[key] = loadID
         PetRuntime.shared.loads[key] = task
         await task.value
-        PetRuntime.shared.loads[key] = nil
+        if PetRuntime.shared.loadIDs[key] == loadID {
+            PetRuntime.shared.loads[key] = nil
+            PetRuntime.shared.loadIDs[key] = nil
+        }
     }
 
     private func performPetRefresh(profile: String?) async {
         let state = pets(for: profile)
-        guard mode == .live, let client, !PetRuntime.shared.unsupported else {
+        guard mode == .live else {
             // Demo mode: no sheet to draw and no gateway to ask. The surface
             // stays absent rather than faked.
-            if mode != .live { state.markUnsupported() }
+            state.markUnsupported()
             state.hasLoaded = true
             return
         }
-        let scope = petScope(profile)
+        guard let context = await petContext(profileID: profile, state: state) else {
+            state.hasLoaded = true
+            return
+        }
         state.isLoading = true
         defer {
             state.isLoading = false
-            state.hasLoaded = true
+            if petStateIsCurrent(state, profileID: profile, target: context.target) {
+                state.hasLoaded = true
+            }
         }
 
         let meta: PetMeta
-        switch await Self.probe({ try await client.petInfoMeta(profile: scope) }) {
+        let metaProbe = await Self.probe({
+            try await context.client.petInfoMeta(profile: context.target.profile)
+        })
+        guard petStateIsCurrent(state, profileID: profile, target: context.target) else { return }
+        switch metaProbe {
         case .value(let value):
             meta = value
         case .unsupported:
-            markPetsUnsupported()
+            markPetsUnsupported(gatewayID: context.target.gatewayID)
             return
         case .failed(let message):
             state.notice = message
@@ -449,24 +594,32 @@ extension AppModel {
         }
         // Cache hit — the bitmap for this revision is already decoded, so the
         // whole refresh cost one small RPC.
-        if let cached = PetRuntime.shared.sheet(revision: meta.revision) {
+        if let cached = PetRuntime.shared.sheet(gatewayID: context.target.gatewayID,
+                                                revision: meta.revision) {
             state.apply(meta: meta, sheet: cached)
             return
         }
         // Cache miss. `knownRevision` is tied to the bitmap actually held, not
         // to the metadata, so "unchanged" always means we can keep drawing.
         let known = state.sheet?.revision ?? ""
-        switch await Self.probe({ try await client.petInfo(profile: scope, knownRevision: known) }) {
+        let infoProbe = await Self.probe({
+            try await context.client.petInfo(profile: context.target.profile,
+                                             knownRevision: known)
+        })
+        guard petStateIsCurrent(state, profileID: profile, target: context.target) else { return }
+        switch infoProbe {
         case .value(let payload):
-            await applyPetInfo(payload, to: state)
+            await applyPetInfo(payload, to: state, profileID: profile, target: context.target)
         case .unsupported:
-            markPetsUnsupported()
+            markPetsUnsupported(gatewayID: context.target.gatewayID)
         case .failed(let message):
             state.notice = message
         }
     }
 
-    private func applyPetInfo(_ payload: PetInfoPayload, to state: PetSurfaceState) async {
+    private func applyPetInfo(_ payload: PetInfoPayload, to state: PetSurfaceState,
+                              profileID: String?, target: PetTarget) async {
+        guard petStateIsCurrent(state, profileID: profileID, target: target) else { return }
         guard payload.enabled, let pet = payload.pet else {
             state.clearActive()
             return
@@ -484,7 +637,8 @@ extension AppModel {
             state.clearActive()
             return
         }
-        PetRuntime.shared.store(sheet)
+        guard petStateIsCurrent(state, profileID: profileID, target: target) else { return }
+        PetRuntime.shared.store(sheet, gatewayID: target.gatewayID)
         state.apply(pet: pet, sheet: sheet)
     }
 
@@ -498,16 +652,12 @@ extension AppModel {
         }.value
     }
 
-    private func markPetsUnsupported() {
-        PetRuntime.shared.unsupported = true
-        for state in PetRuntime.shared.states.values { state.markUnsupported() }
-    }
-
-    /// `nil` means the gateway's launch profile, which is a real value — an
-    /// empty string is not, and must never ride the wire.
-    private func petScope(_ profile: String?) -> String? {
-        guard let profile, !profile.isEmpty else { return nil }
-        return profile
+    private func markPetsUnsupported(gatewayID: String) {
+        PetRuntime.shared.unsupportedGateways.insert(gatewayID)
+        for state in PetRuntime.shared.states.values
+            where state.target?.gatewayID == gatewayID {
+            state.markUnsupported()
+        }
     }
 
     // MARK: - Gallery
@@ -518,11 +668,14 @@ extension AppModel {
     /// which usually hits the manifest cache the first call warmed.
     public func loadPetGallery(profile: String?, localOnly: Bool = false) async {
         let state = pets(for: profile)
-        guard mode == .live, let client, state.supported,
-              !PetRuntime.shared.unsupported else { return }
-        switch await Self.probe({
-            try await client.petGallery(profile: petScope(profile), localOnly: localOnly)
-        }) {
+        guard mode == .live, state.supported,
+              let context = await petContext(profileID: profile, state: state) else { return }
+        let result = await Self.probe({
+            try await context.client.petGallery(profile: context.target.profile,
+                                                localOnly: localOnly)
+        })
+        guard petStateIsCurrent(state, profileID: profile, target: context.target) else { return }
+        switch result {
         case .value(let snapshot):
             // A local-only pass must not blank a fuller list already on screen.
             guard !localOnly || snapshot.pets.count >= state.gallery.pets.count
@@ -534,7 +687,7 @@ extension AppModel {
             state.gallery = snapshot
             state.notice = nil
         case .unsupported:
-            markPetsUnsupported()
+            markPetsUnsupported(gatewayID: context.target.gatewayID)
         case .failed(let message):
             state.notice = message
         }
@@ -542,8 +695,11 @@ extension AppModel {
 
     /// Both passes, in the order that paints fastest.
     public func loadPetGalleryProgressively(profile: String?) async {
-        await loadPetGallery(profile: profile, localOnly: true)
-        await loadPetGallery(profile: profile, localOnly: false)
+        let state = pets(for: profile)
+        guard let target = state.target else { return }
+        let pinnedProfile = petProfileID(for: target)
+        await loadPetGallery(profile: pinnedProfile, localOnly: true)
+        await loadPetGallery(profile: pinnedProfile, localOnly: false)
     }
 
     /// A cropped idle-frame PNG for one gallery row, memoized per slug. The
@@ -553,15 +709,20 @@ extension AppModel {
     public func loadPetThumbnail(_ entry: PetGalleryEntry, profile: String?) async -> Data? {
         let state = pets(for: profile)
         if let cached = state.thumbnails[entry.slug] { return cached }
-        guard mode == .live, let client, state.supported else { return nil }
+        guard mode == .live, state.supported,
+              let context = await petContext(profileID: profile, state: state) else { return nil }
         let key = "thumb:\(entry.slug)"
         guard state.busy.insert(key).inserted else { return nil }
         defer { state.busy.remove(key) }
         // `url` is only meaningful for a pet that isn't installed yet: the
         // gateway fetches the manifest sheet so the phone never talks to the CDN.
-        let data = try? await client.petThumbnail(slug: entry.slug,
-                                                  url: entry.installed ? "" : entry.spritesheetURL,
-                                                  profile: petScope(profile))
+        let data = try? await context.client.petThumbnail(
+            slug: entry.slug,
+            url: entry.installed ? "" : entry.spritesheetURL,
+            profile: context.target.profile)
+        guard petStateIsCurrent(state, profileID: profile, target: context.target) else {
+            return nil
+        }
         guard let data else { return nil }
         state.thumbnails[entry.slug] = data
         return data
@@ -573,12 +734,17 @@ extension AppModel {
     @discardableResult
     public func selectPet(slug: String, profile: String?) async -> Bool {
         let state = pets(for: profile)
-        guard mode == .live, let client, !slug.isEmpty else { return false }
+        guard mode == .live, !slug.isEmpty,
+              let context = await petContext(profileID: profile, state: state) else { return false }
         let key = "select:\(slug)"
         state.busy.insert(key)
         defer { state.busy.remove(key) }
         do {
-            let mutation = try await client.petSelect(slug: slug, profile: petScope(profile))
+            let mutation = try await context.client.petSelect(
+                slug: slug, profile: context.target.profile)
+            guard petStateIsCurrent(state, profileID: profile, target: context.target) else {
+                return false
+            }
             guard mutation.ok else {
                 // The handler errors on a real failure, so this is the odd
                 // "installed nothing, said nothing" case — still not silence.
@@ -586,10 +752,14 @@ extension AppModel {
                 return false
             }
             state.notice = nil
-            await refreshPet(profile: profile)
-            await loadPetGallery(profile: profile, localOnly: true)
+            let pinnedProfile = petProfileID(for: context.target)
+            await refreshPet(profile: pinnedProfile)
+            await loadPetGallery(profile: pinnedProfile, localOnly: true)
             return true
         } catch {
+            guard petStateIsCurrent(state, profileID: profile, target: context.target) else {
+                return false
+            }
             state.notice = Self.shortMessage(error)
             return false
         }
@@ -601,22 +771,30 @@ extension AppModel {
     public func renamePet(slug: String, to name: String, profile: String?) async -> String? {
         let state = pets(for: profile)
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard mode == .live, let client, !slug.isEmpty, !trimmed.isEmpty else { return nil }
+        guard mode == .live, !slug.isEmpty, !trimmed.isEmpty,
+              let context = await petContext(profileID: profile, state: state) else { return nil }
         let key = "rename:\(slug)"
         state.busy.insert(key)
         defer { state.busy.remove(key) }
         do {
-            let mutation = try await client.petRename(slug: slug, name: trimmed,
-                                                      profile: petScope(profile))
+            let mutation = try await context.client.petRename(
+                slug: slug, name: trimmed, profile: context.target.profile)
+            guard petStateIsCurrent(state, profileID: profile, target: context.target) else {
+                return nil
+            }
             guard mutation.ok else {
                 state.notice = "pet.rename returned ok:false for \(slug)"
                 return nil
             }
             state.notice = nil
-            await refreshPet(profile: profile)
-            await loadPetGallery(profile: profile, localOnly: true)
+            let pinnedProfile = petProfileID(for: context.target)
+            await refreshPet(profile: pinnedProfile)
+            await loadPetGallery(profile: pinnedProfile, localOnly: true)
             return mutation.slug.isEmpty ? slug : mutation.slug
         } catch {
+            guard petStateIsCurrent(state, profileID: profile, target: context.target) else {
+                return nil
+            }
             state.notice = Self.shortMessage(error)
             return nil
         }
@@ -626,18 +804,26 @@ extension AppModel {
     /// the display off server-side, so nothing renders a missing sprite.
     public func removePet(slug: String, profile: String?) async {
         let state = pets(for: profile)
-        guard mode == .live, let client, !slug.isEmpty else { return }
+        guard mode == .live, !slug.isEmpty,
+              let context = await petContext(profileID: profile, state: state) else { return }
         let key = "remove:\(slug)"
         state.busy.insert(key)
         defer { state.busy.remove(key) }
         do {
-            try await client.petRemove(slug: slug, profile: petScope(profile))
+            try await context.client.petRemove(slug: slug, profile: context.target.profile)
+            guard petStateIsCurrent(state, profileID: profile, target: context.target) else {
+                return
+            }
             state.thumbnails.removeValue(forKey: slug)
             state.notice = nil
             if state.pet?.slug == slug { state.clearActive() }
-            await refreshPet(profile: profile)
-            await loadPetGallery(profile: profile, localOnly: true)
+            let pinnedProfile = petProfileID(for: context.target)
+            await refreshPet(profile: pinnedProfile)
+            await loadPetGallery(profile: pinnedProfile, localOnly: true)
         } catch {
+            guard petStateIsCurrent(state, profileID: profile, target: context.target) else {
+                return
+            }
             state.notice = Self.shortMessage(error)
         }
     }
@@ -645,15 +831,22 @@ extension AppModel {
     /// `display.pet.enabled = false`. Installed pets survive; nothing renders.
     public func disablePets(profile: String?) async {
         let state = pets(for: profile)
-        guard mode == .live, let client else { return }
+        guard mode == .live,
+              let context = await petContext(profileID: profile, state: state) else { return }
         state.busy.insert("disable")
         defer { state.busy.remove("disable") }
         do {
-            try await client.petDisable(profile: petScope(profile))
+            try await context.client.petDisable(profile: context.target.profile)
+            guard petStateIsCurrent(state, profileID: profile, target: context.target) else {
+                return
+            }
             state.clearActive()
             state.gallery.enabled = false
             state.notice = nil
         } catch {
+            guard petStateIsCurrent(state, profileID: profile, target: context.target) else {
+                return
+            }
             state.notice = Self.shortMessage(error)
         }
     }
@@ -669,14 +862,22 @@ extension AppModel {
         let state = pets(for: profile)
         let clamped = Pet.clampScale(value)
         state.setScale(clamped)
-        guard mode == .live, let client else { return }
+        guard mode == .live,
+              let context = await petContext(profileID: profile, state: state) else { return }
         state.busy.insert("scale")
         defer { state.busy.remove("scale") }
         do {
-            let applied = try await client.petScale(clamped, profile: petScope(profile))
+            let applied = try await context.client.petScale(
+                clamped, profile: context.target.profile)
+            guard petStateIsCurrent(state, profileID: profile, target: context.target) else {
+                return
+            }
             state.setScale(Pet.clampScale(applied))
             state.notice = nil
         } catch {
+            guard petStateIsCurrent(state, profileID: profile, target: context.target) else {
+                return
+            }
             state.notice = Self.shortMessage(error)
         }
     }
@@ -687,8 +888,11 @@ extension AppModel {
     /// False means offer setup, not a dead prompt box.
     public func refreshPetGenerateStatus(profile: String?) async {
         let state = pets(for: profile)
-        guard mode == .live, let client, state.supported else { return }
-        switch await Self.probe({ try await client.petGenerateStatus() }) {
+        guard mode == .live, state.supported,
+              let context = await petContext(profileID: profile, state: state) else { return }
+        let result = await Self.probe({ try await context.client.petGenerateStatus() })
+        guard petStateIsCurrent(state, profileID: profile, target: context.target) else { return }
+        switch result {
         case .value(let capability):
             state.generation.available = capability.available
             state.generation.providers = capability.providers
@@ -706,7 +910,11 @@ extension AppModel {
     public func startPetGeneration(profile: String?) {
         let state = pets(for: profile)
         let prompt = state.generation.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard mode == .live, let client, !state.generation.isBusy, !prompt.isEmpty else { return }
+        let runtime = PetRuntime.shared
+        guard mode == .live, let target = state.target,
+              !PetRuntime.shared.unsupportedGateways.contains(target.gatewayID),
+              runtime.runTask == nil,
+              !state.generation.isBusy, !prompt.isEmpty else { return }
 
         state.generation.phase = .drafting
         state.generation.drafts = []
@@ -717,14 +925,36 @@ extension AppModel {
         let count = state.generation.count
         let provider = state.generation.provider
 
-        let runtime = PetRuntime.shared
-        runtime.generatingProfile = profile ?? ""
+        runtime.generatingProfile = target.stateKey
         runtime.cancelled = false
         runtime.runTask?.cancel()
-        runtime.runTask = Task { @MainActor in
+        let runID = UUID()
+        runtime.runID = runID
+        runtime.runTask = Task { @MainActor [weak self] in
+            defer {
+                if PetRuntime.shared.runID == runID {
+                    PetRuntime.shared.cancelled = false
+                    PetRuntime.shared.runTask = nil
+                    PetRuntime.shared.runID = nil
+                    PetRuntime.shared.generatingProfile = nil
+                }
+            }
+            guard let self else { return }
             do {
+                let client = try await self.routedClient(gatewayID: target.gatewayID)
+                await self.attachRoutedEventsIfNeeded(client: client,
+                                                      gatewayID: target.gatewayID,
+                                                      preserveStateOnReplacement: true)
+                guard PetRuntime.shared.runID == runID,
+                      self.petStateIsCurrent(state, profileID: profile, target: target) else {
+                    return
+                }
                 let result = try await client.petGenerate(prompt: prompt, count: count,
                                                           provider: provider)
+                guard PetRuntime.shared.runID == runID,
+                      self.petStateIsCurrent(state, profileID: profile, target: target) else {
+                    return
+                }
                 if !result.token.isEmpty { state.generation.token = result.token }
                 if !result.drafts.isEmpty { state.generation.drafts = result.drafts }
                 if state.generation.drafts.isEmpty {
@@ -734,14 +964,16 @@ extension AppModel {
                     state.generation.selectedDraft = state.generation.drafts.first?.index
                 }
             } catch {
+                guard PetRuntime.shared.runID == runID,
+                      self.petStateIsCurrent(state, profileID: profile, target: target) else {
+                    return
+                }
                 state.generation.phase = .idle
                 state.generation.drafts = []
                 if !PetRuntime.shared.cancelled {
                     state.generation.error = Self.shortMessage(error)
                 }
             }
-            PetRuntime.shared.cancelled = false
-            PetRuntime.shared.runTask = nil
         }
     }
 
@@ -752,7 +984,11 @@ extension AppModel {
     public func hatchPet(profile: String?) {
         let state = pets(for: profile)
         let name = state.generation.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard mode == .live, let client, !state.generation.isBusy,
+        let runtime = PetRuntime.shared
+        guard mode == .live, let target = state.target,
+              !PetRuntime.shared.unsupportedGateways.contains(target.gatewayID),
+              runtime.runTask == nil,
+              !state.generation.isBusy,
               let index = state.generation.selectedDraft,
               !state.generation.token.isEmpty, !name.isEmpty else { return }
 
@@ -770,26 +1006,56 @@ extension AppModel {
         state.generation.error = nil
         state.clearHatched()
 
-        let runtime = PetRuntime.shared
-        runtime.generatingProfile = profile ?? ""
+        runtime.generatingProfile = target.stateKey
         runtime.cancelled = false
         runtime.runTask?.cancel()
-        runtime.runTask = Task { @MainActor in
+        let runID = UUID()
+        runtime.runID = runID
+        runtime.runTask = Task { @MainActor [weak self] in
+            defer {
+                if PetRuntime.shared.runID == runID {
+                    PetRuntime.shared.cancelled = false
+                    PetRuntime.shared.runTask = nil
+                    PetRuntime.shared.runID = nil
+                    PetRuntime.shared.generatingProfile = nil
+                }
+            }
+            guard let self else { return }
             do {
+                let client = try await self.routedClient(gatewayID: target.gatewayID)
+                await self.attachRoutedEventsIfNeeded(client: client,
+                                                      gatewayID: target.gatewayID,
+                                                      preserveStateOnReplacement: true)
+                guard PetRuntime.shared.runID == runID,
+                      self.petStateIsCurrent(state, profileID: profile, target: target) else {
+                    return
+                }
                 let result = try await client.petHatch(token: token, index: index, name: name,
                                                        prompt: prompt, cancelToken: cancelToken,
                                                        provider: provider)
+                guard PetRuntime.shared.runID == runID,
+                      self.petStateIsCurrent(state, profileID: profile, target: target) else {
+                    return
+                }
                 state.generation.hatched = result
                 state.generation.warnings = result.warnings
                 if let pet = result.payload.pet, let base64 = result.payload.spritesheetBase64,
                    let sheet = await Self.decodePetSheet(base64: base64, revision: pet.revision,
                                                          geometry: pet.geometry) {
-                    PetRuntime.shared.store(sheet)
+                    guard PetRuntime.shared.runID == runID,
+                          self.petStateIsCurrent(state, profileID: profile, target: target) else {
+                        return
+                    }
+                    PetRuntime.shared.store(sheet, gatewayID: target.gatewayID)
                     state.hatchedPet = pet
                     state.hatchedSheet = sheet
                 }
                 state.generation.phase = .preview
             } catch {
+                guard PetRuntime.shared.runID == runID,
+                      self.petStateIsCurrent(state, profileID: profile, target: target) else {
+                    return
+                }
                 // The drafts are still staged, so this lands back on the
                 // chooser rather than throwing the whole run away.
                 state.generation.phase = .choosing
@@ -797,8 +1063,6 @@ extension AppModel {
                     state.generation.error = Self.shortMessage(error)
                 }
             }
-            PetRuntime.shared.cancelled = false
-            PetRuntime.shared.runTask = nil
         }
     }
 
@@ -807,11 +1071,18 @@ extension AppModel {
     /// occupies it.
     public func cancelPetRun(profile: String?) {
         let state = pets(for: profile)
-        guard state.generation.isBusy, mode == .live, let client else { return }
-        PetRuntime.shared.cancelled = true
+        let runtime = PetRuntime.shared
+        guard state.generation.isBusy, mode == .live, let target = state.target,
+              runtime.generatingProfile == target.stateKey,
+              runtime.runTask != nil else { return }
+        runtime.cancelled = true
         let tokens = [state.generation.hatchToken, state.generation.token]
             .filter { !$0.isEmpty }
-        Task {
+        Task { [weak self] in
+            guard let self,
+                  let client = try? await self.routedClient(gatewayID: target.gatewayID) else {
+                return
+            }
             for token in tokens { await client.petCancel(token: token) }
         }
     }
@@ -820,8 +1091,10 @@ extension AppModel {
     /// generation stages gateway-globally.
     public func adoptHatchedPet(profile: String?) async {
         let state = pets(for: profile)
-        guard let hatched = state.generation.hatched else { return }
-        let adopted = await selectPet(slug: hatched.slug, profile: profile)
+        guard let hatched = state.generation.hatched,
+              let target = state.target else { return }
+        let adopted = await selectPet(slug: hatched.slug,
+                                      profile: petProfileID(for: target))
         guard adopted else { return }
         state.generation.reset()
         state.clearHatched()
@@ -831,12 +1104,17 @@ extension AppModel {
     /// deleting it, not just forgetting it.
     public func discardHatchedPet(profile: String?) async {
         let state = pets(for: profile)
-        if let hatched = state.generation.hatched, mode == .live, let client {
-            _ = try? await client.petRemove(slug: hatched.slug, profile: petScope(profile))
+        let target = state.target
+        if let hatched = state.generation.hatched, mode == .live,
+           let context = await petContext(profileID: profile, state: state) {
+            _ = try? await context.client.petRemove(
+                slug: hatched.slug, profile: context.target.profile)
         }
         state.generation.reset()
         state.clearHatched()
-        await loadPetGallery(profile: profile, localOnly: true)
+        if let target {
+            await loadPetGallery(profile: petProfileID(for: target), localOnly: true)
+        }
     }
 
     /// Back to the prompt form, keeping what the gateway told us about itself.
