@@ -25,6 +25,19 @@ public enum CapabilitySection: String, CaseIterable, Sendable, Identifiable {
     public var id: String { rawValue }
 }
 
+struct CapabilityTarget: Hashable, Sendable {
+    var gatewayID: String
+    /// Raw Hermes profile name. nil is the gateway launch profile.
+    var profile: String?
+
+    var stateKey: String {
+        if let profile {
+            return GatewayBotRoute(gatewayID: gatewayID, profile: profile).qualifiedID
+        }
+        return "capabilities:\(gatewayID.count):\(gatewayID)"
+    }
+}
+
 // MARK: - Screen state
 
 /// Observable state for one profile's capabilities. `AppModel`'s stored
@@ -36,6 +49,7 @@ public enum CapabilitySection: String, CaseIterable, Sendable, Identifiable {
 public final class CapabilityState {
     /// Profile (bot id) these capabilities belong to. Empty = launch profile.
     public var profile: String = ""
+    @ObservationIgnored var target: CapabilityTarget?
 
     public var skills: [SkillEntry] = []
     public var mcpServers: [MCPServer] = []
@@ -68,6 +82,13 @@ public final class CapabilityState {
         skills.isEmpty && mcpServers.isEmpty && mcpCatalog.isEmpty
             && toolsets.isEmpty && plugins.isEmpty
     }
+
+    func resetForDetach() {
+        skills.removeAll(); mcpServers.removeAll(); mcpCatalog.removeAll()
+        toolsets.removeAll(); plugins.removeAll(); probes.removeAll()
+        supported.removeAll(); busy.removeAll()
+        isLoading = false; hasLoaded = false; notice = nil
+    }
 }
 
 /// Per-profile stores + the in-flight OAuth polls, keyed by profile.
@@ -75,6 +96,13 @@ public final class CapabilityState {
 final class CapabilityRuntime {
     static let shared = CapabilityRuntime()
     var states: [String: CapabilityState] = [:]
+
+    func drop(gatewayID: String) {
+        for state in states.values where state.target?.gatewayID == gatewayID {
+            state.resetForDetach()
+        }
+        states = states.filter { $0.value.target?.gatewayID != gatewayID }
+    }
 }
 
 // MARK: - Model API
@@ -84,12 +112,51 @@ extension AppModel {
     /// The (memoized) capability store for a bot. Pass nil for the gateway's
     /// launch profile.
     public func capabilities(for profile: String?) -> CapabilityState {
-        let key = profile ?? ""
+        let target = capabilityTarget(profileID: profile)
+        let key = target?.stateKey ?? "demo:\(profile ?? "")"
         if let existing = CapabilityRuntime.shared.states[key] { return existing }
         let fresh = CapabilityState()
-        fresh.profile = key
+        fresh.profile = target?.profile ?? profile ?? ""
+        fresh.target = target
         CapabilityRuntime.shared.states[key] = fresh
         return fresh
+    }
+
+    internal func capabilityTarget(profileID: String?) -> CapabilityTarget? {
+        if let profileID, let route = GatewayBotRoute(qualifiedID: profileID) {
+            return CapabilityTarget(gatewayID: route.gatewayID, profile: route.profile)
+        }
+        guard let gatewayID = LiveRuntime.shared.gatewayID else { return nil }
+        let profile = profileID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return CapabilityTarget(gatewayID: gatewayID,
+                                profile: profile?.isEmpty == false ? profile : nil)
+    }
+
+    internal func dropCapabilityScope(gatewayID: String) {
+        CapabilityRuntime.shared.drop(gatewayID: gatewayID)
+    }
+
+    private func capabilityContext(profileID: String?, state: CapabilityState) async
+        -> (CapabilityTarget, GatewayClient)? {
+        guard let target = state.target,
+              capabilityTarget(profileID: profileID) == target,
+              CapabilityRuntime.shared.states[target.stateKey] === state else {
+            state.notice = noticeText(GatewayRouteError.noRoute.localizedDescription)
+            return nil
+        }
+        do {
+            return (target, try await routedClient(gatewayID: target.gatewayID))
+        } catch {
+            state.notice = noticeText(Self.shortMessage(error))
+            return nil
+        }
+    }
+
+    private func capabilityStateIsCurrent(_ state: CapabilityState,
+                                          profileID: String?,
+                                          target: CapabilityTarget) -> Bool {
+        capabilityTarget(profileID: profileID) == target
+            && CapabilityRuntime.shared.states[target.stateKey] === state
     }
 
     /// The profile a Capabilities screen should open on when the caller has no
@@ -116,16 +183,20 @@ extension AppModel {
         guard !state.isLoading else { return }
         state.isLoading = true
         state.notice = nil
+        var didFinish = false
         defer {
             state.isLoading = false
-            state.hasLoaded = true
+            if didFinish { state.hasLoaded = true }
         }
 
-        guard mode == .live, let client else {
+        guard mode == .live else {
             CapabilityDemo.fill(state, skills: skills)
+            didFinish = true
             return
         }
-        let scope = profile?.isEmpty == false ? profile : nil
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state)
+        else { return }
+        let scope = target.profile
 
         // 1. profiles.describe — the per-profile truth for skills + toolsets.
         //    It requires a name, so the launch-profile view skips it and falls
@@ -136,6 +207,8 @@ extension AppModel {
             if case .value(let value) = await Self.probe({
                 try await client.profileCapabilities(scope)
             }) {
+                guard capabilityStateIsCurrent(state, profileID: profile,
+                                               target: target) else { return }
                 described = value
             }
         }
@@ -144,7 +217,9 @@ extension AppModel {
         //    live outside this profile's own dir.
         var catalog: [String: [String]] = [:]
         var skillsSupported = described != nil
-        switch await Self.probe({ try await client.skillCatalog(profile: scope) }) {
+        let skillProbe = await Self.probe({ try await client.skillCatalog(profile: scope) })
+        guard capabilityStateIsCurrent(state, profileID: profile, target: target) else { return }
+        switch skillProbe {
         case .value(let value):
             catalog = value
             skillsSupported = true
@@ -161,7 +236,9 @@ extension AppModel {
         //    profile-independent.
         var toolsets = described?.toolsets ?? []
         var toolsetsSupported = !toolsets.isEmpty
-        switch await Self.probe({ try await client.toolsList() }) {
+        let toolsProbe = await Self.probe({ try await client.toolsList() })
+        guard capabilityStateIsCurrent(state, profileID: profile, target: target) else { return }
+        switch toolsProbe {
         case .value(let universe):
             toolsetsSupported = true
             if toolsets.isEmpty {
@@ -182,7 +259,9 @@ extension AppModel {
 
         // 4. MCP: configured servers + the bundled catalog.
         var mcpSupported = false
-        switch await Self.probe({ try await client.mcpServers(profile: scope) }) {
+        let serversProbe = await Self.probe({ try await client.mcpServers(profile: scope) })
+        guard capabilityStateIsCurrent(state, profileID: profile, target: target) else { return }
+        switch serversProbe {
         case .value(let servers):
             state.mcpServers = servers
             mcpSupported = true
@@ -193,7 +272,9 @@ extension AppModel {
             mcpSupported = true
             state.notice = noticeText(message)
         }
-        switch await Self.probe({ try await client.mcpCatalog(profile: scope) }) {
+        let catalogProbe = await Self.probe({ try await client.mcpCatalog(profile: scope) })
+        guard capabilityStateIsCurrent(state, profileID: profile, target: target) else { return }
+        switch catalogProbe {
         case .value(let entries):
             state.mcpCatalog = entries
             mcpSupported = true
@@ -203,7 +284,9 @@ extension AppModel {
         Self.setSupport(state, .mcp, mcpSupported)
 
         // 5. Gateway plugins.
-        switch await Self.probe({ try await client.pluginsList(profile: scope) }) {
+        let pluginsProbe = await Self.probe({ try await client.pluginsList(profile: scope) })
+        guard capabilityStateIsCurrent(state, profileID: profile, target: target) else { return }
+        switch pluginsProbe {
         case .value(let rows):
             state.plugins = rows
             Self.setSupport(state, .plugins, true)
@@ -215,6 +298,7 @@ extension AppModel {
             Self.setSupport(state, .plugins, true)
             state.notice = noticeText(message)
         }
+        didFinish = true
     }
 
     // MARK: Skills
@@ -228,15 +312,24 @@ extension AppModel {
         let previous = state.skills[index].enabled
         state.skills[index].enabled = enabled
 
-        guard mode == .live, let client, let name = profile, !name.isEmpty else { return }
+        guard mode == .live else { return }
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state),
+              let name = target.profile else {
+            state.skills[index].enabled = previous
+            return
+        }
         let key = "skill:\(skill.name)"
         state.busy.insert(key)
         defer { state.busy.remove(key) }
         let disabled = state.skills.filter { $0.scope == .profile && !$0.enabled }.map(\.name)
         do {
             try await client.configureProfile(name: name, disabledSkills: disabled)
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             state.notice = nil
         } catch {
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             state.skills[index].enabled = previous
             state.notice = noticeText(Self.shortMessage(error))
         }
@@ -245,20 +338,27 @@ extension AppModel {
     /// skills.reload — rescan the tree after an install or a file edit.
     public func rescanSkills(profile: String?) async {
         let state = capabilities(for: profile)
-        guard mode == .live, let client else { return }
+        guard mode == .live else { return }
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state)
+        else { return }
         state.busy.insert("skills:reload")
         defer { state.busy.remove("skills:reload") }
         do {
             _ = try await client.reloadSkills()
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             state.notice = nil
         } catch let error as GatewayError where error.code == GatewayClient.methodNotFound {
             // An older gateway simply has no rescan; the list is still valid.
             return
         } catch {
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             state.notice = noticeText(Self.shortMessage(error))
             return
         }
-        await loadCapabilities(profile: profile)
+        await refreshSkills(state: state, profileID: profile,
+                            target: target, client: client)
     }
 
     // MARK: Toolsets
@@ -272,10 +372,15 @@ extension AppModel {
         let previous = state.toolsets[index].enabled
         state.toolsets[index].enabled = enabled
 
-        guard mode == .live, let client else { return }
+        guard mode == .live else { return }
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state)
+        else {
+            state.toolsets[index].enabled = previous
+            return
+        }
         // Writing the pin needs a profile to write it to; the launch-profile
         // view is read-only rather than silently dropping the change.
-        guard let name = profile, !name.isEmpty else {
+        guard let name = target.profile else {
             state.toolsets[index].enabled = previous
             return
         }
@@ -286,9 +391,13 @@ extension AppModel {
         let names = allOn ? [] : state.toolsets.filter(\.enabled).map(\.name)
         do {
             try await client.setProfileToolsets(name: name, enabled: names)
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             state.toolsetsPinned = !allOn
             state.notice = nil
         } catch {
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             state.toolsets[index].enabled = previous
             state.notice = noticeText(Self.shortMessage(error))
         }
@@ -299,17 +408,21 @@ extension AppModel {
     public func setPlugin(_ plugin: GatewayPlugin, enabled: Bool, profile: String?) async {
         let state = capabilities(for: profile)
         guard let index = state.plugins.firstIndex(where: { $0.id == plugin.id }) else { return }
-        guard mode == .live, let client else {
+        guard mode == .live else {
             state.plugins[index].status = enabled ? "enabled" : "not enabled"
             return
         }
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state)
+        else { return }
         let key = "plugin:\(plugin.id)"
         state.busy.insert(key)
         defer { state.busy.remove(key) }
         do {
             let refreshed = try await client.pluginToggle(
-                profile: profile?.isEmpty == false ? profile : nil,
+                profile: target.profile,
                 key: plugin.key.isEmpty ? plugin.name : plugin.key, enable: enabled)
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             if let refreshed {
                 state.plugins[index] = refreshed
             } else {
@@ -317,6 +430,8 @@ extension AppModel {
             }
             state.notice = nil
         } catch {
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             state.notice = noticeText(Self.shortMessage(error))
         }
     }
@@ -328,21 +443,27 @@ extension AppModel {
     @discardableResult
     public func testMCPServer(_ server: MCPServer, profile: String?) async -> MCPProbeResult? {
         let state = capabilities(for: profile)
-        guard mode == .live, let client else {
+        guard mode == .live else {
             let probe = CapabilityDemo.probe(for: server)
             state.probes[server.name] = probe
             return probe
         }
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state)
+        else { return nil }
         let key = "mcp:\(server.name)"
         state.busy.insert(key)
         defer { state.busy.remove(key) }
         do {
             let probe = try await client.mcpTestServer(
-                profile: profile?.isEmpty == false ? profile : nil, name: server.name)
+                profile: target.profile, name: server.name)
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return nil }
             state.probes[server.name] = probe
             state.notice = nil
             return probe
         } catch {
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return nil }
             state.notice = noticeText(Self.shortMessage(error))
             return nil
         }
@@ -351,19 +472,26 @@ extension AppModel {
     /// Install a bundled catalog entry into this profile's config.yaml.
     public func installCatalogServer(_ entry: MCPCatalogEntry, profile: String?) async {
         let state = capabilities(for: profile)
-        guard mode == .live, let client else {
+        guard mode == .live else {
             CapabilityDemo.install(entry, into: state)
             return
         }
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state)
+        else { return }
         let key = "catalog:\(entry.name)"
         state.busy.insert(key)
         defer { state.busy.remove(key) }
         do {
             try await client.mcpAddFromCatalog(
-                profile: profile?.isEmpty == false ? profile : nil, name: entry.name)
+                profile: target.profile, name: entry.name)
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             state.notice = nil
-            await refreshMCP(profile: profile)
+            await refreshMCP(state: state, profileID: profile,
+                             target: target, client: client)
         } catch {
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             state.notice = noticeText(Self.shortMessage(error))
         }
     }
@@ -375,21 +503,28 @@ extension AppModel {
         let state = capabilities(for: profile)
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
-        guard mode == .live, let client else {
+        guard mode == .live else {
             CapabilityDemo.add(name: trimmed, url: url, command: command,
                                args: args, into: state)
             return true
         }
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state)
+        else { return false }
         state.busy.insert("mcp:add")
         defer { state.busy.remove("mcp:add") }
         do {
             try await client.mcpAddServer(
-                profile: profile?.isEmpty == false ? profile : nil,
+                profile: target.profile,
                 name: trimmed, url: url, command: command, args: args)
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return false }
             state.notice = nil
-            await refreshMCP(profile: profile)
+            await refreshMCP(state: state, profileID: profile,
+                             target: target, client: client)
             return true
         } catch {
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return false }
             state.notice = noticeText(Self.shortMessage(error))
             return false
         }
@@ -397,22 +532,29 @@ extension AppModel {
 
     public func removeMCPServer(_ server: MCPServer, profile: String?) async {
         let state = capabilities(for: profile)
-        guard mode == .live, let client else {
+        guard mode == .live else {
             state.mcpServers.removeAll { $0.name == server.name }
             state.probes[server.name] = nil
             return
         }
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state)
+        else { return }
         let key = "mcp:\(server.name)"
         state.busy.insert(key)
         defer { state.busy.remove(key) }
         do {
             try await client.mcpRemoveServer(
-                profile: profile?.isEmpty == false ? profile : nil, name: server.name)
+                profile: target.profile, name: server.name)
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             state.mcpServers.removeAll { $0.name == server.name }
             state.probes[server.name] = nil
             state.notice = nil
-            await refreshMCP(profile: profile)
+            await refreshMCP(state: state, profileID: profile,
+                             target: target, client: client)
         } catch {
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return }
             state.notice = noticeText(Self.shortMessage(error))
         }
     }
@@ -423,18 +565,25 @@ extension AppModel {
                              envVar: String?, profile: String?) async -> Bool {
         let state = capabilities(for: profile)
         guard !value.isEmpty else { return false }
-        guard mode == .live, let client else { return true }
+        guard mode == .live else { return true }
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state)
+        else { return false }
         let key = "mcp:\(server.name)"
         state.busy.insert(key)
         defer { state.busy.remove(key) }
         do {
             try await client.mcpSetAPIKey(
-                profile: profile?.isEmpty == false ? profile : nil,
+                profile: target.profile,
                 name: server.name, value: value, envVar: envVar)
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return false }
             state.notice = nil
-            await refreshMCP(profile: profile)
+            await refreshMCP(state: state, profileID: profile,
+                             target: target, client: client)
             return true
         } catch {
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return false }
             state.notice = noticeText(Self.shortMessage(error))
             return false
         }
@@ -445,16 +594,22 @@ extension AppModel {
     /// phone only opens the page and polls.
     public func beginMCPOAuth(_ server: MCPServer, profile: String?) async -> MCPOAuthFlow? {
         let state = capabilities(for: profile)
-        guard mode == .live, let client else { return nil }
+        guard mode == .live else { return nil }
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state)
+        else { return nil }
         let key = "mcp:\(server.name)"
         state.busy.insert(key)
         defer { state.busy.remove(key) }
         do {
             let flow = try await client.mcpOAuthStart(
-                profile: profile?.isEmpty == false ? profile : nil, name: server.name)
+                profile: target.profile, name: server.name)
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return nil }
             state.notice = nil
             return flow
         } catch {
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else { return nil }
             state.notice = noticeText(Self.shortMessage(error))
             return nil
         }
@@ -467,8 +622,12 @@ extension AppModel {
     public func awaitMCPOAuth(_ server: MCPServer, flow: MCPOAuthFlow,
                               profile: String?) async -> MCPOAuthStatus {
         let state = capabilities(for: profile)
-        guard mode == .live, let client else {
+        guard mode == .live else {
             return MCPOAuthStatus(status: "error", errorMessage: nil, authURL: nil)
+        }
+        guard let (target, client) = await capabilityContext(profileID: profile, state: state)
+        else {
+            return MCPOAuthStatus(status: "error", errorMessage: state.notice, authURL: nil)
         }
         let key = "mcp:\(server.name)"
         state.busy.insert(key)
@@ -478,20 +637,49 @@ extension AppModel {
         while Date() < deadline {
             try? await Task.sleep(for: .seconds(2))
             if Task.isCancelled { break }
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else {
+                return MCPOAuthStatus(status: "error", errorMessage: nil, authURL: nil)
+            }
             let status: MCPOAuthStatus
             do {
                 status = try await client.mcpOAuthPoll(
-                    profile: profile?.isEmpty == false ? profile : nil,
+                    profile: target.profile,
                     name: server.name, sessionID: flow.sessionID)
             } catch {
+                guard capabilityStateIsCurrent(state, profileID: profile,
+                                               target: target) else {
+                    return MCPOAuthStatus(status: "error", errorMessage: nil, authURL: nil)
+                }
                 let message = Self.shortMessage(error)
                 state.notice = noticeText(message)
                 return MCPOAuthStatus(status: "error", errorMessage: message, authURL: nil)
             }
+            guard capabilityStateIsCurrent(state, profileID: profile,
+                                           target: target) else {
+                return MCPOAuthStatus(status: "error", errorMessage: nil, authURL: nil)
+            }
             if status.isPending { continue }
             if status.isApproved {
-                await refreshMCP(profile: profile)
-                _ = await testMCPServer(server, profile: profile)
+                await refreshMCP(state: state, profileID: profile,
+                                 target: target, client: client)
+                do {
+                    let probe = try await client.mcpTestServer(
+                        profile: target.profile, name: server.name)
+                    guard capabilityStateIsCurrent(state, profileID: profile,
+                                                   target: target) else {
+                        return MCPOAuthStatus(status: "error", errorMessage: nil,
+                                              authURL: nil)
+                    }
+                    state.probes[server.name] = probe
+                } catch {
+                    guard capabilityStateIsCurrent(state, profileID: profile,
+                                                   target: target) else {
+                        return MCPOAuthStatus(status: "error", errorMessage: nil,
+                                              authURL: nil)
+                    }
+                    state.notice = noticeText(Self.shortMessage(error))
+                }
             } else if let message = status.errorMessage {
                 state.notice = noticeText(message)
             }
@@ -501,19 +689,57 @@ extension AppModel {
     }
 
     /// Re-read just the MCP slice after a write.
-    private func refreshMCP(profile: String?) async {
-        let state = capabilities(for: profile)
-        guard mode == .live, let client else { return }
-        let scope = profile?.isEmpty == false ? profile : nil
-        if case .value(let servers) = await Self.probe({ try await client.mcpServers(profile: scope) }) {
+    private func refreshMCP(state: CapabilityState, profileID: String?,
+                            target: CapabilityTarget, client: GatewayClient) async {
+        guard mode == .live,
+              capabilityStateIsCurrent(state, profileID: profileID, target: target)
+        else { return }
+        if case .value(let servers) = await Self.probe({
+            try await client.mcpServers(profile: target.profile)
+        }) {
+            guard capabilityStateIsCurrent(state, profileID: profileID,
+                                           target: target) else { return }
             state.mcpServers = servers
         }
-        if case .value(let entries) = await Self.probe({ try await client.mcpCatalog(profile: scope) }) {
+        if case .value(let entries) = await Self.probe({
+            try await client.mcpCatalog(profile: target.profile)
+        }) {
+            guard capabilityStateIsCurrent(state, profileID: profileID,
+                                           target: target) else { return }
             state.mcpCatalog = entries
         }
     }
 
     // MARK: - Helpers
+
+    private func refreshSkills(state: CapabilityState, profileID: String?,
+                               target: CapabilityTarget, client: GatewayClient) async {
+        guard capabilityStateIsCurrent(state, profileID: profileID, target: target) else { return }
+        var described: ProfileCapabilities?
+        if let profile = target.profile,
+           case .value(let value) = await Self.probe({
+               try await client.profileCapabilities(profile)
+           }) {
+            guard capabilityStateIsCurrent(state, profileID: profileID,
+                                           target: target) else { return }
+            described = value
+        }
+        var catalog: [String: [String]] = [:]
+        var supported = described != nil
+        let result = await Self.probe({ try await client.skillCatalog(profile: target.profile) })
+        guard capabilityStateIsCurrent(state, profileID: profileID, target: target) else { return }
+        switch result {
+        case .value(let value):
+            catalog = value
+            supported = true
+        case .unsupported:
+            break
+        case .failed(let message):
+            state.notice = noticeText(message)
+        }
+        state.skills = Self.mergeSkills(described: described, catalog: catalog)
+        Self.setSupport(state, .skills, supported || !state.skills.isEmpty)
+    }
 
     /// Outcome of one capability probe: a value, "this gateway has no such
     /// RPC" (hide the section), or a real failure (keep it, show a notice).
