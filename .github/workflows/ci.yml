@@ -1,14 +1,5 @@
-# CI for the GitHub mirror. (Cursor Origin CI: TBD.)
-#
-# Two jobs:
-#   package — SwiftPM build + protocol checks (no Xcode project needed;
-#             the package compiles for macOS by design, see docs/ARCHITECTURE.md)
-#   ios-app — xcodegen-generated project, simulator build, no code signing.
-#             Currently continue-on-error: the app shell has no entry point yet
-#             (ios/Talaria/App/ is empty and the widgets target's Live Activity
-#             view is pending), so this job documents the target state rather
-#             than gating merges. Make it required in the PR that lands the
-#             app entry point.
+# Required pull-request gates. Their stable job names intentionally match the
+# Skynet-Ventures repository protection contract.
 
 name: CI
 
@@ -22,41 +13,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  parity-contract:
-    name: Parity contract
-    runs-on: ubuntu-latest
+  verify:
+    name: verify
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
       - name: Validate pinned Hermes authority manifest
         run: python3 scripts/check_hermes_upstream.py
 
-  package:
-    name: Swift package (build + talaria-verify)
-    runs-on: macos-15
-    defaults:
-      run:
-        working-directory: Packages/Talaria
-    steps:
-      - uses: actions/checkout@v4
-
-      # macos-15 runners default to Xcode 16.x, which is all we need.
       - name: Toolchain info
         run: xcodebuild -version && swift --version
 
       - name: swift build
+        working-directory: Packages/Talaria
         run: swift build
 
       - name: Swift tests
+        working-directory: Packages/Talaria
         run: swift test
 
       - name: Protocol checks
+        working-directory: Packages/Talaria
         run: swift run talaria-verify
 
-  ios-app:
-    name: iOS app (xcodegen + simulator build)
+  release-gates:
+    name: release-gates
     runs-on: macos-15
-    # See header comment — flip this off when ios/Talaria/App lands.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -76,3 +59,16 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO
+
+  optional-privacy:
+    name: optional-privacy
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Multi-gateway source isolation is Talaria's privacy boundary: a short
+      # Hermes runtime id may collide across machines, but messages and
+      # approvals must never cross that boundary.
+      - name: Source-qualified isolation regressions
+        working-directory: Packages/Talaria
+        run: swift test --filter SourceQualifiedRoutingTests
