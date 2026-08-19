@@ -54,6 +54,18 @@ private final class ProfileLifecycleRuntime {
     func acquireOrdinaryTraffic(gatewayID: String) -> GatewayClient.TrafficLease? {
         guard !heldGateways.contains(gatewayID),
               !gatewaysInFlight.contains(gatewayID) else { return nil }
+        return makeOrdinaryTrafficLease(gatewayID: gatewayID)
+    }
+
+    func finishAuthoritativeReconciliation(gatewayID: String) -> GatewayClient.TrafficLease {
+        // MainActor makes this an atomic exclusive-to-shared handoff: there is
+        // no point where a successor lifecycle can enter before recovery owns
+        // an ordinary lease.
+        gatewaysInFlight.remove(gatewayID)
+        return makeOrdinaryTrafficLease(gatewayID: gatewayID)
+    }
+
+    private func makeOrdinaryTrafficLease(gatewayID: String) -> GatewayClient.TrafficLease {
         ordinaryTrafficCounts[gatewayID, default: 0] += 1
         return GatewayClient.TrafficLease { @Sendable in
             await MainActor.run {
@@ -98,8 +110,10 @@ enum ProfileLifecycleTrafficAdmission {
     /// agree. Owner reconnect and roster refresh are ordinary traffic, so they
     /// must happen after this boundary rather than receiving a privileged
     /// bypass through the exclusive filesystem window.
-    static func finishAuthoritativeReconciliation(_ gatewayID: String) {
-        endLifecycle(gatewayID)
+    static func finishAuthoritativeReconciliation(
+        _ gatewayID: String
+    ) -> GatewayClient.TrafficLease {
+        ProfileLifecycleRuntime.shared.finishAuthoritativeReconciliation(gatewayID: gatewayID)
     }
 
     static func allows(_ gatewayID: String) -> Bool {
@@ -136,10 +150,10 @@ final class ProfileLifecycleExclusiveLease {
 
     init(gatewayID: String) { self.gatewayID = gatewayID }
 
-    func finishAuthoritativeReconciliation() {
-        guard isHeld else { return }
+    func finishAuthoritativeReconciliation() -> GatewayClient.TrafficLease {
+        precondition(isHeld, "Profile lifecycle exclusive lease already released")
         isHeld = false
-        ProfileLifecycleTrafficAdmission.finishAuthoritativeReconciliation(gatewayID)
+        return ProfileLifecycleTrafficAdmission.finishAuthoritativeReconciliation(gatewayID)
     }
 
     func releaseIfHeld() {
@@ -283,8 +297,9 @@ extension AppModel {
             // Hermes and local route state now agree. End the exclusive
             // filesystem fence before the owner refresh acquires an ordinary
             // transport lease; uncertain outcomes never reach this boundary.
-            exclusive.finishAuthoritativeReconciliation()
+            let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await refreshProfileRoster(gatewayID: target.route.gatewayID)
+            await recoveryLease.release()
             return .renamed(canonicalName: canonical, displayName: result.displayName)
         }
         guard canonical != target.route.profile,
@@ -298,11 +313,12 @@ extension AppModel {
         reconcileProfileRoute(target, canonicalNewName: canonical,
                               scope: baseURL, preserved: preserved,
                               restorePrimaryIfUnclaimed: wasActive)
-        exclusive.finishAuthoritativeReconciliation()
+        let recoveryLease = exclusive.finishAuthoritativeReconciliation()
         await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                             wasActive: wasActive, baseURL: baseURL,
                                             credential: credential)
         if !wasActive { await refreshProfileRoster(gatewayID: target.route.gatewayID) }
+        await recoveryLease.release()
         return .renamed(canonicalName: canonical, displayName: result.displayName)
     }
 
@@ -354,11 +370,12 @@ extension AppModel {
         reconcileProfileRoute(target, canonicalNewName: nil,
                               scope: baseURL, preserved: preserved,
                               restorePrimaryIfUnclaimed: wasActive)
-        exclusive.finishAuthoritativeReconciliation()
+        let recoveryLease = exclusive.finishAuthoritativeReconciliation()
         await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                             wasActive: wasActive, baseURL: baseURL,
                                             credential: credential)
         if !wasActive { await refreshProfileRoster(gatewayID: target.route.gatewayID) }
+        await recoveryLease.release()
         return .deleted
     }
 
@@ -378,19 +395,21 @@ extension AppModel {
             reconcileProfileRoute(target, canonicalNewName: requested, scope: baseURL,
                                   preserved: preserved,
                                   restorePrimaryIfUnclaimed: wasActive)
-            exclusive.finishAuthoritativeReconciliation()
+            let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                                 wasActive: wasActive, baseURL: baseURL,
                                                 credential: credential)
             if !wasActive { await refreshProfileRoster(gatewayID: target.route.gatewayID) }
+            await recoveryLease.release()
             return .renamed(canonicalName: requested, displayName: nil)
         case .notCommitted:
             restoreParkedProfileLifecycleStateIfNeeded(target, wasActive: wasActive)
             ProfileLifecycleRuntime.shared.restore(target.route)
-            exclusive.finishAuthoritativeReconciliation()
+            let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                                 wasActive: wasActive, baseURL: baseURL,
                                                 credential: credential)
+            await recoveryLease.release()
             return .refused(originalError)
         case .indeterminate:
             holdIndeterminateLifecycle(target)
@@ -412,12 +431,14 @@ extension AppModel {
         switch verdict {
         case .committed:
             ProfileLifecycleRuntime.shared.restore(target.route)
-            exclusive.finishAuthoritativeReconciliation()
+            let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await refreshProfileRoster(gatewayID: target.route.gatewayID)
+            await recoveryLease.release()
             return .renamed(canonicalName: target.route.profile, displayName: requested)
         case .notCommitted:
             ProfileLifecycleRuntime.shared.restore(target.route)
-            exclusive.finishAuthoritativeReconciliation()
+            let recoveryLease = exclusive.finishAuthoritativeReconciliation()
+            await recoveryLease.release()
             return .refused(originalError)
         case .indeterminate:
             ProfileLifecycleRuntime.shared.heldGateways.insert(target.route.gatewayID)
@@ -440,19 +461,21 @@ extension AppModel {
             reconcileProfileRoute(target, canonicalNewName: nil, scope: baseURL,
                                   preserved: preserved,
                                   restorePrimaryIfUnclaimed: wasActive)
-            exclusive.finishAuthoritativeReconciliation()
+            let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                                 wasActive: wasActive, baseURL: baseURL,
                                                 credential: credential)
             if !wasActive { await refreshProfileRoster(gatewayID: target.route.gatewayID) }
+            await recoveryLease.release()
             return .deleted
         case .notCommitted:
             restoreParkedProfileLifecycleStateIfNeeded(target, wasActive: wasActive)
             ProfileLifecycleRuntime.shared.restore(target.route)
-            exclusive.finishAuthoritativeReconciliation()
+            let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                                 wasActive: wasActive, baseURL: baseURL,
                                                 credential: credential)
+            await recoveryLease.release()
             return .refused(originalError)
         case .indeterminate:
             holdIndeterminateLifecycle(target)

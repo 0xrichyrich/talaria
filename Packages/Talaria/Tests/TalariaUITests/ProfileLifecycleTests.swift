@@ -122,21 +122,29 @@ struct ProfileLifecycleTests {
         // allowed while Hermes' filesystem mutation is unresolved.
         #expect(ProfileLifecycleTrafficAdmission.acquire(gatewayID) == nil)
 
-        ProfileLifecycleTrafficAdmission.finishAuthoritativeReconciliation(gatewayID)
+        let recoveryLease =
+            ProfileLifecycleTrafficAdmission.finishAuthoritativeReconciliation(gatewayID)
+        #expect(!ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
         let ownerTraffic = try #require(
             ProfileLifecycleTrafficAdmission.acquire(gatewayID))
         await ownerTraffic.release()
+        #expect(!ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
+        await recoveryLease.release()
+        #expect(ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
+        ProfileLifecycleTrafficAdmission.endLifecycle(gatewayID)
     }
 
-    @Test @MainActor func completedLeaseCannotReleaseASuccessorLifecycle() {
+    @Test @MainActor func completedLeaseCannotReleaseASuccessorLifecycle() async {
         let gatewayID = "successor-\(UUID().uuidString)"
         #expect(ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
         let first = ProfileLifecycleExclusiveLease(gatewayID: gatewayID)
-        first.finishAuthoritativeReconciliation()
+        let recoveryLease = first.finishAuthoritativeReconciliation()
 
-        #expect(ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
+        #expect(!ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
         first.releaseIfHeld()
-        #expect(ProfileLifecycleTrafficAdmission.acquire(gatewayID) == nil)
+        #expect(!ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
+        await recoveryLease.release()
+        #expect(ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
         ProfileLifecycleTrafficAdmission.endLifecycle(gatewayID)
     }
 
