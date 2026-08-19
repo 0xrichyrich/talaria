@@ -27,6 +27,15 @@ public struct ProfileRenameResult: Sendable, Equatable {
     }
 }
 
+struct ProfileInventoryEntry: Sendable, Equatable {
+    var name: String
+    /// `nil` means the inventory source did not prove the display name. The
+    /// rich Hermes enumerator always emits a string (including empty); its
+    /// directory-scan fallback currently omits this field, so callers must not
+    /// mistake that fallback for proof that a display-name mutation failed.
+    var displayName: String?
+}
+
 enum ProfileNamePolicy {
     static let reserved: Set<String> = [
         "hermes", "default", "test", "tmp", "root", "sudo",
@@ -132,8 +141,8 @@ extension GatewayREST {
     /// ambiguous mutation response while the socket fence is still installed.
     /// Hermes' route falls back to a directory scan if rich enumeration fails,
     /// so absence here is stronger evidence than a stale WebSocket roster.
-    public static func profileNames(baseURL: URL, credential: GatewayCredential) async throws
-        -> Set<String> {
+    static func profileInventory(baseURL: URL, credential: GatewayCredential) async throws
+        -> [String: ProfileInventoryEntry] {
         let request = profileInventoryRequest(baseURL: baseURL, credential: credential)
         let (data, response) = try await URLSession.shared.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -143,17 +152,27 @@ extension GatewayREST {
                                message: value?["detail"]?.stringValue
                                    ?? "Profile inventory failed (HTTP \(code)).")
         }
-        return try decodeProfileNames(value)
+        return try decodeProfileInventory(value)
+    }
+
+    public static func profileNames(baseURL: URL, credential: GatewayCredential) async throws
+        -> Set<String> {
+        Set(try await profileInventory(baseURL: baseURL, credential: credential).keys)
     }
 
     /// Mutation postconditions use absence as proof, so inventory decoding is
     /// deliberately all-or-nothing. Dropping one malformed or colliding row
     /// would turn an incomplete response into a false commit verdict.
     static func decodeProfileNames(_ value: JSONValue?) throws -> Set<String> {
+        Set(try decodeProfileInventory(value).keys)
+    }
+
+    static func decodeProfileInventory(_ value: JSONValue?) throws
+        -> [String: ProfileInventoryEntry] {
         guard let rows = value?["profiles"]?.arrayValue else {
             throw GatewayError(code: -9, message: "Profile inventory was malformed.")
         }
-        var names = Set<String>()
+        var inventory: [String: ProfileInventoryEntry] = [:]
         var folded = Set<String>()
         for row in rows {
             guard let raw = row["name"]?.stringValue else {
@@ -163,12 +182,14 @@ extension GatewayREST {
             guard !name.isEmpty, name == raw else {
                 throw GatewayError(code: -9, message: "Profile inventory contained a blank or non-canonical name.")
             }
-            guard names.insert(name).inserted,
+            guard inventory[name] == nil,
                   folded.insert(name.lowercased()).inserted else {
                 throw GatewayError(code: -9, message: "Profile inventory contained duplicate or conflicting names.")
             }
+            inventory[name] = ProfileInventoryEntry(
+                name: name, displayName: row["display_name"]?.stringValue)
         }
-        return names
+        return inventory
     }
 
     private static func profileLifecycleJSON(_ request: URLRequest, verb: String) async throws

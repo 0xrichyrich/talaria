@@ -12,7 +12,10 @@ pre_approval_request    ``approval`` pushes. Fires in whatever process runs
                         the CLI for terminal runs). Kwargs per upstream:
                         command, description, pattern_key, pattern_keys,
                         session_key, surface, turn_id, tool_call_id,
-                        session_id?. NOTE: the hook does NOT carry the
+                        session_id?. ``session_key`` is the durable identity
+                        used by ``session.resume`` and ``approval.pending``;
+                        the runtime ``session_id`` is never substituted into
+                        an actionable push. NOTE: the hook does NOT carry the
                         approval ``request_id`` — see the README's gap
                         table. Hook-mode pushes therefore send
                         ``approval_request_id: ""`` and the iOS client
@@ -95,10 +98,19 @@ def on_pre_approval_request(**kwargs: Any) -> None:
     surface = str(kwargs.get("surface") or "")
     if surface not in _approval_surfaces():
         return None
+    session_key = str(kwargs.get("session_key") or "").strip()
+    if not session_key:
+        # A runtime session_id cannot be resumed after a cold notification
+        # launch. Sending an approval-shaped payload with it would display an
+        # action Talaria cannot source-qualify or answer, so fail closed.
+        logger.warning(
+            "talaria-push: approval hook omitted actionable push without session_key"
+        )
+        return None
     bot = current_bot()
     event = push_mod.approval_event(
         bot=bot,
-        session_id=str(kwargs.get("session_id") or kwargs.get("session_key") or ""),
+        session_id=session_key,
         description=str(kwargs.get("description") or ""),
         command=str(kwargs.get("command") or ""),
         # Not available on the hook surface (see module docstring / README).
@@ -113,7 +125,9 @@ def on_pre_approval_request(**kwargs: Any) -> None:
 def on_post_approval_response(**kwargs: Any) -> None:
     """Clear the dedupe entry once the approval was answered/timed out."""
     bot = current_bot()
-    session_id = str(kwargs.get("session_id") or kwargs.get("session_key") or "")
+    session_id = str(kwargs.get("session_key") or "").strip()
+    if not session_id:
+        return None
     key = "approval:" + push_mod.stable_hash(
         bot,
         session_id,

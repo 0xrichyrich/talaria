@@ -331,6 +331,27 @@ final class PushDeviceMutationQueueTests: XCTestCase {
         XCTAssertEqual(installer.fence.overlayLease, newLease)
     }
 
+    @MainActor
+    func testProfileLifecycleFenceRejectsVoiceReconnectBeforePoolMutation() {
+        let model = AppModel()
+        let route = GatewayBotRoute(gatewayID: "homelab", profile: "worker")
+        let target = ProfileLifecycleTarget(rosterID: route.qualifiedID, route: route)
+
+        model.activateProfileLifecycleRoute(gatewayID: route.gatewayID,
+                                            profile: route.profile)
+        XCTAssertNotNil(model.voiceReconnectLifecycleToken(for: route))
+
+        // Rename/delete raises this block before awaiting client retirement.
+        // Voice must observe it before interpreting the intentionally closed
+        // pool sentinel as an ordinary dead socket and evicting it.
+        model.abortProfileRuntime(target)
+        XCTAssertNil(model.voiceReconnectLifecycleToken(for: route))
+
+        // Leave shared lifecycle state usable for subsequent serialized tests.
+        model.activateProfileLifecycleRoute(gatewayID: route.gatewayID,
+                                            profile: route.profile)
+    }
+
 
     private func approvalDetail(_ id: String) -> ApprovalDetail {
         ApprovalDetail(.object([
