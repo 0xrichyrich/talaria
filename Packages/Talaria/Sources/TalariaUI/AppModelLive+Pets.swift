@@ -210,14 +210,14 @@ final class PetRuntime {
     /// connection must not clear a replacement connection's in-flight load.
     var loadIDs: [String: UUID] = [:]
 
-    /// The profile whose generate/hatch run owns the progress events. The
-    /// generation RPCs are gateway-global, so only one run exists at a time.
-    var generatingProfile: String?
-    var runTask: Task<Void, Never>?
-    var runID: UUID?
-    /// The user pressed Stop: the RPC's "cancelled" error is an outcome, not a
-    /// failure, and must not raise a notice.
-    var cancelled = false
+    /// Each gateway permits one global generate/hatch run, but independent
+    /// gateways must never block or cancel one another.
+    var generatingProfiles: [String: String] = [:]
+    var runTasks: [String: Task<Void, Never>] = [:]
+    var runIDs: [String: UUID] = [:]
+    /// Gateways where the user pressed Stop: the RPC's "cancelled" error is an
+    /// outcome, not a failure, and must not raise a notice.
+    var cancelledGateways: Set<String> = []
 
     private func key(gatewayID: String, revision: String) -> String {
         "pet-sheet:\(gatewayID.count):\(gatewayID)\(revision)"
@@ -254,13 +254,14 @@ final class PetRuntime {
         sheets.removeAll()
         recency.removeAll()
         unsupportedGateways.removeAll()
-        generatingProfile = nil
+        generatingProfiles.removeAll()
         attachedGatewayID = nil
-        cancelled = false
+        cancelledGateways.removeAll()
         for task in refreshTasks.values { task.cancel() }
         refreshTasks.removeAll()
-        runTask?.cancel(); runTask = nil
-        runID = nil
+        for task in runTasks.values { task.cancel() }
+        runTasks.removeAll()
+        runIDs.removeAll()
         for task in loads.values { task.cancel() }
         loads.removeAll()
         loadIDs.removeAll()
@@ -270,12 +271,12 @@ final class PetRuntime {
         let stateKeys = states.compactMap { key, state in
             state.target?.gatewayID == gatewayID ? key : nil
         }
-        if let generatingProfile, stateKeys.contains(generatingProfile) {
-            runTask?.cancel()
-            runTask = nil
-            runID = nil
-            self.generatingProfile = nil
-            cancelled = true
+        if generatingProfiles[gatewayID] != nil {
+            runTasks[gatewayID]?.cancel()
+            runTasks.removeValue(forKey: gatewayID)
+            runIDs.removeValue(forKey: gatewayID)
+            generatingProfiles.removeValue(forKey: gatewayID)
+            cancelledGateways.insert(gatewayID)
         }
         for key in stateKeys {
             states[key]?.resetForDetach()
@@ -469,7 +470,7 @@ extension AppModel {
     /// The surface that started the in-flight run, if it is still hatching or
     /// drafting. Progress for a run nobody is watching is dropped.
     private func generatingSurface(sourceGatewayID: String) -> PetSurfaceState? {
-        guard let key = PetRuntime.shared.generatingProfile,
+        guard let key = PetRuntime.shared.generatingProfiles[sourceGatewayID],
               let state = PetRuntime.shared.states[key],
               state.target?.gatewayID == sourceGatewayID,
               state.generation.isBusy else { return nil }
@@ -913,7 +914,7 @@ extension AppModel {
         let runtime = PetRuntime.shared
         guard mode == .live, let target = state.target,
               !PetRuntime.shared.unsupportedGateways.contains(target.gatewayID),
-              runtime.runTask == nil,
+              runtime.runTasks[target.gatewayID] == nil,
               !state.generation.isBusy, !prompt.isEmpty else { return }
 
         state.generation.phase = .drafting
@@ -925,18 +926,17 @@ extension AppModel {
         let count = state.generation.count
         let provider = state.generation.provider
 
-        runtime.generatingProfile = target.stateKey
-        runtime.cancelled = false
-        runtime.runTask?.cancel()
+        runtime.generatingProfiles[target.gatewayID] = target.stateKey
+        runtime.cancelledGateways.remove(target.gatewayID)
         let runID = UUID()
-        runtime.runID = runID
-        runtime.runTask = Task { @MainActor [weak self] in
+        runtime.runIDs[target.gatewayID] = runID
+        runtime.runTasks[target.gatewayID] = Task { @MainActor [weak self] in
             defer {
-                if PetRuntime.shared.runID == runID {
-                    PetRuntime.shared.cancelled = false
-                    PetRuntime.shared.runTask = nil
-                    PetRuntime.shared.runID = nil
-                    PetRuntime.shared.generatingProfile = nil
+                if PetRuntime.shared.runIDs[target.gatewayID] == runID {
+                    PetRuntime.shared.cancelledGateways.remove(target.gatewayID)
+                    PetRuntime.shared.runTasks.removeValue(forKey: target.gatewayID)
+                    PetRuntime.shared.runIDs.removeValue(forKey: target.gatewayID)
+                    PetRuntime.shared.generatingProfiles.removeValue(forKey: target.gatewayID)
                 }
             }
             guard let self else { return }
@@ -945,13 +945,13 @@ extension AppModel {
                 await self.attachRoutedEventsIfNeeded(client: client,
                                                       gatewayID: target.gatewayID,
                                                       preserveStateOnReplacement: true)
-                guard PetRuntime.shared.runID == runID,
+                guard PetRuntime.shared.runIDs[target.gatewayID] == runID,
                       self.petStateIsCurrent(state, profileID: profile, target: target) else {
                     return
                 }
                 let result = try await client.petGenerate(prompt: prompt, count: count,
                                                           provider: provider)
-                guard PetRuntime.shared.runID == runID,
+                guard PetRuntime.shared.runIDs[target.gatewayID] == runID,
                       self.petStateIsCurrent(state, profileID: profile, target: target) else {
                     return
                 }
@@ -964,13 +964,13 @@ extension AppModel {
                     state.generation.selectedDraft = state.generation.drafts.first?.index
                 }
             } catch {
-                guard PetRuntime.shared.runID == runID,
+                guard PetRuntime.shared.runIDs[target.gatewayID] == runID,
                       self.petStateIsCurrent(state, profileID: profile, target: target) else {
                     return
                 }
                 state.generation.phase = .idle
                 state.generation.drafts = []
-                if !PetRuntime.shared.cancelled {
+                if !PetRuntime.shared.cancelledGateways.contains(target.gatewayID) {
                     state.generation.error = Self.shortMessage(error)
                 }
             }
@@ -987,7 +987,7 @@ extension AppModel {
         let runtime = PetRuntime.shared
         guard mode == .live, let target = state.target,
               !PetRuntime.shared.unsupportedGateways.contains(target.gatewayID),
-              runtime.runTask == nil,
+              runtime.runTasks[target.gatewayID] == nil,
               !state.generation.isBusy,
               let index = state.generation.selectedDraft,
               !state.generation.token.isEmpty, !name.isEmpty else { return }
@@ -1006,18 +1006,17 @@ extension AppModel {
         state.generation.error = nil
         state.clearHatched()
 
-        runtime.generatingProfile = target.stateKey
-        runtime.cancelled = false
-        runtime.runTask?.cancel()
+        runtime.generatingProfiles[target.gatewayID] = target.stateKey
+        runtime.cancelledGateways.remove(target.gatewayID)
         let runID = UUID()
-        runtime.runID = runID
-        runtime.runTask = Task { @MainActor [weak self] in
+        runtime.runIDs[target.gatewayID] = runID
+        runtime.runTasks[target.gatewayID] = Task { @MainActor [weak self] in
             defer {
-                if PetRuntime.shared.runID == runID {
-                    PetRuntime.shared.cancelled = false
-                    PetRuntime.shared.runTask = nil
-                    PetRuntime.shared.runID = nil
-                    PetRuntime.shared.generatingProfile = nil
+                if PetRuntime.shared.runIDs[target.gatewayID] == runID {
+                    PetRuntime.shared.cancelledGateways.remove(target.gatewayID)
+                    PetRuntime.shared.runTasks.removeValue(forKey: target.gatewayID)
+                    PetRuntime.shared.runIDs.removeValue(forKey: target.gatewayID)
+                    PetRuntime.shared.generatingProfiles.removeValue(forKey: target.gatewayID)
                 }
             }
             guard let self else { return }
@@ -1026,14 +1025,14 @@ extension AppModel {
                 await self.attachRoutedEventsIfNeeded(client: client,
                                                       gatewayID: target.gatewayID,
                                                       preserveStateOnReplacement: true)
-                guard PetRuntime.shared.runID == runID,
+                guard PetRuntime.shared.runIDs[target.gatewayID] == runID,
                       self.petStateIsCurrent(state, profileID: profile, target: target) else {
                     return
                 }
                 let result = try await client.petHatch(token: token, index: index, name: name,
                                                        prompt: prompt, cancelToken: cancelToken,
                                                        provider: provider)
-                guard PetRuntime.shared.runID == runID,
+                guard PetRuntime.shared.runIDs[target.gatewayID] == runID,
                       self.petStateIsCurrent(state, profileID: profile, target: target) else {
                     return
                 }
@@ -1042,7 +1041,7 @@ extension AppModel {
                 if let pet = result.payload.pet, let base64 = result.payload.spritesheetBase64,
                    let sheet = await Self.decodePetSheet(base64: base64, revision: pet.revision,
                                                          geometry: pet.geometry) {
-                    guard PetRuntime.shared.runID == runID,
+                    guard PetRuntime.shared.runIDs[target.gatewayID] == runID,
                           self.petStateIsCurrent(state, profileID: profile, target: target) else {
                         return
                     }
@@ -1052,14 +1051,14 @@ extension AppModel {
                 }
                 state.generation.phase = .preview
             } catch {
-                guard PetRuntime.shared.runID == runID,
+                guard PetRuntime.shared.runIDs[target.gatewayID] == runID,
                       self.petStateIsCurrent(state, profileID: profile, target: target) else {
                     return
                 }
                 // The drafts are still staged, so this lands back on the
                 // chooser rather than throwing the whole run away.
                 state.generation.phase = .choosing
-                if !PetRuntime.shared.cancelled {
+                if !PetRuntime.shared.cancelledGateways.contains(target.gatewayID) {
                     state.generation.error = Self.shortMessage(error)
                 }
             }
@@ -1073,9 +1072,9 @@ extension AppModel {
         let state = pets(for: profile)
         let runtime = PetRuntime.shared
         guard state.generation.isBusy, mode == .live, let target = state.target,
-              runtime.generatingProfile == target.stateKey,
-              runtime.runTask != nil else { return }
-        runtime.cancelled = true
+              runtime.generatingProfiles[target.gatewayID] == target.stateKey,
+              runtime.runTasks[target.gatewayID] != nil else { return }
+        runtime.cancelledGateways.insert(target.gatewayID)
         let tokens = [state.generation.hatchToken, state.generation.token]
             .filter { !$0.isEmpty }
         Task { [weak self] in

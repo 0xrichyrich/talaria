@@ -126,7 +126,7 @@ public extension AppModel {
         let runtime = MultiGatewayRuntime.shared
         if let existing = runtime.routedEvents[gatewayID],
            ObjectIdentifier(existing.client) == ObjectIdentifier(client) { return }
-        if preserveStateOnReplacement, runtime.routedEvents[gatewayID] == nil {
+        if preserveStateOnReplacement {
             await removeRoutedEventSubscription(gatewayID: gatewayID)
         } else {
             await detachRoutedEvents(gatewayID: gatewayID)

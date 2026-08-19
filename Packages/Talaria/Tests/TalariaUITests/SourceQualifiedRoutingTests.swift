@@ -556,7 +556,7 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         LiveRuntime.shared.gatewayID = "primary"
         let remote = model.pets(for: "homelab::default")
         remote.generation.phase = .drafting
-        PetRuntime.shared.generatingProfile = remote.target!.stateKey
+        PetRuntime.shared.generatingProfiles["homelab"] = remote.target!.stateKey
         let event = GatewayEvent(type: "pet.generate.progress", sessionID: "",
                                  payload: .object(["token": .string("remote-token"),
                                                    "count": .number(4)]))
@@ -566,6 +566,31 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         model.routePetEvent(event, sourceGatewayID: "homelab")
         XCTAssertEqual(remote.generation.token, "remote-token")
         XCTAssertEqual(remote.generation.expectedDrafts, 4)
+    }
+
+    func testPetGenerationRunsAreIndependentPerGateway() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let primary = model.pets(for: "default")
+        let remote = model.pets(for: "homelab::default")
+        let runtime = PetRuntime.shared
+        primary.generation.phase = .drafting
+        remote.generation.phase = .drafting
+        runtime.generatingProfiles["primary"] = primary.target!.stateKey
+        runtime.generatingProfiles["homelab"] = remote.target!.stateKey
+        runtime.runIDs["primary"] = UUID()
+        runtime.runIDs["homelab"] = UUID()
+        runtime.runTasks["primary"] = Task { try? await Task.sleep(for: .seconds(10)) }
+        runtime.runTasks["homelab"] = Task { try? await Task.sleep(for: .seconds(10)) }
+
+        model.dropPetScope(gatewayID: "homelab")
+
+        XCTAssertNotNil(runtime.runTasks["primary"])
+        XCTAssertNotNil(runtime.runIDs["primary"])
+        XCTAssertEqual(runtime.generatingProfiles["primary"], primary.target!.stateKey)
+        XCTAssertNil(runtime.runTasks["homelab"])
+        XCTAssertNil(runtime.runIDs["homelab"])
+        XCTAssertNil(runtime.generatingProfiles["homelab"])
     }
 
     func testRoutineGatewayDetachPreservesOtherGatewayRows() {
