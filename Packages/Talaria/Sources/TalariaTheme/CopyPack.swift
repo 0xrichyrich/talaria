@@ -133,7 +133,7 @@ public struct CopyPack: Sendable {
         kickerConn: "UPLINKS", titleConn: "Connections", appearance: "Appearance",
         gatewaysSec: "Gateways", addGateway: "+ Add gateway — URL or Hermes Cloud",
         notifySec: "Notify me when",
-        pushNote: "Delivered over APNs by the gateway’s push relay; critical approvals can break through Focus.",
+        pushNote: "Delivered over APNs by the gateway’s push relay; Time Sensitive approvals can break through Focus when iOS allows it.",
         tag: "NEEDS APPROVAL", unto: "to",
         approve: "Approve", approveSend: "Approve & send", deny: "Deny", pendChip: "PENDING",
         digestHead: "DIGEST · 3 OF 6", digestLink: "Open full digest →",

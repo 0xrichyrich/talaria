@@ -32,6 +32,9 @@ public struct NotificationsCard: View {
         case unregistered
         /// iOS accepted authorization but APNs device registration failed.
         case registrationFailed(String)
+        /// The gateway plugin exists, but its APNs credentials or relay state
+        /// cannot currently deliver notifications.
+        case relayMisconfigured(String)
         case ready(devices: Int)
         case noRelay
     }
@@ -77,7 +80,7 @@ public struct NotificationsCard: View {
                     action("Send test push", primary: false) { await test() }
                 case .denied:
                     action("Open Settings", primary: false) { openSystemSettings() }
-                case .noRelay:
+                case .noRelay, .relayMisconfigured:
                     action("Recheck", primary: false) { await refresh() }
                 }
                 Spacer()
@@ -99,7 +102,7 @@ public struct NotificationsCard: View {
     private var dotColor: Color {
         switch stage {
         case .ready: theme.ok
-        case .denied, .noRelay, .registrationFailed: theme.danger
+        case .denied, .noRelay, .registrationFailed, .relayMisconfigured: theme.danger
         case .unknown: theme.faint
         default: theme.warn
         }
@@ -110,6 +113,7 @@ public struct NotificationsCard: View {
         case .ready: "Notifications on"
         case .denied: "Notifications blocked"
         case .noRelay: "Relay not installed"
+        case .relayMisconfigured: "Relay needs attention"
         case .unregistered: "Almost there"
         case .registrationFailed: "APNs registration failed"
         default: "Notifications off"
@@ -124,6 +128,8 @@ public struct NotificationsCard: View {
             return "iOS is blocking Talaria's notifications. Turn them back on in Settings → Talaria → Notifications."
         case .noRelay:
             return "This gateway has no talaria-push relay plugin, so it can't send pushes. Install app/relay on the gateway host, then recheck."
+        case .relayMisconfigured(let reason):
+            return "This gateway registered the phone, but its APNs relay is not ready: \(reason)"
         case .unregistered:
             return "Notifications are allowed on this device but the gateway hasn't registered it yet."
         case .registrationFailed(let message):
@@ -188,6 +194,10 @@ public struct NotificationsCard: View {
             stage = .noRelay
             return
         }
+        if let issue = PushRelayContract.configurationIssue(relay) {
+            stage = .relayMisconfigured(issue)
+            return
+        }
         let devices: Int
         if let reported = relay["devices"]?.intValue ?? relay["device_count"]?.intValue {
             devices = reported
@@ -244,7 +254,8 @@ public struct NotificationsCard: View {
             try await client.sendTestPush(tokenHex: PushCoordinator.shared.deviceTokenHex)
             message = "Test push sent — it should arrive in a second."
         } catch {
-            message = "Test failed: \(error.localizedDescription)"
+            let detail = (error as? GatewayError)?.message ?? error.localizedDescription
+            message = "Test failed: \(detail)"
         }
         #endif
     }

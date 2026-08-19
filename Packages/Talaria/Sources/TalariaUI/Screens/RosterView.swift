@@ -294,7 +294,7 @@ public struct RosterView: View {
         // lives in `AppModel`, which `TalariaTheme` cannot import. Without
         // this line `talariaLiveBots` keeps its empty default and the whole
         // second clause is inert: the row's sway and its 6 pt dot say "alive"
-        // while the face beside them stares idle with no chin dots.
+        // while the face beside them stares idle.
         //
         // The set, not the union with `.working`: `AvatarView` already ORs the
         // first clause in, and publishing only the half it cannot compute

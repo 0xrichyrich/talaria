@@ -22,12 +22,11 @@ public struct TranscriptPresentationPolicy: Sendable, Equatable {
         detail == .advanced
     }
 
-    /// Quiet mode is avatar-first while work is active and retains failures
-    /// afterward. Running and successfully completed details remain in the
-    /// model and appear immediately when Advanced is enabled.
+    /// Quiet mode is avatar-only while work is active. Every tool detail,
+    /// including failures, remains in the model and appears immediately when
+    /// Advanced is enabled; none of it competes with the bot-focused view.
     public func visibleToolCalls(_ calls: [ToolCall]) -> [ToolCall] {
-        guard detail == .quiet else { return calls }
-        return calls.filter { $0.state == .failed }
+        detail == .quiet ? [] : calls
     }
 
     /// A quiet transcript always uses the face as its busy affordance.

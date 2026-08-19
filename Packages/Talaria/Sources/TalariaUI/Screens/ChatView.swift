@@ -75,6 +75,7 @@ public struct ChatView: View {
     @ScaledMetric(relativeTo: .body) private var inkComposerSize = 15
     @State private var showModelSheet = false
     @State private var showCommands = false
+    @State private var initialTranscriptAnchored = false
     @FocusState private var composerFocused: Bool
 
     /// Tapback set, matching desktop's reaction picker.
@@ -281,7 +282,22 @@ public struct ChatView: View {
             // rather than vanishing at some threshold.
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
+            .task(id: initialTranscriptAnchorKey) {
+                guard !initialTranscriptAnchored, !messages.isEmpty else { return }
+                // A long LazyVStack does not have its final bottom geometry on
+                // the first paint. Anchor once after the initial layout, then
+                // again after the first lazy measurement pass. Subsequent
+                // transcript updates keep the normal animated behavior below
+                // and never fight a person's manual scroll position.
+                await Task.yield()
+                proxy.scrollTo("chat-bottom", anchor: .bottom)
+                try? await Task.sleep(for: .milliseconds(60))
+                guard !Task.isCancelled else { return }
+                proxy.scrollTo("chat-bottom", anchor: .bottom)
+                initialTranscriptAnchored = true
+            }
             .onChange(of: messages.count) {
+                guard initialTranscriptAnchored else { return }
                 withAnimation(ChatComposerLayoutPolicy.animation(
                     reducedMotion: reducedMotion, duration: 0.25
                 )) {
@@ -295,7 +311,12 @@ public struct ChatView: View {
                     proxy.scrollTo("chat-bottom", anchor: .bottom)
                 }
             }
+            .onChange(of: botID) { _, _ in initialTranscriptAnchored = false }
         }
+    }
+
+    private var initialTranscriptAnchorKey: String {
+        "\(botID)\u{1f}\(messages.count)\u{1f}\(String(describing: messages.last?.id))"
     }
 
     @ViewBuilder private func messageRow(_ message: ChatMessage) -> some View {

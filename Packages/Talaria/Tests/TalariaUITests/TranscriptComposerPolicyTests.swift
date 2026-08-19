@@ -2,6 +2,7 @@
 import Foundation
 import XCTest
 @testable import TalariaKit
+@testable import TalariaTheme
 @testable import TalariaUI
 
 final class TranscriptComposerPolicyTests: XCTestCase {
@@ -21,14 +22,14 @@ final class TranscriptComposerPolicyTests: XCTestCase {
         XCTAssertEqual(defaults.string(forKey: TalariaSettingsStore.transcriptDetailKey), "quiet")
     }
 
-    func testQuietPresentationKeepsOnlyFailedTools() {
+    func testQuietPresentationHidesAllToolDetails() {
         let calls = [
             ToolCall(id: "running", name: "read", context: "", state: .running),
             ToolCall(id: "done", name: "search", context: "", state: .done),
             ToolCall(id: "failed", name: "terminal", context: "", state: .failed),
         ]
         let quiet = TranscriptPresentationPolicy(detail: .quiet)
-        XCTAssertEqual(quiet.visibleToolCalls(calls).map(\.id), ["failed"])
+        XCTAssertTrue(quiet.visibleToolCalls(calls).isEmpty)
         XCTAssertFalse(quiet.showsReasoning(isLive: true))
         XCTAssertTrue(quiet.showsWorkingAvatar(isTurnRunning: true, hasLiveDetail: true))
     }
@@ -43,6 +44,18 @@ final class TranscriptComposerPolicyTests: XCTestCase {
         XCTAssertTrue(advanced.showsReasoning(isLive: false))
         XCTAssertTrue(advanced.showsWorkingAvatar(isTurnRunning: true, hasLiveDetail: false))
         XCTAssertFalse(advanced.showsWorkingAvatar(isTurnRunning: true, hasLiveDetail: true))
+    }
+
+    func testIdleAvatarKeepsIndependentBreatheAndGazeMotionWithoutWorkState() {
+        let first = FacePose.at(.idle, t: 0, phase: 0)
+        let later = FacePose.at(.idle, t: 1.25, phase: 0.8)
+        XCTAssertFalse(first.working)
+        XCTAssertFalse(later.working)
+        XCTAssertNotEqual(first.roll, later.roll)
+        XCTAssertNotEqual(first.gazeX, later.gazeX)
+        XCTAssertNotEqual(first.gazeY, later.gazeY)
+        XCTAssertEqual(first.eyeScale, 1)
+        XCTAssertGreaterThan(FacePose.at(.work, t: 0).eyeScale, 1)
     }
 
     func testComposerAllocatesFullEditorWidthAndAccessibleControls() {
