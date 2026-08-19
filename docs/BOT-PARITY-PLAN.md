@@ -1,5 +1,10 @@
 # Plan — 1:1 with the Bot Mode plugin
 
+> [!IMPORTANT]
+> This phase plan is retained as historical implementation context. The active,
+> dependency-ordered program and exact Hermes source authority are in
+> [`PARITY-BASELINE.md`](PARITY-BASELINE.md).
+
 **Status: Phases B, C and D have landed. A–F below are unchanged from the proposal;
 the per-phase notes record what actually shipped.**
 

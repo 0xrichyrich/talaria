@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/nousresearch/hermes-agent.git",
+  "ref": "HEAD",
+  "commit": "395c70d616f6426e990632ff8b57cf1e9499702f",
+  "auditedAt": "2026-08-18",
+  "talariaBaseline": "e5fe2e7633cd4b0cc25034733c405e82efaf3d54",
+  "authorityFiles": [
+    {
+      "path": "apps/desktop/src/plugins/hermes-bots/plugin.js",
+      "sha256": "e73f7e8cb3a4399226024d17b286e489b952daf13d0764bbb0426343714d7ac6"
+    },
+    {
+      "path": "website/docs/user-guide/bot-mode.md",
+      "sha256": "2fd010273b366fcf82775896bc4292e24367eb9aa539f3b718214cf23faa9682"
+    },
+    {
+      "path": "website/docs/user-guide/desktop.md",
+      "sha256": "c5e22516e9e72b07cc452e0ac20f1d5a84b465e8922d6d4da2b44c9cc6f1884f"
+    },
+    {
+      "path": "website/docs/user-guide/multi-connection-desktop.md",
+      "sha256": "69dfcef878d4ce93a416608aaa01e58db87e385da0ef18db7279899668c62f8a"
+    },
+    {
+      "path": "apps/desktop/DESIGN.md",
+      "sha256": "27d7c123ba9e8dc18c6dde94df360309357788705cd4de88b241b679a4bd11b2"
+    }
+  ]
+}

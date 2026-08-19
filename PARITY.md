@@ -1,5 +1,11 @@
 # Hermes Desktop ↔ Talaria — parity contract
 
+> [!WARNING]
+> This row ledger is a historical 2026-08-17/18 snapshot. Its percentages and
+> source line citations are not current Hermes parity claims. New work is
+> governed by the exact upstream pin and completion rules in
+> [`docs/PARITY-BASELINE.md`](docs/PARITY-BASELINE.md).
+
 **Snapshot: 2026-08-17** (spot-checks re-verified 2026-08-18; **30 rows moved by the 2026-08-18 overnight run**, see [below](#the-2026-08-18-overnight-run)) · **1,190 rows** across 10 areas · every row cites a desktop `file:line`.
 
 > **Bot Mode has its own, deeper contract** in [`docs/BOT-MODE-PARITY.md`](docs/BOT-MODE-PARITY.md) — roster rows, canonical chat, handles/mentions, A2A delegation, group chats and the bot CRUD surface are enumerated there at the same granularity. This document covers the ten *app* areas and touches Bot Mode only where it shows up in the shared shell (the `profiles-botmode` section below).
@@ -1811,4 +1817,3 @@ The effort sheet seeds from `ChatState.reasoningEffort`, which starts empty and 
 - **Do not trust a stale status.** This document was written from an audit that was partly stale within hours; the corrections above are dated for exactly that reason. Before quoting a ⭕ at someone, grep `Sources/` for it.
 - **➖ is a decision, not a status.** Moving a row out of ➖ needs a stated reason (usually: iPad, or the gateway grew a route that makes a local-only behaviour remote). Moving a row *into* ➖ needs the analogue named, or it is just a deferral wearing a costume.
 - **Bot Mode rows live in [`docs/BOT-MODE-PARITY.md`](docs/BOT-MODE-PARITY.md).** If a behaviour is about the roster, canonical chat, handles, delegation or group rooms, it belongs there, not here.
-

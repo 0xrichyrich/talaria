@@ -1,5 +1,11 @@
 # Bot Mode Parity
 
+> [!WARNING]
+> This row ledger audits an older Hermes Bot Mode implementation. Current work
+> must use the exact upstream pin and completion rules in
+> [`PARITY-BASELINE.md`](PARITY-BASELINE.md). Do not quote the percentages below
+> as current coverage until this ledger is regenerated.
+
 **Talaria's primary reference is Hermes Desktop's Bot Mode**, the in-tree plugin at
 `hermes-agent-upstream/apps/desktop/src/plugins/hermes-bots/plugin.js` (8,323 lines).
 
