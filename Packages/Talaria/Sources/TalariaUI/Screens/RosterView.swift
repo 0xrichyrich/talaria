@@ -2,6 +2,22 @@ import SwiftUI
 import TalariaKit
 import TalariaTheme
 
+enum RosterRoomPolicy {
+    static func showsEmpty(primaryBots: Int, rooms: Int, foreignBots: Int,
+                           isSearching: Bool) -> Bool {
+        primaryBots == 0 && rooms == 0 && foreignBots == 0 && !isSearching
+    }
+
+    static func matches(_ room: RoomRecord, needle: String) -> Bool {
+        room.name.lowercased().contains(needle)
+            || room.members.contains { member in
+                (member.title ?? "").lowercased().contains(needle)
+                    || member.handle.lowercased().contains(needle)
+                    || (member.sourceLabel ?? "").lowercased().contains(needle)
+            }
+    }
+}
+
 // The roster — the app's home screen. Themed kicker+title header with the
 // search glyph, theme cycler, network chip and "+" (new bot); an offline
 // banner when the gateway is unreachable; staggered-entrance bot rows with
@@ -110,12 +126,65 @@ public struct RosterView: View {
 
     private var isSearching: Bool { !needle.isEmpty }
 
+    private enum HomeRosterItem: Identifiable {
+        case bot(Bot)
+        case foreign(ForeignRosterEntry)
+        case room(RoomRecord)
+
+        var id: String {
+            switch self {
+            case .bot(let bot): "bot:\(bot.id)"
+            case .foreign(let entry): "bot:\(entry.id)"
+            case .room(let room): "room:\(room.id.description)"
+            }
+        }
+    }
+
     /// The rows the list draws: `rankedBots` narrowed, never re-sorted. The
     /// filter is applied to the array in the order it is already painted, so
     /// pinned-then-recency survives typing (plugin.js:2961-2962, 7657-7668).
     private var visibleBots: [Bot] {
         model.rankedBots.filterBots(needle: needle,
                                     connectionLabel: model.activeConnectionLabel)
+    }
+
+    private var visibleRooms: [RoomRecord] {
+        guard !needle.isEmpty else { return model.rooms }
+        return model.rooms.filter { RosterRoomPolicy.matches($0, needle: needle) }
+    }
+
+    /// Rooms and bots share one messaging roster. Pinned bots retain their
+    /// explicit top group; everything else is ordered by real conversation
+    /// recency, so an active room moves naturally beside an active bot rather
+    /// than living in a second shelf users have to remember to inspect.
+    private var visibleHomeItems: [HomeRosterItem] {
+        (visibleBots.map(HomeRosterItem.bot)
+            + visibleForeign.map(HomeRosterItem.foreign)
+            + visibleRooms.map(HomeRosterItem.room))
+            .enumerated()
+            .sorted { left, right in
+                let lp = isPinned(left.element)
+                let rp = isPinned(right.element)
+                if lp != rp { return lp }
+                let la = activityDate(left.element)
+                let ra = activityDate(right.element)
+                if la != ra { return la > ra }
+                return left.offset < right.offset
+            }
+            .map(\.element)
+    }
+
+    private func isPinned(_ item: HomeRosterItem) -> Bool {
+        if case .bot(let bot) = item { return model.isPinned(bot.id) }
+        return false
+    }
+
+    private func activityDate(_ item: HomeRosterItem) -> Double {
+        switch item {
+        case .bot(let bot): RosterSignals.shared.activity(of: bot.id)
+        case .foreign(let entry): (entry.lastActive ?? 0) * 1_000
+        case .room(let room): room.lastActivityAt.timeIntervalSince1970 * 1_000
+        }
     }
 
     private var visibleForeign: [ForeignRosterEntry] {
@@ -128,13 +197,13 @@ public struct RosterView: View {
     /// the union, so a phone whose only rows live on other gateways still gets
     /// a field.
     private var showsSearchField: Bool {
-        !model.bots.isEmpty || !model.foreignRosterEntries.isEmpty
+        !model.bots.isEmpty || !model.foreignRosterEntries.isEmpty || !model.rooms.isEmpty
     }
 
     /// Both halves of the union came back empty for a live query — desktop's
     /// `No bots match “…”` (plugin.js:7874-7885).
     private var showsNoMatches: Bool {
-        isSearching && visibleBots.isEmpty && visibleForeign.isEmpty
+        isSearching && visibleBots.isEmpty && visibleForeign.isEmpty && visibleRooms.isEmpty
     }
 
     public var body: some View {
@@ -147,6 +216,9 @@ public struct RosterView: View {
                     .padding(.horizontal, 20)
                     .padding(.bottom, 6)
             }
+            roomMetadataOutboxBanner
+                .padding(.horizontal, 16)
+                .padding(.bottom, model.roomMetadataPendingCount > 0 ? 7 : 0)
             // Who is working right now — above the list, never inside it, and
             // zero height when nobody is (Components/ActiveNowStrip.swift,
             // plugin.js:6888-6937). A separate view by construction, so
@@ -163,27 +235,38 @@ public struct RosterView: View {
             }
             ScrollView {
                 LazyVStack(spacing: listGap) {
-                    if model.bots.isEmpty && !isSearching {
+                    if RosterRoomPolicy.showsEmpty(primaryBots: model.bots.count,
+                                                   rooms: model.rooms.count,
+                                                   foreignBots: model.foreignRosterEntries.count,
+                                                   isSearching: isSearching) {
                         emptyState
                             .padding(.top, 60)
                     } else {
-                        let ranked = visibleBots
-                        ForEach(Array(ranked.enumerated()), id: \.element.id) { index, bot in
-                            row(for: bot, index: index)
-                                // Keyed by id, never by index: the entrance is
-                                // arrival, and a re-rank must not replay it.
-                                .modifier(RosterEntrance(botID: bot.id,
-                                                         delay: Double(min(index, 12)) * 0.045))
+                        let ranked = visibleHomeItems
+                        ForEach(Array(ranked.enumerated()), id: \.element.id) { index, item in
+                            switch item {
+                            case .bot(let bot):
+                                row(for: bot, index: index)
+                                    // Keyed by id, never by index: the entrance is
+                                    // arrival, and a re-rank must not replay it.
+                                    .modifier(RosterEntrance(botID: bot.id,
+                                                             delay: Double(min(index, 12)) * 0.045))
+                            case .foreign(let entry):
+                                foreignRow(entry)
+                                    .modifier(RosterEntrance(botID: entry.id,
+                                                             delay: Double(min(index, 12)) * 0.045))
+                            case .room(let room):
+                                roomRow(room)
+                                    .modifier(RosterEntrance(botID: "room:\(room.id.description)",
+                                                             delay: Double(min(index, 12)) * 0.045))
+                            }
                         }
                         .animation(.easeOut(duration: 0.35), value: ranked.map(\.id))
                     }
-                    // The rest of the fleet: every bot on a saved gateway that
-                    // is not the live one, under its own divider. Deliberately
-                    // OUTSIDE the empty branch — with nothing connected, the
-                    // other gateways are the only roster there is, and an
-                    // "add a gateway" empty state above rows this phone
-                    // already knows about would be a lie.
-                    MultiGatewayRosterSection(model: model, needle: needle)
+                    // Gateways that contributed no bot rows remain actionable
+                    // footnotes. Actual foreign bots are already interleaved
+                    // above with local bots and rooms by recency.
+                    MultiGatewayRosterSection(model: model, needle: needle, includeEntries: false)
                     if showsNoMatches {
                         noMatchesRow
                             .padding(.top, 40)
@@ -192,7 +275,7 @@ public struct RosterView: View {
                     // gateways"), so it stands down while a query is narrowing
                     // the list — a count that does not match what is on screen
                     // reads as a bug, and desktop has no footer to consult.
-                    if !model.bots.isEmpty && !isSearching {
+                    if (!model.unionRosterBots.isEmpty || !model.rooms.isEmpty) && !isSearching {
                         footer
                             .padding(.top, 10)
                     }
@@ -235,6 +318,7 @@ public struct RosterView: View {
             // Coming back from another tab, the numbers can be up to a slow
             // tick old; ask once on arrival rather than showing stale ranking.
             await model.refreshRosterSignalsNow()
+            await model.loadRooms()
         }
         // The union roster's own refresh. It lives HERE rather than on the
         // section it feeds because that section sits inside a LazyVStack: below
@@ -258,6 +342,54 @@ public struct RosterView: View {
         .onChange(of: showsSearchField) {
             if !showsSearchField { search = "" }
         }
+    }
+
+    @ViewBuilder private var roomMetadataOutboxBanner: some View {
+        switch RoomMetadataOutboxPolicy.status(
+            pendingCount: model.roomMetadataPendingCount,
+            lastError: model.roomMetadataLastError
+        ) {
+        case .clear:
+            EmptyView()
+        case .waiting(let count):
+            roomMetadataOutboxBannerContent(
+                count: count,
+                detail: "Room membership updates are waiting to sync.",
+                isFailure: false
+            )
+        case .retryRequired(let count, _):
+            roomMetadataOutboxBannerContent(
+                count: count,
+                detail: "Room membership could not sync. Reconnect the owning gateway and retry.",
+                isFailure: true
+            )
+        }
+    }
+
+    private func roomMetadataOutboxBannerContent(count: Int, detail: String,
+                                                  isFailure: Bool) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: isFailure ? "exclamationmark.arrow.triangle.2.circlepath" :
+                    "arrow.triangle.2.circlepath")
+                .foregroundStyle(isFailure ? theme.danger : theme.warn)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(count) room membership update\(count == 1 ? "" : "s") pending")
+                    .font(theme.body(11, weight: .semibold)).foregroundStyle(theme.ink)
+                Text(detail).font(theme.body(9.5)).foregroundStyle(theme.faint).lineLimit(2)
+            }
+            Spacer(minLength: 6)
+            Button("Retry") { Task { await model.flushRoomMetadataOutbox() } }
+                .buttonStyle(.plain).font(theme.body(10, weight: .bold))
+                .foregroundStyle(theme.accent).frame(minWidth: 44, minHeight: 44)
+                .accessibilityLabel("Retry room membership updates")
+        }
+        .padding(.leading, 12).padding(.trailing, 6)
+        .background((isFailure ? theme.danger : theme.warn).opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .strokeBorder((isFailure ? theme.danger : theme.warn).opacity(0.25), lineWidth: 1))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("room-metadata-outbox-banner")
     }
 
     // MARK: - Header controls
@@ -513,6 +645,69 @@ public struct RosterView: View {
     }
 
     // MARK: - Rows
+
+    private func roomRow(_ room: RoomRecord) -> some View {
+        RoomRow(room: room, theme: theme, avatarData: model.roomAvatarData(room.id)) {
+            model.feedback(.open)
+            model.openBotID = nil
+            model.openRoomID = room.id
+        }
+        .padding(rowPadding)
+        .background(rowBackground)
+        .overlay(alignment: .bottom) {
+            if theme.rowStyle == .ledger {
+                Rectangle().fill(theme.ink.opacity(0.16)).frame(height: 1)
+            }
+        }
+    }
+
+    private func foreignRow(_ entry: ForeignRosterEntry) -> some View {
+        let bot = model.rosterBot(for: entry)
+        let badgeState: ConnectionBadge.State = entry.needsSignIn ? .needsSignIn
+            : entry.isStale ? .stale : .live
+        return Button {
+            Task { @MainActor in await model.openForeignBot(entry) }
+        } label: {
+            HStack(alignment: .center, spacing: 13) {
+                AvatarView(bot: bot, size: 38, theme: theme)
+                    .opacity(entry.isStale || entry.needsSignIn ? 0.45 : 1)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline, spacing: 7) {
+                        BotIdentityLabel(bot: bot, theme: theme, scale: .row)
+                        ConnectionBadge(label: entry.connectionLabel,
+                                        kind: entry.connectionKind,
+                                        state: badgeState, theme: theme)
+                    }
+                    Text(foreignStatus(entry))
+                        .font(previewFont(hot: false)).foregroundStyle(theme.faint)
+                        .lineLimit(1).truncationMode(.tail)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .semibold)).foregroundStyle(theme.faint)
+            }
+            .padding(rowPadding).background(rowBackground)
+            .overlay(alignment: .bottom) {
+                if theme.rowStyle == .ledger {
+                    Rectangle().fill(theme.ink.opacity(0.1)).frame(height: 1)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func foreignStatus(_ entry: ForeignRosterEntry) -> String {
+        if entry.needsSignIn { return copy.gatewayNeedsSignIn(theme.id) }
+        if entry.isStale {
+            let formatter = RelativeDateTimeFormatter()
+            formatter.unitsStyle = .abbreviated
+            return copy.gatewayLastSeen(
+                formatter.localizedString(for: entry.fetchedAt, relativeTo: .now), theme.id)
+        }
+        let preview = entry.preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        return preview.isEmpty ? copy.remoteBotReady(entry.connectionLabel, theme.id) : preview
+    }
 
     private func row(for bot: Bot, index: Int) -> some View {
         Button {
@@ -844,9 +1039,12 @@ public struct RosterView: View {
     // MARK: - Footer
 
     private var footer: some View {
-        Text(TalariaVoice.rosterFooter(botCount: model.bots.count,
-                                       gatewayCount: max(model.connections.count, 1),
-                                       theme.id))
+        let bots = TalariaVoice.rosterFooter(botCount: model.unionRosterBots.count,
+                                             gatewayCount: max(model.connections.count, 1),
+                                             theme.id)
+        let roomCount = model.rooms.count
+        let rooms = roomCount == 1 ? "1 room" : "\(roomCount) rooms"
+        return Text(roomCount == 0 ? bots : "\(bots) · \(rooms)")
             .font(footFont)
             .tracking(theme.id == .soft ? 0 : theme.id == .control ? 1 : 2)
             .foregroundStyle(theme.id == .soft ? theme.ink.opacity(0.35)
@@ -934,19 +1132,19 @@ extension CopyPack {
     /// character, not three dots (plugin.js:7838).
     static func rosterSearchPlaceholder(_ t: ThemeID) -> String {
         switch t {
-        case .soft: "Search bots…"
-        case .control: "FILTER ROSTER…"
-        case .ink: "Seek a name…"
+        case .soft: "Search bots and rooms…"
+        case .control: "FILTER ROSTER + ROOMS…"
+        case .ink: "Seek a name or room…"
         }
     }
 
-    /// Screen-reader name for the field — desktop's aria-label is
-    /// 'Search bots' (plugin.js:7835).
+    /// Screen-reader name expands desktop's bot-only field because the mobile
+    /// home roster also contains durable rooms.
     static func rosterSearchLabel(_ t: ThemeID) -> String {
         switch t {
-        case .soft: "Search bots"
-        case .control: "FILTER ROSTER"
-        case .ink: "seek a name"
+        case .soft: "Search bots and rooms"
+        case .control: "FILTER ROSTER AND ROOMS"
+        case .ink: "seek a name or room"
         }
     }
 
@@ -958,12 +1156,13 @@ extension CopyPack {
         }
     }
 
-    /// Desktop: `No bots match “<query>”` (plugin.js:7884). The query is shown
+    /// Desktop: `No bots match “<query>”` (plugin.js:7884). Rooms share this
+    /// mobile list, so the empty result names both kinds. The query is shown
     /// as typed — the '@' strip is a matching rule, not a correction, so
     /// quoting the stripped needle back would look like a typo the app made.
     static func rosterSearchNoMatch(_ query: String, _ t: ThemeID) -> String {
         switch t {
-        case .soft: "No bots match “\(query)”"
+        case .soft: "No bots or rooms match “\(query)”"
         case .control: "NO MATCH: \(query.uppercased())"
         case .ink: "None on the roll answer to “\(query)”"
         }

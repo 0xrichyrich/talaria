@@ -199,23 +199,17 @@ public struct MentionResolution: Sendable, Equatable {
 
     public var isEmpty: Bool { bots.isEmpty && ambiguous.isEmpty && unknown.isEmpty }
 
-    /// The half of `bots` this app can actually deliver to — desktop's
-    /// `localMentions` (plugin.js:8289), which it filters by exactly this
-    /// flag.
-    public var deliverable: [Bot] { bots.filter { $0.remoteSource == nil } }
+    /// Every resolved bot is deliverable. The UI turns each row into a
+    /// `GatewayBotRoute` before dispatch, so a foreign row travels through the
+    /// retained client for its own source rather than through the primary
+    /// socket. This is desktop's local + remote split recombined after Talaria
+    /// gained a multi-gateway client pool.
+    public var deliverable: [Bot] { bots }
 
-    /// The half that resolved but lives on another gateway — desktop's
-    /// `remoteMentions` (plugin.js:8290).
-    ///
-    /// Upstream delivers these over Connections, because its main process
-    /// holds every connection open (`deliverRemoteRosterMentions`, 2593-2660,
-    /// routes each one through `host.requestProfile`). Talaria holds ONE
-    /// socket, so this half is addressable — the whole point of the
-    /// `@name-device` form is that it names a specific machine — but not
-    /// deliverable from here. Naming it is what lets the surfaces say so
-    /// instead of submitting `homelab::default` to the live gateway as if it
-    /// were a profile.
-    public var unreachable: [Bot] { bots.filter { $0.remoteSource != nil } }
+    /// Kept as a source-compatible spelling for surfaces compiled against the
+    /// earlier one-socket implementation. A resolved foreign row is no longer
+    /// unreachable merely because it lives on another saved gateway.
+    public var unreachable: [Bot] { [] }
 }
 
 // MARK: - Resolving against the roster (plugin.js:2434-2497)
@@ -303,17 +297,16 @@ public enum MentionResolver {
 
     /// "A bot never @s itself" (`isActiveRosterBot`, plugin.js:2414-2429).
     ///
-    /// Upstream compares the connection id as well as the name, and its
-    /// `remoteSource` branch (2420-2422) says a foreign row is the speaker
-    /// only when it is on the speaker's OWN source. Talaria's speaker always
-    /// lives on the one socket this app holds and a foreign row never does, so
-    /// that branch is a constant `false` here — spelled out rather than left
-    /// to fall out of the id comparison, because it is load-bearing: without
-    /// it, `default` speaking on this gateway would silently swallow the
-    /// homelab's `default` and un-poison the bare name it collides with.
+    /// Upstream compares the connection id as well as the name. A qualified
+    /// speaker can now be a bot on a retained secondary connection, so its
+    /// source-qualified roster id identifies itself. A bare speaker remains a
+    /// primary bot and therefore cannot suppress a same-named foreign row.
     public static func isSpeaker(_ bot: Bot, speaking speaker: String?) -> Bool {
         guard let speaker, !speaker.isEmpty else { return false }
-        guard bot.remoteSource == nil else { return false }
+        if bot.remoteSource != nil {
+            return bot.id.caseInsensitiveCompare(speaker) == .orderedSame
+        }
+        guard GatewayBotRoute(qualifiedID: speaker) == nil else { return false }
         return bot.id.caseInsensitiveCompare(speaker) == .orderedSame
     }
 }
@@ -426,14 +419,14 @@ public struct RoutedDraft: Sendable, Equatable {
     /// @handles — it only APPENDS a note (plugin.js:8319) — so an untouched
     /// draft here is byte-identical to the one that came in.
     public var text: String
-    /// Bots to hand off to, first-mention order. Deliverable ones only —
-    /// desktop's `localMentions` (plugin.js:8289).
+    /// Bots to hand off to, first-mention order. Includes foreign rows: the UI
+    /// converts every row to an exact source route before doing wire work.
     public var recipients: [Bot] = []
     /// Tokens that fit more than one bot and were therefore refused. Nothing
     /// was sent to any of them.
     public var refused: [MentionCollision] = []
-    /// Bots the draft addressed that live on another gateway — desktop's
-    /// `remoteMentions` (8290). Named, not delivered; see `route`.
+    /// Compatibility field from the former one-socket implementation. Always
+    /// empty now that retained secondary clients can deliver foreign rows.
     public var unreachable: [Bot] = []
 
     public init(text: String, recipients: [Bot] = [], refused: [MentionCollision] = [],
@@ -455,35 +448,29 @@ public enum MentionMiddleware {
     /// Run the middleware over a draft.
     ///
     /// The pipeline is upstream's, in upstream's order: the fast gate on the
-    /// raw text (8244), resolution against the roster (8252-8256 → 2434), the
-    /// local/remote split (8289-8290), and — only when something actually
-    /// resolved — the appended note (8319). A draft that mentions nobody,
+    /// raw text (8244), resolution against the roster (8252-8256 → 2434), and
+    /// — only when something actually resolved — the appended note (8319).
+    /// The desktop local/remote split (8289-8290) is recombined because both
+    /// halves are dispatched through exact gateway routes. A draft that mentions nobody,
     /// mentions only unknown handles, or mentions only ambiguous ones comes
     /// back untouched (8285-8287), because a mention must never block or
     /// mangle a send.
     ///
-    /// THE SPLIT IS WHERE TALARIA PARTS COMPANY. Desktop routes the remote
-    /// half over Connections and appends a second note about it (8312-8317);
-    /// Talaria holds one socket, so the remote half is reported back to the
-    /// caller as `unreachable` and NOTHING is promised about it in the text.
-    /// The note names only the recipients that were really handed off, because
-    /// the note is an instruction the sending agent will act on — a name in it
-    /// that never received the message is a lie the model then repeats to the
-    /// user. A draft whose only mentions are unreachable therefore comes back
-    /// byte-identical, which is the same failure shape as the ambiguous case.
+    /// The note names only recipients that resolved. The caller still has to
+    /// construct a route descriptor for every row before it returns this text;
+    /// if route construction fails, it must fail closed and submit the original
+    /// draft rather than promise delivery.
     public static func route(_ text: String, roster: [Bot],
                              speaking speaker: String?) -> RoutedDraft {
         guard BotMention.mentions(text) else { return RoutedDraft(text: text) }
         let resolution = MentionResolver.resolve(text, roster: roster, speaking: speaker)
-        let recipients = resolution.deliverable
+        let recipients = resolution.bots
         guard !recipients.isEmpty else {
-            return RoutedDraft(text: text, refused: resolution.collisions,
-                               unreachable: resolution.unreachable)
+            return RoutedDraft(text: text, refused: resolution.collisions)
         }
         return RoutedDraft(text: text + handoffNote(to: recipients),
                            recipients: recipients,
-                           refused: resolution.collisions,
-                           unreachable: resolution.unreachable)
+                           refused: resolution.collisions)
     }
 
     /// The instruction block appended to the outgoing text.
@@ -497,11 +484,11 @@ public enum MentionMiddleware {
     /// AppModelLive+A2A.swift), so the remote block is the true one and the
     /// local one would be a lie the agent would act on.
     ///
-    /// Two words change from 8312-8317: "Desktop … over Connections" becomes
-    /// "Talaria … over the gateway", because that is who is delivering and
-    /// where. "Do not switch Gateway" is kept verbatim, and it is not
-    /// decoration: switching tears down the reply watch that is about to carry
-    /// the answer back (`detachA2ARouter`).
+    /// The actor changes from Desktop to Talaria; "Connections" stays literal
+    /// in meaning because each recipient is routed through its retained gateway
+    /// client. "Do not switch Gateway" is kept as an instruction to the sending
+    /// agent: the app already chose every destination and the model must not try
+    /// to reproduce that routing itself.
     ///
     /// Not themed. This is an instruction to a model, not copy for a person —
     /// the same reason upstream keeps it a literal.

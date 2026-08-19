@@ -1,6 +1,6 @@
 #if canImport(XCTest)
 import XCTest
-import TalariaKit
+@testable import TalariaKit
 @testable import TalariaUI
 
 @MainActor
@@ -22,6 +22,7 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         FeedsRuntime.shared.cronJobs.removeAll()
         FeedsRuntime.shared.cronScope.removeAll()
         FeedsRuntime.shared.routineTargets.removeAll()
+        FeedsRuntime.shared.inboxSessions.removeAll()
         CronDetailRuntime.shared.reset()
         CronDetailRuntime.shared.changeTick = 0
         CapabilityRuntime.shared.states.removeAll()
@@ -31,6 +32,7 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         PetRuntime.shared.reset()
         SessionsRuntime.shared.resetPrimaryScope()
         SessionsRuntime.shared.resetRoutedScope(gatewayID: "homelab")
+        A2ARuntime.shared.reset()
         super.tearDown()
     }
 
@@ -944,6 +946,287 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         XCTAssertEqual(model.takeRoutedUnreadForPrimary(profile: "default"), 3)
         XCTAssertNil(MultiGatewayRuntime.shared.routedUnread[route])
         XCTAssertEqual(model.takeRoutedUnreadForPrimary(profile: "default"), 0)
+    }
+
+    func testQualifiedRemoteMentionSpeakerExcludesOnlyItself() {
+        let primary = Bot.unlisted(id: "default")
+        let remote = Bot(id: "homelab::default", job: "", shape: .circle, hue: .teal,
+                         handleOverride: "default-homelab",
+                         remoteSource: BotSource(profile: "default", gatewayID: "homelab",
+                                                 connectionLabel: "Homelab"))
+
+        let result = MentionResolver.resolve("@default check", roster: [primary, remote],
+                                             speaking: "homelab::default")
+
+        XCTAssertEqual(result.bots.map(\.id), ["default"])
+    }
+
+    func testForeignMentionBecomesExactRoutableEndpoint() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let remote = Bot(id: "homelab::researcher", job: "", shape: .circle, hue: .teal,
+                         remoteSource: BotSource(profile: "researcher", gatewayID: "homelab",
+                                                 connectionLabel: "Homelab"))
+        let draft = MentionMiddleware.route("@researcher investigate", roster: [remote],
+                                            speaking: "default")
+
+        XCTAssertEqual(draft.recipients.map(\.id), ["homelab::researcher"])
+        XCTAssertTrue(draft.unreachable.isEmpty)
+        XCTAssertEqual(model.a2aEndpoint(for: remote)?.route,
+                       GatewayBotRoute(gatewayID: "homelab", profile: "researcher"))
+    }
+
+    func testRemoteDefaultEndpointKeepsRouteHandleAndBareAttributionHandleDistinct() {
+        let model = AppModel()
+        LiveRuntime.shared.gatewayID = "primary"
+        let remote = Bot(id: "homelab::default", job: "", shape: .circle, hue: .teal,
+                         handleOverride: "default-homelab",
+                         remoteSource: BotSource(profile: "default", gatewayID: "homelab",
+                                                 connectionLabel: "Homelab"))
+
+        let endpoint = model.a2aEndpoint(for: remote)
+
+        XCTAssertEqual(endpoint?.handle, "default-homelab")
+        XCTAssertEqual(endpoint?.attributionHandle, "hermes")
+        XCTAssertEqual(endpoint?.route,
+                       GatewayBotRoute(gatewayID: "homelab", profile: "default"))
+    }
+
+    func testAttemptDeliveryKeysIsolateEqualProfilesBodiesAndSessions() {
+        let body = "same body"
+        let attempt = UUID()
+        let primary = GatewayBotRoute(gatewayID: "primary", profile: "default")
+        let remote = GatewayBotRoute(gatewayID: "homelab", profile: "default")
+
+        let primaryKey = AppModel.deliveryKey(route: primary, body: body, attemptID: attempt)
+        let remoteKey = AppModel.deliveryKey(route: remote, body: body, attemptID: attempt)
+        let repeatKey = AppModel.deliveryKey(route: primary, body: body, attemptID: UUID())
+
+        XCTAssertEqual(Set([primaryKey, remoteKey, repeatKey]).count, 3)
+    }
+
+    func testOptimisticDeliveryLookupUsesAttemptUUIDBeforeEqualBodyFallback() {
+        let model = AppModel()
+        let route = GatewayBotRoute(gatewayID: "primary", profile: "default")
+        let firstID = UUID()
+        let secondID = UUID()
+        let firstKey = AppModel.deliveryKey(route: route, body: "same", attemptID: firstID)
+        let secondKey = AppModel.deliveryKey(route: route, body: "same", attemptID: secondID)
+        A2ARuntime.shared.deliveries[firstKey] = A2ADelivery(
+            to: "default", route: route, attemptID: firstID,
+            bodyHash: AppModel.stableHash("same"), queuedBehindRun: false,
+            state: .replied, at: Date(timeIntervalSince1970: 1))
+        A2ARuntime.shared.deliveries[secondKey] = A2ADelivery(
+            to: "default", route: route, attemptID: secondID,
+            bodyHash: AppModel.stableHash("same"), queuedBehindRun: true,
+            state: .waiting, at: Date(timeIntervalSince1970: 2))
+        let firstRow = A2AMessage(id: firstID, fromBotID: "ops", toBotID: "default",
+                                  time: "now", text: "same")
+
+        XCTAssertEqual(model.delivery(for: firstRow)?.state, .replied)
+        XCTAssertEqual(model.delivery(for: firstRow)?.attemptID, firstID)
+    }
+
+    func testA2AScopeResetCancelsOnlyOwningGateway() {
+        let runtime = A2ARuntime.shared
+        let primary = GatewayBotRoute(gatewayID: "primary", profile: "default")
+        let remote = GatewayBotRoute(gatewayID: "homelab", profile: "default")
+        let primaryKey = AppModel.deliveryKey(route: primary, body: "same", attemptID: UUID())
+        let remoteKey = AppModel.deliveryKey(route: remote, body: "same", attemptID: UUID())
+        let primaryTask = Task<Void, Never> { try? await Task.sleep(for: .seconds(60)) }
+        let remoteTask = Task<Void, Never> { try? await Task.sleep(for: .seconds(60)) }
+        let primaryOpen = Task<A2ACanonicalSession, Error> {
+            try await Task.sleep(for: .seconds(60))
+            return A2ACanonicalSession(runtime: "same", stored: "same")
+        }
+        let remoteOpen = Task<A2ACanonicalSession, Error> {
+            try await Task.sleep(for: .seconds(60))
+            return A2ACanonicalSession(runtime: "same", stored: "same")
+        }
+        runtime.watchers[primaryKey] = primaryTask
+        runtime.watchers[remoteKey] = remoteTask
+        runtime.watcherScopes[primaryKey] = "primary"
+        runtime.watcherScopes[remoteKey] = "homelab"
+        runtime.canonicalOpens[primary] = primaryOpen
+        runtime.canonicalOpens[remote] = remoteOpen
+        runtime.deliveries[primaryKey] = A2ADelivery(
+            to: "default", route: primary, queuedBehindRun: false,
+            state: .waiting, at: Date())
+        runtime.deliveries[remoteKey] = A2ADelivery(
+            to: "homelab::default", route: remote, queuedBehindRun: false,
+            state: .waiting, at: Date())
+
+        runtime.reset(gatewayID: "homelab")
+
+        XCTAssertFalse(primaryTask.isCancelled)
+        XCTAssertTrue(remoteTask.isCancelled)
+        XCTAssertFalse(primaryOpen.isCancelled)
+        XCTAssertTrue(remoteOpen.isCancelled)
+        XCTAssertNotNil(runtime.deliveries[primaryKey])
+        XCTAssertNil(runtime.deliveries[remoteKey])
+        primaryTask.cancel()
+        primaryOpen.cancel()
+    }
+
+    func testCapturedPrimaryDisconnectScrubsBareScopeButPreservesRemote() {
+        let model = AppModel()
+        let primaryID = UUID()
+        let remoteID = UUID()
+        model.agentInbox = [
+            A2AMessage(id: primaryID, fromBotID: "ops", toBotID: "default",
+                       time: "now", text: "primary"),
+            A2AMessage(id: remoteID, fromBotID: "ops", toBotID: "homelab::default",
+                       time: "now", text: "remote"),
+        ]
+        FeedsRuntime.shared.inboxSessions = [
+            primaryID: SessionRef(gatewayID: "primary", botID: "default", storedID: "same"),
+            remoteID: SessionRef(gatewayID: "homelab", botID: "homelab::default",
+                                 storedID: "same"),
+        ]
+        // Reproduce the deliberate-disconnect ordering that previously lost
+        // source identity before A2A teardown.
+        LiveRuntime.shared.gatewayID = nil
+
+        model.detachA2ARouter(departingGatewayID: "primary")
+
+        XCTAssertEqual(model.agentInbox.map(\.id), [remoteID])
+        XCTAssertNil(FeedsRuntime.shared.inboxSessions[primaryID])
+        XCTAssertEqual(FeedsRuntime.shared.inboxSessions[remoteID]?.gatewayID, "homelab")
+    }
+
+    func testAcceptedSubmitNeverBecomesFailureWhenScopeInvalidates() {
+        let retained = A2AAcceptedOutcome.afterSubmit(scopeIsCurrent: true)
+        let detached = A2AAcceptedOutcome.afterSubmit(scopeIsCurrent: false)
+
+        XCTAssertEqual(retained.state, .waiting)
+        XCTAssertTrue(retained.retainWatcher)
+        XCTAssertEqual(detached.state, .quiet)
+        XCTAssertFalse(detached.retainWatcher)
+        if case .failed = detached.state {
+            XCTFail("an accepted prompt cannot be reclassified as transport failure")
+        }
+    }
+
+    func testFederatedInboxMergePreservesUnscannedRemoteAndReplacesAnchoredOptimistic() {
+        let primaryID = UUID()
+        let remoteAttempt = UUID()
+        let legacyRemoteID = UUID()
+        let primary = A2AMessage(id: primaryID, fromBotID: "ops", toBotID: "default",
+                                 time: "now", text: "primary old")
+        let remote = A2AMessage(id: remoteAttempt, fromBotID: "ops",
+                                toBotID: "homelab::default", time: "now", text: "remote")
+        // Older persisted rows can have bare participants on both sides. The
+        // source-qualified SessionRef, not the colliding ids, owns them.
+        let legacyRemote = A2AMessage(id: legacyRemoteID, fromBotID: "ops",
+                                      toBotID: "default", time: "now", text: "legacy remote")
+        let refs = [
+            primaryID: SessionRef(gatewayID: "primary", botID: "default", storedID: "same"),
+            remoteAttempt: SessionRef(gatewayID: "homelab", botID: "homelab::default",
+                                      storedID: "same"),
+            legacyRemoteID: SessionRef(gatewayID: "homelab", botID: "default",
+                                       storedID: "same"),
+        ]
+        let primaryServer = A2AMessage(id: UUID(), fromBotID: "ci", toBotID: "default",
+                                       time: "now", text: "primary fresh")
+        let primaryRef = SessionRef(gatewayID: "primary", botID: "default", storedID: "same")
+
+        let first = A2AInboxMerge.merge(
+            existing: [primary, remote, legacyRemote], existingRefs: refs,
+            server: [(primaryServer, Date(), primaryRef)], successfulGateways: ["primary"],
+            optimisticRows: [remoteAttempt: "homelab"], primaryGatewayID: "primary", limit: 80)
+
+        XCTAssertEqual(Set(first.messages.map(\.id)),
+                       [remoteAttempt, legacyRemoteID, primaryServer.id])
+        XCTAssertEqual(first.refs[remoteAttempt]?.gatewayID, "homelab")
+        XCTAssertEqual(first.refs[legacyRemoteID]?.gatewayID, "homelab")
+
+        let remoteServer = A2AMessage(id: remoteAttempt, fromBotID: "ops",
+                                      toBotID: "homelab::default", time: "now", text: "remote")
+        let remoteRef = SessionRef(gatewayID: "homelab", botID: "homelab::default",
+                                   storedID: "same")
+        let second = A2AInboxMerge.merge(
+            existing: first.messages, existingRefs: first.refs,
+            server: [(remoteServer, Date(), remoteRef)], successfulGateways: ["homelab"],
+            optimisticRows: [remoteAttempt: "homelab"], primaryGatewayID: "primary", limit: 80)
+
+        XCTAssertEqual(second.messages.filter { $0.id == remoteAttempt }.count, 1)
+        XCTAssertEqual(second.refs[remoteAttempt]?.gatewayID, "homelab")
+        XCTAssertTrue(second.settled.contains(remoteAttempt))
+    }
+
+    func testSessionRefReopensItsCapturedGatewayAcrossPrimaryRoleChanges() {
+        let ref = SessionRef(gatewayID: "homelab", botID: "default", storedID: "same")
+
+        XCTAssertEqual(ref.rosterID(activeGatewayID: "primary"), "homelab::default")
+        XCTAssertEqual(ref.rosterID(activeGatewayID: "homelab"), "default")
+        XCTAssertNil(SessionRef(gatewayID: "", botID: "default", storedID: "same")
+            .rosterID(activeGatewayID: "primary"))
+    }
+
+    func testFreshPinAuthorityHonorsRepinDeletionRaceAndReadFailure() {
+        XCTAssertEqual(A2APinAuthority.choose(
+            cached: "old", current: "old", sampledWrite: 2, currentWrite: 2,
+            serverReadSucceeded: true, serverPin: "desktop-new"), "desktop-new")
+        XCTAssertNil(A2APinAuthority.choose(
+            cached: "old", current: "old", sampledWrite: 2, currentWrite: 2,
+            serverReadSucceeded: true, serverPin: nil))
+        XCTAssertEqual(A2APinAuthority.choose(
+            cached: "old", current: "phone-new", sampledWrite: 2, currentWrite: 3,
+            serverReadSucceeded: true, serverPin: "stale-server"), "phone-new")
+        XCTAssertEqual(A2APinAuthority.choose(
+            cached: "old", current: "old", sampledWrite: 2, currentWrite: 2,
+            serverReadSucceeded: false, serverPin: nil), "old")
+    }
+
+    func testCanonicalLookupUsesDatabaseTitleAfterPinWithoutFortyRowWindow() {
+        // Forty-one newer sessions cannot hide Bot Chat because production
+        // sends this exact title to session.resume instead of searching a list.
+        let newerSessionCount = 41
+        XCTAssertGreaterThan(newerSessionCount, 40)
+        XCTAssertEqual(A2ASessionResolver.lookupTargets(pin: "pinned", title: "Bot Chat"),
+                       ["pinned", "Bot Chat"])
+        XCTAssertEqual(A2ASessionResolver.lookupTargets(pin: nil, title: "Bot Chat"),
+                       ["Bot Chat"])
+    }
+
+    func testReplyRequiresExactAttributedPromptAnchor() {
+        let attributed = "Message from 🤖 Ops (@ops): deploy"
+        let substringOnly: [JSONValue] = [
+            .object(["role": .string("user"),
+                     "content": .string("prefix \(attributed) suffix")]),
+            .object(["role": .string("assistant"), "content": .string("wrong")]),
+        ]
+        let exact: [JSONValue] = substringOnly + [
+            .object(["role": .string("user"), "content": .string(attributed)]),
+            .object(["role": .string("assistant"), "content": .string("right")]),
+        ]
+
+        XCTAssertNil(A2AReplyResolver.reply(to: attributed, in: substringOnly))
+        XCTAssertEqual(A2AReplyResolver.reply(to: attributed, in: exact), "right")
+    }
+
+    func testIdenticalHandoffBodiesRelayOnlyTheirOwnAttemptReply() {
+        let body = "deploy the same build"
+        let first = A2AWire.attributed(displayTitle: "Ops", handle: "ops", body: body,
+                                       attemptID: UUID(uuidString:
+                                        "00000000-0000-0000-0000-000000000001")!)
+        let second = A2AWire.attributed(displayTitle: "Ops", handle: "ops", body: body,
+                                        attemptID: UUID(uuidString:
+                                         "00000000-0000-0000-0000-000000000002")!)
+        let transcript: [JSONValue] = [
+            .object(["role": .string("user"), "content": .string(first)]),
+            .object(["role": .string("assistant"), "content": .string("first reply")]),
+            .object(["role": .string("user"), "content": .string(second)]),
+            .object(["role": .string("assistant"), "content": .string("second reply")]),
+        ]
+
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(A2AReplyResolver.reply(to: first, in: transcript), "first reply")
+        XCTAssertEqual(A2AReplyResolver.reply(to: second, in: transcript), "second reply")
+        XCTAssertEqual(AppModel.strippedA2A(first), body,
+                       "the wire attempt UUID must not leak into the inbox preview")
+        XCTAssertEqual(AppModel.strippedA2A(second), body)
+        XCTAssertEqual(AppModel.a2aSender(in: first), "ops")
     }
 
     private func approval(id: String, botID: String) -> Approval {

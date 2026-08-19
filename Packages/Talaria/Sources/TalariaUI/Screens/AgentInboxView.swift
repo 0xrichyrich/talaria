@@ -448,9 +448,8 @@ private struct HandoffSheet: View {
         return !rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// A bot on another gateway resolves but cannot be carried to from here
-    /// (one socket — `MentionResolution.unreachable`), so it never counts
-    /// towards a sendable draft. `MentionRecipients` says why.
+    /// Every resolved bot has a source route. Foreign recipients travel through
+    /// their retained gateway client; only the speaker stays primary-local.
     private var canSend: Bool {
         !from.isEmpty && !resolution.deliverable.isEmpty && hasBody && !sending
     }
@@ -525,14 +524,13 @@ private struct HandoffSheet: View {
     /// @handle, so the recipient's messaging protocol knows an agent — not its
     /// human — is talking (plugin.js:2635).
     ///
-    /// `liveRosterBots`, the same array the roster strip below draws from, and
-    /// for the mirror-image reason: picking a speaker takes its handle back
-    /// OUT of the draft (`select(speaker:)`), so it has to be the handle the
-    /// draft was given. The two arrays hold the same rows with the same ids
-    /// and differ only in `Bot.handle` — bare here, `@name-device` there — so
-    /// reading `bots` for one chip row and `liveRosterBots` for the other made
-    /// the removal a silent no-op on exactly the profiles the suffix exists
-    /// for, leaving the draft addressing its own speaker.
+    /// `liveRosterBots` deliberately: a sender is a profile on the primary
+    /// gateway, while recipients may span the union roster. Picking a speaker
+    /// takes its handle back OUT of the draft (`select(speaker:)`), so this must
+    /// still be the annotated live row whose `@name-device` handle the union
+    /// resolver sees. Reading plain `bots` here made that removal a silent
+    /// no-op on exactly the profiles the suffix exists for, leaving the draft
+    /// addressing its own speaker.
     private var speakerPicker: some View {
         VStack(alignment: .leading, spacing: 6) {
             label(copy.handoffFrom(theme.id))
@@ -554,14 +552,13 @@ private struct HandoffSheet: View {
     /// a bot and its @handle lands in the draft. Same mechanism as typing it —
     /// the mentions in the text are the single source of routing.
     private var rosterStrip: some View {
-        // `liveRosterBots`, not `bots`: the chip appends `bot.handle` into the
-        // draft, so it has to be the handle the resolver will accept back. A
-        // profile name that also exists on a saved gateway is addressable only
-        // by its `@name-device` form (plugin.js:2334, 2457-2466) — tapping a
-        // chip that inserted the bare `@hermes` would compose a draft that
-        // refuses itself. Live rows only: a foreign bot is not reachable from
-        // this socket, and the strip is a list of things you can send to.
-        let addressable = model.liveRosterBots.filter { bot in
+        // `unionRosterBots`, not `bots`: the chip appends `bot.handle` into the
+        // draft, so it has to be the exact handle the union resolver accepts.
+        // A duplicated profile is addressable only by its source-specific
+        // `@name-device` form (plugin.js:2334, 2457-2466). Foreign rows stay in
+        // this recipient strip because dispatch retains their GatewayBotRoute;
+        // the speaker picker above remains live-only.
+        let addressable = model.unionRosterBots.filter { bot in
             bot.id != from && !resolution.bots.contains(where: { $0.id == bot.id })
         }
         return Group {

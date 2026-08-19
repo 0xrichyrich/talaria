@@ -157,7 +157,7 @@ public struct StorageItem: Identifiable, Sendable, Equatable {
 /// A measured group of storage items. `kind` picks the themed heading; the
 /// contents are always enumerated, never assumed.
 public struct StorageGroup: Identifiable, Sendable, Equatable {
-    public enum Kind: String, Sendable { case keychain, preferences, caches }
+    public enum Kind: String, Sendable { case keychain, preferences, appData, caches }
 
     public var kind: Kind
     public var items: [StorageItem]
@@ -412,10 +412,20 @@ extension AppModel {
         var caches = await Self.diskCacheItems()
         caches.append(contentsOf: spriteCacheItems())
 
+        var appData: [StorageItem] = []
+        if let usage = try? await RoomStore.shared.storageUsage(), usage.totalBytes > 0 {
+            appData.append(StorageItem(
+                id: "appdata.rooms",
+                title: "Room transcripts and attachments",
+                detail: "Protected on this device",
+                bytes: usage.totalBytes))
+        }
+
         return StorageInventory(
             groups: [
                 StorageGroup(kind: .keychain, items: credentials),
                 StorageGroup(kind: .preferences, items: preferences),
+                StorageGroup(kind: .appData, items: appData),
                 StorageGroup(kind: .caches, items: caches),
             ].filter { !$0.isEmpty },
             measuredAt: Date())
@@ -620,7 +630,11 @@ extension AppModel {
     /// The full reset: credentials, saved gateways, preferences, caches, and
     /// the in-memory world. Bots and their history live on the gateway and are
     /// untouched — this only unmakes what Talaria wrote here.
-    public func deleteAllLocalData() async {
+    public func deleteAllLocalData() async throws {
+        // Device-owned transcripts/blobs are the only part of this reset that
+        // can fail durably. Prove their empty index first; otherwise preserve
+        // credentials/preferences and surface an actionable partial failure.
+        try await deleteAllRoomData()
         await signOutOfEverything()
         if client != nil { await disconnectGateway() }
         for gateway in ConnectionRegistry.shared.saved {

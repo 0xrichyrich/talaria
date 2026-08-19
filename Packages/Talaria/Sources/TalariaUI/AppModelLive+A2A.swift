@@ -21,15 +21,15 @@ import TalariaTheme
 //   mention autocomplete         7996-8046   prefix-on-handle, cap 8
 //   mention middleware           8206-8321   the fast bail, the fallback path
 //
-// Two deliberate divergences from the plugin, both documented at their site:
+// Two deliberate mobile adaptations from the plugin:
 //
 // 1. Talaria does NOT append desktop's `[@mention handoff — …]` instruction
 //    block (plugin.js:8305-8311). That block asks the *sending agent* to shell
 //    out to `hermes -p <bot> chat …` on its own machine. A phone has no
-//    terminal and no shell to quote into; it has a socket. So a mention here
-//    takes desktop's OTHER delivery path — the cross-connection one at
-//    plugin.js:2593, which submits the same attributed text over RPC and
-//    relays the reply — which is exactly the shape a phone can honor.
+//    terminal and no shell to quote into; it has retained gateway clients. So
+//    every mention takes desktop's cross-connection path at plugin.js:2593,
+//    source-routed through the owning client, with the same attributed submit
+//    and reply relay. The primary connection never changes for a handoff.
 //
 // 2. Every handoff submits with `queued: true`. See `submitHandoff`: it is the
 //    whole of "a mid-run bot cannot be interrupted".
@@ -92,11 +92,175 @@ public struct A2ADelivery: Sendable, Equatable {
     }
 
     public var to: String
+    /// Exact gateway/profile that accepted this attempt. Nil only for legacy
+    /// in-memory entries constructed by older tests/callers.
+    public var route: GatewayBotRoute?
+    /// One identity per submit attempt. Equal recipient/body pairs must not
+    /// replace each other's watcher or delivery outcome.
+    public var attemptID: UUID
+    /// Stable body fingerprint used to reconnect transcript rows to the most
+    /// recent matching attempt without making it the attempt identity.
+    public var bodyHash: Int?
     /// The gateway parked this behind a turn that was already running. Kept
     /// after the reply lands, because it explains a slow answer.
     public var queuedBehindRun: Bool
     public var state: State
     public var at: Date
+
+    public init(to: String, route: GatewayBotRoute? = nil, attemptID: UUID = UUID(),
+                bodyHash: Int? = nil, queuedBehindRun: Bool,
+                state: State, at: Date) {
+        self.to = to; self.route = route; self.attemptID = attemptID
+        self.bodyHash = bodyHash; self.queuedBehindRun = queuedBehindRun
+        self.state = state; self.at = at
+    }
+}
+
+/// A bot identity after roster resolution and before any wire work. Both the
+/// UI identity and the exact gateway route travel together; no dispatch API
+/// accepts a bare profile id.
+struct A2AEndpoint: Sendable, Equatable {
+    var rosterID: String
+    var route: GatewayBotRoute
+    var displayTitle: String
+    var handle: String
+    /// Sender-attribution form. Upstream derives this from the bare profile,
+    /// not the source-annotated roster row (plugin.js:8298).
+    var attributionHandle: String
+    var connectionLabel: String?
+}
+
+struct A2ACanonicalSession: Sendable, Equatable {
+    var runtime: String
+    var stored: String
+}
+
+/// Pure session-selection policy, split out so pin/title/create precedence is
+/// testable without a socket. Only an exact title is a title candidate.
+enum A2ASessionResolver {
+    /// Durable pin first, then the gateway's authoritative exact-title lookup.
+    /// No bounded session.list window participates in canonical identity.
+    static func lookupTargets(pin: String?, title: String) -> [String] {
+        var targets: [String] = []
+        if let pin, !pin.isEmpty { targets.append(pin) }
+        if !title.isEmpty, !targets.contains(title) { targets.append(title) }
+        return targets
+    }
+}
+
+enum A2APinAuthority {
+    static func choose(cached: String?, current: String?, sampledWrite: Int,
+                       currentWrite: Int, serverReadSucceeded: Bool,
+                       serverPin: String?) -> String? {
+        if currentWrite != sampledWrite { return current }
+        return serverReadSucceeded ? serverPin : cached
+    }
+}
+
+/// Wire-only attempt identity. The anchor sits inside the attribution prefix,
+/// before its final colon, so `strippedA2A` removes it from every inbox/preview
+/// surface while the canonical transcript can distinguish repeated bodies.
+enum A2AWire {
+    static func attributed(displayTitle: String, handle: String, body: String,
+                           attemptID: UUID) -> String {
+        "Message from 🤖 \(displayTitle) (@\(handle)) "
+            + "[Talaria handoff attempt \(attemptID.uuidString.lowercased())]: \(body)"
+    }
+
+    static func attemptID(in attributed: String) -> UUID? {
+        guard let range = attributed.range(
+            of: #"\[Talaria handoff attempt ([0-9a-fA-F-]{36})\]"#,
+            options: .regularExpression) else { return nil }
+        let marker = String(attributed[range])
+        guard let idRange = marker.range(
+            of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"#,
+            options: .regularExpression) else { return nil }
+        return UUID(uuidString: String(marker[idRange]))
+    }
+
+    /// Deterministic companion id for the assistant row belonging to an
+    /// attempt. Distinct from its user row while surviving transcript rebuilds.
+    static func replyID(for attemptID: UUID) -> UUID {
+        var bytes = attemptID.uuid
+        bytes.15 ^= 0x80
+        return UUID(uuid: bytes)
+    }
+}
+
+struct A2AAcceptedOutcome: Sendable, Equatable {
+    var state: A2ADelivery.State
+    var retainWatcher: Bool
+
+    static func afterSubmit(scopeIsCurrent: Bool) -> Self {
+        scopeIsCurrent
+            ? Self(state: .waiting, retainWatcher: true)
+            : Self(state: .quiet, retainWatcher: false)
+    }
+}
+
+enum A2AInboxMerge {
+    static func source(of message: A2AMessage, ref: SessionRef?,
+                       optimisticRows: [UUID: String],
+                       primaryGatewayID: String?) -> String? {
+        if let source = optimisticRows[message.id] { return source }
+        if let source = ref?.gatewayID, !source.isEmpty { return source }
+        if let route = GatewayBotRoute(qualifiedID: message.toBotID) { return route.gatewayID }
+        if let route = GatewayBotRoute(qualifiedID: message.fromBotID) { return route.gatewayID }
+        return primaryGatewayID
+    }
+
+    static func merge(existing: [A2AMessage], existingRefs: [UUID: SessionRef],
+                      server: [(A2AMessage, Date, SessionRef)],
+                      successfulGateways: Set<String>, optimisticRows: [UUID: String],
+                      primaryGatewayID: String?, limit: Int)
+        -> (messages: [A2AMessage], refs: [UUID: SessionRef], settled: Set<UUID>) {
+        let serverOrdered = server.sorted { $0.1 > $1.1 }
+        let serverIDs = Set(serverOrdered.map { $0.0.id })
+        let preserved = existing.filter { message in
+            guard let gatewayID = source(of: message, ref: existingRefs[message.id],
+                                         optimisticRows: optimisticRows,
+                                         primaryGatewayID: primaryGatewayID) else { return true }
+            if !successfulGateways.contains(gatewayID) { return true }
+            return optimisticRows[message.id] != nil && !serverIDs.contains(message.id)
+        }
+        var seen: Set<UUID> = []
+        let messages = Array((preserved + serverOrdered.map(\.0))
+            .filter { seen.insert($0.id).inserted }.prefix(limit))
+        var refs = existingRefs.filter { id, _ in
+            preserved.contains(where: { $0.id == id })
+        }
+        for entry in serverOrdered { refs[entry.0.id] = entry.2 }
+        let visibleIDs = Set(messages.map(\.id))
+        refs = refs.filter { visibleIDs.contains($0.key) }
+        return (messages, refs, serverIDs)
+    }
+}
+
+/// Exact-attribution reply selection. A substring or an absent prompt anchor
+/// must never relay an unrelated answer from a busy canonical chat.
+enum A2AReplyResolver {
+    static func reply(to attributed: String, in messages: [JSONValue]) -> String? {
+        var anchor: Int?
+        for (index, row) in messages.enumerated() where row["role"]?.stringValue == "user" {
+            if ArtifactScan.text(of: row) == attributed { anchor = index }
+        }
+        guard let anchor else { return nil }
+        var reply: String?
+        var index = anchor + 1
+        while index < messages.count {
+            let row = messages[index]
+            // This exact attempt owns one turn only. Crossing the next user row
+            // is how two identical queued handoffs used to steal one reply.
+            if row["role"]?.stringValue == "user" { break }
+            if row["role"]?.stringValue == "assistant" {
+                let text = ArtifactScan.text(of: row)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty { reply = text }
+            }
+            index += 1
+        }
+        return reply
+    }
 }
 
 /// Book-keeping the a2a surfaces need. `AppModel`'s stored properties live in
@@ -107,9 +271,10 @@ public struct A2ADelivery: Sendable, Equatable {
 final class A2ARuntime {
     static let shared = A2ARuntime()
 
-    /// Handoffs this app sent, keyed by recipient + body. NOT by message id:
-    /// an inbox sweep rebuilds every row from the transcript with a fresh
-    /// UUID, and the delivery note has to survive that.
+    /// Handoffs this app sent, keyed by source-qualified recipient + body hash
+    /// + attempt UUID. A rebuilt transcript row has a fresh UUID, so lookup can
+    /// fall back to its qualified recipient/body while live optimistic rows
+    /// retain exact attempt identity.
     var deliveries: [String: A2ADelivery] = [:]
 
     @ObservationIgnored var watchers: [String: Task<Void, Never>] = [:]
@@ -117,9 +282,22 @@ final class A2ARuntime {
     /// finishes asynchronously, so it must not tidy up after the watch that
     /// replaced it.
     @ObservationIgnored var watcherGeneration: [String: Int] = [:]
+    /// Gateway owning each live watcher, including the interval between submit
+    /// and delivery-table publication. Enables exact-source detach.
+    @ObservationIgnored var watcherScopes: [String: String] = [:]
+    /// Invalidates a task even when cancellation races an RPC already in flight.
+    @ObservationIgnored var scopeGenerations: [String: Int] = [:]
+    /// Coalesce concurrent handoffs to the same bot so pin/title misses cannot
+    /// mint two hidden canonical chats in parallel.
+    @ObservationIgnored var canonicalOpens: [GatewayBotRoute: Task<A2ACanonicalSession, Error>] = [:]
+    @ObservationIgnored var canonicalOpenGenerations: [GatewayBotRoute: Int] = [:]
+    /// Optimistic rows that a sweep must retain until the exact anchored rows
+    /// appear in the owning gateway's transcript.
+    @ObservationIgnored var optimisticRows: [UUID: String] = [:]
     @ObservationIgnored var eventToken: UUID?
     /// Which gateway the state above belongs to; a swap owns none of it.
     @ObservationIgnored var routedClient: ObjectIdentifier?
+    @ObservationIgnored var inboxGatewayID: String?
     @ObservationIgnored var attachTask: Task<Void, Never>?
     @ObservationIgnored var sweepDebounce: Task<Void, Never>?
     @ObservationIgnored var idlePoll: Task<Void, Never>?
@@ -128,13 +306,45 @@ final class A2ARuntime {
     @ObservationIgnored var viewers = 0
 
     func reset() {
+        let gateways = Set(watcherScopes.values)
+            .union(deliveries.values.compactMap { $0.route?.gatewayID })
+            .union(canonicalOpens.keys.map(\.gatewayID))
+        for gatewayID in gateways { scopeGenerations[gatewayID, default: 0] += 1 }
         deliveries.removeAll()
         for task in watchers.values { task.cancel() }
         watchers.removeAll()
         watcherGeneration.removeAll()
+        watcherScopes.removeAll()
+        for task in canonicalOpens.values { task.cancel() }
+        canonicalOpens.removeAll()
+        canonicalOpenGenerations.removeAll()
+        optimisticRows.removeAll()
         sweepDebounce?.cancel(); sweepDebounce = nil
         idlePoll?.cancel(); idlePoll = nil
         eventToken = nil
+        inboxGatewayID = nil
+    }
+
+    /// Surrender only one retained gateway. Other gateway reply watches keep
+    /// their captured client/session and continue independently.
+    func reset(gatewayID: String) {
+        scopeGenerations[gatewayID, default: 0] += 1
+        let keys = Set(deliveries.compactMap { key, delivery in
+            delivery.route?.gatewayID == gatewayID
+                || GatewayBotRoute(qualifiedID: delivery.to)?.gatewayID == gatewayID ? key : nil
+        }).union(watcherScopes.compactMap { $0.value == gatewayID ? $0.key : nil })
+        for key in keys {
+            watchers.removeValue(forKey: key)?.cancel()
+            watcherGeneration.removeValue(forKey: key)
+            watcherScopes.removeValue(forKey: key)
+            deliveries.removeValue(forKey: key)
+        }
+        let routes = canonicalOpens.keys.filter { $0.gatewayID == gatewayID }
+        for route in routes {
+            canonicalOpens.removeValue(forKey: route)?.cancel()
+            canonicalOpenGenerations.removeValue(forKey: route)
+        }
+        optimisticRows = optimisticRows.filter { $0.value != gatewayID }
     }
 
     /// Keep the note table bounded; oldest deliveries lose their note first.
@@ -146,6 +356,7 @@ final class A2ARuntime {
             deliveries.removeValue(forKey: key)
             watchers.removeValue(forKey: key)?.cancel()
             watcherGeneration.removeValue(forKey: key)
+            watcherScopes.removeValue(forKey: key)
         }
     }
 }
@@ -201,16 +412,63 @@ public extension AppModel {
     }
 
     /// The delivery note for an inbox row, when this app is the one that sent
-    /// it. Keyed by recipient + body so it survives a feed rebuild.
+    /// it. Transcript rows do not carry Talaria's attempt UUID, so choose the
+    /// newest matching source-qualified recipient/body attempt after a rebuild.
     func delivery(for message: A2AMessage) -> A2ADelivery? {
-        A2ARuntime.shared.deliveries[Self.deliveryKey(to: message.toBotID, body: message.text)]
+        let hash = Self.stableHash(message.text)
+        if let exact = A2ARuntime.shared.deliveries.values.first(where: {
+            $0.attemptID == message.id
+        }) { return exact }
+        return A2ARuntime.shared.deliveries.values
+            .filter { delivery in
+                delivery.to == message.toBotID && (delivery.bodyHash ?? hash) == hash
+            }
+            .max(by: { $0.at < $1.at })
     }
 
-    /// Recipient + body. The sender half is deliberately not in the key: the
-    /// attribution prefix carries a display NAME, and reading it back gives a
-    /// token, not a profile id.
+    /// Legacy deterministic spelling retained for lifecycle tests and entries
+    /// created before attempt-qualified delivery keys. New dispatch uses the
+    /// route + UUID overload below.
     static func deliveryKey(to: String, body: String) -> String {
         "\(to.lowercased())|\(stableHash(body))"
+    }
+
+    /// Exact source + body fingerprint + attempt UUID. Profile, body and even
+    /// runtime/stored session ids are allowed to collide across gateways and
+    /// repeat submissions; none can replace another attempt's state.
+    static func deliveryKey(route: GatewayBotRoute, body: String, attemptID: UUID) -> String {
+        "\(route.gatewayID.count):\(route.gatewayID)|\(route.profile.count):\(route.profile)"
+            + "|\(stableHash(body))|\(attemptID.uuidString.lowercased())"
+    }
+
+    /// Turn one union-roster row into a dispatch endpoint. Foreign rows already
+    /// carry their source; local rows are scoped to the current primary.
+    internal func a2aEndpoint(for bot: Bot) -> A2AEndpoint? {
+        let route: GatewayBotRoute
+        if let source = bot.remoteSource {
+            route = GatewayBotRoute(gatewayID: source.gatewayID, profile: source.profile)
+        } else {
+            guard let activeGatewayID else { return nil }
+            route = GatewayBotRoute(gatewayID: activeGatewayID, profile: bot.profileName)
+        }
+        return A2AEndpoint(rosterID: bot.id, route: route,
+                           displayTitle: bot.displayTitle, handle: bot.handle,
+                           attributionHandle: Bot.unlisted(id: route.profile).handle,
+                           connectionLabel: bot.remoteSource?.connectionLabel
+                               ?? (route.gatewayID == activeGatewayID ? activeConnectionLabel : nil))
+    }
+
+    internal func a2aEndpoint(forRosterID rosterID: String) -> A2AEndpoint? {
+        if let bot = unionRosterBots.first(where: { $0.id == rosterID }) {
+            return a2aEndpoint(for: bot)
+        }
+        guard let route = gatewayRoute(for: rosterID) else { return nil }
+        let bot = identity(rosterID)
+        let label = ConnectionRegistry.shared.saved.first(where: { $0.id == route.gatewayID })?.name
+        return A2AEndpoint(rosterID: rosterID, route: route,
+                           displayTitle: bot.displayTitle, handle: bot.handle,
+                           attributionHandle: Bot.unlisted(id: route.profile).handle,
+                           connectionLabel: label)
     }
 }
 
@@ -234,31 +492,51 @@ public extension AppModel {
 
     /// Surrender everything this surface registered on the departing gateway.
     ///
-    /// Every piece of a2a state names something that only exists on ONE
-    /// gateway: a `sessions.changed` subscription on its socket, delivery notes
-    /// keyed by its profile names, and reply watches holding its stored-session
-    /// ids. Left standing across a switch, those watches keep polling — against
-    /// the NEW gateway, since they re-read `self.client` each tick — and can
-    /// relay a stranger's transcript into the feed as an answer to a message
-    /// that was never sent there. Called from `dropPerGatewayCaches`, which is
-    /// the one hook both ways out of a link go through.
-    func detachA2ARouter() {
+    /// Every piece of a2a state names one gateway: its `sessions.changed`
+    /// subscription, source-qualified delivery notes, and reply watches holding
+    /// that source's client/session. Teardown cancels only the captured primary;
+    /// retained secondary watches continue on their own clients. Called from
+    /// `dropPerGatewayCaches`, the hook both ways out of a primary link use.
+    func detachA2ARouter(departingGatewayID capturedGatewayID: String? = nil) {
         let runtime = A2ARuntime.shared
         let departing = client.map(ObjectIdentifier.init)
+        let departingGatewayID = capturedGatewayID ?? activeGatewayID
+            ?? LiveRuntime.shared.gatewayID
         // While the departing client is still around to surrender it to.
         if let token = runtime.eventToken, let client {
             Task { await client.removeEventHandler(token) }
         }
         runtime.attachTask?.cancel(); runtime.attachTask = nil
-        runtime.reset()
+        if let departingGatewayID {
+            dropA2AScope(gatewayID: departingGatewayID, wasPrimary: true)
+        } else {
+            runtime.reset()
+        }
         runtime.routedClient = nil
-        agentInbox.removeAll()
-        FeedsRuntime.shared.inboxSessions.removeAll()
+        runtime.inboxGatewayID = nil
         FeedsRuntime.shared.lastInboxScan = nil
         // The inbox may be the screen the user is looking at while the switch
         // happens; it re-attaches itself to the incoming gateway rather than
         // sitting empty until they navigate away and back.
         armInboxAttach(avoiding: departing)
+    }
+
+    /// Drop one retained gateway's handoff attempts without disturbing any
+    /// other source. `detachRoutedEvents(gatewayID:)` calls this when a pooled
+    /// secondary is retired; the primary detach path above uses the same hook.
+    func dropA2AScope(gatewayID: String, wasPrimary: Bool = false) {
+        A2ARuntime.shared.reset(gatewayID: gatewayID)
+        let prefix = gatewayID + GatewayBotRoute.separator
+        agentInbox.removeAll { message in
+            message.fromBotID.hasPrefix(prefix) || message.toBotID.hasPrefix(prefix)
+                || (wasPrimary
+                    && GatewayBotRoute(qualifiedID: message.fromBotID) == nil
+                    && GatewayBotRoute(qualifiedID: message.toBotID) == nil)
+        }
+        FeedsRuntime.shared.inboxSessions = FeedsRuntime.shared.inboxSessions.filter { _, ref in
+            ref.gatewayID != gatewayID
+        }
+        FeedsRuntime.shared.lastInboxScan = nil
     }
 
     /// The inbox left the screen. Reply watches deliberately outlive it — a
@@ -285,6 +563,17 @@ public extension AppModel {
         }
     }
 
+    /// Primary and retained-secondary session signals share one federated
+    /// sweep. The source is carried by the caller even though the merge itself
+    /// refreshes every eligible source.
+    func routeA2AChange(_ event: GatewayEvent, sourceGatewayID: String?) {
+        guard mode == .live, A2ARuntime.shared.viewers > 0 else { return }
+        guard case .changed(let what) = TypedGatewayEvent(event),
+              what == "sessions.changed" else { return }
+        _ = sourceGatewayID
+        sweepInbox(after: A2APolicy.changeDebounce)
+    }
+
     /// One sweep: every profile's own a2a conversation, split back into
     /// attributed rows.
     ///
@@ -297,53 +586,104 @@ public extension AppModel {
     /// of its traffic — including handoffs sent from this phone, which land
     /// wherever the pin points.
     func refreshInboxLive() async {
-        guard mode == .live, let client, !bots.isEmpty else { return }
+        guard mode == .live else { return }
+        let endpoints = unionRosterBots.compactMap(a2aEndpoint(for:))
+        guard !endpoints.isEmpty else { return }
         let runtime = FeedsRuntime.shared
         guard !runtime.inboxScanning else { return }
-        // Transcripts are REST-only; the WS surface has no history endpoint.
-        guard let (base, credential) = gatewayRESTContext() else {
-            runtime.inboxNote = theme.copy.needsRESTNote(theme.themeID)
-            return
-        }
         runtime.inboxScanning = true
         defer { runtime.inboxScanning = false; runtime.lastInboxScan = Date() }
 
         var collected: [(A2AMessage, Date, SessionRef)] = []
         var scanned = 0
+        var completedProfiles: [String: Int] = [:]
+        var failedGateways: Set<String> = []
+        let selected = Array(endpoints.prefix(A2APolicy.scanProfiles))
+        let totalProfiles = Dictionary(grouping: endpoints, by: { $0.route.gatewayID })
+            .mapValues(\.count)
+        let selectedProfiles = Dictionary(grouping: selected, by: { $0.route.gatewayID })
+            .mapValues(\.count)
+        for (gatewayID, count) in totalProfiles
+        where selectedProfiles[gatewayID, default: 0] < count {
+            // A capped partial source cannot authoritatively replace rows from
+            // profiles this sweep did not inspect.
+            failedGateways.insert(gatewayID)
+        }
 
-        for bot in bots.prefix(A2APolicy.scanProfiles) {
+        for endpoint in selected {
             guard !Task.isCancelled else { return }
+            let route = endpoint.route
+            guard let sourceClient = try? await routedClient(for: route),
+                  let (base, credential) = gatewayRESTContext(gatewayID: route.gatewayID) else {
+                failedGateways.insert(route.gatewayID)
+                continue
+            }
             var targets: [String] = []
-            if let pin = CanonicalChatRuntime.shared.pins[bot.id], !pin.isEmpty {
+            if let pin = CanonicalChatRuntime.shared.pins[endpoint.rosterID], !pin.isEmpty {
                 targets.append(pin)
             }
-            // Bot Mode sessions are hidden, and session.list drops hidden rows
-            // unless asked (methods_session.py:180-186).
-            if let sessions = try? await client.listSessions(limit: 40, profile: bot.id,
-                                                             includeHidden: true) {
-                for session in sessions where AppModel.isInboxSession(session.title) {
+
+            // Exact database/title resolution is independent of recency and
+            // finds a canonical chat even behind >40 newer sessions.
+            do {
+                let live = try await sourceClient.resumeSession(
+                    Self.canonicalChatTitle, profile: route.profile, deferHistory: true)
+                let stored = live.storedSessionID
+                if !stored.isEmpty, !targets.contains(stored) { targets.append(stored) }
+            } catch let error as GatewayError where error.code == GatewayError.storedSessionGone {
+                // Brand-new profile: no canonical transcript yet.
+            } catch {
+                failedGateways.insert(route.gatewayID)
+                continue
+            }
+
+            // Legacy "Agent Inbox" sessions have no canonical pin/title.
+            do {
+                let sessions = try await sourceClient.listSessions(
+                    limit: 200, profile: route.profile, includeHidden: true)
+                for session in sessions where session.title.lowercased().contains("agent inbox") {
                     guard targets.count < A2APolicy.scanSessionsPerProfile else { break }
                     if !targets.contains(session.id) { targets.append(session.id) }
                 }
+            } catch {
+                failedGateways.insert(route.gatewayID)
+                continue
             }
+
+            var profileComplete = true
             for stored in targets.prefix(A2APolicy.scanSessionsPerProfile) {
                 guard !Task.isCancelled else { return }
-                guard let rows = try? await GatewayREST.sessionMessages(
-                    baseURL: base, credential: credential, storedID: stored,
-                    profile: bot.id, limit: A2APolicy.scanMessages) else { continue }
-                scanned += 1
-                let ref = SessionRef(botID: bot.id, storedID: stored)
-                for (message, at) in AppModel.inboxMessages(in: rows, owner: bot.id) {
-                    collected.append((message, at, ref))
+                do {
+                    let rows = try await GatewayREST.sessionMessages(
+                        baseURL: base, credential: credential, storedID: stored,
+                        profile: route.profile, limit: A2APolicy.scanMessages)
+                    scanned += 1
+                    let ref = SessionRef(gatewayID: route.gatewayID,
+                                         botID: endpoint.rosterID, storedID: stored)
+                    for (message, at) in AppModel.inboxMessages(
+                        in: rows, owner: endpoint.rosterID) {
+                        collected.append((message, at, ref))
+                    }
+                } catch {
+                    profileComplete = false
+                    failedGateways.insert(route.gatewayID)
                 }
             }
+            if profileComplete { completedProfiles[route.gatewayID, default: 0] += 1 }
         }
 
-        let ordered = collected.sorted { $0.1 > $1.1 }.prefix(A2APolicy.feedLimit)
-        var refs: [UUID: SessionRef] = [:]
-        for entry in ordered { refs[entry.0.id] = entry.2 }
-        runtime.inboxSessions = refs
-        agentInbox = ordered.map(\.0)
+        let successfulGateways = Set(totalProfiles.compactMap { gatewayID, count in
+            !failedGateways.contains(gatewayID)
+                && completedProfiles[gatewayID, default: 0] == count ? gatewayID : nil
+        })
+        let merged = A2AInboxMerge.merge(
+            existing: agentInbox, existingRefs: runtime.inboxSessions,
+            server: collected, successfulGateways: successfulGateways,
+            optimisticRows: A2ARuntime.shared.optimisticRows,
+            primaryGatewayID: LiveRuntime.shared.gatewayID, limit: A2APolicy.feedLimit)
+        for id in merged.settled { A2ARuntime.shared.optimisticRows[id] = nil }
+        runtime.inboxSessions = merged.refs
+        agentInbox = merged.messages
         runtime.inboxNote = theme.copy.inboxSourceNote(theme.themeID, sessions: scanned)
     }
 }
@@ -382,10 +722,14 @@ private extension AppModel {
         let runtime = A2ARuntime.shared
         let identity = ObjectIdentifier(client)
         if runtime.routedClient != identity {
-            // A different gateway owns none of the previous traffic: its
-            // deliveries and reply watches were all about another fleet.
-            runtime.reset()
+            // Replace only the inbox subscription's source. Reply watches for
+            // retained secondary gateways carry their own client and survive.
+            if let previous = runtime.inboxGatewayID,
+               previous != activeGatewayID {
+                runtime.reset(gatewayID: previous)
+            }
             runtime.routedClient = identity
+            runtime.inboxGatewayID = activeGatewayID
             subscribeToA2AChanges(client)
         }
         sweepInbox(after: 0)
@@ -393,19 +737,15 @@ private extension AppModel {
     }
 
     func subscribeToA2AChanges(_ client: GatewayClient) {
+        let sourceGatewayID = activeGatewayID
         Task { @MainActor in
             let token = await client.addEventHandler { event in
-                Task { @MainActor [weak self] in self?.a2aChange(event) }
+                Task { @MainActor [weak self] in
+                    self?.routeA2AChange(event, sourceGatewayID: sourceGatewayID)
+                }
             }
             A2ARuntime.shared.eventToken = token
         }
-    }
-
-    func a2aChange(_ event: GatewayEvent) {
-        guard mode == .live, A2ARuntime.shared.viewers > 0 else { return }
-        guard case .changed(let what) = TypedGatewayEvent(event),
-              what == "sessions.changed" else { return }
-        sweepInbox(after: A2APolicy.changeDebounce)
     }
 
     func startIdleInboxPoll() {
@@ -467,10 +807,11 @@ public extension AppModel {
         // would contradict the note this same function is about to append to
         // the outgoing message — and send the user back to retype a mention
         // @ci has already received.
-        let delivered = !routed.recipients.isEmpty
+        let recipients = routed.recipients.compactMap(a2aEndpoint(for:))
+        let delivered = !recipients.isEmpty && recipients.count == routed.recipients.count
         for collision in routed.refused { refuse(collision, in: botID, delivered: delivered) }
-        for bot in routed.unreachable { refuseElsewhere(bot, in: botID) }
         guard delivered else { return text }
+        guard let sender = a2aEndpoint(forRosterID: botID) else { return text }
 
         // Fire-and-forget, the way upstream fires `deliverRemoteRosterMentions`
         // (`void`, 8295-8300): the user's own turn starts now, not after N
@@ -482,10 +823,9 @@ public extension AppModel {
         // the activity ledger by `deliverHandoff`; only a total failure earns
         // a line in this chat, because the note in the message above it has
         // already told the agent the delivery happened.
-        let recipients = routed.recipients.map(\.id)
         Task { @MainActor in
             do {
-                try await deliverHandoff(from: botID, to: recipients, text: text)
+                try await dispatchHandoff(from: sender, to: recipients, text: text)
             } catch {
                 chat(for: botID).messages.append(ChatMessage(
                     author: .system, time: Self.clock(),
@@ -536,27 +876,6 @@ private extension AppModel {
         }
     }
 
-    /// A handle that resolved to a bot on another gateway.
-    ///
-    /// Desktop takes this branch and DELIVERS (plugin.js:8295-8300 fires
-    /// `deliverRemoteRosterMentions`, which routes each recipient through
-    /// `host.requestProfile` on its own connection). Talaria holds one socket,
-    /// so it cannot, and the honest answer is the same shape as the ambiguity
-    /// refusal: say it in the chat it was typed in, name the machine, and let
-    /// the message itself send unchanged. The alternative — submitting a
-    /// recipient whose id is `homelab::default` to the live gateway — is the
-    /// exact wrong-machine delivery the whole rule exists to prevent.
-    ///
-    /// Desktop's own remote note names the device in parentheses (8313); this
-    /// borrows that, because "switch to Homelab" is the only action there is.
-    func refuseElsewhere(_ bot: Bot, in botID: String) {
-        let label = bot.remoteSource?.connectionLabel ?? ""
-        let line = theme.copy.mentionElsewhere(theme.themeID, handle: bot.handle, label: label)
-        Task { @MainActor in
-            chat(for: botID).messages.append(
-                ChatMessage(author: .system, time: Self.clock(), text: line))
-        }
-    }
 }
 
 // MARK: - Composing a handoff
@@ -568,30 +887,37 @@ public extension AppModel {
     /// The shape is desktop's cross-connection delivery (plugin.js:2593):
     /// resolve each recipient's canonical Bot Chat, submit the attributed
     /// text, then watch that session for the reply and relay it back into the
-    /// feed. Recipients are independent — one unreachable bot does not cancel
+    /// feed. Recipients are independent — one failed gateway does not cancel
     /// the rest — so a per-recipient failure is recorded on that delivery and
     /// only a total failure throws.
     ///
     /// Returns the number of recipients the gateway accepted.
+    /// UI boundary for the handoff sheet. Resolve all ids to source-qualified
+    /// endpoints before entering dispatch; a missing route fails closed.
     @discardableResult
-    func deliverHandoff(from sender: String, to recipients: [String],
+    func deliverHandoff(from senderID: String, to recipientIDs: [String],
                         text: String) async throws -> Int {
+        guard let sender = a2aEndpoint(forRosterID: senderID) else {
+            throw GatewayRouteError.noRoute
+        }
+        let recipients = recipientIDs.compactMap(a2aEndpoint(forRosterID:))
+        guard recipients.count == recipientIDs.count else { throw GatewayRouteError.noRoute }
+        return try await dispatchHandoff(from: sender, to: recipients, text: text)
+    }
+
+    @discardableResult
+    internal func dispatchHandoff(from sender: A2AEndpoint, to recipients: [A2AEndpoint],
+                                  text: String) async throws -> Int {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return 0 }
-        // Belt and braces on the one-socket rule. Every caller already splits
-        // recipients on `remoteSource` before getting here, but a foreign row's
-        // id is the source-qualified `botRosterKey` (plugin.js:2669) — passing
-        // one through would ask this gateway to open a profile literally named
-        // "homelab::default", and a gateway that happened to have such a
-        // profile would receive a message meant for another machine.
-        let elsewhere = Set(foreignRosterEntries.map(\.id))
-        var targets: [String] = []
-        for id in recipients
-        where !id.isEmpty && id != sender && !elsewhere.contains(id) && !targets.contains(id) {
-            targets.append(id)
+        var targets: [A2AEndpoint] = []
+        var seen: Set<GatewayBotRoute> = []
+        for endpoint in recipients
+        where endpoint.route != sender.route && seen.insert(endpoint.route).inserted {
+            targets.append(endpoint)
         }
         guard !targets.isEmpty else { return 0 }
-        guard mode == .live, let client else {
+        guard mode == .live else {
             throw GatewayError(code: -3, message: "connect a gateway to hand off")
         }
 
@@ -602,38 +928,65 @@ public extension AppModel {
         // another bot's permanent transcript for the profile that presents as
         // Hermes/@hermes.
         //
-        // `identity(_:)` reads the UN-annotated roster on purpose, so the
-        // handle here is the bare/alias form even when the sender's name is
-        // duplicated across gateways. That is upstream's own choice, not an
+        // `A2AEndpoint.attributionHandle` derives from the UN-annotated profile
+        // on purpose, so the handle here is the bare/alias form even when the
+        // sender's name is duplicated across gateways. That is upstream's own choice, not an
         // oversight: it builds the sender with `botHandle(live.name)` —  one
         // argument, no row, so the `@name-device` branch at 2407 cannot fire
         // (plugin.js:8298). The prefix says who spoke, and the recipient reads
         // it back as a name; the device suffix belongs to addressing, which is
         // the other direction.
-        let identity = identity(sender)
-        let attributed = "Message from 🤖 \(identity.displayTitle) (@\(identity.handle)): \(body)"
-
         var accepted = 0
         var firstFailure: Error?
         for target in targets {
+            let attemptID = UUID()
+            let attributed = A2AWire.attributed(displayTitle: sender.displayTitle,
+                                                handle: sender.attributionHandle,
+                                                body: body, attemptID: attemptID)
+            let scopeGeneration = A2ARuntime.shared.scopeGenerations[
+                target.route.gatewayID] ?? 0
+            func scopeIsCurrent() -> Bool {
+                (A2ARuntime.shared.scopeGenerations[target.route.gatewayID] ?? 0)
+                    == scopeGeneration
+            }
             do {
+                let client = try await routedClient(for: target.route)
+                guard scopeIsCurrent() else { throw CancellationError() }
                 let session = try await canonicalInboxSession(for: target, client: client)
+                guard scopeIsCurrent() else { throw CancellationError() }
                 // Baseline BEFORE the submit, so the watch can tell the reply
                 // from what was already there (plugin.js:2620). A canonical
                 // chat that has never been prompted has no db row at all
                 // (methods_session.py:114-120), so a missing count is a real
                 // zero rather than a failed read — and a stale zero is
                 // harmless, because the reply scan anchors on our own message.
-                let baseline = await storedMessageCount(of: session.stored, profile: target) ?? 0
+                let baseline = await storedMessageCount(of: session.stored,
+                                                        route: target.route,
+                                                        client: client) ?? 0
+                guard scopeIsCurrent() else { throw CancellationError() }
                 let queued = try await client.submitHandoff(sessionID: session.runtime,
                                                             text: attributed)
+                // Returning from prompt.submit is the acceptance boundary.
+                // A detach racing immediately after it may stop observation,
+                // but cannot turn a delivered prompt into a failure/nothing.
+                let outcome = A2AAcceptedOutcome.afterSubmit(
+                    scopeIsCurrent: scopeIsCurrent())
                 accepted += 1
-                record(handoff: body, from: sender, to: target, queued: queued)
-                watchForReply(to: target, sender: sender, body: body, attributed: attributed,
-                              stored: session.stored, baseline: baseline)
+                let key = record(handoff: body, from: sender, to: target,
+                                 attemptID: attemptID, queued: queued,
+                                 state: outcome.state)
+                if outcome.retainWatcher {
+                    watchForReply(to: target, sender: sender, body: body,
+                                  attemptID: attemptID, attributed: attributed,
+                                  stored: session.stored, baseline: baseline, client: client)
+                } else {
+                    reportQuietHandoff(to: target, key: key)
+                }
             } catch {
                 if firstFailure == nil { firstFailure = error }
-                recordFailure(error, to: target, body: body)
+                if scopeIsCurrent() {
+                    recordFailure(error, to: target, body: body, attemptID: attemptID)
+                }
             }
         }
         if accepted == 0, let firstFailure { throw firstFailure }
@@ -650,32 +1003,97 @@ private extension AppModel {
     /// the `ui_meta["hermes-bots"].chat` pin, then resume-by-title, then a
     /// hidden create (plugin.js:2506-2544). Never "the most recent session":
     /// a handoff has to land in the conversation tapping that bot opens.
-    func canonicalInboxSession(for botID: String,
+    func canonicalInboxSession(for endpoint: A2AEndpoint,
                                client: GatewayClient) async throws -> (runtime: String, stored: String) {
-        var pin = CanonicalChatRuntime.shared.pins[botID]
-        if pin == nil || pin?.isEmpty == true {
-            // The roster poll seeds the pin table, but a bot this phone has
-            // never opened may not be in it yet. Sessions are not needed and
-            // cost a per-profile db scan (methods_profiles.py).
-            if let profiles = try? await client.listProfiles(includeSessions: false),
-               let row = profiles.first(where: { $0.name == botID }) {
-                pin = row.uiMeta?["hermes-bots"]?.objectValue?["chat"]?.stringValue
+        let runtime = A2ARuntime.shared
+        if let existing = runtime.canonicalOpens[endpoint.route] {
+            let result = try await existing.value
+            return (result.runtime, result.stored)
+        }
+        let generation = (runtime.canonicalOpenGenerations[endpoint.route] ?? 0) + 1
+        runtime.canonicalOpenGenerations[endpoint.route] = generation
+        let task = Task { @MainActor [weak self] () throws -> A2ACanonicalSession in
+            guard let self else {
+                throw GatewayError(code: -3, message: "handoff route was released")
+            }
+            return try await self.resolveCanonicalInboxSession(for: endpoint, client: client)
+        }
+        runtime.canonicalOpens[endpoint.route] = task
+        defer {
+            if runtime.canonicalOpenGenerations[endpoint.route] == generation {
+                runtime.canonicalOpens[endpoint.route] = nil
+                runtime.canonicalOpenGenerations[endpoint.route] = nil
             }
         }
-        for target in [pin, Self.canonicalChatTitle].compactMap({ $0 }) where !target.isEmpty {
-            // `session.resume` takes a durable key OR an exact title
-            // (methods_session.py:349-352), which is how a phone finds a
-            // forever chat minted on the laptop when the pin never reached it.
-            guard let live = try? await client.resumeSession(target, profile: botID,
-                                                             deferHistory: true),
-                  !live.sessionID.isEmpty else { continue }
-            let stored = live.storedSessionID.isEmpty ? target : live.storedSessionID
-            return (live.sessionID, stored)
+        let result = try await task.value
+        return (result.runtime, result.stored)
+    }
+
+    private func resolveCanonicalInboxSession(for endpoint: A2AEndpoint,
+                                              client: GatewayClient) async throws
+        -> A2ACanonicalSession {
+        let botID = endpoint.rosterID
+        let profile = endpoint.route.profile
+        let canonical = CanonicalChatRuntime.shared
+        let sampledWrite = canonical.writeCount[botID] ?? 0
+        let cachedPin = canonical.pins[botID]
+        let pin: String?
+        do {
+            let profiles = try await client.listProfiles(includeSessions: false)
+            guard let row = profiles.first(where: { $0.name == profile }) else {
+                throw GatewayRouteError.noRoute
+            }
+            // A successful fresh read is authoritative, including deletion;
+            // only a concurrent local write may outrank this sampled answer.
+            pin = A2APinAuthority.choose(
+                cached: cachedPin, current: canonical.pins[botID],
+                sampledWrite: sampledWrite,
+                currentWrite: canonical.writeCount[botID] ?? 0,
+                serverReadSucceeded: true,
+                serverPin: BotModeMeta(uiMeta: row.uiMeta)?.pinnedChat)
+            canonical.pins[botID] = pin
+        } catch let error as GatewayRouteError {
+            throw error
+        } catch {
+            pin = A2APinAuthority.choose(
+                cached: cachedPin, current: canonical.pins[botID],
+                sampledWrite: sampledWrite,
+                currentWrite: canonical.writeCount[botID] ?? 0,
+                serverReadSucceeded: false, serverPin: nil)
         }
+        try Task.checkCancellation()
+
+        // 1. Fresh server pin. 2. Gateway/database exact-title resolver. The
+        // latter searches the profile store directly and cannot miss a Bot Chat
+        // merely because forty newer sessions exist.
+        for target in A2ASessionResolver.lookupTargets(
+            pin: pin, title: Self.canonicalChatTitle) {
+            do {
+                let live = try await client.resumeSession(target, profile: profile,
+                                                          deferHistory: true)
+                try Task.checkCancellation()
+                guard !live.sessionID.isEmpty else {
+                    throw GatewayError(code: -8, message: "session.resume returned no id")
+                }
+                let stored = live.storedSessionID.isEmpty ? target : live.storedSessionID
+                if target == Self.canonicalChatTitle, !stored.isEmpty {
+                    await pinCanonicalChat(stored, botID: botID)
+                }
+                return A2ACanonicalSession(runtime: live.sessionID, stored: stored)
+            } catch let error as GatewayError where error.code == GatewayError.storedSessionGone {
+                continue
+            } catch {
+                throw error
+            }
+        }
+        try Task.checkCancellation()
+
+        // 3. No exact canonical session exists: mint one hidden.
         // Born hidden, like every Bot Mode session (plugin.js:2540-2542): a
         // handoff must not drop a stray "Bot Chat" row into desktop's recents.
-        let created = try await client.createSession(profile: botID,
+        let created = try await client.createSession(profile: profile,
                                                      title: Self.canonicalChatTitle, hidden: true)
+        try Task.checkCancellation()
         guard !created.sessionID.isEmpty else {
             throw GatewayError(code: -8, message: "session.create returned no id")
         }
@@ -684,7 +1102,9 @@ private extension AppModel {
             // laptop's roster tap open the same conversation.
             await pinCanonicalChat(created.storedSessionID, botID: botID)
         }
-        return (created.sessionID, created.storedSessionID)
+        try Task.checkCancellation()
+        return A2ACanonicalSession(runtime: created.sessionID,
+                                   stored: created.storedSessionID)
     }
 
     /// Stored row count for a session this app does not own — the cheap side
@@ -693,28 +1113,36 @@ private extension AppModel {
     /// touching the live session, so it can be polled without disturbing a
     /// turn in flight. `include_hidden` because every Bot Mode session is
     /// hidden (methods_session.py:180-186).
-    func storedMessageCount(of storedID: String, profile: String) async -> Int? {
-        guard !storedID.isEmpty, let client else { return nil }
-        guard let rows = try? await client.listSessions(limit: 40, profile: profile,
+    func storedMessageCount(of storedID: String, route: GatewayBotRoute,
+                            client: GatewayClient) async -> Int? {
+        guard !storedID.isEmpty else { return nil }
+        guard let rows = try? await client.listSessions(limit: 40, profile: route.profile,
                                                         includeHidden: true) else { return nil }
         return rows.first(where: { $0.id == storedID })?.messageCount
     }
 
-    func record(handoff body: String, from sender: String, to target: String, queued: Bool) {
+    @discardableResult
+    func record(handoff body: String, from sender: A2AEndpoint, to target: A2AEndpoint,
+                attemptID: UUID, queued: Bool, state: A2ADelivery.State = .waiting) -> String {
         let runtime = A2ARuntime.shared
-        let key = Self.deliveryKey(to: target, body: body)
+        let key = Self.deliveryKey(route: target.route, body: body, attemptID: attemptID)
         runtime.watchers.removeValue(forKey: key)?.cancel()
-        runtime.deliveries[key] = A2ADelivery(to: target, queuedBehindRun: queued,
-                                              state: .waiting, at: Date())
+        runtime.deliveries[key] = A2ADelivery(to: target.rosterID, route: target.route,
+                                              attemptID: attemptID,
+                                              bodyHash: Self.stableHash(body),
+                                              queuedBehindRun: queued,
+                                              state: state, at: Date())
         runtime.prune()
 
         // Show it immediately; the sweep replaces it with the stored row.
-        agentInbox.insert(A2AMessage(fromBotID: sender, toBotID: target,
+        agentInbox.insert(A2AMessage(id: attemptID, fromBotID: sender.rosterID,
+                                     toBotID: target.rosterID,
                                      time: Self.clock(), text: body), at: 0)
+        runtime.optimisticRows[attemptID] = target.route.gatewayID
         FeedsRuntime.shared.lastInboxScan = nil
-        recordActivity(kind: .mention, botID: target,
+        recordActivity(kind: .mention, botID: target.rosterID,
                        text: theme.copy.feedHandoffSent(theme.themeID)
-                           + " @" + identity(sender).handle,
+                           + " @" + sender.handle,
                        subtext: Self.previewLine(body))
         // …and out loud, the first of desktop's three delivery outcomes
         // (plugin.js:2637-2641). The composer has already closed on the send, so
@@ -727,10 +1155,11 @@ private extension AppModel {
         // A2A path with its own keys. A mirror would file a second row for one
         // delivery, which is the thing `toast()`'s key pairing exists to prevent.
         toast(kind: .info,
-              title: theme.copy.toastHandoffSent(identity(target).handle,
-                                                 on: activeConnectionLabel, theme.themeID),
+              title: theme.copy.toastHandoffSent(target.handle,
+                                                 on: target.connectionLabel, theme.themeID),
               message: Self.previewLine(body),
-              botID: target, key: "handoff:\(key)", ledger: false)
+              botID: target.rosterID, key: "handoff:\(key)", ledger: false)
+        return key
     }
 
     /// One recipient could not be reached while others could. The composer has
@@ -738,14 +1167,18 @@ private extension AppModel {
     /// left to say so — and it is the right place: the row survives the sweep,
     /// which is about to rebuild the feed from transcripts this message never
     /// reached.
-    func recordFailure(_ error: Error, to target: String, body: String) {
+    func recordFailure(_ error: Error, to target: A2AEndpoint, body: String,
+                       attemptID: UUID) {
         let runtime = A2ARuntime.shared
-        let key = Self.deliveryKey(to: target, body: body)
+        let key = Self.deliveryKey(route: target.route, body: body, attemptID: attemptID)
         runtime.watchers.removeValue(forKey: key)?.cancel()
-        runtime.deliveries[key] = A2ADelivery(to: target, queuedBehindRun: false,
+        runtime.deliveries[key] = A2ADelivery(to: target.rosterID, route: target.route,
+                                              attemptID: attemptID,
+                                              bodyHash: Self.stableHash(body),
+                                              queuedBehindRun: false,
                                               state: .failed(Self.reason(error)), at: Date())
         runtime.prune()
-        recordActivity(kind: .mention, botID: target,
+        recordActivity(kind: .mention, botID: target.rosterID,
                        text: theme.copy.a2aFailedNote(theme.themeID,
                                                       reason: Self.reason(error)),
                        subtext: Self.previewLine(body))
@@ -753,49 +1186,62 @@ private extension AppModel {
         // replaces the "on its way" card under the same key, so one delivery
         // stays one card even when it ends badly.
         toast(kind: .failure,
-              title: theme.copy.toastCouldNotReach(activeConnectionLabel
-                                                       ?? identity(target).displayTitle,
+              title: theme.copy.toastCouldNotReach(target.connectionLabel
+                                                       ?? target.displayTitle,
                                                    theme.themeID),
               message: Self.reason(error),
-              botID: target, key: "handoff:\(key)", ledger: false)
+              botID: target.rosterID, key: "handoff:\(key)", ledger: false)
     }
 
     /// Wait out the recipient's turn and relay its answer, bounded
     /// (plugin.js:2549). A timeout is not an error — the message is in their
     /// chat and the next sweep will find the reply whenever it lands.
-    func watchForReply(to target: String, sender: String, body: String, attributed: String,
-                       stored: String, baseline: Int) {
+    func watchForReply(to target: A2AEndpoint, sender: A2AEndpoint, body: String,
+                       attemptID: UUID, attributed: String, stored: String, baseline: Int,
+                       client: GatewayClient) {
         guard !stored.isEmpty else { return }
         let runtime = A2ARuntime.shared
-        let key = Self.deliveryKey(to: target, body: body)
+        let key = Self.deliveryKey(route: target.route, body: body, attemptID: attemptID)
         let generation = (runtime.watcherGeneration[key] ?? 0) + 1
         runtime.watcherGeneration[key] = generation
+        runtime.watcherScopes[key] = target.route.gatewayID
+        let scopeGeneration = runtime.scopeGenerations[target.route.gatewayID] ?? 0
         let deadline = Date().addingTimeInterval(A2APolicy.replyDeadline)
         runtime.watchers[key] = Task { @MainActor [weak self] in
             defer {
                 // Only if this is still the live watch for the key.
                 if A2ARuntime.shared.watcherGeneration[key] == generation {
                     A2ARuntime.shared.watchers[key] = nil
+                    A2ARuntime.shared.watcherScopes[key] = nil
                 }
             }
             while Date() < deadline, !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(A2APolicy.replyPoll))
                 guard !Task.isCancelled, let self, self.mode == .live,
-                      let client = self.client else { return }
+                      (A2ARuntime.shared.scopeGenerations[target.route.gatewayID]
+                        ?? 0) == scopeGeneration else { return }
                 // Cheap probe first: nothing has been written, nothing to read.
-                let count = await self.storedMessageCount(of: stored, profile: target)
+                let count = await self.storedMessageCount(of: stored, route: target.route,
+                                                          client: client)
                 if let count, count <= baseline { continue }
                 // Something landed. One authoritative read — `running` and
                 // `inflight` are what say the turn is finished rather than
                 // half-written (plugin.js:2566).
-                guard let live = try? await client.resumeSession(stored, profile: target,
+                guard let live = try? await client.resumeSession(stored,
+                                                                 profile: target.route.profile,
                                                                  deferHistory: false),
+                      !Task.isCancelled,
+                      (A2ARuntime.shared.scopeGenerations[target.route.gatewayID]
+                        ?? 0) == scopeGeneration,
                       !live.running, live.inflight == nil,
-                      let reply = Self.reply(to: attributed, in: live.messages) else { continue }
+                      let reply = A2AReplyResolver.reply(to: attributed,
+                                                        in: live.messages) else { continue }
                 self.relay(reply: reply, from: target, to: sender, key: key)
                 return
             }
-            guard A2ARuntime.shared.watcherGeneration[key] == generation else { return }
+            guard A2ARuntime.shared.watcherGeneration[key] == generation,
+                  (A2ARuntime.shared.scopeGenerations[target.route.gatewayID]
+                    ?? 0) == scopeGeneration else { return }
             if var delivery = A2ARuntime.shared.deliveries[key], delivery.state == .waiting {
                 delivery.state = .quiet
                 A2ARuntime.shared.deliveries[key] = delivery
@@ -812,47 +1258,31 @@ private extension AppModel {
 
     /// The reply watch ran out. Split off the closure above so the toast reads
     /// as one statement rather than four optional-chained fragments.
-    private func reportQuietHandoff(to target: String, key: String) {
+    private func reportQuietHandoff(to target: A2AEndpoint, key: String) {
         toast(kind: .info,
-              title: theme.copy.toastNoReplyYet(identity(target).handle,
-                                                on: activeConnectionLabel, theme.themeID),
-              botID: target, key: "handoff:\(key)", ledger: false)
+              title: theme.copy.toastNoReplyYet(target.handle,
+                                                on: target.connectionLabel, theme.themeID),
+              botID: target.rosterID, key: "handoff:\(key)", ledger: false)
     }
 
     /// The reply to OUR message: the newest assistant turn that follows the
     /// user row we wrote. Upstream takes the last assistant message outright
     /// (plugin.js:2569-2583); anchoring to our own row instead keeps a queued
     /// handoff from relaying the answer to whatever the bot was already doing.
-    static func reply(to attributed: String, in messages: [JSONValue]) -> String? {
-        // -1 when our row is not in this page of the transcript, which makes
-        // the scan below fall back to upstream's plain "last assistant".
-        var anchor = -1
-        for (index, row) in messages.enumerated() where row["role"]?.stringValue == "user" {
-            if ArtifactScan.text(of: row).contains(attributed) { anchor = index }
-        }
-        var index = messages.count - 1
-        while index > anchor {
-            let row = messages[index]
-            if row["role"]?.stringValue == "assistant" {
-                let text = ArtifactScan.text(of: row)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                return text.isEmpty ? nil : text
-            }
-            index -= 1
-        }
-        return nil
-    }
-
-    func relay(reply: String, from target: String, to sender: String, key: String) {
+    func relay(reply: String, from target: A2AEndpoint, to sender: A2AEndpoint, key: String) {
+        let attemptID = A2ARuntime.shared.deliveries[key]?.attemptID
         if var delivery = A2ARuntime.shared.deliveries[key] {
             delivery.state = .replied
             A2ARuntime.shared.deliveries[key] = delivery
         }
-        agentInbox.insert(A2AMessage(fromBotID: target, toBotID: sender,
+        let replyID = attemptID.map(A2AWire.replyID(for:)) ?? UUID()
+        agentInbox.insert(A2AMessage(id: replyID, fromBotID: target.rosterID,
+                                     toBotID: sender.rosterID,
                                      time: Self.clock(), text: Self.previewLine(reply)), at: 0)
-        recordActivity(kind: .mention, botID: sender,
+        A2ARuntime.shared.optimisticRows[replyID] = target.route.gatewayID
+        recordActivity(kind: .mention, botID: sender.rosterID,
                        text: theme.copy.feedHandoffReply(theme.themeID)
-                           + " @" + identity(target).handle,
+                           + " @" + target.handle,
                        subtext: Self.previewLine(reply))
         // The answer, out loud (plugin.js:2646-2650): title `🤖 <name>
         // (<label>)`, body the reply clipped to 500. Filed under the RESPONDER,
@@ -860,10 +1290,10 @@ private extension AppModel {
         // having spoken, and the ledger row above is filed under the sender
         // because what IT records is the reply arriving back.
         toast(kind: .success,
-              title: theme.copy.toastHandoffReply(identity(target).displayTitle,
-                                                  on: activeConnectionLabel, theme.themeID),
+              title: theme.copy.toastHandoffReply(target.displayTitle,
+                                                  on: target.connectionLabel, theme.themeID),
               message: ActivityNotice.clip(reply, to: ActivityNotice.replyLimit),
-              botID: target, key: "handoff:\(key)", ledger: false)
+              botID: target.rosterID, key: "handoff:\(key)", ledger: false)
         // Let the transcript be the source of truth for the row.
         sweepInbox(after: 0.5)
     }

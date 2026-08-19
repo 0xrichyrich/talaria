@@ -26,6 +26,7 @@ struct PrivacySettingsSection: View {
     @State private var confirming: Verb?
     /// Bytes released by the last cache clear, shown until the next one.
     @State private var freed: Int64?
+    @State private var deleteError: String?
 
     private enum Verb: String, Identifiable {
         case clearCaches, signOutEverywhere, deleteEverything
@@ -101,6 +102,7 @@ struct PrivacySettingsSection: View {
         switch kind {
         case .keychain: copy.settingsKeychainSec(theme.id)
         case .preferences: copy.settingsPrefsSec(theme.id)
+        case .appData: "On-device data"
         case .caches: copy.settingsCachesSec(theme.id)
         }
     }
@@ -111,7 +113,13 @@ struct PrivacySettingsSection: View {
         SettingsSection(theme: theme,
                         title: copy.settingsDataSec(theme.id),
                         footnote: copy.settingsDataNote(theme.id)) {
-            SettingsGroup(theme: theme) {
+            VStack(alignment: .leading, spacing: 8) {
+                if let deleteError {
+                    Text(deleteError)
+                        .font(theme.body(11)).foregroundStyle(theme.danger)
+                        .accessibilityIdentifier("delete-local-data-error")
+                }
+                SettingsGroup(theme: theme) {
                 SettingsActionRow(theme: theme,
                                   title: copy.settingsClearCaches(theme.id),
                                   subtitle: freed.map { copy.settingsCachesCleared(theme.id,
@@ -133,6 +141,7 @@ struct PrivacySettingsSection: View {
                                   isBusy: busy == .deleteEverything,
                                   isLast: true) {
                     confirming = .deleteEverything
+                }
                 }
             }
         }
@@ -188,7 +197,15 @@ struct PrivacySettingsSection: View {
 
     private func deleteEverything() async {
         busy = .deleteEverything
-        await model.deleteAllLocalData()
+        deleteError = nil
+        do { try await model.deleteAllLocalData() }
+        catch RoomStoreError.deleteCommitFailed {
+            deleteError = "Room data could not be erased. Nothing was reported as deleted; try again."
+        } catch RoomStoreError.deleteCleanupFailed {
+            deleteError = "Room records were cleared, but residual attachment files could not be removed. Try again."
+        } catch {
+            deleteError = "Local data deletion did not finish: \(error.localizedDescription)"
+        }
         await measure()
         busy = nil
     }

@@ -458,24 +458,26 @@ extension AppModel {
               let route = gatewayRoute(for: botID),
               let client = try? await routedClient(for: route) else { return }
 
-        runtime.writing.insert(botID)
-        defer { runtime.writing.remove(botID) }
-        do {
-            // Fresh read: ui_meta rides every profiles.list, and desktop may
-            // have rewritten the block since the last roster poll. Sessions are
-            // not needed here and cost a per-profile db scan.
-            let profiles = try await client.listProfiles(includeSessions: false)
-            guard let row = profiles.first(where: { $0.name == route.profile }) else { return }
-            var block = row.uiMeta?["hermes-bots"]?.objectValue ?? [:]
-            block["chat"] = .string(storedID)
-            try await client.applyProfileEdit(
-                name: route.profile,
-                ProfileEdit(uiMeta: .object(["hermes-bots": .object(block)])))
-        } catch {
-            // Desktop's three-valued outcome (plugin.js:250-270) exists so an
-            // older gateway that does not speak the contract produces no toast
-            // at all. Neither outcome is actionable here: the chat is already
-            // open and the pin holds locally, so nothing is surfaced.
+        _ = try? await withBotModeMetaMutation(route: route) {
+            runtime.writing.insert(botID)
+            defer { runtime.writing.remove(botID) }
+            do {
+                // Fresh read: ui_meta rides every profiles.list, and desktop may
+                // have rewritten the block since the last roster poll. Sessions are
+                // not needed here and cost a per-profile db scan.
+                let profiles = try await client.listProfiles(includeSessions: false)
+                guard let row = profiles.first(where: { $0.name == route.profile }) else { return }
+                var block = row.uiMeta?["hermes-bots"]?.objectValue ?? [:]
+                block["chat"] = .string(storedID)
+                try await client.applyProfileEdit(
+                    name: route.profile,
+                    ProfileEdit(uiMeta: .object(["hermes-bots": .object(block)])))
+            } catch {
+                // Desktop's three-valued outcome (plugin.js:250-270) exists so an
+                // older gateway that does not speak the contract produces no toast
+                // at all. Neither outcome is actionable here: the chat is already
+                // open and the pin holds locally, so nothing is surfaced.
+            }
         }
     }
 
