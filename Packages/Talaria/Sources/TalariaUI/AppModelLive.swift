@@ -187,6 +187,10 @@ extension AppModel {
         runtime.eventPump?.cancel(); runtime.eventPump = nil
         if let gatewayID = departingGatewayID { dropApprovalScope(gatewayID: gatewayID) }
         runtime.resetSessionState()
+        // Teardown while both the captured source id and its client still
+        // exist. Clearing either first makes A2A mistake a deliberate primary
+        // disconnect for an unknown-source reset and cancel retained remotes.
+        dropPerGatewayCaches(gatewayID: departingGatewayID)
         if let gatewayID = departingGatewayID {
             await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gatewayID)
         } else if let client {
@@ -226,7 +230,6 @@ extension AppModel {
         // contract version — which is precisely the number a client uses to
         // decide which RPC shapes it may send.
         detachSettingsDiagnostics()
-        dropPerGatewayCaches(gatewayID: departingGatewayID)
         connections = ConnectionRegistry.shared.rows
     }
 
@@ -258,12 +261,11 @@ extension AppModel {
         // memory rather than a mix-up — but holding another machine's files
         // resident after leaving it is not a thing to do quietly.
         ArtifactStore.shared.flush()
-        // Agent-to-agent: a `sessions.changed` subscription on the socket being
-        // closed, plus reply watches holding stored-session ids that only mean
-        // something on the departing gateway. Those watches re-read `client`
-        // every tick, so left standing they poll the NEXT gateway with the last
-        // one's ids — the one way a2a state can cross a switch.
-        detachA2ARouter()
+        // Agent-to-agent: surrender the departing primary's subscription,
+        // source-qualified refs and captured-client watches. Secondary watches
+        // remain retained; the explicit gateway id prevents a cleared runtime
+        // from being mistaken for permission to reset every source.
+        detachA2ARouter(departingGatewayID: gatewayID)
         // A toast is the app answering a mutation aimed at THIS gateway. Left
         // standing across a switch, "Duplicating inbox…" hangs over a roster
         // that never had an `inbox`, and its ledger row would settle into the

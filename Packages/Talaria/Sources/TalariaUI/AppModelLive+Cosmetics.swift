@@ -495,58 +495,64 @@ extension AppModel {
         guard mode == .live else { return .persisted }
         guard let context = try? await profileContext(for: botID) else { return .failed }
         let signals = RosterSignals.shared
-        signals.writing.insert(botID)
-        defer { signals.writing.remove(botID) }
-
-        // Sampled BEFORE the read's await, so the answer in hand can be dated
-        // against this app's own pin writes — the same primitive `refreshRoster`
-        // uses to decide whether a roster answer may overwrite a pin.
-        let pinWrites = CanonicalChatRuntime.shared.writeCount
-        var block: [String: JSONValue] = [:]
         do {
-            let profiles = try await context.client.listProfiles(includeSessions: false)
-            guard let row = profiles.first(where: { $0.name == context.route.profile }) else {
-                return .failed
+            return try await withBotModeMetaMutation(route: context.route) {
+                signals.writing.insert(botID)
+                defer { signals.writing.remove(botID) }
+
+                // Sampled BEFORE the read's await, so the answer in hand can be dated
+                // against this app's own pin writes — the same primitive `refreshRoster`
+                // uses to decide whether a roster answer may overwrite a pin.
+                let pinWrites = CanonicalChatRuntime.shared.writeCount
+                var block: [String: JSONValue] = [:]
+                do {
+                    let profiles = try await context.client.listProfiles(includeSessions: false)
+                    guard let row = profiles.first(where: { $0.name == context.route.profile }) else {
+                        return .failed
+                    }
+                    block = row.uiMeta?["hermes-bots"]?.objectValue ?? [:]
+                } catch {
+                    return .failed
+                }
+
+                // The canonical-chat pin is the one key that must never be lost here,
+                // and it is lost two different ways. A block with no `chat` at all is
+                // the obvious one — desktop reads an omitted key as a deletion, so a
+                // pin held locally is re-asserted rather than dropped. The other is a
+                // block whose `chat` is STALE: opening a bot pins its forever-chat, and
+                // a look saved in the same breath can read the profile before that pin
+                // lands and then write the old session id back over it, silently
+                // moving the conversation the roster tap opens. So whenever this app
+                // pinned during (or across) the read, the local pin wins.
+                let localPin = CanonicalChatRuntime.shared.pins[botID]
+                let pinnedSinceRead = CanonicalChatRuntime.shared.hasLocalPinWrite(botID, since: pinWrites)
+                if let localPin, block["chat"] == nil || pinnedSinceRead {
+                    block["chat"] = .string(localPin)
+                }
+                for (key, value) in patch {
+                    if let value { block[key] = value } else { block.removeValue(forKey: key) }
+                }
+
+                var uiMeta: [String: JSONValue] = ["hermes-bots": .object(block)]
+                if let (shape, hue) = alsoTalaria {
+                    uiMeta["talaria"] = .object(["shape": .string(shape.rawValue),
+                                                 "hue": .string(hue.rawValue)])
+                }
+
+                do {
+                    let applied = try await context.client.applyProfileEdit(
+                        name: context.route.profile, ProfileEdit(uiMeta: .object(uiMeta)))
+                    if applied["ui_meta"] == true {
+                        await refreshProfileRoster(gatewayID: context.route.gatewayID)
+                        return .persisted
+                    }
+                    // No `applied` contract at all is the documented older-gateway
+                    // shape, not a refusal (plugin.js:250-262).
+                    return applied.isEmpty ? .unsupported : .failed
+                } catch {
+                    return .failed
+                }
             }
-            block = row.uiMeta?["hermes-bots"]?.objectValue ?? [:]
-        } catch {
-            return .failed
-        }
-
-        // The canonical-chat pin is the one key that must never be lost here,
-        // and it is lost two different ways. A block with no `chat` at all is
-        // the obvious one — desktop reads an omitted key as a deletion, so a
-        // pin held locally is re-asserted rather than dropped. The other is a
-        // block whose `chat` is STALE: opening a bot pins its forever-chat, and
-        // a look saved in the same breath can read the profile before that pin
-        // lands and then write the old session id back over it, silently
-        // moving the conversation the roster tap opens. So whenever this app
-        // pinned during (or across) the read, the local pin wins.
-        let localPin = CanonicalChatRuntime.shared.pins[botID]
-        let pinnedSinceRead = CanonicalChatRuntime.shared.hasLocalPinWrite(botID, since: pinWrites)
-        if let localPin, block["chat"] == nil || pinnedSinceRead {
-            block["chat"] = .string(localPin)
-        }
-        for (key, value) in patch {
-            if let value { block[key] = value } else { block.removeValue(forKey: key) }
-        }
-
-        var uiMeta: [String: JSONValue] = ["hermes-bots": .object(block)]
-        if let (shape, hue) = alsoTalaria {
-            uiMeta["talaria"] = .object(["shape": .string(shape.rawValue),
-                                         "hue": .string(hue.rawValue)])
-        }
-
-        do {
-            let applied = try await context.client.applyProfileEdit(
-                name: context.route.profile, ProfileEdit(uiMeta: .object(uiMeta)))
-            if applied["ui_meta"] == true {
-                await refreshProfileRoster(gatewayID: context.route.gatewayID)
-                return .persisted
-            }
-            // No `applied` contract at all is the documented older-gateway
-            // shape, not a refusal (plugin.js:250-262).
-            return applied.isEmpty ? .unsupported : .failed
         } catch {
             return .failed
         }

@@ -42,6 +42,8 @@ public struct TalariaRootView: View {
     // other screens drive: selectedTab, openBotID, showOnboarding).
     @State private var showSearch = false
     @State private var showCreate = false
+    @State private var showCreateMenu = false
+    @State private var showCreateRoom = false
     @State private var showProfile = false
     @State private var showVoice = false
     @State private var showConnections = false
@@ -85,7 +87,8 @@ public struct TalariaRootView: View {
 
     /// The tab bar lives only on the five tab screens.
     private var showsTabBar: Bool {
-        model.openBotID == nil && routinesBotID == nil && !showConnections
+        model.openBotID == nil && model.openRoomID == nil
+            && routinesBotID == nil && !showConnections
             && capabilitiesRequest == nil && !showVoice && !model.showOnboarding
     }
 
@@ -194,6 +197,27 @@ public struct TalariaRootView: View {
         .sheet(isPresented: $showCreate) {
             CreateBotView(model: model)
         }
+        .sheet(isPresented: $showCreateRoom) {
+            CreateRoomView(model: model) { roomID in
+                withAnimation(pushAnimation) {
+                    model.openBotID = nil
+                    model.openRoomID = roomID
+                }
+            }
+        }
+        .confirmationDialog("Create", isPresented: $showCreateMenu,
+                            titleVisibility: .visible) {
+            Button("Agent") { showCreate = true }
+            Button("Group Room") { showCreateRoom = true }
+                .disabled(model.unionRosterBots.count < RoomEngine.minimumMembers)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            if model.unionRosterBots.count < RoomEngine.minimumMembers {
+                Text("Connect at least two agents before creating a room.")
+            } else {
+                Text("Create one agent or a room shared by agents across your gateways.")
+            }
+        }
         .sheet(item: $sessionsRequest) { request in
             // onOpen fires after the sheet has already rebound the chat, so
             // this only has to clear the way to it.
@@ -210,10 +234,19 @@ public struct TalariaRootView: View {
                 showVoice = false
                 showProfile = false
             } else {
+                model.openRoomID = nil
                 // One rule for every route into a chat — palette, banner,
                 // deep link, activity row: entering pops what covered it.
                 revealChat()
             }
+        }
+        .onChange(of: model.openRoomID) {
+            guard model.openRoomID != nil else { return }
+            model.openBotID = nil
+            routinesBotID = nil
+            showVoice = false
+            showProfile = false
+            revealChat()
         }
         .onChange(of: clientToken) { attachEventRouters() }
         // `connectGateway` assigns the client, awaits the dial, and only then
@@ -267,6 +300,17 @@ public struct TalariaRootView: View {
                              onOpenProfile: { showProfile = true },
                              onRoutines: { withAnimation(pushAnimation) { routinesBotID = botID } },
                              onVoice: { withAnimation(sheetAnimation) { showVoice = true } })
+                }
+                .transition(pushTransition)
+            }
+
+            // Rooms are stable, device-local identities layered over exact
+            // source-qualified Hermes sessions. They use the same push depth
+            // as a bot chat, so opening either one replaces the other.
+            if let roomID = model.openRoomID {
+                ZStack {
+                    theme.bg.ignoresSafeArea()
+                    RoomView(model: model, roomID: roomID)
                 }
                 .transition(pushTransition)
             }
@@ -372,7 +416,7 @@ public struct TalariaRootView: View {
             case .home:
                 RosterView(model: model,
                            onSearch: { showSearch = true },
-                           onCreate: { showCreate = true },
+                           onCreate: { showCreateMenu = true },
                            onConnections: { withAnimation(pushAnimation) { showConnections = true } })
             case .activity:
                 ActivityView(model: model,
@@ -430,6 +474,7 @@ public struct TalariaRootView: View {
     private func goToTab(_ tab: CopyPack.Tab) {
         withAnimation(pushAnimation) {
             model.openBotID = nil
+            model.openRoomID = nil
             showConnections = false
             capabilitiesRequest = nil
             routinesBotID = nil
@@ -573,6 +618,7 @@ public struct TalariaRootView: View {
         case .approval:
             withAnimation(pushAnimation) {
                 model.openBotID = nil
+                model.openRoomID = nil
                 showConnections = false
                 model.selectedTab = .approvals
             }

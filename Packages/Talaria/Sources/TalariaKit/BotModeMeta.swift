@@ -1,7 +1,7 @@
 import Foundation
 
 /// Desktop Bot Mode stores per-bot cosmetics server-side in the profile's
-/// `ui_meta["hermes-bots"]` block (title, shape, color, pinned chat), synced
+/// `ui_meta["hermes-bots"]` block (title, shape, color, pinned chat, rooms), synced
 /// through `profiles.configure` so they follow the profile between machines.
 ///
 /// This type is the PARSE of that block, not the precedence over it: which of
@@ -39,14 +39,18 @@ public struct BotModeMeta: Sendable, Equatable {
     /// A plain boolean that rides ui_meta to every machine, so a laptop pin
     /// pins here too.
     public var pinned: Bool
+    /// Canonical room memberships. Current Hermes stores an ordered `groups`
+    /// array; the older scalar `group` is only a projection of its first item.
+    public var groups: [String]
 
     public init(title: String? = nil, shape: String? = nil,
                 colorHex: String? = nil, pinnedChat: String? = nil,
                 imageKind: String? = nil, created: Double? = nil,
-                pinned: Bool = false) {
+                pinned: Bool = false, groups: [String] = []) {
         self.title = title; self.shape = shape
         self.colorHex = colorHex; self.pinnedChat = pinnedChat
         self.imageKind = imageKind; self.created = created; self.pinned = pinned
+        self.groups = Self.normalizedGroups(groups)
     }
 
     /// Parse the desktop block out of a profile's `ui_meta`.
@@ -67,6 +71,50 @@ public struct BotModeMeta: Sendable, Equatable {
         imageKind = block["imageKind"]?.stringValue
         created = block["created"]?.doubleValue
         pinned = block["pinned"]?.boolValue == true
+        // A canonical array is authoritative, including an empty array.
+        // Current Hermes falls back to the legacy scalar only when `groups`
+        // is absent or not an array (`botGroups`, plugin.js), so malformed
+        // server metadata resolves the same way on desktop and mobile.
+        if let canonical = block["groups"]?.arrayValue {
+            groups = Self.normalizedGroups(canonical.compactMap(\.stringValue))
+        } else {
+            groups = Self.normalizedGroups([block["group"]?.stringValue].compactMap { $0 })
+        }
+    }
+
+    /// Compatibility value written beside `groups` for older Bot Mode builds.
+    public var legacyGroupProjection: String? { groups.first }
+
+    /// Ordered trim/dedupe shared by reads and writes. Comparison is literal,
+    /// matching Hermes: differently-cased room names remain distinct.
+    public static func normalizedGroups(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for value in values {
+            let group = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !group.isEmpty, seen.insert(group).inserted else { continue }
+            result.append(group)
+        }
+        return result
+    }
+
+    /// Server patch shape: `groups` is canonical and `group` remains a
+    /// first-membership projection until legacy desktop builds age out.
+    public static func membershipProjection(_ values: [String]) -> [String: JSONValue] {
+        let groups = normalizedGroups(values)
+        return [
+            "groups": .array(groups.map(JSONValue.string)),
+            "group": groups.first.map(JSONValue.string) ?? .null,
+        ]
+    }
+
+    /// Rename a canonical membership without moving its seat in the ordered
+    /// array. The first element is also the legacy scalar projection, so a
+    /// remove-then-append implementation would silently change old clients'
+    /// active room.
+    public static func replacingGroup(_ oldName: String, with newName: String,
+                                      in values: [String]) -> [String] {
+        normalizedGroups(values.map { $0 == oldName ? newName : $0 })
     }
 
     /// The stored asset is a real picture a human chose, not a rasterized copy

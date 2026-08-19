@@ -141,12 +141,14 @@ Region 6's 30 ⭕. Mostly about a phone that was asleep catching up correctly.
 
 ---
 
-## Phase E — Group rooms (~4–5 days)
+## Phase E — Group rooms · implemented, live certification pending
 
-Region 5's headline: **the single biggest unbuilt feature in Bot Mode.** A
-room with several bots, a shared log, deterministic `@mention` turn selection,
-≤3 rotated round-robin rounds, `(pass)` as silence, per-member watermarks, a
-`needs you` badge, composite avatars, and hidden member sessions.
+Region 5's headline is now implemented: a room with several source-qualified
+bots, a shared protected log, deterministic `@mention` turn selection, ≤3
+rotated round-robin rounds/10 posts, `(pass)` as silence, per-member watermarks,
+a `needs you` badge, composite avatars, attachments, activity and hidden member
+sessions. Durable accepted/uncertain attempts require explicit reconciliation;
+offline metadata changes remain in an ordered per-source outbox.
 
 Worth its own phase because it is the one place where "Bot Mode on a phone"
 could beat the desktop: a group of agents in your pocket is a better fit for a
@@ -155,14 +157,16 @@ resolver (done), mention middleware (Phase C).
 
 ---
 
-## Phase F — Federation (~3–4 days)
+## Phase F — Federation · implemented, live certification pending
 
-The multi-gateway union roster: connection chips, `@name-device` handles,
-second-class foreign rows, cross-connection delivery and reply relay. Today
-Talaria switches gateways on tap rather than holding several live links.
+The multi-gateway union roster now retains source clients, uses connection
+chips and `@name-device` handles, and routes foreign chats, A2A handoffs,
+replies and room turns without switching primary ownership. All durable and
+in-memory identities carry the owning gateway.
 
-Deliberately last: it multiplies the state space of everything before it, and
-it is only valuable once the single-gateway experience is genuinely good.
+This remains the highest-risk state-space multiplier, so automated collision,
+detach, retry and same-name tests do not substitute for the pending live-
+gateway/device certification.
 
 ---
 

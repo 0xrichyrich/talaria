@@ -191,14 +191,19 @@ extension ProtocolChecks {
                     .bots.map(\.id) == ["home-lab::ci"],
                    "a unique foreign row is addressable by its bare name (2445)")
 
-        // A foreign row is never the speaker, however its profile is named:
-        // upstream's remoteSource branch (2420-2422) needs the SAME source,
-        // and Talaria's speaker is always on the live one. Without this the
-        // far `default` would be skipped and the bare name would un-poison.
+        // A bare speaker is on the primary source, so the same-named foreign
+        // row still claims its form and prevents wrong-source self matching.
         let speaking = MentionResolver.resolve("@default ping", roster: union, speaking: "default")
         try expect(speaking.bots.map(\.id) == ["home-lab::default"],
                    "excluding the LIVE speaker leaves the far row still claiming the bare name")
         try expect(speaking.ambiguous.isEmpty, "…so the form is no longer poisoned")
+
+        // A qualified secondary speaker does recognize its own row, while the
+        // colliding primary remains available.
+        let farSpeaking = MentionResolver.resolve("@default ping", roster: union,
+                                                  speaking: "home-lab::default")
+        try expect(farSpeaking.bots.map(\.id) == ["default"],
+                   "a qualified remote speaker excludes itself on its own source")
     }
 
     // MARK: What the surfaces do with it
@@ -253,9 +258,9 @@ extension ProtocolChecks {
         try expect(live.first?.matchesRosterSearch("hermes") == true,
                    "…and still returns the near one, by the name its row reads")
 
-        // The middleware split (8289-8290). Upstream delivers the remote half
-        // over Connections (2593-2660); Talaria holds one socket, so it names
-        // that half instead and promises nothing about it in the text.
+        // The middleware resolves both halves. AppModel converts every row to
+        // a GatewayBotRoute and desktop's Connections delivery is mirrored by
+        // Talaria's retained client pool.
         let near = MentionMiddleware.route("@default-macbook ship it", roster: union,
                                            speaking: "ops")
         try expect(near.recipients.map(\.id) == ["default"], "a live row is a recipient")
@@ -265,27 +270,23 @@ extension ProtocolChecks {
 
         let farOnly = MentionMiddleware.route("@default-home-lab ship it", roster: union,
                                               speaking: "ops")
-        try expect(farOnly.recipients.isEmpty, "a row on another gateway is NOT delivered")
-        try expect(farOnly.unreachable.map(\.id) == ["home-lab::default"],
-                   "…it is reported so the surface can say where it lives")
-        try expect(farOnly.text == "@default-home-lab ship it",
-                   "and the draft comes back byte-identical — no note promises a delivery "
-                   + "that did not happen (cf. 8285-8287)")
+        try expect(farOnly.recipients.map(\.id) == ["home-lab::default"],
+                   "a row on another gateway is a routable recipient")
+        try expect(farOnly.unreachable.isEmpty, "…with nothing stranded")
+        try expect(farOnly.text.hasSuffix("that agent.]"),
+                   "and the dispatch note is appended")
 
         let both = MentionMiddleware.route("@default-macbook and @default-home-lab go",
                                            roster: union, speaking: "ops")
-        try expect(both.recipients.map(\.id) == ["default"], "the split keeps only the live half")
-        try expect(both.unreachable.map(\.id) == ["home-lab::default"], "and names the other")
+        try expect(both.recipients.map(\.id) == ["default", "home-lab::default"],
+                   "both gateway routes remain recipients")
+        try expect(both.unreachable.isEmpty, "and neither is stranded")
         try expect(both.text.hasSuffix("that agent.]"), "the note is still appended, unmangled")
 
-        // The note is an instruction the sending agent acts on, so a name in
-        // it that never received the message is a lie the model then repeats
-        // to the user. The draft still carries the typed handle; the NOTE must
-        // not.
+        // Both exact handles are named because both exact routes are dispatched.
         let note = both.text.dropFirst("@default-macbook and @default-home-lab go".count)
-        try expect(!note.contains("@default-home-lab"),
-                   "the unreachable handle appears nowhere in the appended note")
-        try expect(note.contains("@default-macbook"), "…and the delivered one does")
+        try expect(note.contains("@default-home-lab"), "the remote recipient is named")
+        try expect(note.contains("@default-macbook"), "…and the primary recipient is named")
     }
 
     // MARK: displayName rule 1 — a foreign `default` is named by its machine

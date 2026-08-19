@@ -130,10 +130,12 @@ public struct MultiGatewayRosterSection: View {
     /// block too — and the device label is a match field, which is what makes
     /// typing a machine's name list everything on it (plugin.js:2974-2976).
     private let needle: String
+    private let includeEntries: Bool
 
-    public init(model: AppModel, needle: String = "") {
+    public init(model: AppModel, needle: String = "", includeEntries: Bool = true) {
         self.model = model
         self.needle = needle
+        self.includeEntries = includeEntries
     }
 
     private var theme: ThemePack { model.theme.pack }
@@ -146,7 +148,7 @@ public struct MultiGatewayRosterSection: View {
         // it. The refresh that FEEDS these rows deliberately does not live
         // here — this view sits in a lazy list and may never be built on a
         // long roster; the roster screen owns the task instead.
-        let entries = model.foreignRosterEntries(matching: needle)
+        let entries = includeEntries ? model.foreignRosterEntries(matching: needle) : []
         // Gateways that listed NOTHING are a footnote about the fleet, not
         // roster rows, so a live query has nothing of theirs to narrow —
         // answering "homelab" with a machine that has no bots on it would be

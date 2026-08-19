@@ -1170,14 +1170,16 @@ the place you run your team from.*
 
 ### Phase 3 — The team
 
-*Federation and rooms. Real product beyond the single-gateway model, and the reason 21 of the ➖
-rows exist.*
+*Federation and rooms. Implemented in the 2026-08-19 rooms/federation slice;
+the older row-by-row audit markers above are historical until the ledger is
+regenerated. Automated package, protocol, source-isolation, Debug and Release
+gates are green; live-gateway and real-device certification remain pending.*
 
 | # | Item | First concrete step | Prereq |
 | --- | --- | --- | --- |
-| 3.1 | **Group rooms** — shared log, deterministic `@mention` turn selection, ≤3 rotated round-robin rounds, `(pass)` as silence, per-member watermarks, `needs you` badge, composite avatars, hidden member sessions | Model the room log locally (desktop keeps it in `ctx.storage['group-chats']` with membership on server `ui_meta.group`), then drive turns with `session.resume`/`prompt.submit` per member | 1.2, 1.3, 2.5 |
-| 3.2 | **Multi-source union roster** — connection chips, `@name-device` handles, second-class foreign rows | Teach `ConnectionRegistry` to hold more than one live link, then apply the annotate/append split keyed on the live gateway id; key all bot meta by `(gatewayID, profileName)` | 1.x complete |
-| 3.3 | **Cross-connection delivery + reply relay** — resolve the remote canonical chat (pin → resume-by-title → create hidden), submit the attributed prefix, poll, relay | Reuse the Phase 1 resolver against a second client instance; port the three-toast dispatch/reply/no-reply sequence | 3.2 |
+| 3.1 | **Group rooms** — shared log, deterministic `@mention` turn selection, ≤3 rotated round-robin rounds, `(pass)` as silence, per-member watermarks, `needs you` badge, composite avatars, hidden member sessions | Implemented in `RoomModels`/`RoomEngine`/`RoomStore`, `AppModelLive+Rooms`, and the mobile room views; live certification pending | 1.2, 1.3, 2.5 |
+| 3.2 | **Multi-source union roster** — connection chips, `@name-device` handles, second-class foreign rows | Implemented with retained clients and `GatewayBotRoute` identity; collision/detach tests are source-qualified | 1.x complete |
+| 3.3 | **Cross-connection delivery + reply relay** — resolve the remote canonical chat (pin → resume-by-title → create hidden), submit the attributed prefix, poll, relay | Implemented with exact attempt anchors, fresh pin authority, captured routed clients and federated inbox reconciliation | 3.2 |
 | 3.4 | **Performance discipline** — one shared face clock, dormancy on scene phase and tab, cancelled blink tasks, pre-warm on scroll-into-view | Replace per-avatar `Task` loops with a single `TimelineView(.animation)` driver; gate the 1 s roster ticker (`RosterView.swift:108-113`) on tab + scene phase | — |
 | 3.5 | **Avatar backfill to peers** (`pushLocalAvatars`) — required the moment upload lands, or a phone-uploaded avatar never reaches other machines | Push local-only images to `profiles.set_asset` on roster load when the server lacks one | 2.8 |
 

@@ -1040,7 +1040,8 @@ extension AppModel {
         func reconciled(_ ref: SessionRef) -> SessionRef? {
             guard sourceIDs.contains(ref.botID) else { return ref }
             guard let destinationID else { return nil }
-            return SessionRef(botID: destinationID, storedID: ref.storedID)
+            return SessionRef(gatewayID: target.gatewayID,
+                              botID: destinationID, storedID: ref.storedID)
         }
         feeds.artifactSessions = feeds.artifactSessions.compactMapValues(reconciled)
         feeds.inboxSessions = feeds.inboxSessions.compactMapValues(reconciled)

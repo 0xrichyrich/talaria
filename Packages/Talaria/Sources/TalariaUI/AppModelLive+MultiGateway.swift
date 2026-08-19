@@ -163,6 +163,7 @@ public extension AppModel {
                 self.routeToolEvent(event, sourceGatewayID: gatewayID)
                 self.routeSessionEvent(event, sourceGatewayID: gatewayID)
                 self.routePetEvent(event, sourceGatewayID: gatewayID)
+                self.routeA2AChange(event, sourceGatewayID: gatewayID)
             }
         }
         runtime.routedEvents[gatewayID] = MultiGatewayRuntime.RoutedEvents(
@@ -178,6 +179,7 @@ public extension AppModel {
         dropCapabilityScope(gatewayID: gatewayID)
         dropModelScope(gatewayID: gatewayID)
         dropApprovalPolicyScope(gatewayID: gatewayID)
+        dropA2AScope(gatewayID: gatewayID)
         ProfileAssetStore.shared.drop(gatewayID: gatewayID)
         dropPetScope(gatewayID: gatewayID)
         LiveRuntime.shared.resetRoutedState(gatewayID: gatewayID)
@@ -374,6 +376,7 @@ public extension AppModel {
             : []
         await ConnectionRegistry.shared.enumerateSecondaryRosters(excluding: excluded)
         applySecondaryUnreadAnswers()
+        await flushRoomMetadataOutbox()
     }
 
     /// Keep the union roster warm while the roster screen is on-stage. Driven

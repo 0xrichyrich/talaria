@@ -66,8 +66,10 @@ older Hermes snapshot and current upstream expanded materially. There is no
 defensible newer percentage until the granular ledgers are regenerated.
 
 The current implementation is best described as a mobile Hermes client with
-substantial Bot Mode support, not yet a 1:1 client. The largest remaining
-product gaps are group rooms, rich transcript controls, and gateway-backed
+substantial Bot Mode support, not yet a 1:1 client. Source-qualified A2A and
+standalone multi-member rooms are now implemented and automated-gate certified;
+they remain provisional until live-gateway and real-device certification. The
+largest remaining product gaps are rich transcript controls and gateway-backed
 workspace/command-center surfaces:
 
 - Talaria retains authenticated clients for multiple gateways and routes chat,
@@ -80,13 +82,16 @@ workspace/command-center surfaces:
   source-qualified inference OAuth/custom endpoints, voice providers, memory
   providers, profile rename/delete, runtime controls, logs, and push filters;
   these new paths remain partial until live-gateway certification.
-- Talaria's in-flight room work models one group per bot; current Hermes uses
-  multiple memberships and standalone rooms.
-- Foreign room members are not yet delivered through their owning connection.
-- Current Hermes also exposes agent-guided `tour.request` prompts, whole-turn
-  activity across transcript gaps, and a bounded room activity feed. These are
-  queued with Talaria's transcript and room batches rather than being mistaken
-  for management API drift.
+- Talaria stores multiple ordered room memberships per bot, standalone room
+  identity, a protected local transcript/blob index, and source-qualified
+  member descriptors. Foreign members resolve through their retained owning
+  gateway; accepted/uncertain sends are durable and never blindly replayed.
+  Membership convergence uses a source-qualified persistent outbox so an
+  offline create/rename/disband can finish after reconnect.
+- Current Hermes also exposes agent-guided `tour.request` prompts and whole-turn
+  activity across transcript gaps. Talaria's room work includes the bounded
+  current-run activity feed; tours and transcript activity remain queued with
+  the transcript batch rather than being mistaken for management API drift.
 
 ## Delivery ledger
 

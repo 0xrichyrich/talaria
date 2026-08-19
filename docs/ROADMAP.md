@@ -170,8 +170,9 @@ administer. Ordered by how often a phone-first operator needs it.
 > (`AppModelLive+MultiGateway.swift`, `ConnectionRegistry.swift`), the cosmetics
 > bridge made two-way per decision 3 (`AppModelLive+Cosmetics.swift`), avatar
 > generation (`Components/AvatarPicker.swift`), and roster craft — recency, the
-> 90 s liveness window, pinning, the unread watermark. Group rooms are **not**
-> done (see below).
+> 90 s liveness window, pinning, the unread watermark. Standalone group rooms
+> and retained-gateway federation landed in the subsequent rooms/federation
+> slice; live-gateway/device certification remains open.
 
 The parts of the plugin that make it feel like a fleet rather than a list.
 
@@ -275,12 +276,14 @@ single best test of the client.
 
 ### 2. Bot Mode gaps that survived Phase 4
 
-- **Group rooms / multi-bot chats.** Region 5 of
-  [BOT-MODE-PARITY.md](BOT-MODE-PARITY.md) is 30 rows still ⭕: the group row in
-  the roster, the room view with speaker attribution, `resolveGroupResponders`,
-  the bounded round-robin drive, per-member watermarks, `(pass)` semantics,
-  disband. A2A between two bots works; a *room* does not exist. This is the
-  largest single remaining Bot Mode idea.
+- **Group rooms / multi-bot chats — implemented, certification pending.** The
+  room row is interleaved into the roster; the mobile room view has threaded
+  speaker attribution, deterministic responder selection, a bounded three-round/
+  ten-post drive, `(pass)`, watermarks, `@user` attention, activity, attachments,
+  settings, rename and disband. Member sessions and metadata are source-qualified
+  across retained gateways. Automated Swift, protocol, Debug and Release gates
+  are green; live Hermes and phone reliability checks are still required before
+  this can be called production-certified.
 - **`/new` and `/reset` inside the canonical chat** are still offered as plain
   slash commands with no reroute to `/compact` and no "this chat never resets"
   explanation — so the app still hands the user a way to fork the one thing

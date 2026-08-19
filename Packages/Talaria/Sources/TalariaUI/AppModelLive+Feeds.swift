@@ -95,7 +95,10 @@ final class FeedsRuntime {
         routinesNote = ""; routinesError = nil; lastRoutinesRefresh = nil
         routinesLoaded = false
         artifactSessions.removeAll(); artifactsNote = ""; lastArtifactScan = nil
-        inboxSessions.removeAll(); inboxNote = ""; lastInboxScan = nil
+        // Inbox refs are gateway-qualified and may belong to retained
+        // secondary clients. Primary teardown removes only its scope through
+        // dropA2AScope; a primary client identity change must preserve remotes.
+        inboxNote = ""; lastInboxScan = nil
         artifactsTask?.cancel(); artifactsTask = nil
         inboxTask?.cancel(); inboxTask = nil
         routinesTask?.cancel(); routinesTask = nil
@@ -110,9 +113,18 @@ struct RoutineTarget: Sendable, Equatable {
 
 /// Where a derived row came from, so a tap can reopen the exact session.
 struct SessionRef: Sendable, Equatable {
+    /// Exact source of both the profile and durable session id.
+    var gatewayID: String
     var botID: String
     /// Durable session key (session.resume / REST transcript id).
     var storedID: String
+
+    func rosterID(activeGatewayID: String?) -> String? {
+        let profile = GatewayBotRoute(qualifiedID: botID)?.profile ?? botID
+        guard !gatewayID.isEmpty, !profile.isEmpty else { return nil }
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: profile)
+        return route.gatewayID == activeGatewayID ? route.profile : route.qualifiedID
+    }
 }
 
 /// One journal row. `ActivityItem` carries a display clock string only, so the
@@ -842,7 +854,11 @@ public extension AppModel {
                                                  sessionID: session.id, sessionTitle: title,
                                                  sessionStart: session.startedAt)
                     for artifact in harvest {
-                        refs[artifact.id] = SessionRef(botID: bot.id, storedID: session.id)
+                        if let gatewayID = LiveRuntime.shared.gatewayID {
+                            refs[artifact.id] = SessionRef(gatewayID: gatewayID,
+                                                           botID: bot.id,
+                                                           storedID: session.id)
+                        }
                     }
                     found.append(contentsOf: harvest)
                 } catch {
@@ -899,7 +915,8 @@ public extension AppModel {
     /// instead, so routing an artifact/inbox jump through it would land the
     /// user somewhere other than the session the row describes.
     internal func open(_ ref: SessionRef) {
-        openStoredSession(ref.storedID, botID: ref.botID)
+        guard let rosterID = ref.rosterID(activeGatewayID: activeGatewayID) else { return }
+        openStoredSession(ref.storedID, botID: rosterID)
     }
 
     /// tool.complete → artifact rows, for files produced while you watch. Same
@@ -921,9 +938,10 @@ public extension AppModel {
             let artifact = Self.artifact(from: value, botID: botID,
                                          sessionID: stored ?? sessionID,
                                          sessionTitle: tool.name, at: Date())
-            if let stored {
+            if let stored, let gatewayID = stateRoute(for: botID)?.gatewayID {
                 FeedsRuntime.shared.artifactSessions[artifact.id] =
-                    SessionRef(botID: botID, storedID: stored)
+                    SessionRef(gatewayID: gatewayID,
+                               botID: botID, storedID: stored)
             }
             artifacts.insert(artifact, at: 0)
             added = true
@@ -995,47 +1013,9 @@ public extension AppModel {
     /// upstream's handoff writes into (`hermes -p <bot> chat -c "Agent Inbox"`).
     /// Rows are split back into from → to by the A2A prefix the sender uses.
     func refreshAgentInbox(force: Bool = false) async {
-        guard mode == .live, let client, !bots.isEmpty else { return }
         let runtime = FeedsRuntime.shared
-        if runtime.inboxScanning { return }
         if !force, let last = runtime.lastInboxScan, last.timeIntervalSinceNow > -60 { return }
-        guard let (base, credential) = gatewayRESTContext() else {
-            runtime.inboxNote = theme.copy.needsRESTNote(theme.themeID)
-            return
-        }
-
-        runtime.inboxScanning = true
-        defer { runtime.inboxScanning = false; runtime.lastInboxScan = Date() }
-
-        var messages: [(A2AMessage, Date, SessionRef)] = []
-        var sessionCount = 0
-
-        for bot in bots.prefix(10) {
-            // `isInboxSession` matches "Bot Chat" too, and Bot Mode sessions —
-            // canonical chats included — are hidden, which session.list drops
-            // unless asked (methods_session.py:180-186).
-            guard let sessions = try? await client.listSessions(limit: 40, profile: bot.id,
-                                                                includeHidden: true) else { continue }
-            let inboxes = sessions.filter { Self.isInboxSession($0.title) }.prefix(2)
-            for session in inboxes {
-                guard !Task.isCancelled else { return }
-                guard let rows = try? await GatewayREST.sessionMessages(
-                    baseURL: base, credential: credential,
-                    storedID: session.id, profile: bot.id, limit: 60) else { continue }
-                sessionCount += 1
-                let ref = SessionRef(botID: bot.id, storedID: session.id)
-                for (message, at) in Self.inboxMessages(in: rows, owner: bot.id) {
-                    messages.append((message, at, ref))
-                }
-            }
-        }
-
-        let ordered = messages.sorted { $0.1 > $1.1 }.prefix(80)
-        var refs: [UUID: SessionRef] = [:]
-        for entry in ordered { refs[entry.0.id] = entry.2 }
-        runtime.inboxSessions = refs
-        agentInbox = ordered.map(\.0)
-        runtime.inboxNote = theme.copy.inboxSourceNote(theme.themeID, sessions: sessionCount)
+        await refreshInboxLive()
     }
 
     /// The CLI handoff names the conversation; both the current "Agent Inbox"
@@ -1049,6 +1029,7 @@ public extension AppModel {
     static func inboxMessages(in rows: [JSONValue], owner: String) -> [(A2AMessage, Date)] {
         var out: [(A2AMessage, Date)] = []
         var lastSender: String?
+        var lastAttemptID: UUID?
         for row in rows {
             let role = row["role"]?.stringValue ?? ""
             guard role == "user" || role == "assistant" else { continue }
@@ -1059,64 +1040,26 @@ public extension AppModel {
             if role == "user" {
                 guard let sender = a2aSender(in: text) else { continue }
                 lastSender = sender
-                out.append((A2AMessage(fromBotID: sender, toBotID: owner, time: time,
+                lastAttemptID = A2AWire.attemptID(in: text)
+                out.append((A2AMessage(id: lastAttemptID ?? UUID(),
+                                       fromBotID: sender, toBotID: owner, time: time,
                                        text: strippedA2A(text)), at))
             } else if let sender = lastSender {
                 // The owner's reply goes back to whoever last wrote in.
-                out.append((A2AMessage(fromBotID: owner, toBotID: sender, time: time,
+                out.append((A2AMessage(id: lastAttemptID.map(A2AWire.replyID(for:)) ?? UUID(),
+                                       fromBotID: owner, toBotID: sender, time: time,
                                        text: previewLine(text)), at))
             }
         }
         return out
     }
 
-    /// Hand a message to another bot: it lands in that bot's own "Agent Inbox"
-    /// session with the sender attribution the roster convention expects.
+    /// Compatibility boundary for the original one-recipient feed action.
+    /// Exact source resolution and all wire work live in `deliverHandoff`;
+    /// keeping a second primary-client implementation here would let an old
+    /// caller silently send a qualified remote id to the wrong gateway.
     func sendHandoff(from: String, to: String, text: String) async throws {
-        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty, from != to else { return }
-        guard mode == .live, let client else {
-            throw GatewayError(code: -3, message: "connect a gateway to hand off")
-        }
-        // The attribution prefix is a wire contract, and both halves are the
-        // sender's IDENTITY, not its profile id: desktop sends
-        // `Message from 🤖 ${senderName} (@${senderHandle})` where senderName
-        // is the display title and senderHandle the @handle (plugin.js:2635,
-        // and the same shape in the CLI recipe at 3654). Sending the raw
-        // profile name put "Message from 🤖 default (@default)" into the other
-        // bot's permanent transcript for the profile that presents as
-        // Hermes/@hermes.
-        let sender = identity(from)
-        let attributed = "Message from 🤖 \(sender.displayTitle) (@\(sender.handle)): \(body)"
-        // Inbox and canonical ("Bot Chat") sessions are hidden, and session.list
-        // omits hidden rows unless asked (methods_session.py:180-186) — without
-        // the flag an existing inbox is invisible and every handoff mints a
-        // second one.
-        let sessions = try await client.listSessions(limit: 40, profile: to, includeHidden: true)
-        let existing = sessions.first { Self.isInboxSession($0.title) }
-        let live: LiveSession
-        if let existing {
-            live = try await client.resumeSession(existing.id, profile: to, deferHistory: true)
-        } else {
-            live = try await client.createSession(profile: to, title: "Agent Inbox")
-        }
-        guard !live.sessionID.isEmpty else {
-            throw GatewayError(code: -8, message: "could not open \(to)'s inbox session")
-        }
-        try await client.submitPrompt(sessionID: live.sessionID, text: attributed)
-
-        // Show it immediately; the next sweep replaces it with the stored row
-        // (and picks up the reply), so drop the sweep throttle too.
-        let message = A2AMessage(fromBotID: from, toBotID: to, time: Self.clock(), text: body)
-        agentInbox.insert(message, at: 0)
-        let stored = live.storedSessionID.isEmpty ? existing?.id : live.storedSessionID
-        if let stored {
-            FeedsRuntime.shared.inboxSessions[message.id] = SessionRef(botID: to, storedID: stored)
-        }
-        FeedsRuntime.shared.lastInboxScan = nil
-        recordActivity(kind: .mention, botID: to,
-                       text: theme.copy.feedHandoffSent(theme.themeID) + " @" + from,
-                       subtext: Self.previewLine(body))
+        _ = try await deliverHandoff(from: from, to: [to], text: text)
     }
 
     /// Inbox row tap → the owning bot's inbox session.
