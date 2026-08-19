@@ -95,6 +95,29 @@ written.
 - [ ] Certify the complete matrix against the pinned gateway and document only
       the remaining true platform exceptions.
 
+## Crash-recovery snapshot disposition
+
+Commit `3139626a73b2e41bce0c3ef6e5dfa15b0817f5c6` is recovery material, not an
+integration branch. It diverged from the Phase B baseline while independently
+carrying versions of work that later landed through the reviewed Phase C and D
+PRs. It must never be merged or cherry-picked wholesale.
+
+- Phase C handles, search, and mentions already landed on `main`; their reviewed
+  versions are authoritative.
+- Phase D notifications, activity, unread state, and forever-chat protection
+  already landed on `main`; their reviewed versions are authoritative.
+- The snapshot's singular `group` room model is rejected because current Hermes
+  uses multiple memberships and standalone rooms. Room work starts from the
+  pinned upstream contract, not from that data model.
+- Avatar/cosmetic pieces that are not already on `main` may be extracted later
+  only after comparison with current Hermes blob-avatar behavior.
+- No parity row moves merely because the snapshot contains an implementation.
+
+CI now runs both the portable `talaria-verify` executable and individually
+named XCTest cases. New pure behavior belongs in `TalariaKit` with focused
+XCTest coverage; gateway and lifecycle slices add integration fixtures before
+their status can move to present.
+
 ## Merge rule
 
 Runtime PRs merge in dependency order. Each PR must identify the ledger rows it
