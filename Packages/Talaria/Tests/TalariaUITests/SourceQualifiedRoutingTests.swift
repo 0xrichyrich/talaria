@@ -721,6 +721,35 @@ final class SourceQualifiedRoutingTests: XCTestCase {
                        GatewayBotRoute(gatewayID: "homelab", profile: "default"))
     }
 
+    func testModelSettingsTargetPrefersExplicitGateway() {
+        XCTAssertEqual(ModelSettingsTargetFence.resolve(
+            selected: "homelab", available: ["primary", "homelab"],
+            active: "primary", runtime: "primary"), "homelab")
+        XCTAssertEqual(ModelSettingsTargetFence.resolve(
+            selected: nil, available: ["primary"],
+            active: "primary", runtime: "stale"), "primary")
+        XCTAssertEqual(ModelSettingsTargetFence.resolve(
+            selected: nil, available: [],
+            active: nil, runtime: "reconnecting"), "reconnecting")
+        XCTAssertEqual(ModelSettingsTargetFence.resolve(
+            selected: "deleted", available: ["primary"],
+            active: "primary", runtime: "primary"), "primary")
+    }
+
+    func testModelSettingsRejectsLateResultAfterGatewayRoundTrip() {
+        // A → B → A has the same apparent gateway id, but not the same
+        // generation. The first A request must not paint over the second.
+        XCTAssertFalse(ModelSettingsTargetFence.accepts(
+            stateGatewayID: "primary", targetGatewayID: "primary",
+            generation: 4, currentGeneration: 6))
+        XCTAssertFalse(ModelSettingsTargetFence.accepts(
+            stateGatewayID: "homelab", targetGatewayID: "primary",
+            generation: 6, currentGeneration: 6))
+        XCTAssertTrue(ModelSettingsTargetFence.accepts(
+            stateGatewayID: "primary", targetGatewayID: "primary",
+            generation: 6, currentGeneration: 6))
+    }
+
     func testModelGatewayDetachScrubsOnlyOwningSource() {
         let model = AppModel()
         LiveRuntime.shared.gatewayID = "primary"

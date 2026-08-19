@@ -131,6 +131,9 @@ Multi-connection implementation checkpoints:
 - [x] Source-qualified gateway-global approval mode, timeout, allowlist
       revocation, bypass display, and messaging pairing administration with an
       explicit gateway selector and per-source live refresh.
+- [x] Source-qualified gateway default model/reasoning settings, provider
+      credential save/disconnect, and catalog refresh with generation-fenced
+      reads and secret scrubbing across gateway switches.
 - [ ] Source-qualified remaining management mutations.
 
 ## Crash-recovery snapshot disposition
