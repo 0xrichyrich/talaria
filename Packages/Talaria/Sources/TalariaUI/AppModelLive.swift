@@ -731,6 +731,8 @@ extension AppModel {
                     await ConnectionRegistry.shared.refreshSecondaryRoster(
                         gatewayID: sourceGatewayID)
                     self.applySecondaryUnreadAnswers(gatewayID: sourceGatewayID)
+                } else if sourceGatewayID != nil, what == "cron.changed" {
+                    await self.refreshRoutinesLive(force: true)
                 }
             }
 
@@ -920,11 +922,12 @@ extension AppModel {
 
     func liveToggleRoutine(_ routine: Routine) {
         Task { @MainActor in
-            guard let client else { return }
-            _ = try? await client.cronManage(.object([
-                "action": .string(routine.isOn ? "enable" : "disable"),
-                "id": .string(routine.id),
-            ]))
+            guard let target = FeedsRuntime.shared.routineTargets[routine.id],
+                  let client = try? await routedClient(gatewayID: target.route.gatewayID)
+            else { return }
+            try? await client.cronSetPaused(jobID: target.route.jobID,
+                                            paused: !routine.isOn,
+                                            profile: target.profile)
         }
     }
 

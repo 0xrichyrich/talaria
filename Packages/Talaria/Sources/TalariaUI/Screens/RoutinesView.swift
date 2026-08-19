@@ -108,7 +108,8 @@ public struct RoutinesView: View {
                                    state: state(of: routine),
                                    quarantined: model.routineIsQuarantined(routine),
                                    isBusy: busyRoutineID == routine.id,
-                                   showsActions: model.mode == .live,
+                                   showsActions: model.mode == .live
+                                       && model.routineHasFullManagement(routine),
                                    open: { open(routine) },
                                    toggle: { model.setRoutineEnabled(routine, enabled: !routine.isOn) },
                                    runNow: { runNow(routine) },
@@ -120,7 +121,9 @@ public struct RoutinesView: View {
                         emptyLine
                     }
 
-                    newRoutineRow
+                    if GatewayBotRoute(qualifiedID: botID) == nil {
+                        newRoutineRow
+                    }
 
                     if !others.isEmpty {
                         Text(copy.otherBots)
@@ -176,6 +179,10 @@ public struct RoutinesView: View {
     private func open(_ routine: Routine) {
         actionError = nil
         actionNote = nil
+        guard model.routineHasFullManagement(routine) else {
+            actionNote = "Switching this remote routine is available now; full remote history and editing are the next delivery slice."
+            return
+        }
         withAnimation(.easeOut(duration: 0.32)) { editing = routine }
     }
 

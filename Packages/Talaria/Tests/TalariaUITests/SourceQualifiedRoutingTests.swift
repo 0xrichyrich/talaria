@@ -18,6 +18,10 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         ApprovalBridges.shared.sweptSessions.removeAll()
         ApprovalBridges.shared.sweepFailures.removeAll()
         ApprovalBridges.shared.sweepEpochs.removeAll()
+        FeedsRuntime.shared.cronJobs.removeAll()
+        FeedsRuntime.shared.cronScope.removeAll()
+        FeedsRuntime.shared.routineTargets.removeAll()
+        CronDetailRuntime.shared.quarantined.removeAll()
         SessionsRuntime.shared.resetPrimaryScope()
         SessionsRuntime.shared.resetRoutedScope(gatewayID: "homelab")
         super.tearDown()
@@ -320,6 +324,46 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         XCTAssertNil(ApprovalOutcomes.shared.choice(for: item.id))
     }
 
+    func testCollidingRoutineIDsKeepDistinctGatewayTargets() {
+        let model = AppModel()
+        model.mode = .live
+        LiveRuntime.shared.gatewayID = "primary"
+        let primary = routine(id: "same", botID: "default")
+        let remoteID = GatewayRoutineRoute(gatewayID: "homelab", jobID: "same").qualifiedID
+        let remote = routine(id: remoteID, botID: "homelab::default")
+        FeedsRuntime.shared.routineTargets[primary.id] = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "primary", jobID: "same"),
+            bot: GatewayBotRoute(gatewayID: "primary", profile: "default"), profile: nil)
+        FeedsRuntime.shared.routineTargets[remote.id] = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "homelab", jobID: "same"),
+            bot: GatewayBotRoute(gatewayID: "homelab", profile: "default"), profile: "default")
+
+        XCTAssertTrue(model.routineHasFullManagement(primary))
+        XCTAssertFalse(model.routineHasFullManagement(remote))
+        XCTAssertEqual(FeedsRuntime.shared.routineTargets[remote.id]?.route.jobID, "same")
+    }
+
+    func testRoutineGatewayDetachPreservesOtherGatewayRows() {
+        let model = AppModel()
+        let primary = routine(id: "primary-job", botID: "default")
+        let remoteID = GatewayRoutineRoute(gatewayID: "homelab", jobID: "remote-job").qualifiedID
+        let remote = routine(id: remoteID, botID: "homelab::default")
+        let orphanedCacheRow = routine(id: "stale-cache", botID: "homelab::researcher")
+        model.routines = [primary, remote, orphanedCacheRow]
+        FeedsRuntime.shared.routineTargets[primary.id] = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "primary", jobID: "primary-job"),
+            bot: GatewayBotRoute(gatewayID: "primary", profile: "default"), profile: nil)
+        FeedsRuntime.shared.routineTargets[remote.id] = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "homelab", jobID: "remote-job"),
+            bot: GatewayBotRoute(gatewayID: "homelab", profile: "default"), profile: nil)
+
+        model.dropRoutineScope(gatewayID: "homelab")
+
+        XCTAssertEqual(model.routines, [primary])
+        XCTAssertNotNil(FeedsRuntime.shared.routineTargets[primary.id])
+        XCTAssertNil(FeedsRuntime.shared.routineTargets[remote.id])
+    }
+
     func testUnreadWatermarksKeepCollidingProfilesInSeparateGatewayScopes() {
         let suite = "talaria-unread-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -444,6 +488,11 @@ final class SourceQualifiedRoutingTests: XCTestCase {
             bot: GatewayBotRoute(gatewayID: gatewayID, profile: profile),
             session: GatewaySessionRoute(gatewayID: gatewayID, sessionID: sessionID),
             requestID: requestID)
+    }
+
+    private func routine(id: String, botID: String) -> Routine {
+        Routine(id: id, botID: botID, name: "Backup", schedule: "every 1h",
+                next: "in 1h", last: "", isOn: true)
     }
 }
 #endif

@@ -118,27 +118,32 @@ public extension AppModel {
     /// not load cronjobs" over data that loaded fine, and then retries the
     /// failing pause inside a failing query forever.
     func quarantineLegacyRoutines() async {
-        guard mode == .live, let client else { return }
+        guard mode == .live else { return }
         let runtime = CronDetailRuntime.shared
         let feeds = FeedsRuntime.shared
-        let victims = feeds.cronJobs.values.filter {
-            Self.isLegacyDelegated($0) && $0.isActive && !runtime.quarantined.contains($0.id)
+        let victims = feeds.cronJobs.filter { id, job in
+            Self.isLegacyDelegated(job) && job.isActive && !runtime.quarantined.contains(id)
         }
         guard !victims.isEmpty else { return }
         var paused = false
-        for job in victims {
-            runtime.quarantined.insert(job.id)
+        for (id, job) in victims {
+            guard let target = feeds.routineTargets[id],
+                  let client = try? await routedClient(gatewayID: target.route.gatewayID)
+            else { continue }
+            runtime.quarantined.insert(id)
             do {
-                try await client.cronSetPaused(jobID: job.id, paused: true,
-                                               profile: feeds.cronScope[job.id] ?? nil)
+                try await client.cronSetPaused(jobID: target.route.jobID, paused: true,
+                                               profile: target.profile)
                 paused = true
-                recordActivity(kind: .routine, botID: job.taggedBotID ?? "default",
+                let botID = target.route.gatewayID == LiveRuntime.shared.gatewayID
+                    ? target.bot.profile : target.bot.qualifiedID
+                recordActivity(kind: .routine, botID: botID,
                                text: theme.copy.routineQuarantined(theme.themeID) + " — " + job.displayTitle,
                                subtext: theme.copy.routineQuarantineWhy(theme.themeID),
-                               key: "cron-quarantine:\(job.id)")
+                               key: "cron-quarantine:\(id)")
             } catch {
                 // Retried on the next list; never surfaced as a list failure.
-                runtime.quarantined.remove(job.id)
+                runtime.quarantined.remove(id)
             }
         }
         if paused { await refreshRoutinesLive(force: true) }
@@ -312,6 +317,9 @@ public extension AppModel {
                          repeatForever: Bool = true, continuity: Bool = false,
                          deliver: [String] = [], model: String? = nil,
                          provider: String? = nil) async throws {
+        guard GatewayBotRoute(qualifiedID: botID) == nil else {
+            throw GatewayRouteError.noRoute
+        }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanInstruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTitle.isEmpty, !cleanInstruction.isEmpty else {
@@ -378,6 +386,9 @@ public extension AppModel {
     func saveRoutine(_ job: CronJobDetail, botID: String, title: String, schedule: String,
                      instruction: String, deliver: [String]?, model: String?,
                      provider: String?, continuity: Bool?) async throws {
+        guard GatewayBotRoute(qualifiedID: botID) == nil else {
+            throw GatewayRouteError.noRoute
+        }
         guard mode == .live, let (base, credential) = gatewayRESTContext() else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
         }
