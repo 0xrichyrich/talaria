@@ -136,6 +136,28 @@ public final class UnreadWatermarkStore {
         persist()
     }
 
+    /// Reconcile the one durable identity Hermes just renamed or deleted.
+    /// Source wins deliberately: a destination mark can only be stale because
+    /// Hermes refuses renaming onto an existing profile, while the source mark
+    /// is the history attached to the accepted directory move.
+    func reconcileProfileLifecycle(profile: String, newProfile: String?, scope: URL?) {
+        guard let scopeKey = Self.key(for: scope), !profile.isEmpty else { return }
+        var state = scopes[scopeKey] ?? UnreadWatermarkScope()
+        let sourceMark = state.marks.removeValue(forKey: profile)
+        let sourceObserved = observed[scopeKey]?.removeValue(forKey: profile)
+        let sourceSuppressed = suppressNext[scopeKey]?.remove(profile) != nil
+        if let newProfile, !newProfile.isEmpty {
+            state.marks.removeValue(forKey: newProfile)
+            observed[scopeKey]?.removeValue(forKey: newProfile)
+            suppressNext[scopeKey]?.remove(newProfile)
+            if let sourceMark { state.marks[newProfile] = sourceMark }
+            if let sourceObserved { observed[scopeKey, default: [:]][newProfile] = sourceObserved }
+            if sourceSuppressed { suppressNext[scopeKey, default: []].insert(newProfile) }
+        }
+        scopes[scopeKey] = state
+        persist()
+    }
+
     /// Drop every mark for every gateway, in memory and on disk. Paired with
     /// Settings' "delete local data": that path removes the backing key, and
     /// without this the next poll would write the whole lot straight back (the

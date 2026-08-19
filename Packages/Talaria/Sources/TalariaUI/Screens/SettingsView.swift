@@ -4,12 +4,9 @@ import TalariaTheme
 
 // Settings — roadmap Phase 2.
 //
-// Desktop ships 202 discrete settings controls; this screen is deliberately not
-// a port of them. The settled decision is that raw config and env editing does
-// not belong on a phone — "an agent can be asked to make config changes, that
-// doesn't need to live on device" — so what is here is the set a phone-first
-// operator reaches for, and everything else is an honest pointer at desktop
-// (with the reminder that asking a bot is usually faster than either).
+// Raw YAML and environment editing do not belong on a phone. Dedicated,
+// authenticated Hermes management APIs do: this surface exposes their typed
+// mobile controls and leaves only host filesystem/process knobs to desktop.
 //
 // Sections, in the roadmap's order:
 //   Gateways      — the connection registry, merged from Connections.
@@ -64,20 +61,32 @@ public struct SettingsView: View {
                     ModelSettingsSection(model: model)
                         .settingsEntrance(delay: 0.13, reduced: reducedMotion)
 
+                    InferenceProviderSettingsSection(model: model)
+                        .settingsEntrance(delay: 0.15, reduced: reducedMotion)
+
                     VoiceSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.16, reduced: reducedMotion)
+                        .settingsEntrance(delay: 0.18, reduced: reducedMotion)
+
+                    ProfileLifecycleSettingsSection(model: model)
+                        .settingsEntrance(delay: 0.2, reduced: reducedMotion)
+
+                    OperatorSettingsSection(model: model)
+                        .settingsEntrance(delay: 0.22, reduced: reducedMotion)
+
+                    MemoryProviderSettingsSection(model: model)
+                        .settingsEntrance(delay: 0.24, reduced: reducedMotion)
 
                     // Solo sits above Privacy on purpose: it is the one section
                     // here that is *not* about the gateway, and a person looking
                     // for "does this work without a server" looks in Settings.
                     SoloSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.2, reduced: reducedMotion)
+                        .settingsEntrance(delay: 0.26, reduced: reducedMotion)
 
                     PrivacySettingsSection(model: model)
-                        .settingsEntrance(delay: 0.24, reduced: reducedMotion)
+                        .settingsEntrance(delay: 0.28, reduced: reducedMotion)
 
                     AboutSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.28, reduced: reducedMotion)
+                        .settingsEntrance(delay: 0.3, reduced: reducedMotion)
 
                     DesktopPointerSection(theme: theme, copy: copy)
                         .settingsEntrance(delay: 0.32, reduced: reducedMotion)
@@ -171,8 +180,8 @@ struct AboutSettingsSection: View {
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
 
-    private static let repoURL = URL(string: "https://github.com/0xrichyrich/talaria")!
-    private static let docsURL = URL(string: "https://github.com/0xrichyrich/talaria/tree/main/app/docs")!
+    private static let repoURL = URL(string: "https://github.com/Skynet-Ventures/talaria")!
+    private static let docsURL = URL(string: "https://github.com/Skynet-Ventures/talaria/tree/main/docs")!
     private static let upstreamURL = URL(string: "https://github.com/NousResearch/hermes-agent")!
 
     var body: some View {

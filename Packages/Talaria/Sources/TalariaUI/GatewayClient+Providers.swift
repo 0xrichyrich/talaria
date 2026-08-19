@@ -117,6 +117,23 @@ public struct TTSVoiceCatalog: Sendable, Equatable {
     }
 }
 
+/// Dynamic provider choices from GET /api/config/schema. Hermes merges built-
+/// ins, command providers, plugin registrations, and the current profile value
+/// on every request; keeping this server-driven prevents Talaria from freezing
+/// a vendor list that immediately drifts.
+public struct VoiceProviderOptions: Sendable, Equatable {
+    public var tts: [String]
+    public var stt: [String]
+
+    public init(_ value: JSONValue) {
+        let fields = value["fields"]
+        tts = fields?["tts.provider"]?["options"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        stt = fields?["stt.provider"]?["options"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+
+    public static let empty = VoiceProviderOptions(.null)
+}
+
 /// The host-side voice mode reported by `voice.toggle`.
 public struct HostVoiceState: Sendable, Equatable {
     /// HERMES_VOICE — the umbrella bit on the gateway machine.
@@ -170,17 +187,22 @@ public struct PushDeviceRecord: Sendable, Equatable {
     public var tokenHex: String
     /// "dev" (APNs sandbox) | "prod".
     public var environment: String
+    /// Stable Talaria saved-connection id echoed into this gateway's pushes.
+    public var gatewayID: String?
     /// Bots allowed to push here. Empty = every bot.
     public var profileFilter: [String]
 
-    public init(tokenHex: String, environment: String = "dev", profileFilter: [String] = []) {
-        self.tokenHex = tokenHex; self.environment = environment; self.profileFilter = profileFilter
+    public init(tokenHex: String, environment: String = "dev", gatewayID: String? = nil,
+                profileFilter: [String] = []) {
+        self.tokenHex = tokenHex; self.environment = environment
+        self.gatewayID = gatewayID; self.profileFilter = profileFilter
     }
 
     init?(_ v: JSONValue) {
         guard let token = v["device_token"]?.stringValue, !token.isEmpty else { return nil }
         self.init(tokenHex: token,
                   environment: v["environment"]?.stringValue ?? "dev",
+                  gatewayID: v["gateway_id"]?.stringValue,
                   profileFilter: v["profile_filter"]?.arrayValue?.compactMap(\.stringValue) ?? [])
     }
 }
@@ -300,6 +322,14 @@ extension GatewayClient {
                                unauthorized: unauthorized, sttProvider: stt, probed: true)
     }
 
+    func voiceProviderOptions(profile: String? = nil) async -> VoiceProviderOptions {
+        guard let schema = try? await restJSON(path: "api/config/schema",
+                                               query: profileQuery(profile), timeout: 20) else {
+            return .empty
+        }
+        return VoiceProviderOptions(schema)
+    }
+
     /// Write one nested config leaf through `PUT /api/config`. The server
     /// deep-merges, so `["tts","elevenlabs","voice_id"]` rewrites that key and
     /// leaves `model_id` — and every other section — untouched.
@@ -350,12 +380,13 @@ extension GatewayClient {
     /// Re-POST this device with a per-bot allow-list. Registration is an
     /// idempotent upsert, so this is also how the filter is CHANGED; an empty
     /// list means "every bot", which is the relay's own default.
-    func registerPushDevice(tokenHex: String, environment: String,
+    func registerPushDevice(tokenHex: String, environment: String, gatewayID: String,
                             profileFilter: [String]) async throws {
         let body: JSONValue = .object([
             "device_token": .string(tokenHex),
             "platform": "ios",
             "environment": .string(environment),
+            "gateway_id": .string(gatewayID),
             "profile_filter": .array(profileFilter.map(JSONValue.string)),
         ])
         try await restJSON(path: "api/plugins/talaria-push/devices", method: "POST",
