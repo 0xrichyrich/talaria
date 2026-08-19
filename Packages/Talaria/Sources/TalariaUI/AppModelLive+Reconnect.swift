@@ -584,6 +584,7 @@ extension AppModel {
     /// that knows every primary surface to clear. Source-qualified remote chat
     /// state is restored afterward because those clients remain connected.
     private func flushWorldForGatewaySwitch() {
+        preservePrimaryUnreadForGatewaySwitch()
         let remoteChats = chats.filter { GatewayBotRoute(qualifiedID: $0.key) != nil }
         let remoteApprovals = approvals.filter { GatewayBotRoute(qualifiedID: $0.botID) != nil }
         let remoteQueue = composeQueue.filter { GatewayBotRoute(qualifiedID: $0.botID) != nil }

@@ -47,16 +47,15 @@ public final class UnreadWatermarkStore {
 
     private let defaults: UserDefaults
     private var scopes: [String: UnreadWatermarkScope] = [:]
-    private var scopeKey: String?
 
     /// Newest stamp seen for each bot in this scope, from the last ingest. Not
     /// persisted — the next roster answer restates it in full, and it exists
     /// only so `acknowledge` has something to advance to between polls.
-    private var observed: [String: Double] = [:]
+    private var observed: [String: [String: Double]] = [:]
 
     /// Bots the NEXT ingest must not badge: the bot whose chat was open at the
     /// previous ingest, plus any explicit acknowledge. See `ingest`.
-    private var suppressNext: Set<String> = []
+    private var suppressNext: [String: Set<String>] = [:]
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -78,23 +77,9 @@ public final class UnreadWatermarkStore {
         defaults.set(data, forKey: Self.storageKey)
     }
 
-    /// A gateway with no key of its own — nothing is recorded until one
-    /// arrives, so a disconnected app cannot write marks into a shared bucket.
+    /// A gateway with no key of its own records nothing, so disconnected state
+    /// can never fall into a shared bucket.
     private static func key(for base: URL?) -> String? { base?.absoluteString }
-
-    // MARK: Scope
-
-    /// Point the store at a gateway, loading whatever this phone already knew
-    /// about it. Cheap and idempotent; call it as often as is convenient.
-    func rescope(to base: URL?) {
-        let next = Self.key(for: base)
-        guard next != scopeKey else { return }
-        scopeKey = next
-        // Per-poll state belongs to the gateway that produced it. The marks do
-        // not: they are already loaded from disk under every key.
-        observed.removeAll()
-        suppressNext.removeAll()
-    }
 
     // MARK: The diff
 
@@ -116,22 +101,23 @@ public final class UnreadWatermarkStore {
     /// code path this phase was rebuilt to remove.
     @discardableResult
     func ingest(_ activity: [String: Double], openBot: String?, scope: URL?) -> [String] {
-        rescope(to: scope)
-        guard let scopeKey, !activity.isEmpty else { return [] }
-        // Read-or-create rather than read: `rescope` is a no-op when the gateway
-        // has not changed, so a wipe in between would otherwise leave this scope
-        // with no state and every later poll a no-op.
+        guard let scopeKey = Self.key(for: scope), !activity.isEmpty else { return [] }
         let current = scopes[scopeKey] ?? UnreadWatermarkScope()
-        let spared = suppressNext.union(openBot.map { [$0] } ?? [])
+        let spared = (suppressNext[scopeKey] ?? []).union(openBot.map { [$0] } ?? [])
         let fold = UnreadWatermarks.fold(current, activity: activity, spared: spared,
                                          now: Date.now.timeIntervalSince1970)
 
+        var scopeObserved = observed[scopeKey] ?? [:]
         for (botID, stamp) in activity {
-            observed[botID] = max(observed[botID] ?? 0, max(0, stamp))
+            scopeObserved[botID] = max(scopeObserved[botID] ?? 0, max(0, stamp))
         }
+        observed[scopeKey] = scopeObserved
         scopes[scopeKey] = fold.scope
         scopes = UnreadWatermarks.evict(scopes)
-        suppressNext = openBot.map { [$0] } ?? []
+        let retained = Set(scopes.keys)
+        observed = observed.filter { retained.contains($0.key) }
+        suppressNext = suppressNext.filter { retained.contains($0.key) }
+        suppressNext[scopeKey] = openBot.map { [$0] } ?? []
         persist()
         return fold.moved
     }
@@ -140,16 +126,13 @@ public final class UnreadWatermarkStore {
 
     /// The user is looking at this bot. Advances its mark to the newest activity
     /// this phone has observed and spares it from the next ingest.
-    public func acknowledge(_ botID: String) {
-        guard let scopeKey else { return }
-        // Read-or-create, the same way `ingest` does: a chat opened before this
-        // gateway's first roster answer has no scope yet, and the difference
-        // between recording that and dropping it on the floor is one line.
+    public func acknowledge(_ botID: String, scope: URL?) {
+        guard let scopeKey = Self.key(for: scope) else { return }
         let state = scopes[scopeKey] ?? UnreadWatermarkScope()
-        scopes[scopeKey] = UnreadWatermarks.acknowledge(botID, observed: observed[botID] ?? 0,
-                                                        in: state,
-                                                        now: Date.now.timeIntervalSince1970)
-        suppressNext.insert(botID)
+        scopes[scopeKey] = UnreadWatermarks.acknowledge(
+            botID, observed: observed[scopeKey]?[botID] ?? 0, in: state,
+            now: Date.now.timeIntervalSince1970)
+        suppressNext[scopeKey, default: []].insert(botID)
         persist()
     }
 
@@ -161,10 +144,6 @@ public final class UnreadWatermarkStore {
         scopes.removeAll()
         observed.removeAll()
         suppressNext.removeAll()
-        // Forget which gateway is current too, so the next roster answer
-        // rebuilds the scope from nothing and seeds silently — a wipe should
-        // leave the phone in exactly the state a fresh install is in.
-        scopeKey = nil
         defaults.removeObject(forKey: Self.storageKey)
     }
 }
@@ -252,6 +231,90 @@ extension AppModel {
         }
     }
 
+    /// Record one completed turn without collapsing source-qualified bots into
+    /// the primary `bots` array. Used by both the live event stream and the
+    /// reconnect liveness sweep.
+    func recordUnread(for botID: String) {
+        guard openBotID != botID else { return }
+        if let route = GatewayBotRoute(qualifiedID: botID) {
+            MultiGatewayRuntime.shared.routedUnread[route, default: 0] += 1
+        } else if let index = bots.firstIndex(where: { $0.id == botID }) {
+            bots[index].unread += 1
+        }
+    }
+
+    /// Clear exactly one bot's badge. A qualified bot can share its profile
+    /// name with the active gateway and must never clear that local row.
+    func clearUnread(for botID: String) {
+        if let route = GatewayBotRoute(qualifiedID: botID) {
+            MultiGatewayRuntime.shared.routedUnread.removeValue(forKey: route)
+        } else if let index = bots.firstIndex(where: { $0.id == botID }) {
+            bots[index].unread = 0
+            bots[index].mentionsYou = false
+        }
+    }
+
+    /// The active gateway is about to become a retained secondary. Preserve
+    /// its row counts before the primary world is flushed.
+    func preservePrimaryUnreadForGatewaySwitch() {
+        guard let gatewayID = LiveRuntime.shared.gatewayID else { return }
+        for bot in bots where bot.unread > 0 {
+            let route = GatewayBotRoute(gatewayID: gatewayID, profile: bot.id)
+            MultiGatewayRuntime.shared.routedUnread[route] = max(
+                MultiGatewayRuntime.shared.routedUnread[route] ?? 0, bot.unread)
+        }
+    }
+
+    /// A retained secondary has become primary. Move its count into the live
+    /// row exactly once so the tab rollup neither loses nor double-counts it.
+    func takeRoutedUnreadForPrimary(profile: String) -> Int {
+        guard let gatewayID = LiveRuntime.shared.gatewayID else { return 0 }
+        return MultiGatewayRuntime.shared.routedUnread.removeValue(
+            forKey: GatewayBotRoute(gatewayID: gatewayID, profile: profile)) ?? 0
+    }
+
+    /// Tab-bar rollup across the primary rows and every retained secondary.
+    var totalRosterUnread: Int {
+        let primary = bots.reduce(0) { $0 + $1.unread }
+        let primaryGateway = LiveRuntime.shared.gatewayID
+        let routed = MultiGatewayRuntime.shared.routedUnread.reduce(0) { total, entry in
+            entry.key.gatewayID == primaryGateway ? total : total + entry.value
+        }
+        return primary + routed
+    }
+
+    /// Fold the most recent cached answer for every secondary gateway into its
+    /// own durable watermark scope. Called immediately after enumeration and
+    /// after a source-specific `sessions.changed` refresh.
+    func applySecondaryUnreadAnswers(gatewayID onlyGatewayID: String? = nil) {
+        guard mode == .live else { return }
+        let registry = ConnectionRegistry.shared
+        let openRoute = openBotID.flatMap(stateRoute(for:))
+        for gateway in registry.saved {
+            guard gateway.id != LiveRuntime.shared.gatewayID,
+                  onlyGatewayID == nil || gateway.id == onlyGatewayID,
+                  let baseURL = gateway.baseURL,
+                  let roster = registry.secondaryRosters[gateway.id] else { continue }
+            var activity: [String: Double] = [:]
+            for row in roster.profiles where !row.name.isEmpty {
+                activity[row.name] = max(activity[row.name] ?? 0, row.lastActive ?? 0)
+            }
+            let openProfile = openRoute?.gatewayID == gateway.id ? openRoute?.profile : nil
+            let moved = UnreadWatermarkStore.shared.ingest(
+                activity, openBot: openProfile, scope: baseURL)
+            for profile in moved {
+                let route = GatewayBotRoute(gatewayID: gateway.id, profile: profile)
+                if MultiGatewayRuntime.shared.routedUnread[route] == nil {
+                    MultiGatewayRuntime.shared.routedUnread[route] = 1
+                }
+                if ActivityToastPref.shared.enabled,
+                   let row = roster.profiles.first(where: { $0.name == profile }) {
+                    announceRoutedActivity(route: route, row: row)
+                }
+            }
+        }
+    }
+
     /// The opt-in toast that goes with a badge (plugin.js:137-148).
     ///
     /// Two titles, chosen by an anchored test over the roster preview
@@ -287,23 +350,35 @@ extension AppModel {
               botID: botID, ledger: false)
     }
 
+    private func announceRoutedActivity(route: GatewayBotRoute, row: SecondaryProfile) {
+        let copy = theme.copy
+        let themeID = theme.themeID
+        let botID = route.qualifiedID
+        let label = botName(botID, themeID)
+        toast(kind: .info,
+              title: ActivityNotice.isInbound(row.preview)
+                  ? copy.activityToastInbound(label, themeID)
+                  : copy.activityToastGeneric(label, themeID),
+              message: ActivityNotice.body(
+                row.preview, fallback: copy.activityToastNoPreview(themeID)),
+              botID: botID, ledger: false)
+    }
+
     /// Fold a roster answer's stamps into the durable marks and report the
     /// moves. Called from `applyRosterAnswer` with `RosterSignals.lastActive` —
     /// the table that answer just wrote — so the marks, the ranking and the rows
     /// all come off one payload on one tick.
     func unreadMoves(scope: URL?) -> [String] {
         guard mode == .live else { return [] }
+        let openProfile: String?
+        if let openBotID, let route = stateRoute(for: openBotID),
+           route.gatewayID == LiveRuntime.shared.gatewayID {
+            openProfile = route.profile
+        } else {
+            openProfile = nil
+        }
         return UnreadWatermarkStore.shared.ingest(RosterSignals.shared.lastActive,
-                                                  openBot: openBotID, scope: scope)
-    }
-
-    /// Point the store at whatever gateway is current. Called on both edges of a
-    /// connection (AppModelLive.swift), because between a switch and that
-    /// gateway's first roster answer there is no `ingest` to do it — and an
-    /// `acknowledge` in that window would land on the departed gateway's marks
-    /// for a profile that merely shares a name.
-    public func rescopeUnreadWatermarks() {
-        UnreadWatermarkStore.shared.rescope(to: LiveRuntime.shared.baseURL)
+                                                  openBot: openProfile, scope: scope)
     }
 
     /// A chat was opened — the single door every route in reports through: the
@@ -313,13 +388,16 @@ extension AppModel {
     /// The bot being read is never the bot that badges you, and the mark has to
     /// move with the badge or the next poll raises the same activity again.
     public func noteChatOpened(_ botID: String) {
-        UnreadWatermarkStore.shared.acknowledge(botID)
+        guard let route = stateRoute(for: botID),
+              let baseURL = gatewayBaseURL(for: route) else { return }
+        UnreadWatermarkStore.shared.acknowledge(route.profile, scope: baseURL)
     }
 
     /// "Delete local data" — drop every gateway's marks. The next roster answer
     /// re-seeds silently, exactly like a fresh install.
     public func forgetUnreadWatermarks() {
         UnreadWatermarkStore.shared.forgetEverything()
+        MultiGatewayRuntime.shared.routedUnread.removeAll()
     }
 }
 

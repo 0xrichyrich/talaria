@@ -63,10 +63,11 @@ defensible newer percentage until the granular ledgers are regenerated.
 
 The current implementation is best described as a mobile Hermes client with
 substantial Bot Mode support, not a 1:1 client. The largest correctness gaps
-are multi-connection routing and group rooms:
+are the remaining multi-connection management surfaces and group rooms:
 
-- Talaria federates roster reads but maintains one live gateway and switches
-  the application when opening a foreign bot.
+- Talaria retains authenticated clients for multiple gateways and routes chat,
+  events, sessions, approvals, and unread state by source. Routines,
+  capabilities, and several management mutations remain primary-only.
 - Talaria's in-flight room work models one group per bot; current Hermes uses
   multiple memberships and standalone rooms.
 - Foreign room members are not yet delivered through their owning connection.
@@ -106,7 +107,9 @@ Multi-connection implementation checkpoints:
       bots without changing the primary connection.
 - [x] Source-qualified stored-session list/open/rename/delete/branch/compress/
       export/search and title events, with collision-safe caches.
-- [ ] Source-qualified approvals, unread state, routines, capabilities, and mutations.
+- [x] Source-qualified unread events, durable roster watermarks, badge clearing,
+      and gateway-role transitions, including colliding profile names.
+- [ ] Source-qualified approval recovery, routines, capabilities, and mutations.
 
 ## Crash-recovery snapshot disposition
 

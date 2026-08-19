@@ -103,7 +103,7 @@ public struct TalariaRootView: View {
         var badges: [CopyPack.Tab: Int] = [:]
         let pending = model.pendingApprovalCount()
         if pending > 0 { badges[.approvals] = pending }
-        let unread = model.bots.reduce(0) { $0 + $1.unread }
+        let unread = model.totalRosterUnread
         if unread > 0 { badges[.home] = unread }
         return badges
     }
