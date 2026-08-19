@@ -189,6 +189,20 @@ enum ProfileLifecycleRecoveryPolicy {
     }
 }
 
+@MainActor
+enum ProfileLifecycleSwitchClaim {
+    static func acquire() -> Bool {
+        let supervisor = ConnectionSupervisor.shared
+        guard !supervisor.isReconnecting else { return false }
+        supervisor.isReconnecting = true
+        return true
+    }
+
+    static func release() {
+        ConnectionSupervisor.shared.isReconnecting = false
+    }
+}
+
 private struct ProfileLifecyclePreservedState {
     var portrait: Data?
     var unread: Int
@@ -246,6 +260,9 @@ extension AppModel {
         else { return .refused("Sign in to that gateway to rename this profile.") }
         guard !ProfileLifecycleRuntime.shared.heldGateways.contains(target.route.gatewayID) else {
             return .refused("That gateway has an unresolved profile change. Verify its profiles outside Talaria, then restart the app before trying again.")
+        }
+        guard !ConnectionSupervisor.shared.isReconnecting else {
+            return .refused("A gateway connection change is already in progress. Try again when it finishes.")
         }
         let cleanName = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanName.isEmpty else { return .refused("Enter a profile name.") }
@@ -363,6 +380,9 @@ extension AppModel {
         else { return .refused("Sign in to that gateway to delete this profile.") }
         guard !ProfileLifecycleRuntime.shared.heldGateways.contains(target.route.gatewayID) else {
             return .refused("That gateway has an unresolved profile change. Verify its profiles outside Talaria, then restart the app before trying again.")
+        }
+        guard !ConnectionSupervisor.shared.isReconnecting else {
+            return .refused("A gateway connection change is already in progress. Try again when it finishes.")
         }
         guard ProfileLifecycleTrafficAdmission.beginLifecycle(target.route.gatewayID)
         else { return .refused("That gateway is busy with another request or profile change. Try again when it finishes.") }
@@ -629,6 +649,13 @@ extension AppModel {
     private func retireProfileLifecycleClient(_ gatewayID: String, baseURL: URL,
                                               credential: GatewayCredential) async
         -> ProfileLifecycleRetirement {
+        // There is no actor suspension between the public preflight check and
+        // this claim. Hold the same mutex used by switchGateway across the
+        // disconnect await, otherwise B can install itself while A's ordinary
+        // disconnect is suspended and then be cleared by A's cleanup.
+        precondition(ProfileLifecycleSwitchClaim.acquire(),
+                     "profile lifecycle retirement lost its switch claim")
+        defer { ProfileLifecycleSwitchClaim.release() }
         let wasActive = gatewayID == LiveRuntime.shared.gatewayID && client != nil
         if wasActive {
             await disconnectGateway()

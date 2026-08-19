@@ -195,6 +195,22 @@ struct ProfileLifecycleTests {
         #expect(!plan.destinationIsPrimary)
     }
 
+    @Test @MainActor func retirementDisconnectExcludesBSwitchUntilCleanupCompletes() {
+        let supervisor = ConnectionSupervisor.shared
+        let original = supervisor.isReconnecting
+        supervisor.isReconnecting = false
+        defer { supervisor.isReconnecting = original }
+
+        #expect(ProfileLifecycleSwitchClaim.acquire())
+        // This is the exact admission check switchGateway(B) performs while
+        // disconnectGateway(A) is suspended in the client-pool await.
+        #expect(!ProfileLifecycleSwitchClaim.acquire())
+        ProfileLifecycleSwitchClaim.release()
+
+        #expect(ProfileLifecycleSwitchClaim.acquire())
+        ProfileLifecycleSwitchClaim.release()
+    }
+
     @Test @MainActor func clientReleasesOrdinaryLeaseOnTransportFailure() async throws {
         let gatewayID = "release-\(UUID().uuidString)"
         let client = GatewayClient(
