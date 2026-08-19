@@ -94,6 +94,14 @@ enum ProfileLifecycleTrafficAdmission {
         ProfileLifecycleRuntime.shared.gatewaysInFlight.remove(gatewayID)
     }
 
+    /// Called only after Hermes' postcondition and all local route/queue state
+    /// agree. Owner reconnect and roster refresh are ordinary traffic, so they
+    /// must happen after this boundary rather than receiving a privileged
+    /// bypass through the exclusive filesystem window.
+    static func finishAuthoritativeReconciliation(_ gatewayID: String) {
+        endLifecycle(gatewayID)
+    }
+
     static func allows(_ gatewayID: String) -> Bool {
         let runtime = ProfileLifecycleRuntime.shared
         return !runtime.gatewaysInFlight.contains(gatewayID)
@@ -118,6 +126,26 @@ enum ProfileLifecycleTrafficAdmission {
                 message: "Gateway traffic is paused while a profile change is being resolved.")
         }
         return lease
+    }
+}
+
+@MainActor
+final class ProfileLifecycleExclusiveLease {
+    private let gatewayID: String
+    private var isHeld = true
+
+    init(gatewayID: String) { self.gatewayID = gatewayID }
+
+    func finishAuthoritativeReconciliation() {
+        guard isHeld else { return }
+        isHeld = false
+        ProfileLifecycleTrafficAdmission.finishAuthoritativeReconciliation(gatewayID)
+    }
+
+    func releaseIfHeld() {
+        guard isHeld else { return }
+        isHeld = false
+        ProfileLifecycleTrafficAdmission.endLifecycle(gatewayID)
     }
 }
 
@@ -194,7 +222,8 @@ extension AppModel {
         }
         guard ProfileLifecycleTrafficAdmission.beginLifecycle(target.route.gatewayID)
         else { return .refused("That gateway is busy with another request or profile change. Try again when it finishes.") }
-        defer { ProfileLifecycleTrafficAdmission.endLifecycle(target.route.gatewayID) }
+        let exclusive = ProfileLifecycleExclusiveLease(gatewayID: target.route.gatewayID)
+        defer { exclusive.releaseIfHeld() }
 
         let changesDirectory = target.route.profile != "default"
         let preserved = captureProfileLifecycleState(target)
@@ -222,22 +251,22 @@ extension AppModel {
             guard changesDirectory else {
                 return await resolveAmbiguousDefaultDisplayRename(
                     target, requested: cleanName, originalError: error.message,
-                    baseURL: baseURL, credential: credential)
+                    baseURL: baseURL, credential: credential, exclusive: exclusive)
             }
             return await resolveAmbiguousRename(
                 target, requested: cleanName, originalError: error.message,
                 baseURL: baseURL, credential: credential, wasActive: wasActive,
-                preserved: preserved)
+                preserved: preserved, exclusive: exclusive)
         } catch {
             guard changesDirectory else {
                 return await resolveAmbiguousDefaultDisplayRename(
                     target, requested: cleanName, originalError: error.localizedDescription,
-                    baseURL: baseURL, credential: credential)
+                    baseURL: baseURL, credential: credential, exclusive: exclusive)
             }
             return await resolveAmbiguousRename(
                 target, requested: cleanName, originalError: error.localizedDescription,
                 baseURL: baseURL, credential: credential, wasActive: wasActive,
-                preserved: preserved)
+                preserved: preserved, exclusive: exclusive)
         }
 
         let canonical = result.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -248,9 +277,13 @@ extension AppModel {
                 return await resolveAmbiguousDefaultDisplayRename(
                     target, requested: cleanName,
                     originalError: "Hermes returned an inconsistent default-profile rename result.",
-                    baseURL: baseURL, credential: credential)
+                    baseURL: baseURL, credential: credential, exclusive: exclusive)
             }
             ProfileLifecycleRuntime.shared.restore(target.route)
+            // Hermes and local route state now agree. End the exclusive
+            // filesystem fence before the owner refresh acquires an ordinary
+            // transport lease; uncertain outcomes never reach this boundary.
+            exclusive.finishAuthoritativeReconciliation()
             await refreshProfileRoster(gatewayID: target.route.gatewayID)
             return .renamed(canonicalName: canonical, displayName: result.displayName)
         }
@@ -260,11 +293,12 @@ extension AppModel {
                 target, requested: cleanName,
                 originalError: "Hermes did not return a valid changed canonical profile name.",
                 baseURL: baseURL, credential: credential, wasActive: wasActive,
-                preserved: preserved)
+                preserved: preserved, exclusive: exclusive)
         }
         reconcileProfileRoute(target, canonicalNewName: canonical,
                               scope: baseURL, preserved: preserved,
                               restorePrimaryIfUnclaimed: wasActive)
+        exclusive.finishAuthoritativeReconciliation()
         await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                             wasActive: wasActive, baseURL: baseURL,
                                             credential: credential)
@@ -292,7 +326,8 @@ extension AppModel {
         }
         guard ProfileLifecycleTrafficAdmission.beginLifecycle(target.route.gatewayID)
         else { return .refused("That gateway is busy with another request or profile change. Try again when it finishes.") }
-        defer { ProfileLifecycleTrafficAdmission.endLifecycle(target.route.gatewayID) }
+        let exclusive = ProfileLifecycleExclusiveLease(gatewayID: target.route.gatewayID)
+        defer { exclusive.releaseIfHeld() }
 
         let preserved = captureProfileLifecycleState(target)
         parkProfileLifecycleState(target)
@@ -308,17 +343,18 @@ extension AppModel {
             return await resolveAmbiguousDelete(
                 target, originalError: error.message, baseURL: baseURL,
                 credential: credential, wasActive: wasActive,
-                preserved: preserved)
+                preserved: preserved, exclusive: exclusive)
         } catch {
             return await resolveAmbiguousDelete(
                 target, originalError: error.localizedDescription, baseURL: baseURL,
                 credential: credential, wasActive: wasActive,
-                preserved: preserved)
+                preserved: preserved, exclusive: exclusive)
         }
 
         reconcileProfileRoute(target, canonicalNewName: nil,
                               scope: baseURL, preserved: preserved,
                               restorePrimaryIfUnclaimed: wasActive)
+        exclusive.finishAuthoritativeReconciliation()
         await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                             wasActive: wasActive, baseURL: baseURL,
                                             credential: credential)
@@ -329,7 +365,8 @@ extension AppModel {
     private func resolveAmbiguousRename(
         _ target: ProfileLifecycleTarget, requested: String, originalError: String,
         baseURL: URL, credential: GatewayCredential, wasActive: Bool,
-        preserved: ProfileLifecyclePreservedState
+        preserved: ProfileLifecyclePreservedState,
+        exclusive: ProfileLifecycleExclusiveLease
     ) async -> ProfileLifecycleOutcome {
         let names = try? await GatewayREST.profileNames(baseURL: baseURL, credential: credential)
         let verdict = names.map {
@@ -341,6 +378,7 @@ extension AppModel {
             reconcileProfileRoute(target, canonicalNewName: requested, scope: baseURL,
                                   preserved: preserved,
                                   restorePrimaryIfUnclaimed: wasActive)
+            exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                                 wasActive: wasActive, baseURL: baseURL,
                                                 credential: credential)
@@ -349,6 +387,7 @@ extension AppModel {
         case .notCommitted:
             restoreParkedProfileLifecycleStateIfNeeded(target, wasActive: wasActive)
             ProfileLifecycleRuntime.shared.restore(target.route)
+            exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                                 wasActive: wasActive, baseURL: baseURL,
                                                 credential: credential)
@@ -361,7 +400,8 @@ extension AppModel {
 
     private func resolveAmbiguousDefaultDisplayRename(
         _ target: ProfileLifecycleTarget, requested: String, originalError: String,
-        baseURL: URL, credential: GatewayCredential
+        baseURL: URL, credential: GatewayCredential,
+        exclusive: ProfileLifecycleExclusiveLease
     ) async -> ProfileLifecycleOutcome {
         let inventory = try? await GatewayREST.profileInventory(
             baseURL: baseURL, credential: credential)
@@ -372,10 +412,12 @@ extension AppModel {
         switch verdict {
         case .committed:
             ProfileLifecycleRuntime.shared.restore(target.route)
+            exclusive.finishAuthoritativeReconciliation()
             await refreshProfileRoster(gatewayID: target.route.gatewayID)
             return .renamed(canonicalName: target.route.profile, displayName: requested)
         case .notCommitted:
             ProfileLifecycleRuntime.shared.restore(target.route)
+            exclusive.finishAuthoritativeReconciliation()
             return .refused(originalError)
         case .indeterminate:
             ProfileLifecycleRuntime.shared.heldGateways.insert(target.route.gatewayID)
@@ -386,7 +428,8 @@ extension AppModel {
     private func resolveAmbiguousDelete(
         _ target: ProfileLifecycleTarget, originalError: String,
         baseURL: URL, credential: GatewayCredential, wasActive: Bool,
-        preserved: ProfileLifecyclePreservedState
+        preserved: ProfileLifecyclePreservedState,
+        exclusive: ProfileLifecycleExclusiveLease
     ) async -> ProfileLifecycleOutcome {
         let names = try? await GatewayREST.profileNames(baseURL: baseURL, credential: credential)
         let verdict = names.map {
@@ -397,6 +440,7 @@ extension AppModel {
             reconcileProfileRoute(target, canonicalNewName: nil, scope: baseURL,
                                   preserved: preserved,
                                   restorePrimaryIfUnclaimed: wasActive)
+            exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                                 wasActive: wasActive, baseURL: baseURL,
                                                 credential: credential)
@@ -405,6 +449,7 @@ extension AppModel {
         case .notCommitted:
             restoreParkedProfileLifecycleStateIfNeeded(target, wasActive: wasActive)
             ProfileLifecycleRuntime.shared.restore(target.route)
+            exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                                 wasActive: wasActive, baseURL: baseURL,
                                                 credential: credential)
