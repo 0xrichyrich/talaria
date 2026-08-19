@@ -10,9 +10,9 @@ import TalariaKit
 //                                  generate_code 609 (entry shape)
 //   hermes_cli/pairing.py        — `hermes pairing list|approve|revoke`, the
 //                                  CLI this screen exists to replace
-//   hermes_cli/web_server.py     — GET /api/pairing 13354,
-//                                  POST /api/pairing/approve 13363,
-//                                  POST /api/pairing/revoke 13399
+//   hermes_cli/web_server.py     — GET /api/pairing 13437,
+//                                  POST /api/pairing/approve 13446,
+//                                  POST /api/pairing/revoke 13482
 //   hermes_cli/web_models.py:445 — PairingApprove / PairingRevoke bodies
 //
 // THE RULE THIS FILE EXISTS TO ENFORCE: an approval grants on `request_id`,
@@ -26,7 +26,7 @@ import TalariaKit
 //
 // This surface is REST, not JSON-RPC: pairing lives on the dashboard app the
 // gateway mounts (`hermes_cli/web_server.py`), and the WS gateway carries only
-// the `pairing.changed` broadcast (server.py:3753). A gateway that does not
+// the `pairing.changed` broadcast (server.py:3841). A gateway that does not
 // mount those routes answers 404, which reads as `.unsupported` and hides the
 // surface rather than showing an error nobody can act on.
 

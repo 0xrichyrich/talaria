@@ -247,16 +247,12 @@ extension AppModel {
             // never let the departing primary survive a role switch.
             dropCapabilityScope(gatewayID: gatewayID)
             dropModelScope(gatewayID: gatewayID)
+            dropApprovalPolicyScope(gatewayID: gatewayID)
         }
         // Cron detail: the `cron.changed` subscription, per-job records, run
         // histories, and the "this gateway has no cron REST router" verdict —
         // the last of which decides whether editing and history exist at all.
         detachCronDetailRouter()
-        // The approval-policy store re-probes itself on the next load, but its
-        // `pairing.changed` subscription is a live registration on the socket
-        // being closed and has to be surrendered while that client is still
-        // around to surrender it to.
-        detachPairingWatch()
         // Up to 40 MB of decoded artifact bodies and thumbnails fetched from
         // the departing gateway. Keys are gateway-scoped, so this is about the
         // memory rather than a mix-up — but holding another machine's files

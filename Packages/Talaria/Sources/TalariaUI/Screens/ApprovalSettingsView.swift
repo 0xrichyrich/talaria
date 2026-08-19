@@ -99,6 +99,9 @@ public struct ApprovalSettingsView: View {
             header
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
+                    if model.approvalPolicyGatewayChoices.count > 1 {
+                        gatewaySection
+                    }
                     if let notice = store.notice {
                         noticeCard(notice)
                     }
@@ -140,6 +143,31 @@ public struct ApprovalSettingsView: View {
                 .padding(.bottom, 60)
             }
         }
+    }
+
+    private var gatewaySection: some View {
+        SettingsSection(theme: theme,
+                        title: copy.policyGatewaySec(themeID),
+                        footnote: copy.policyGatewayNote(themeID)) {
+            SettingsGroup(theme: theme) {
+                Picker(copy.policyGatewaySec(themeID), selection: Binding(
+                    get: { model.approvalPolicyGatewayID },
+                    set: { gatewayID in
+                        guard let gatewayID else { return }
+                        Task { await model.selectApprovalPolicyGateway(gatewayID) }
+                    })) {
+                    ForEach(model.approvalPolicyGatewayChoices) { gateway in
+                        Text(gateway.name + (gateway.isActive
+                                             ? copy.policyGatewayActive(themeID) : ""))
+                            .tag(Optional(gateway.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(theme.accent)
+                .padding(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
+            }
+        }
+        .settingsEntrance(delay: 0, reduced: reducedMotion)
     }
 
     // MARK: Header
@@ -504,6 +532,30 @@ public extension View {
 // MARK: - Copy
 
 extension CopyPack {
+
+    func policyGatewaySec(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Gateway"
+        case .control: "POLICY SOURCE"
+        case .ink: "THE HOUSE THESE ORDERS BIND"
+        }
+    }
+
+    func policyGatewayNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Approval rules and pairing belong to one gateway. Choose the machine you mean to administer."
+        case .control: "POLICY + PAIRING ARE GATEWAY-LOCAL. SELECT AN EXPLICIT TARGET."
+        case .ink: "Each house keeps its own seals and its own door; name the house before changing either."
+        }
+    }
+
+    func policyGatewayActive(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: " · active"
+        case .control: " [ACTIVE]"
+        case .ink: " · present"
+        }
+    }
 
     func policyKicker(_ t: ThemeID) -> String {
         switch t {
