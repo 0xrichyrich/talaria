@@ -11,12 +11,9 @@ import TalariaKit
 // carrying a device label, and the duplicate-name rule mints `@name-device`
 // handles once across all sources (electron/connection-registry.ts:330-372).
 //
-// WHAT IS REAL HERE, PRECISELY. `GatewayClientPool` now keeps authenticated
-// secondary connections alive and coalesces dials. The union roster no longer
-// relies on throwaway probe sockets. Opening a foreign row still switches the
-// primary AppModel world in this slice; moving chat/session/event state to the
-// source-qualified route is the next integration step. This file must not
-// claim Desktop parity until that switch is removed.
+// `GatewayClientPool` keeps authenticated secondary connections alive and
+// coalesces dials. Chat, events, sessions, approvals, and unread state retain
+// their source route instead of switching the primary AppModel world.
 
 /// Book-keeping for the union roster. `AppModel`'s stored properties live in
 /// AppModel.swift (another owner); extensions cannot add storage, so the
@@ -38,6 +35,10 @@ final class MultiGatewayRuntime {
     }
 
     var routedEvents: [String: RoutedEvents] = [:]
+    /// Unread counts for bots whose gateway is not currently primary.
+    /// Primary rows keep the existing `Bot.unread` storage for compatibility;
+    /// gateway switches move counts between the two representations.
+    var routedUnread: [GatewayBotRoute: Int] = [:]
 }
 
 public extension AppModel {
@@ -76,6 +77,20 @@ public extension AppModel {
     /// profile name.
     func gatewayRoute(for rosterID: String) -> GatewayBotRoute? {
         GatewayBotRoute.resolve(rosterID: rosterID, activeGatewayID: activeGatewayID)
+    }
+
+    /// Resolve state ownership without requiring a connected client. Unlike
+    /// `gatewayRoute`, this is valid during reconnect and gateway switching,
+    /// when UI state still needs a collision-safe key.
+    func stateRoute(for rosterID: String) -> GatewayBotRoute? {
+        if let qualified = GatewayBotRoute(qualifiedID: rosterID) { return qualified }
+        guard let gatewayID = LiveRuntime.shared.gatewayID, !rosterID.isEmpty else { return nil }
+        return GatewayBotRoute(gatewayID: gatewayID, profile: rosterID)
+    }
+
+    func gatewayBaseURL(for route: GatewayBotRoute) -> URL? {
+        if route.gatewayID == LiveRuntime.shared.gatewayID { return LiveRuntime.shared.baseURL }
+        return ConnectionRegistry.shared.saved.first(where: { $0.id == route.gatewayID })?.baseURL
     }
 
     /// Obtain the client that owns a source-qualified bot. The primary client
@@ -206,6 +221,9 @@ public extension AppModel {
                    status: .idle,
                    preview: entry.preview,
                    previewTime: Self.shortTime(entry.lastActive),
+                   unread: MultiGatewayRuntime.shared.routedUnread[
+                    GatewayBotRoute(gatewayID: entry.gatewayID, profile: entry.profile)
+                   ] ?? 0,
                    description: entry.job,
                    // The far gateway's `ui_meta` title, or nothing — never a
                    // stand-in derived here. `Bot.displayTitle` applies the
@@ -288,10 +306,8 @@ public extension AppModel {
     /// left the minted handle rendering on the roster and addressable by
     /// nobody.
     ///
-    /// The roster surfaces deliberately do NOT read it: `RosterView` draws the
-    /// two halves as two sections with a divider between them, because opening
-    /// a foreign row switches this phone's gateway rather than messaging in
-    /// place (see the note at the head of this file).
+    /// The roster surface draws the two halves as sections with a source
+    /// divider, while actions still route through this one identity domain.
     var unionRosterBots: [Bot] {
         liveRosterBots + foreignRosterEntries.map { rosterBot(for: $0) }
     }
@@ -310,6 +326,7 @@ public extension AppModel {
             ? Set([LiveRuntime.shared.baseURL?.absoluteString].compactMap { $0 })
             : []
         await ConnectionRegistry.shared.enumerateSecondaryRosters(excluding: excluded)
+        applySecondaryUnreadAnswers()
     }
 
     /// Keep the union roster warm while the roster screen is on-stage. Driven

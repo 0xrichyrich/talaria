@@ -12,6 +12,7 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         runtime.routedSessionToBot.removeAll()
         runtime.approvalSessions.removeAll()
         runtime.routedApprovalSessions.removeAll()
+        MultiGatewayRuntime.shared.routedUnread.removeAll()
         SessionsRuntime.shared.resetPrimaryScope()
         SessionsRuntime.shared.resetRoutedScope(gatewayID: "homelab")
         super.tearDown()
@@ -133,7 +134,7 @@ final class SourceQualifiedRoutingTests: XCTestCase {
 
         model.handle(event: GatewayEvent(
             type: "message.complete", sessionID: "deadbeef",
-            payload: .object(["status": .string("complete"), "text": .string("")])) ,
+            payload: .object(["status": .string("complete"), "text": .string("")])),
             sourceGatewayID: "homelab")
 
         XCTAssertEqual(model.approvals.map(\.id), ["primary-approval"])
@@ -181,6 +182,109 @@ final class SourceQualifiedRoutingTests: XCTestCase {
 
         XCTAssertEqual(model.approvalResponseTarget(for: item, botRoute: bot),
                        ApprovalResponseTarget(bot: bot, session: session))
+    }
+
+    func testUnreadWatermarksKeepCollidingProfilesInSeparateGatewayScopes() {
+        let suite = "talaria-unread-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UnreadWatermarkStore(defaults: defaults)
+        let primary = URL(string: "https://primary.example")!
+        let homelab = URL(string: "https://homelab.example")!
+
+        XCTAssertTrue(store.ingest(["default": 100], openBot: nil, scope: primary).isEmpty)
+        XCTAssertTrue(store.ingest(["default": 500], openBot: nil, scope: homelab).isEmpty)
+        XCTAssertEqual(store.ingest(["default": 101], openBot: nil, scope: primary),
+                       ["default"])
+        XCTAssertEqual(store.ingest(["default": 501], openBot: nil, scope: homelab),
+                       ["default"])
+    }
+
+    func testUnreadAcknowledgeNamesItsGatewayExplicitly() {
+        let suite = "talaria-unread-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UnreadWatermarkStore(defaults: defaults)
+        let primary = URL(string: "https://primary.example")!
+        let homelab = URL(string: "https://homelab.example")!
+        _ = store.ingest(["default": 100], openBot: nil, scope: primary)
+        _ = store.ingest(["default": 100], openBot: nil, scope: homelab)
+
+        store.acknowledge("default", scope: homelab)
+
+        XCTAssertEqual(store.ingest(["default": 200], openBot: nil, scope: primary),
+                       ["default"])
+        XCTAssertTrue(store.ingest(["default": 200], openBot: nil, scope: homelab).isEmpty)
+    }
+
+    func testRemoteUnreadCannotBadgeOrClearCollidingPrimaryBot() {
+        let model = AppModel()
+        let runtime = LiveRuntime.shared
+        runtime.gatewayID = "primary"
+        model.bots = [.unlisted(id: "default")]
+        let remote = GatewayBotRoute(gatewayID: "homelab", profile: "default")
+
+        model.recordUnread(for: remote.qualifiedID)
+
+        XCTAssertEqual(model.bots[0].unread, 0)
+        XCTAssertEqual(MultiGatewayRuntime.shared.routedUnread[remote], 1)
+        XCTAssertEqual(model.totalRosterUnread, 1)
+
+        model.recordUnread(for: "default")
+        model.clearUnread(for: remote.qualifiedID)
+
+        XCTAssertEqual(model.bots[0].unread, 1)
+        XCTAssertNil(MultiGatewayRuntime.shared.routedUnread[remote])
+    }
+
+    func testRemoteCompletionBadgesOnlyItsQualifiedBot() {
+        let model = AppModel()
+        model.mode = .live
+        model.bots = [.unlisted(id: "default")]
+        let runtime = LiveRuntime.shared
+        runtime.gatewayID = "primary"
+        let route = GatewaySessionRoute(gatewayID: "homelab", sessionID: "deadbeef")
+        runtime.routedSessionToBot[route] = "homelab::default"
+        let remote = GatewayBotRoute(gatewayID: "homelab", profile: "default")
+
+        model.handle(event: GatewayEvent(
+            type: "message.complete", sessionID: "deadbeef",
+            payload: .object(["status": .string("complete"), "text": .string("done")])),
+            sourceGatewayID: "homelab")
+
+        XCTAssertEqual(model.bots[0].unread, 0)
+        XCTAssertEqual(MultiGatewayRuntime.shared.routedUnread[remote], 1)
+    }
+
+    func testOpeningRemoteChatClearsOnlyItsQualifiedUnread() {
+        let model = AppModel()
+        model.mode = .demo
+        model.bots = [.unlisted(id: "default")]
+        model.bots[0].unread = 2
+        let remote = GatewayBotRoute(gatewayID: "homelab", profile: "default")
+        MultiGatewayRuntime.shared.routedUnread[remote] = 3
+
+        model.openChat(botID: remote.qualifiedID)
+
+        XCTAssertEqual(model.bots[0].unread, 2)
+        XCTAssertNil(MultiGatewayRuntime.shared.routedUnread[remote])
+    }
+
+    func testUnreadCountSurvivesGatewayRoleTransitionsExactlyOnce() {
+        let model = AppModel()
+        let runtime = LiveRuntime.shared
+        runtime.gatewayID = "primary"
+        model.bots = [.unlisted(id: "default")]
+        model.bots[0].unread = 3
+        let route = GatewayBotRoute(gatewayID: "primary", profile: "default")
+
+        model.preservePrimaryUnreadForGatewaySwitch()
+
+        XCTAssertEqual(MultiGatewayRuntime.shared.routedUnread[route], 3)
+        model.bots = []
+        XCTAssertEqual(model.takeRoutedUnreadForPrimary(profile: "default"), 3)
+        XCTAssertNil(MultiGatewayRuntime.shared.routedUnread[route])
+        XCTAssertEqual(model.takeRoutedUnreadForPrimary(profile: "default"), 0)
     }
 
     private func approval(id: String, botID: String) -> Approval {

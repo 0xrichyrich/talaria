@@ -628,7 +628,7 @@ extension AppModel {
             bots[idx].preview = Self.previewLine(row.preview)
             bots[idx].previewTime = Self.shortTime(row.lastActive)
         }
-        if openBotID != botID { bots[idx].unread += 1 }
+        recordUnread(for: botID)
     }
 }
 

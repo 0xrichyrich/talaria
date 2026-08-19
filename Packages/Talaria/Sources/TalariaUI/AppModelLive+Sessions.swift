@@ -179,10 +179,7 @@ extension AppModel {
         guard !id.isEmpty else { return }
         openBotID = botID
         selectedTab = .home
-        if let idx = bots.firstIndex(where: { $0.id == botID }) {
-            bots[idx].unread = 0
-            bots[idx].mentionsYou = false
-        }
+        clearUnread(for: botID)
         // Same rule as `openChat`: this is a route into the bot's chat, so the
         // durable mark moves with the badge it just cleared.
         noteChatOpened(botID)

@@ -130,13 +130,6 @@ extension AppModel {
         let client = GatewayClient(baseURL: baseURL, credential: credential)
         self.client = client
         runtime.baseURL = baseURL
-        // The unread marks survive a switch (being durable is the point), but
-        // the store has to be pointed at the gateway now being answered for.
-        // Nothing else does it until the first roster answer lands, and an
-        // `acknowledge` inside that window would otherwise advance the DEPARTED
-        // gateway's mark for a profile that merely shares a name.
-        rescopeUnreadWatermarks()
-
         // Events fan out of the client on its own actor; funnel them through
         // one AsyncStream so MainActor delivery preserves wire order (deltas
         // arrive in ~30 fps bursts and must append in order).
@@ -195,10 +188,6 @@ extension AppModel {
         }
         runtime.baseURL = nil
         runtime.gatewayID = nil
-        // No gateway, no scope: with the key cleared the store records nothing
-        // until a connection names one again, so a disconnected app can never
-        // write a mark into the departed gateway's bucket.
-        rescopeUnreadWatermarks()
         client = nil
         isOffline = false
         // Each area's router owns state belonging to *that* gateway. Without
@@ -356,6 +345,7 @@ extension AppModel {
             // second pass of its own, and a row's text and its face must land
             // on the same tick.
             let fresh = (profile.lastSession?.preview).map(Self.flattenPreview) ?? ""
+            let routedUnread = takeRoutedUnreadForPrimary(profile: profile.name)
             var bot = Bot(
                 id: profile.name,
                 job: profile.description ?? "",
@@ -366,7 +356,7 @@ extension AppModel {
                 minutesElapsed: existing?.minutesElapsed ?? 0,
                 preview: fresh.isEmpty ? (existing?.preview ?? "Ready when you are.") : fresh,
                 previewTime: Self.shortTime(profile.lastSession?.lastActive),
-                unread: existing?.unread ?? 0,
+                unread: max(existing?.unread ?? 0, routedUnread),
                 mentionsYou: existing?.mentionsYou ?? false,
                 description: profile.description,
                 pinnedModel: profile.model,
@@ -434,10 +424,7 @@ extension AppModel {
         let botID = resolvedBotID(botID)
         openBotID = botID
         selectedTab = .home
-        if let idx = bots.firstIndex(where: { $0.id == botID }) {
-            bots[idx].unread = 0
-            bots[idx].mentionsYou = false
-        }
+        clearUnread(for: botID)
         // The durable mark has to move with the badge, or the next roster poll
         // finds activity this app already counted from the event stream and
         // raises the dot again on a chat the user is reading
@@ -685,8 +672,8 @@ extension AppModel {
                     bots[idx].preview = Self.previewLine(payload.text)
                     bots[idx].previewTime = AppModel.clock()
                 }
-                if openBotID != botID { bots[idx].unread += 1 }
             }
+            recordUnread(for: botID)
 
         case .sessionUsage(let usage):
             if let botID { chat(for: botID).usage = usage }
@@ -732,6 +719,7 @@ extension AppModel {
                 } else if let sourceGatewayID, what == "sessions.changed" {
                     await ConnectionRegistry.shared.refreshSecondaryRoster(
                         gatewayID: sourceGatewayID)
+                    self.applySecondaryUnreadAnswers(gatewayID: sourceGatewayID)
                 }
             }
 
