@@ -113,5 +113,89 @@ final class SourceQualifiedRoutingTests: XCTestCase {
             SessionsRuntime.key(botID: "homelab::researcher", sessionID: "same-row")],
                        "Remote renamed")
     }
+
+    func testRemoteCompletionPrunesOnlyExactGatewaySessionRoute() {
+        let model = AppModel()
+        model.mode = .live
+        let runtime = LiveRuntime.shared
+        runtime.gatewayID = "primary"
+        runtime.sessionToBot["deadbeef"] = "default"
+        runtime.routedSessionToBot[
+            GatewaySessionRoute(gatewayID: "homelab", sessionID: "deadbeef")
+        ] = "homelab::researcher"
+        runtime.approvalSessions["primary-approval"] = "deadbeef"
+        runtime.routedApprovalSessions["remote-approval"] = GatewaySessionRoute(
+            gatewayID: "homelab", sessionID: "deadbeef")
+        model.approvals = [
+            approval(id: "primary-approval", botID: "default"),
+            approval(id: "remote-approval", botID: "homelab::researcher"),
+        ]
+
+        model.handle(event: GatewayEvent(
+            type: "message.complete", sessionID: "deadbeef",
+            payload: .object(["status": .string("complete"), "text": .string("")])) ,
+            sourceGatewayID: "homelab")
+
+        XCTAssertEqual(model.approvals.map(\.id), ["primary-approval"])
+        XCTAssertEqual(runtime.approvalSessions["primary-approval"], "deadbeef")
+        XCTAssertNil(runtime.routedApprovalSessions["remote-approval"])
+    }
+
+    func testUnmappedRemoteApprovalCannotFallbackToPrimaryBot() {
+        let model = AppModel()
+        model.mode = .live
+        let runtime = LiveRuntime.shared
+        runtime.gatewayID = "primary"
+        runtime.defaultBotID = "default"
+
+        model.handle(event: approvalEvent(requestID: "orphaned", sessionID: "deadbeef"),
+                     sourceGatewayID: "homelab")
+
+        XCTAssertTrue(model.approvals.isEmpty)
+        XCTAssertNil(runtime.approvalSessions["orphaned"])
+        XCTAssertNil(runtime.routedApprovalSessions["orphaned"])
+    }
+
+    func testApprovalResponseRejectsMixedGatewayOwnership() {
+        let model = AppModel()
+        let runtime = LiveRuntime.shared
+        runtime.gatewayID = "primary"
+        runtime.routedApprovalSessions["remote-approval"] = GatewaySessionRoute(
+            gatewayID: "homelab", sessionID: "deadbeef")
+        let item = approval(id: "remote-approval", botID: "default")
+
+        let target = model.approvalResponseTarget(
+            for: item, botRoute: GatewayBotRoute(gatewayID: "primary", profile: "default"))
+
+        XCTAssertNil(target)
+    }
+
+    func testApprovalResponseKeepsQualifiedRemoteDestination() {
+        let model = AppModel()
+        let runtime = LiveRuntime.shared
+        runtime.gatewayID = "primary"
+        let session = GatewaySessionRoute(gatewayID: "homelab", sessionID: "deadbeef")
+        runtime.routedApprovalSessions["remote-approval"] = session
+        let item = approval(id: "remote-approval", botID: "homelab::researcher")
+        let bot = GatewayBotRoute(gatewayID: "homelab", profile: "researcher")
+
+        XCTAssertEqual(model.approvalResponseTarget(for: item, botRoute: bot),
+                       ApprovalResponseTarget(bot: bot, session: session))
+    }
+
+    private func approval(id: String, botID: String) -> Approval {
+        Approval(id: id, botID: botID, kind: .command, title: "Run",
+                 target: "shell", subject: "echo ok", body: "echo ok",
+                 why: "test", age: "now")
+    }
+
+    private func approvalEvent(requestID: String, sessionID: String) -> GatewayEvent {
+        GatewayEvent(type: "approval.request", sessionID: sessionID, payload: .object([
+            "request_id": .string(requestID),
+            "command": .string("echo ok"),
+            "description": .string("Run command"),
+            "choices": .array([.string("once"), .string("deny")]),
+        ]))
+    }
 }
 #endif
