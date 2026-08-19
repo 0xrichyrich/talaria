@@ -112,6 +112,34 @@ struct ProfileLifecycleTests {
         await replacement.release()
     }
 
+    @Test @MainActor
+    func authoritativeReconciliationReopensOwnerReconnectAndDefaultRosterRefresh() async throws {
+        let gatewayID = "authoritative-\(UUID().uuidString)"
+        #expect(ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
+
+        // Reconnect and the default-profile roster refresh use the same
+        // ordinary client/REST admission as every external caller. Neither is
+        // allowed while Hermes' filesystem mutation is unresolved.
+        #expect(ProfileLifecycleTrafficAdmission.acquire(gatewayID) == nil)
+
+        ProfileLifecycleTrafficAdmission.finishAuthoritativeReconciliation(gatewayID)
+        let ownerTraffic = try #require(
+            ProfileLifecycleTrafficAdmission.acquire(gatewayID))
+        await ownerTraffic.release()
+    }
+
+    @Test @MainActor func completedLeaseCannotReleaseASuccessorLifecycle() {
+        let gatewayID = "successor-\(UUID().uuidString)"
+        #expect(ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
+        let first = ProfileLifecycleExclusiveLease(gatewayID: gatewayID)
+        first.finishAuthoritativeReconciliation()
+
+        #expect(ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID))
+        first.releaseIfHeld()
+        #expect(ProfileLifecycleTrafficAdmission.acquire(gatewayID) == nil)
+        ProfileLifecycleTrafficAdmission.endLifecycle(gatewayID)
+    }
+
     @Test @MainActor func clientReleasesOrdinaryLeaseOnTransportFailure() async throws {
         let gatewayID = "release-\(UUID().uuidString)"
         let client = GatewayClient(
