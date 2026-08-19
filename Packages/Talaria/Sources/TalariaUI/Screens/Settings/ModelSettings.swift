@@ -39,6 +39,19 @@ import TalariaTheme
 // over an invented shape would be worse than the honest pointer in the
 // section's footnote.
 
+struct ModelSettingsTargetFence {
+    static func resolve(selected: String?, available: Set<String>,
+                        active: String?, runtime: String?) -> String? {
+        let validSelection = selected.flatMap { available.contains($0) ? $0 : nil }
+        return validSelection ?? active ?? runtime
+    }
+
+    static func accepts(stateGatewayID: String?, targetGatewayID: String?,
+                        generation: Int, currentGeneration: Int) -> Bool {
+        stateGatewayID == targetGatewayID && generation == currentGeneration
+    }
+}
+
 public struct ModelSettingsSection: View {
     private let model: AppModel
 
@@ -48,7 +61,10 @@ public struct ModelSettingsSection: View {
 
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
-    private var client: GatewayClient? { model.client }
+
+    @State private var selectedGatewayID: String?
+    @State private var stateGatewayID: String?
+    @State private var loadGeneration = 0
 
     // Catalog + gateway defaults
     @State private var catalog: ModelCatalog = .empty
@@ -75,12 +91,18 @@ public struct ModelSettingsSection: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 22) {
+            if gatewayChoices.count > 1 {
+                gatewaySection
+            }
             modelSection
             effortSection
             providerSection
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .task { await load() }
+        .task(id: targetGatewayID) {
+            prepareForGateway(targetGatewayID)
+            await load(gatewayID: targetGatewayID)
+        }
         .confirmationDialog(disconnectTarget?.name ?? "",
                             isPresented: Binding(get: { disconnectTarget != nil },
                                                  set: { if !$0 { disconnectTarget = nil } }),
@@ -93,6 +115,38 @@ public struct ModelSettingsSection: View {
             }
         } message: {
             Text(copy.settingsDisconnectNote(theme.id))
+        }
+    }
+
+    private var gatewayChoices: [SavedGateway] {
+        model.mode == .live ? ConnectionRegistry.shared.saved : []
+    }
+
+    private var targetGatewayID: String? {
+        ModelSettingsTargetFence.resolve(selected: selectedGatewayID,
+                                         available: Set(gatewayChoices.map(\.id)),
+                                         active: model.activeGatewayID,
+                                         runtime: LiveRuntime.shared.gatewayID)
+    }
+
+    private var gatewaySection: some View {
+        SettingsSection(theme: theme,
+                        title: copy.settingsModelGateway(theme.id),
+                        footnote: copy.settingsModelGatewayNote(theme.id)) {
+            SettingsGroup(theme: theme) {
+                Picker(copy.settingsModelGateway(theme.id), selection: Binding(
+                    get: { targetGatewayID },
+                    set: { selectedGatewayID = $0 })) {
+                    ForEach(gatewayChoices) { gateway in
+                        Text(gateway.name + (gateway.id == model.activeGatewayID
+                                             ? copy.settingsModelGatewayActive(theme.id) : ""))
+                            .tag(Optional(gateway.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(theme.accent)
+                .padding(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
+            }
         }
     }
 
@@ -609,15 +663,52 @@ public struct ModelSettingsSection: View {
 
     // MARK: - Actions
 
-    private func load(refresh: Bool = false) async {
-        guard !isLoading else { return }
+    private func prepareForGateway(_ gatewayID: String?) {
+        guard stateGatewayID != gatewayID else { return }
+        loadGeneration &+= 1
+        stateGatewayID = gatewayID
+        catalog = .empty
+        effort = ModelLabels.defaultEffort
+        isLoading = false
+        hasLoaded = false
+        loadError = nil
+        notice = nil
+        pendingConfirm = nil
+        isPicking = false
+        query = ""
+        busyModel = nil
+        keyTarget = nil
+        keyDraft = ""
+        busyProvider = nil
+        disconnectTarget = nil
+    }
+
+    private func gatewayClient(for gatewayID: String?) async throws -> GatewayClient {
+        if let gatewayID { return try await model.routedClient(gatewayID: gatewayID) }
+        if let client = model.client { return client }
+        throw AppModel.GatewayRouteError.noRoute
+    }
+
+    private func isCurrent(_ gatewayID: String?, generation: Int) -> Bool {
+        targetGatewayID == gatewayID && ModelSettingsTargetFence.accepts(
+            stateGatewayID: stateGatewayID, targetGatewayID: gatewayID,
+            generation: generation, currentGeneration: loadGeneration)
+    }
+
+    private func load(refresh: Bool = false, gatewayID: String? = nil) async {
+        let gatewayID = gatewayID ?? targetGatewayID
+        guard stateGatewayID == gatewayID, !isLoading else { return }
+        loadGeneration &+= 1
+        let generation = loadGeneration
         isLoading = true
         defer {
-            isLoading = false
-            hasLoaded = true
+            if isCurrent(gatewayID, generation: generation) {
+                isLoading = false
+                hasLoaded = true
+            }
         }
 
-        guard model.mode == .live, let client else {
+        guard model.mode == .live else {
             catalog = AppModel.demoCatalog(pinned: nil)
             effort = ModelLabels.defaultEffort
             loadError = nil
@@ -625,39 +716,52 @@ public struct ModelSettingsSection: View {
         }
 
         do {
-            catalog = try await client.defaultModelCatalog(refresh: refresh)
+            let client = try await gatewayClient(for: gatewayID)
+            let loaded = try await client.defaultModelCatalog(refresh: refresh)
+            guard isCurrent(gatewayID, generation: generation) else { return }
+            catalog = loaded
             loadError = nil
+            // A gateway too old for `config.get key:"reasoning"` leaves the
+            // scale on its built-in default rather than blanking the row.
+            if let value = try? await client.defaultReasoningEffort(), !value.isEmpty,
+               isCurrent(gatewayID, generation: generation) {
+                effort = value
+            }
         } catch let error as GatewayError {
+            guard isCurrent(gatewayID, generation: generation) else { return }
             // A failed refresh must not blank a catalog we already have.
             if !catalog.hasSelectableModels { catalog = .empty }
             loadError = error.message
         } catch {
+            guard isCurrent(gatewayID, generation: generation) else { return }
             if !catalog.hasSelectableModels { catalog = .empty }
             loadError = error.localizedDescription
-        }
-        // A gateway too old for `config.get key:"reasoning"` leaves the scale
-        // on its built-in default rather than blanking the row.
-        if let value = try? await client.defaultReasoningEffort(), !value.isEmpty {
-            effort = value
         }
     }
 
     private func selectDefault(_ modelID: String, provider: String? = nil,
                                confirmExpensive: Bool = false) async {
+        guard stateGatewayID == targetGatewayID else { return }
+        let gatewayID = stateGatewayID
+        let generation = loadGeneration
         notice = nil
         pendingConfirm = nil
         busyModel = modelID
-        defer { busyModel = nil }
+        defer {
+            if isCurrent(gatewayID, generation: generation) { busyModel = nil }
+        }
 
-        guard model.mode == .live, let client else {
+        guard model.mode == .live else {
             catalog.model = modelID
             note(copy.settingsDemoWrite(theme.id), warning: false)
             return
         }
 
         do {
+            let client = try await gatewayClient(for: gatewayID)
             let outcome = try await client.applyDefaultModel(modelID, provider: provider,
                                                              confirmExpensive: confirmExpensive)
+            guard isCurrent(gatewayID, generation: generation) else { return }
             if outcome.confirmRequired {
                 let message = outcome.confirmMessage.isEmpty ? outcome.warning
                                                              : outcome.confirmMessage
@@ -673,7 +777,9 @@ public struct ModelSettingsSection: View {
             catalog.model = resolved
             isPicking = false
             query = ""
-            await load()
+            busyModel = nil
+            await load(gatewayID: gatewayID)
+            guard targetGatewayID == gatewayID else { return }
 
             // `scope` is the gateway's own word for where the write landed;
             // anything but "global" means the saved default did NOT change, and
@@ -694,15 +800,23 @@ public struct ModelSettingsSection: View {
     }
 
     private func selectEffort(_ value: String) async {
-        guard model.mode == .live, let client else { return }
+        guard model.mode == .live else { return }
+        guard stateGatewayID == targetGatewayID else { return }
+        let gatewayID = stateGatewayID
+        let generation = loadGeneration
         let previous = effort
         effort = value
         do {
-            effort = try await client.applyDefaultReasoningEffort(value)
+            let client = try await gatewayClient(for: gatewayID)
+            let resolved = try await client.applyDefaultReasoningEffort(value)
+            guard isCurrent(gatewayID, generation: generation) else { return }
+            effort = resolved
         } catch let error as GatewayError {
+            guard isCurrent(gatewayID, generation: generation) else { return }
             effort = previous
             note(error.message, warning: true)
         } catch {
+            guard isCurrent(gatewayID, generation: generation) else { return }
             effort = previous
             note(error.localizedDescription, warning: true)
         }
@@ -710,12 +824,28 @@ public struct ModelSettingsSection: View {
 
     private func saveKey(for provider: ModelProviderRow) async {
         let key = keyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty, let client else { return }
+        guard !key.isEmpty else { return }
+        guard model.mode == .live else {
+            keyDraft = ""
+            keyTarget = nil
+            note(copy.settingsDemoWrite(theme.id), warning: false)
+            return
+        }
+        guard stateGatewayID == targetGatewayID else { return }
+        let gatewayID = stateGatewayID
+        let generation = loadGeneration
+        // A provider secret leaves view state before the first suspension. A
+        // gateway switch, timeout, or cancellation cannot strand it in memory.
+        keyDraft = ""
+        keyTarget = nil
         busyProvider = provider.slug
         notice = nil
-        defer { busyProvider = nil }
+        defer {
+            if isCurrent(gatewayID, generation: generation) { busyProvider = nil }
+        }
 
         do {
+            let client = try await gatewayClient(for: gatewayID)
             // The row `model.save_key` hands back is built with narrower flags
             // than the picker's (no pricing / capabilities / featured), so it is
             // used as proof the key took, not as a replacement row — splicing it
@@ -724,38 +854,50 @@ public struct ModelSettingsSection: View {
             _ = try await client.saveModelProviderKey(slug: provider.slug, apiKey: key)
             // The draft is cleared on every exit path, success or not: a live
             // API key has no business sitting in view state.
-            keyDraft = ""
-            keyTarget = nil
-            await load()
+            guard isCurrent(gatewayID, generation: generation) else { return }
+            busyProvider = nil
+            await load(gatewayID: gatewayID)
+            guard targetGatewayID == gatewayID else { return }
             note(copy.settingsKeySaved(theme.id, provider: provider.name), warning: false)
         } catch let error as GatewayError {
-            keyDraft = ""
+            guard isCurrent(gatewayID, generation: generation) else { return }
             // 4006 managed install, 4003 wrong auth type, 4002 unknown
             // provider — upstream writes those as sentences meant for the
             // user, so passing them through beats paraphrasing them wrong.
             note(error.message, warning: true)
         } catch {
-            keyDraft = ""
+            guard isCurrent(gatewayID, generation: generation) else { return }
             note(error.localizedDescription, warning: true)
         }
     }
 
     private func disconnect(_ provider: ModelProviderRow) async {
         disconnectTarget = nil
-        guard let client else { return }
+        guard model.mode == .live else { return }
+        guard stateGatewayID == targetGatewayID else { return }
+        let gatewayID = stateGatewayID
+        let generation = loadGeneration
         busyProvider = provider.slug
         notice = nil
-        defer { busyProvider = nil }
+        defer {
+            if isCurrent(gatewayID, generation: generation) { busyProvider = nil }
+        }
         do {
+            let client = try await gatewayClient(for: gatewayID)
             let name = try await client.disconnectModelProvider(slug: provider.slug)
+            guard isCurrent(gatewayID, generation: generation) else { return }
             // A plain read, not `refresh`: only the per-provider MODEL LIST is
             // cached, and it is the credential state that just changed — a
             // refresh would re-probe every saved custom endpoint for nothing.
-            await load()
+            busyProvider = nil
+            await load(gatewayID: gatewayID)
+            guard targetGatewayID == gatewayID else { return }
             note(copy.settingsDisconnected(theme.id, provider: name), warning: false)
         } catch let error as GatewayError {
+            guard isCurrent(gatewayID, generation: generation) else { return }
             note(error.message, warning: true)
         } catch {
+            guard isCurrent(gatewayID, generation: generation) else { return }
             note(error.localizedDescription, warning: true)
         }
     }
@@ -772,6 +914,30 @@ public struct ModelSettingsSection: View {
 /// provider warning, an RPC error, a confirm message) passes through verbatim —
 /// only Talaria's own sentences are themed.
 public extension CopyPack {
+
+    func settingsModelGateway(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Gateway"
+        case .control: "MODEL SOURCE"
+        case .ink: "THE HOUSE WHOSE HANDS THESE ARE"
+        }
+    }
+
+    func settingsModelGatewayNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Default models and provider credentials belong to one gateway. Choose the machine you mean to change."
+        case .control: "MODEL DEFAULTS + PROVIDER KEYS ARE GATEWAY-LOCAL. SELECT AN EXPLICIT TARGET."
+        case .ink: "Each house keeps its own hands and secret names; choose the house before changing either."
+        }
+    }
+
+    func settingsModelGatewayActive(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: " · active"
+        case .control: " [ACTIVE]"
+        case .ink: " · present"
+        }
+    }
 
     func settingsModelSection(_ t: ThemeID) -> String {
         switch t {

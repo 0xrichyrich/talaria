@@ -13,37 +13,37 @@ import TalariaKit
 // Verified upstream shapes (hermes-agent-upstream, re-read this pass — no
 // shape here is guessed):
 //
-//   config.set key:"model"           tui_gateway/server.py:11732
+//   config.set key:"model"           tui_gateway/server.py:11829
 //     With no matching session the handler runs `_apply_model_switch("",
-//     {"agent": None}, value, …)` (server.py:11806). Whether that PERSISTS is
-//     decided by `resolve_persist_behavior` (hermes_cli/model_switch.py:583),
+//     {"agent": None}, value, …)` (server.py:11885). Whether that PERSISTS is
+//     decided by `resolve_persist_behavior` (hermes_cli/model_switch.py:732),
 //     which defaults to session-only — `model.persist_switch_by_default` is
 //     False on a fresh install. So a "default model" control has to send the
 //     `--global` flag inside `value`; the parser accepts flags in the raw
-//     string (model_switch.py:700 parse_model_switch_args) and the answer's
-//     `scope` then reads "global" (server.py:4953). Sending the bare id would
+//     string (model_switch.py:849 parse_model_switch_args) and the answer's
+//     `scope` then reads "global" (server.py:5041). Sending the bare id would
 //     write nothing and silently lie.
 //
-//   config.set key:"reasoning"       tui_gateway/server.py:12107
+//   config.set key:"reasoning"       tui_gateway/server.py:12199
 //     Takes an explicit `scope` param: `if global_scope or session is None:
-//     _write_config_key("agent.reasoning_effort", arg)` (server.py:12194).
+//     _write_config_key("agent.reasoning_effort", arg)` (server.py:12286).
 //
 //   config.get key:"reasoning"       tui_gateway/methods_config.py:220
 //     → {value, display}. With no session_id it reports the config default.
 //
-//   GET  /api/config                 hermes_cli/web_server.py:6711
-//   PUT  /api/config {config,profile} hermes_cli/web_server.py:7512
+//   GET  /api/config                 hermes_cli/web_server.py:6794
+//   PUT  /api/config {config,profile} hermes_cli/web_server.py:7595
 //     The PUT DEEP-MERGES over what is on disk (`_deep_merge`,
-//     hermes_cli/config.py:2548) — whose docstring names
+//     hermes_cli/config.py:2584) — whose docstring names
 //     `tts.elevenlabs.voice_id` as exactly this case — so a patch may carry
 //     one leaf without erasing its siblings.
 //
-//   GET /api/audio/elevenlabs/voices hermes_cli/web_server.py:5014
+//   GET /api/audio/elevenlabs/voices hermes_cli/web_server.py:5097
 //     → {available, voices:[{voice_id, name, label}]}. A rejected key answers
 //     HTTP 200 with {available:false, error:"unauthorized"} on purpose, so a
 //     missing/expired key is a state to render, not an error to raise.
 //
-//   voice.toggle {action}            tui_gateway/server.py:14740
+//   voice.toggle {action}            tui_gateway/server.py:14832
 //     "status" | "on" | "off" | "tts". `tts` is a TOGGLE (no explicit value)
 //     and errors 4014 unless voice mode is already on. All of it drives the
 //     gateway HOST's own microphone/speakers — never this phone's.
