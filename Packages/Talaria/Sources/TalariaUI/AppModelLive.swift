@@ -77,6 +77,14 @@ final class LiveRuntime {
     }
 }
 
+/// The independently verified destination for an approval response. Keeping
+/// both identities together prevents a card attributed to one gateway from
+/// borrowing a colliding runtime session id owned by another.
+struct ApprovalResponseTarget: Equatable {
+    var bot: GatewayBotRoute
+    var session: GatewaySessionRoute
+}
+
 extension AppModel {
 
     // MARK: - Connection
@@ -769,10 +777,16 @@ extension AppModel {
         guard !request.requestID.isEmpty,
               !approvals.contains(where: { $0.id == request.requestID }) else { return }
         let runtime = LiveRuntime.shared
-        let owner = explicitOwner ?? botID(forSession: request.sessionID,
-                                           sourceGatewayID: sourceGatewayID)
-            ?? runtime.defaultBotID ?? bots.first?.id ?? "default"
-        if let sourceGatewayID, sourceGatewayID != runtime.gatewayID {
+        let scopedOwner = explicitOwner ?? botID(forSession: request.sessionID,
+                                                  sourceGatewayID: sourceGatewayID)
+        let isRemote = sourceGatewayID != nil && sourceGatewayID != runtime.gatewayID
+        // A secondary event pump covers its whole gateway. An approval for a
+        // session we have not attached therefore has no trustworthy profile
+        // owner. Never invent one from the primary roster: that would render
+        // an answerable card whose response could be sent to another machine.
+        guard !isRemote || scopedOwner != nil else { return }
+        let owner = scopedOwner ?? runtime.defaultBotID ?? bots.first?.id ?? "default"
+        if let sourceGatewayID, isRemote {
             runtime.routedApprovalSessions[request.requestID] = GatewaySessionRoute(
                 gatewayID: sourceGatewayID, sessionID: request.sessionID)
         } else {
@@ -797,11 +811,13 @@ extension AppModel {
     /// answered elsewhere, timed out, or denied by an interrupt).
     private func pruneApprovals(sessionID: String, sourceGatewayID: String? = nil) {
         let runtime = LiveRuntime.shared
-        var stale = runtime.approvalSessions.filter { $0.value == sessionID }.map(\.key)
+        let stale: [String]
         if let sourceGatewayID, sourceGatewayID != runtime.gatewayID {
-            stale += runtime.routedApprovalSessions.filter {
+            stale = runtime.routedApprovalSessions.filter {
                 $0.value == GatewaySessionRoute(gatewayID: sourceGatewayID, sessionID: sessionID)
             }.map(\.key)
+        } else {
+            stale = runtime.approvalSessions.filter { $0.value == sessionID }.map(\.key)
         }
         guard !stale.isEmpty else { return }
         for id in stale { runtime.approvalSessions.removeValue(forKey: id) }
@@ -817,6 +833,29 @@ extension AppModel {
         if text.contains("post") || text.contains("publish") || text.contains("tweet") { return .post }
         if request.patternKey != nil || !request.command.isEmpty { return .command }
         return .other
+    }
+
+    /// Resolve the response route without crossing gateway identity domains.
+    /// A routed request must agree with its card's qualified bot. A primary
+    /// request may use its recorded session (or the primary chat's session for
+    /// legacy events), but remote cards never receive that fallback.
+    func approvalResponseTarget(for approval: Approval,
+                                botRoute: GatewayBotRoute?) -> ApprovalResponseTarget? {
+        guard let botRoute else { return nil }
+        let runtime = LiveRuntime.shared
+        if let session = runtime.routedApprovalSessions[approval.id] {
+            guard session.gatewayID == botRoute.gatewayID else { return nil }
+            return ApprovalResponseTarget(bot: botRoute, session: session)
+        }
+        guard botRoute.gatewayID == runtime.gatewayID else { return nil }
+        if let sessionID = runtime.approvalSessions[approval.id]
+            ?? chats[approval.botID]?.sessionID {
+            return ApprovalResponseTarget(
+                bot: botRoute,
+                session: GatewaySessionRoute(gatewayID: botRoute.gatewayID,
+                                             sessionID: sessionID))
+        }
+        return nil
     }
 
     // MARK: - Live actions (called from AppModel's mode dispatch)
@@ -848,18 +887,19 @@ extension AppModel {
 
     func liveResolveApproval(_ approval: Approval, approve: Bool) {
         Task { @MainActor in
-            guard let route = gatewayRoute(for: approval.botID),
-                  let client = try? await routedClient(for: route) else { return }
+            guard let target = approvalResponseTarget(
+                for: approval, botRoute: gatewayRoute(for: approval.botID)),
+                  let client = try? await routedClient(for: target.bot) else { return }
             let runtime = LiveRuntime.shared
-            // The request → session binding was recorded when the approval
-            // arrived; fall back to the bot's live session.
-            let sid = runtime.routedApprovalSessions.removeValue(forKey: approval.id)?.sessionID
-                ?? runtime.approvalSessions.removeValue(forKey: approval.id)
-                ?? chats[approval.botID]?.sessionID
-            if let sid {
-                try? await client.respondToApproval(sessionID: sid,
-                                                    choice: approve ? .once : .deny,
-                                                    requestID: approval.id)
+            do {
+                try await client.respondToApproval(sessionID: target.session.sessionID,
+                                                   choice: approve ? .once : .deny,
+                                                   requestID: approval.id)
+                runtime.routedApprovalSessions.removeValue(forKey: approval.id)
+                runtime.approvalSessions.removeValue(forKey: approval.id)
+            } catch {
+                // The request-to-session binding remains available for an
+                // explicit retry/recovery path; never retarget after failure.
             }
             recomputeStatus(for: approval.botID)
         }
