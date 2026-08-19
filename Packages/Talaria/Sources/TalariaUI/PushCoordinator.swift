@@ -11,7 +11,7 @@ import TalariaTheme
 // - demo-mode local previews of the relay's payloads (DB.PUSHES shapes).
 //
 // The wire contract for a relay push mirrors the design DB:
-//   { kind, bot, title, body, approval_request_id, session_id }
+//   { kind, gateway_id, bot, title, body, approval_request_id, session_id }
 // with `kind` one of PushKind and `mutable-content: 1` so the
 // TalariaNotificationService extension can decorate it.
 
@@ -24,6 +24,127 @@ public enum PushPayloadKey {
     public static let body = "body"
     public static let approvalRequestID = "approval_request_id"
     public static let sessionID = "session_id"
+    public static let gatewayID = "gateway_id"
+}
+
+/// Resolve an untrusted relay payload into Talaria's collision-safe roster id.
+/// Legacy payloads without gateway_id remain usable only when exactly one
+/// source exists; multiple saved gateways make a bare profile ambiguous and
+/// therefore non-actionable.
+struct PushRouteResolver {
+    static func botID(raw: String?, sourceGatewayID: String?,
+                      knownGatewayIDs: Set<String>, activeGatewayID: String?) -> String? {
+        guard let raw, !raw.isEmpty, raw != "gateway" else { return nil }
+        let source: String
+        if let sourceGatewayID, knownGatewayIDs.contains(sourceGatewayID) {
+            source = sourceGatewayID
+        } else if sourceGatewayID != nil {
+            return nil
+        } else if knownGatewayIDs.count == 1, let only = knownGatewayIDs.first {
+            source = only
+        } else if knownGatewayIDs.isEmpty, activeGatewayID != nil {
+            return raw
+        } else {
+            return nil
+        }
+        return source == activeGatewayID
+            ? raw : GatewayBotRoute(gatewayID: source, profile: raw).qualifiedID
+    }
+}
+
+/// The minimum source-qualified identity required before a notification may
+/// answer a live approval. Hook mode is the only valid source without a
+/// request id, and is restricted to this exact source/profile/session FIFO.
+struct PushApprovalIdentity: Sendable, Equatable {
+    var gatewayID: String
+    var profile: String
+    var storedSessionID: String
+    var requestID: String?
+
+    static func resolve(gatewayID: String?, profile: String?, storedSessionID: String?,
+                        requestID: String?, knownGatewayIDs: Set<String>) -> Self? {
+        guard let gatewayID, knownGatewayIDs.contains(gatewayID),
+              let profile, !profile.isEmpty,
+              GatewayBotRoute(qualifiedID: profile) == nil,
+              let storedSessionID, !storedSessionID.isEmpty else { return nil }
+        return Self(gatewayID: gatewayID, profile: profile,
+                    storedSessionID: storedSessionID,
+                    requestID: requestID.flatMap { $0.isEmpty ? nil : $0 })
+    }
+}
+
+enum PushApprovalSelection {
+    static func select(_ pending: [ApprovalDetail], requestID: String?) -> ApprovalDetail? {
+        guard let requestID else { return pending.first }
+        let matches = pending.filter { $0.request.requestID == requestID }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    static func stillCurrent(_ selected: ApprovalDetail, in pending: [ApprovalDetail],
+                             requestID: String?) -> Bool {
+        select(pending, requestID: requestID)?.request.requestID == selected.request.requestID
+    }
+}
+
+struct PushApprovalResumeSnapshot: Sendable, Equatable {
+    var sessionID: String
+    var storedSessionID: String
+    var profile: String
+}
+
+struct PushApprovalActions {
+    var resume: (_ storedSessionID: String, _ profile: String) async throws
+        -> PushApprovalResumeSnapshot
+    var pending: (_ liveSessionID: String) async throws -> [ApprovalDetail]
+    var answer: (_ liveSessionID: String, _ requestID: String) async throws -> Int
+}
+
+enum PushApprovalOrchestrator {
+    static func approve(identity: PushApprovalIdentity,
+                        connect: (GatewayBotRoute) async throws -> PushApprovalActions)
+        async throws -> ApprovalDetail {
+        let route = GatewayBotRoute(gatewayID: identity.gatewayID, profile: identity.profile)
+        return try await approve(identity: identity, actions: connect(route))
+    }
+
+    /// Cold notification approval transaction. Every read and the final write
+    /// uses the same resumed live session, with a second pending read directly
+    /// before mutation so a timeout/desktop response cannot advance the FIFO.
+    static func approve(identity: PushApprovalIdentity,
+                        actions: PushApprovalActions) async throws -> ApprovalDetail {
+        let resumed = try await actions.resume(identity.storedSessionID, identity.profile)
+        guard !resumed.sessionID.isEmpty else {
+            throw GatewayError(code: -21, message: "Approval session is no longer available.")
+        }
+        guard resumed.profile == identity.profile,
+              resumed.storedSessionID.isEmpty
+                || resumed.storedSessionID == identity.storedSessionID else {
+            throw GatewayError(code: -20, message: "Approval session identity did not match.")
+        }
+        let first = try await actions.pending(resumed.sessionID)
+        guard let selected = PushApprovalSelection.select(first, requestID: identity.requestID) else {
+            throw GatewayError(code: -22, message: "Approval is no longer pending.")
+        }
+        let current = try await actions.pending(resumed.sessionID)
+        guard PushApprovalSelection.stillCurrent(selected, in: current,
+                                                 requestID: identity.requestID) else {
+            throw GatewayError(code: -22, message: "Approval changed before it could be sent.")
+        }
+        guard try await actions.answer(resumed.sessionID, selected.request.requestID) > 0 else {
+            throw GatewayError(code: -22, message: "Approval was already resolved.")
+        }
+        return selected
+    }
+}
+
+public struct PushRegistrationFailure: Sendable, Equatable {
+    public var message: String
+    public var occurredAt: Date
+
+    public init(message: String, occurredAt: Date = Date()) {
+        self.message = message
+        self.occurredAt = occurredAt
+    }
 }
 
 /// Notification category / action identifiers, shared by PushCoordinator,
@@ -39,6 +160,56 @@ public extension Notification.Name {
     /// Connections is a navigation push off the roster (not a tab), so the
     /// root view — which owns that push state — observes this and presents it.
     static let talariaOpenConnections = Notification.Name("bot.talaria.openConnections")
+    /// APNs token registration completed or failed; Settings re-reads the
+    /// typed state immediately instead of relying on a fixed sleep/pull.
+    static let talariaPushRegistrationChanged = Notification.Name(
+        "bot.talaria.pushRegistrationChanged")
+}
+
+/// Serializes read-preserve-write device upserts per gateway. The relay
+/// replaces the whole record, so an automatic reconnect registration racing a
+/// Settings filter edit must never restore the older filter after the user.
+actor PushDeviceMutationQueue {
+    static let shared = PushDeviceMutationQueue()
+
+    private struct Tail {
+        var generation: UInt64
+        var task: Task<Void, Never>
+    }
+    private var tails: [String: Tail] = [:]
+    private var generation: UInt64 = 0
+
+    /// nil means success; a non-empty string is the operation's display error.
+    func run(gatewayID: String,
+             operation: @escaping @Sendable () async -> String?) async -> String? {
+        let previous = tails[gatewayID]?.task
+        generation &+= 1
+        let mine = generation
+        let result = Task<String?, Never> {
+            if let previous { await previous.value }
+            return await operation()
+        }
+        let tail = Task<Void, Never> { _ = await result.value }
+        tails[gatewayID] = Tail(generation: mine, task: tail)
+        let value = await result.value
+        if tails[gatewayID]?.generation == mine { tails[gatewayID] = nil }
+        return value
+    }
+}
+
+/// Synchronous admission fence for Settings filter edits. SwiftUI launches the
+/// network write in a Task, so an ordinary async `busy = true` is too late to
+/// stop a second tap deriving from the same snapshot.
+struct PushFilterMutationAdmission: Sendable {
+    private(set) var active = false
+
+    mutating func claim() -> Bool {
+        guard !active else { return false }
+        active = true
+        return true
+    }
+
+    mutating func release() { active = false }
 }
 
 #if os(iOS)
@@ -117,6 +288,9 @@ public final class PushCoordinator: NSObject {
         // Critical alerts (approvals breaking through Focus) additionally
         // need the com.apple.developer.usernotifications.critical-alerts
         // entitlement; the standard set keeps this working without it.
+        // Time Sensitive delivery is authorized by the app entitlement and the
+        // user's notification settings. UNAuthorizationOptions.timeSensitive
+        // is deprecated on current Apple SDKs.
         let granted = (try? await center.requestAuthorization(
             options: [.alert, .sound, .badge])) ?? false
         if granted { registerForRemoteNotifications() }
@@ -128,6 +302,7 @@ public final class PushCoordinator: NSObject {
     }
 
     public func registerForRemoteNotifications() {
+        registrationFailure = nil
         UIApplication.shared.registerForRemoteNotifications()
     }
 
@@ -135,12 +310,13 @@ public final class PushCoordinator: NSObject {
 
     /// Lower-cased hex APNs token once registration succeeded.
     public private(set) var deviceTokenHex: String?
-    private var tokenWaiters: [CheckedContinuation<String, Never>] = []
+    public private(set) var registrationFailure: PushRegistrationFailure?
+    private var tokenWaiters: [CheckedContinuation<String?, Never>] = []
 
     /// Awaitable token for the gateway relay handshake: resolves immediately
     /// when registration already happened, otherwise suspends until the
     /// AppDelegate reports the token.
-    public var deviceToken: String {
+    public var deviceToken: String? {
         get async {
             if let deviceTokenHex { return deviceTokenHex }
             return await withCheckedContinuation { continuation in
@@ -153,10 +329,22 @@ public final class PushCoordinator: NSObject {
     public func didRegisterForRemoteNotifications(deviceToken data: Data) {
         let hex = data.map { String(format: "%02x", $0) }.joined()
         deviceTokenHex = hex
+        registrationFailure = nil
+        NotificationCenter.default.post(name: .talariaPushRegistrationChanged, object: nil)
         let waiters = tokenWaiters
         tokenWaiters.removeAll()
         for waiter in waiters { waiter.resume(returning: hex) }
         registerWithRelayIfConnected()
+    }
+
+    /// Wire environment must follow the signed build. Development entitlement
+    /// uses APNs sandbox; TestFlight/App Store builds use production.
+    public var apnsEnvironment: String {
+        #if DEBUG
+        "dev"
+        #else
+        "prod"
+        #endif
     }
 
     /// Hand the token to the gateway's talaria-push relay plugin. Safe to call
@@ -167,7 +355,14 @@ public final class PushCoordinator: NSObject {
     /// permission — approvals are the whole point of the relay — so an
     /// undetermined status prompts once here rather than only in onboarding.
     public func registerWithRelayIfConnected() {
-        guard let client = model?.client else { return }
+        registerWithRelay(gatewayID: nil)
+    }
+
+    /// Register against one selected gateway, or every saved gateway when no
+    /// target is supplied. Multi-gateway push is not useful if only the active
+    /// chat machine receives this device token.
+    public func registerWithRelay(gatewayID: String?) {
+        guard let model else { return }
         Task { @MainActor in
             if deviceTokenHex == nil {
                 let status = await authorizationStatus()
@@ -182,7 +377,29 @@ public final class PushCoordinator: NSObject {
             }
             // Wait for the APNs token (already resolved when registration
             // happened earlier in this launch).
-            let hex = await deviceToken
+            guard let hex = await deviceToken else { return }
+            var clients: [(gatewayID: String, client: GatewayClient)] = []
+            if let gatewayID {
+                if let client = try? await model.routedClient(gatewayID: gatewayID) {
+                    clients.append((gatewayID, client))
+                }
+            } else {
+                let lookups = ConnectionRegistry.shared.saved.map { gateway in
+                    Task { @MainActor in
+                        (gateway.id, try? await model.routedClient(gatewayID: gateway.id))
+                    }
+                }
+                for lookup in lookups {
+                    let (id, candidate) = await lookup.value
+                    if let candidate, !clients.contains(where: { $0.client === candidate }) {
+                        clients.append((id, candidate))
+                    }
+                }
+                if clients.isEmpty, let client = model.client,
+                   let activeGatewayID = model.activeGatewayID {
+                    clients.append((activeGatewayID, client))
+                }
+            }
             // The relay's upsert REPLACES the stored record wholesale
             // (talaria_push_relay/devices.py `upsert`), and an omitted
             // `profile_filter` normalizes to [] — "every bot". Re-sending the
@@ -190,17 +407,36 @@ public final class PushCoordinator: NSObject {
             // silently undoing the per-bot choice made in Settings.
             // `environment` is deliberately NOT carried over: it describes this
             // build's aps-environment, not a user preference.
-            let existing = await client.pushDevice(tokenHex: hex)
-            try? await client.registerPushDevice(tokenHex: hex, environment: "dev",
-                                                 profileFilter: existing?.profileFilter ?? [])
+            let environment = apnsEnvironment
+            let registrations = clients.map { target in
+                Task {
+                    await PushDeviceMutationQueue.shared.run(gatewayID: target.gatewayID) {
+                    let existing = await target.client.pushDevice(tokenHex: hex)
+                    do {
+                        try await target.client.registerPushDevice(
+                            tokenHex: hex, environment: environment, gatewayID: target.gatewayID,
+                            profileFilter: existing?.profileFilter ?? [])
+                        return nil
+                    } catch {
+                        return error.localizedDescription
+                    }
+                    }
+                }
+            }
+            for registration in registrations { _ = await registration.value }
         }
     }
 
     /// Forwarded from `application(_:didFailToRegisterForRemoteNotificationsWithError:)`.
-    /// Waiters stay parked — the relay handshake simply never fires; the app
-    /// remains fully usable over the live socket.
+    /// Release every handshake waiter. A later successful APNs callback invokes
+    /// registration again, so retaining failed continuations only leaks tasks.
     public func didFailToRegisterForRemoteNotifications(error: Error) {
         deviceTokenHex = nil
+        registrationFailure = PushRegistrationFailure(message: error.localizedDescription)
+        NotificationCenter.default.post(name: .talariaPushRegistrationChanged, object: nil)
+        let waiters = tokenWaiters
+        tokenWaiters.removeAll()
+        for waiter in waiters { waiter.resume(returning: nil) }
     }
 
     // MARK: - Routing
@@ -235,20 +471,20 @@ public final class PushCoordinator: NSObject {
     /// Notification tap / action routing — same shape as the prototype's
     /// `bannerGo`: approval → approvals, gateway → roster (Connections is one
     /// tap deep), anything else → that bot's chat.
-    private func handle(response: UNNotificationResponse) {
+    private func handle(response: UNNotificationResponse) async {
         guard let model else { return }
         let info = response.notification.request.content.userInfo
         // The relay's wire kind "long_task" is the app's PushKind.task.
         let kind = (info[PushPayloadKey.kind] as? String)
             .flatMap { PushKind(rawValue: $0 == "long_task" ? "task" : $0) }
-        let botID = info[PushPayloadKey.bot] as? String
+        let botID = routedBotID(from: info, model: model)
 
         switch response.actionIdentifier {
         case PushIdentifiers.approveAction:
-            if let approval = approval(matching: info, in: model) {
-                // Through the shared ledger so the inline chat card and the
-                // Approvals tab see the exact outcome.
-                ApprovalOutcomes.shared.resolve(approval, approve: true, in: model)
+            do {
+                try await approveFromPush(info, in: model)
+            } catch {
+                await surfaceApprovalFailure(error.localizedDescription)
             }
         case PushIdentifiers.laterAction:
             break // Explicitly deferred; the approval stays pending.
@@ -262,9 +498,14 @@ public final class PushCoordinator: NSObject {
                 NotificationCenter.default.post(name: .talariaOpenConnections, object: nil)
             default:
                 if let botID, botID != "gateway" {
-                    // Same rule as every other route into a chat: openChat
-                    // resumes the canonical conversation, a raw write does not.
-                    model.openChat(botID: botID)
+                    // Prefer the exact pushed session; older/summary payloads
+                    // without one fall back to the bot's canonical chat.
+                    if let sessionID = info[PushPayloadKey.sessionID] as? String,
+                       !sessionID.isEmpty {
+                        model.openStoredSession(sessionID, botID: botID)
+                    } else {
+                        model.openChat(botID: botID)
+                    }
                 } else {
                     model.selectedTab = .activity
                 }
@@ -274,17 +515,66 @@ public final class PushCoordinator: NSObject {
         }
     }
 
-    private func approval(matching info: [AnyHashable: Any], in model: AppModel) -> Approval? {
-        let botID = info[PushPayloadKey.bot] as? String
-        if let requestID = info[PushPayloadKey.approvalRequestID] as? String,
-           let match = model.approval(matchingWireRequestID: requestID, botID: botID) {
-            return match
+    private func approveFromPush(_ info: [AnyHashable: Any], in model: AppModel) async throws {
+        let identity = PushApprovalIdentity.resolve(
+            gatewayID: info[PushPayloadKey.gatewayID] as? String,
+            profile: info[PushPayloadKey.bot] as? String,
+            storedSessionID: info[PushPayloadKey.sessionID] as? String,
+            requestID: info[PushPayloadKey.approvalRequestID] as? String,
+            knownGatewayIDs: Set(ConnectionRegistry.shared.saved.map(\.id)))
+        guard let identity else {
+            throw GatewayError(code: -20, message: "Approval source is missing or no longer trusted.")
         }
-        // Fall back to the bot's oldest pending approval.
-        if let botID {
-            return model.approvals.first { $0.botID == botID }
+
+        let selected = try await PushApprovalOrchestrator.approve(identity: identity) { route in
+            let client = try await model.routedClient(for: route)
+            await model.attachRoutedEventsIfNeeded(client: client, gatewayID: identity.gatewayID)
+            return PushApprovalActions(
+                resume: { storedID, profile in
+                    let resumed = try await client.resumeSession(
+                        storedID, profile: profile, deferHistory: true)
+                    return PushApprovalResumeSnapshot(sessionID: resumed.sessionID,
+                        storedSessionID: resumed.storedSessionID,
+                        profile: resumed.info.profileName)
+                },
+                pending: { try await client.pendingApprovalDetails(sessionID: $0) },
+                answer: {
+                    try await client.answerApproval(sessionID: $0, choice: .once,
+                                                    requestID: $1)
+                })
         }
-        return nil
+
+        let route = GatewayBotRoute(gatewayID: identity.gatewayID, profile: identity.profile)
+        let rosterID = identity.gatewayID == model.activeGatewayID
+            ? identity.profile : route.qualifiedID
+        if let local = model.approval(matchingWireRequestID: selected.request.requestID,
+                                      botID: rosterID) {
+            ApprovalOutcomes.shared.record(local, approved: true)
+            model.approvals.removeAll { $0.id == local.id }
+            LiveRuntime.shared.approvalTargets.removeValue(forKey: local.id)
+            ApprovalBridges.shared.details.removeValue(forKey: local.id)
+            model.recomputeApprovalStatus(for: local.botID)
+        }
+    }
+
+    private func surfaceApprovalFailure(_ message: String) async {
+        let content = UNMutableNotificationContent()
+        content.title = "Approval not sent"
+        content.body = message
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "talaria-approval-failed-\(UUID().uuidString)",
+            content: content, trigger: nil)
+        try? await UNUserNotificationCenter.current().add(request)
+    }
+
+    private func routedBotID(from info: [AnyHashable: Any], model: AppModel) -> String? {
+        if model.mode == .demo { return info[PushPayloadKey.bot] as? String }
+        return PushRouteResolver.botID(
+            raw: info[PushPayloadKey.bot] as? String,
+            sourceGatewayID: info[PushPayloadKey.gatewayID] as? String,
+            knownGatewayIDs: Set(ConnectionRegistry.shared.saved.map(\.id)),
+            activeGatewayID: model.activeGatewayID)
     }
 
     // MARK: - Demo previews
@@ -371,7 +661,7 @@ extension PushCoordinator: UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
-        handle(response: response)
+        await handle(response: response)
     }
 }
 

@@ -29,7 +29,7 @@ dependencies = [
 talaria-push-sidecar = "talaria_push_relay.sidecar:main"
 
 [project.urls]
-Homepage = "https://cursor.com/codebase/richyrich/talaria"
+Homepage = "https://github.com/Skynet-Ventures/talaria"
 
 [tool.setuptools]
 # The importable package lives inside the hermes plugin directory so the

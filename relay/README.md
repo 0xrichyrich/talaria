@@ -128,18 +128,27 @@ secret on purpose: dashboard auth is the trust boundary.
 ```
 POST   /api/plugins/talaria-push/devices
        {"device_token": "<hex>", "platform": "ios",
-        "environment": "dev"|"prod", "profile_filter": ["ops-bot"]?}
+        "environment": "dev"|"prod", "gateway_id": "<saved-connection-id>",
+        "profile_filter": ["ops-bot"]?}
 GET    /api/plugins/talaria-push/devices
 DELETE /api/plugins/talaria-push/devices            {"device_token": "<hex>"}
 DELETE /api/plugins/talaria-push/devices/{token}
 GET    /api/plugins/talaria-push/status
-POST   /api/plugins/talaria-push/test               {"device_token"?: "...", "kind"?: "approval"}
+POST   /api/plugins/talaria-push/test               {"device_token"?: "...", "kind"?: "mention"}
 ```
 
 `environment` selects APNs sandbox (`dev`, Xcode builds) vs production
-(`prod`, TestFlight/App Store) per device. `profile_filter` limits which
-bots may push to that device (empty = all). Registrations are idempotent
-upserts — the iOS app re-POSTs its token on every launch.
+(`prod`, TestFlight/App Store) per device. `gateway_id` is the phone's stable
+source identity for this gateway; the relay echoes it into every payload so
+colliding profile/session/approval ids cannot route to another saved machine.
+`profile_filter` limits which bots may push to that device (empty = all).
+Registrations are idempotent upserts — the iOS app re-POSTs its token on every
+launch.
+
+The test route defaults to the non-actionable `mention` shape because its
+synthetic bot/session are not authoritative Hermes identities. Passing
+`{"kind":"approval"}` remains useful for inspecting category presentation,
+but its Approve action deliberately fails closed rather than answering work.
 
 Store: `~/.hermes/talaria-push/devices.json`, `0600`, atomic tmp+rename
 writes under an advisory `flock`, corrupt files quarantined as
@@ -159,6 +168,7 @@ auto-prunes the record.
     "interruption-level": "time-sensitive" // approval + gateway; others "active"
   },
   "kind": "approval",                      // approval|long_task|mention|routine|gateway
+  "gateway_id": "2F80…",                  // source-qualified app connection id
   "bot": "ops-bot",
   "session_id": "ab12cd34",
   "approval_request_id": "9f3c…",          // "" in hook mode (see gap table)

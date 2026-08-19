@@ -57,6 +57,10 @@
 	<string>Talaria uses the microphone for voice mode — speech is sent to your own Hermes gateway for transcription.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Attach photos from your library to a message for your agents.</string>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>INSendMessageIntent</string>
+	</array>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>UIAppFonts</key>

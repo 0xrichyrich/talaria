@@ -53,11 +53,15 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: "$(TALARIA_BUNDLE_ID:default=bot.talaria.ios)"
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: Talaria/Support/Info.plist
-        CODE_SIGN_ENTITLEMENTS: Talaria/Support/Talaria.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: NO
         ENABLE_PREVIEWS: YES
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: Talaria/Support/Talaria-dev.entitlements
+        Release:
+          CODE_SIGN_ENTITLEMENTS: Talaria/Support/Talaria.entitlements
 
   # Widget + Live Activity extension. Sources are owned by the widgets
   # build-out; its generated Info.plist lives under the app's Support/ dir so
@@ -94,8 +98,13 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: "$(TALARIA_BUNDLE_ID:default=bot.talaria.ios).widgets"
         TARGETED_DEVICE_FAMILY: "1"
         SKIP_INSTALL: YES
+      configs:
+        # Personal-team Debug installs deliberately stay entitlement-free;
+        # Release shares theme selection with the containing app.
+        Release:
+          CODE_SIGN_ENTITLEMENTS: Talaria/Support/TalariaWidgets.entitlements
 
-  # Notification service extension (decrypts/enriches APNs pushes from the
+  # Notification service extension (decorates APNs pushes from the
   # gateway relay). Principal class must be named NotificationService.
   TalariaNotificationService:
     type: app-extension
