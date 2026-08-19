@@ -73,6 +73,20 @@ struct AppearanceSettingsSection: View {
                     ],
                     selection: store.motion) { store.motion = $0 }
             }
+
+            SettingsSection(theme: theme, title: copy.settingsTranscriptSec(theme.id),
+                            footnote: copy.settingsTranscriptNote(theme.id)) {
+                SettingsGroup(theme: theme) {
+                    SettingsToggleRow(
+                        theme: theme,
+                        title: copy.settingsTranscriptAdvanced(theme.id),
+                        subtitle: copy.settingsTranscriptAdvancedNote(theme.id),
+                        isOn: store.transcriptDetail == .advanced
+                    ) {
+                        store.transcriptDetail = store.transcriptDetail == .advanced ? .quiet : .advanced
+                    }
+                }
+            }
         }
     }
 }
@@ -306,6 +320,38 @@ extension CopyPack {
         case .soft: "Reduced"
         case .control: "DAMPED"
         case .ink: "still"
+        }
+    }
+
+    func settingsTranscriptSec(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Conversation detail"
+        case .control: "TRANSCRIPT DETAIL"
+        case .ink: "WHAT THE PAGE SHOWS"
+        }
+    }
+
+    func settingsTranscriptNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "By default, a working avatar keeps the conversation calm. Tool failures still stay visible. This only changes this device."
+        case .control: "DEFAULT: WORK AVATAR. FAILURES REMAIN VISIBLE. DISPLAY-ONLY; GATEWAY REASONING IS UNCHANGED."
+        case .ink: "By default the face shows that work is under way. Failures remain on the page, and nothing is erased."
+        }
+    }
+
+    func settingsTranscriptAdvanced(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Show tool calls and reasoning"
+        case .control: "SHOW TOOLS + REASONING"
+        case .ink: "show the workings"
+        }
+    }
+
+    func settingsTranscriptAdvancedNote(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Advanced view reveals the structured execution detail Talaria already received."
+        case .control: "REVEALS INGESTED DETAIL. DOES NOT ENABLE OR ALTER MODEL REASONING."
+        case .ink: "Reveal the detail already sent to this device; it does not change how the agent thinks."
         }
     }
 

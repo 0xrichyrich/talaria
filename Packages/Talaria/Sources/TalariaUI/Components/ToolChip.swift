@@ -46,6 +46,7 @@ public struct ToolChip: View {
 
     @State private var expanded = false
     @State private var copied = false
+    @Environment(\.talariaReducedMotion) private var reducedMotion
 
     public init(call: ToolCall, theme: ThemePack, copy: CopyPack, accent: Color) {
         self.call = call
@@ -75,7 +76,7 @@ public struct ToolChip: View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
                 guard expandable else { return }
-                withAnimation(.easeOut(duration: 0.18)) { expanded.toggle() }
+                withAnimation(reducedMotion ? nil : .easeOut(duration: 0.18)) { expanded.toggle() }
             } label: {
                 headline
                     .padding(.vertical, theme.id == .ink ? 5 : 7)
@@ -262,6 +263,7 @@ struct ToolSpinner: View {
     var theme: ThemePack
 
     @State private var spinning = false
+    @Environment(\.talariaReducedMotion) private var reducedMotion
 
     var body: some View {
         Circle()
@@ -269,9 +271,14 @@ struct ToolSpinner: View {
             .stroke(color, style: StrokeStyle(lineWidth: 1.7,
                                               lineCap: theme.id == .ink ? .butt : .round))
             .frame(width: 10, height: 10)
-            .rotationEffect(.degrees(spinning ? 360 : 0))
-            .animation(.linear(duration: 0.9).repeatForever(autoreverses: false), value: spinning)
+            .rotationEffect(.degrees(TranscriptMotionPolicy.toolSpinnerDegrees(
+                spinning: spinning, reducedMotion: reducedMotion
+            )))
+            .animation(reducedMotion ? nil
+                       : .linear(duration: 0.9).repeatForever(autoreverses: false),
+                       value: spinning)
             .shadow(color: theme.glowRadius > 0 ? color.opacity(0.7) : .clear, radius: 4)
-            .onAppear { spinning = true }
+            .onAppear { spinning = !reducedMotion }
+            .onChange(of: reducedMotion) { _, reduced in spinning = !reduced }
     }
 }

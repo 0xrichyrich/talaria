@@ -739,6 +739,7 @@ public struct SoloChatView: View {
     @State private var showConversations = false
     @State private var showExplainer = false
     @FocusState private var composerFocused: Bool
+    @Environment(\.talariaReducedMotion) private var reducedMotion
 
     public init(model: AppModel, onBack: @escaping () -> Void = {}) {
         self.model = model
@@ -748,6 +749,17 @@ public struct SoloChatView: View {
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
     private var runtime: SoloRuntime { SoloRuntime.shared }
+    private var transcriptPolicy: TranscriptPresentationPolicy {
+        TranscriptPresentationPolicy(detail: model.settings.transcriptDetail)
+    }
+
+    private var hasLiveTranscriptDetail: Bool {
+        runtime.turns.contains { turn in
+            let message = turn.message
+            return (message.isStreaming && !(message.reasoning ?? "").isEmpty)
+                || message.toolCalls.contains { $0.state == .running }
+        }
+    }
 
     /// Solo's own colour. Violet is the app's accent hue everywhere a thing is
     /// Talaria's rather than a bot's.
@@ -885,8 +897,12 @@ public struct SoloChatView: View {
                     ForEach(runtime.turns) { turn in
                         row(turn)
                     }
-                    if runtime.isRunning, lastRowIsSilent {
-                        SoloWorkingLine(theme: theme, color: accent, label: copy.soloWorking(theme.id))
+                    if transcriptPolicy.showsWorkingAvatar(
+                        isTurnRunning: runtime.isRunning,
+                        hasLiveDetail: hasLiveTranscriptDetail
+                    ) {
+                        TranscriptWorkingAvatar(model: nil, bot: nil, theme: theme,
+                                                label: copy.soloWorking(theme.id))
                     }
                     Color.clear.frame(height: 1).id("solo-bottom")
                 }
@@ -896,19 +912,13 @@ public struct SoloChatView: View {
             }
             .defaultScrollAnchor(.bottom)
             .onChange(of: runtime.turns.count) {
-                withAnimation(.easeOut(duration: 0.25)) {
+                withAnimation(ChatComposerLayoutPolicy.animation(
+                    reducedMotion: reducedMotion, duration: 0.25
+                )) {
                     proxy.scrollTo("solo-bottom", anchor: .bottom)
                 }
             }
         }
-    }
-
-    /// True while the engine is working but has not produced a token or a tool
-    /// chip yet — the only moment a "working" line adds information.
-    private var lastRowIsSilent: Bool {
-        guard let last = runtime.turns.last else { return true }
-        return last.message.author == .bot && last.message.text.isEmpty
-            && last.message.toolCalls.isEmpty && last.message.card == nil
     }
 
     @ViewBuilder private func row(_ turn: SoloTurn) -> some View {
@@ -986,7 +996,8 @@ public struct SoloChatView: View {
         let message = turn.message
         return HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
-                if let reasoning = message.reasoning, !reasoning.isEmpty {
+                if let reasoning = message.reasoning, !reasoning.isEmpty,
+                   transcriptPolicy.showsReasoning(isLive: message.isStreaming) {
                     ThoughtBlock(reasoning: reasoning, theme: theme,
                                  isLive: message.isStreaming && message.text.isEmpty)
                         .padding(.bottom, message.text.isEmpty ? 0 : 5)
@@ -994,8 +1005,9 @@ public struct SoloChatView: View {
                 if !message.text.isEmpty {
                     botBubble(message.text)
                 }
-                if !message.toolCalls.isEmpty {
-                    ToolCallList(calls: message.toolCalls, theme: theme, copy: copy, accent: accent)
+                let visibleToolCalls = transcriptPolicy.visibleToolCalls(message.toolCalls)
+                if !visibleToolCalls.isEmpty {
+                    ToolCallList(calls: visibleToolCalls, theme: theme, copy: copy, accent: accent)
                         .padding(.top, message.text.isEmpty ? 0 : 7)
                         .padding(.leading, theme.id == .ink ? 12 : 0)
                 }
@@ -1152,7 +1164,8 @@ public struct SoloChatView: View {
                         .foregroundStyle(theme.accentFg)
                 }
             }
-            .frame(width: 40, height: 40)
+            .frame(width: ChatComposerLayoutPolicy.controlHitTarget,
+                   height: ChatComposerLayoutPolicy.controlHitTarget)
             .background(sendBackground,
                         in: RoundedRectangle(cornerRadius: theme.id == .control ? 8 : 20,
                                              style: .continuous))
@@ -1160,8 +1173,10 @@ public struct SoloChatView: View {
                                            style: .continuous))
         }
         .buttonStyle(.plain)
-        .animation(.easeOut(duration: 0.2), value: canSend)
-        .animation(.easeOut(duration: 0.2), value: runtime.isRunning)
+        .animation(ChatComposerLayoutPolicy.animation(reducedMotion: reducedMotion, duration: 0.2),
+                   value: canSend)
+        .animation(ChatComposerLayoutPolicy.animation(reducedMotion: reducedMotion, duration: 0.2),
+                   value: runtime.isRunning)
         .accessibilityLabel(runtime.isRunning ? copy.stopLabel(theme.id) : copy.sendLabel(theme.id))
     }
 
@@ -1200,31 +1215,6 @@ struct SoloEngineBadge: View {
                 .foregroundStyle(theme.faint)
                 .lineLimit(1)
         }
-    }
-}
-
-/// The "working" line, shown only while the engine has produced nothing yet.
-struct SoloWorkingLine: View {
-    var theme: ThemePack
-    var color: Color
-    var label: String
-
-    @State private var pulsing = false
-
-    var body: some View {
-        HStack(spacing: 7) {
-            Circle()
-                .fill(color)
-                .frame(width: 6, height: 6)
-                .opacity(pulsing ? 1 : 0.3)
-                .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true),
-                           value: pulsing)
-            Text(theme.id == .soft ? label : label.uppercased())
-                .font(theme.mono(theme.id == .ink ? 8.5 : 9.5))
-                .tracking(theme.id == .soft ? 0 : 1)
-                .foregroundStyle(theme.faint)
-        }
-        .onAppear { pulsing = true }
     }
 }
 
