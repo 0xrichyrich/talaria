@@ -565,8 +565,18 @@ public struct RosterView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            Button {
+                model.requestCommandCenter(gatewayID: model.activeGatewayID)
+            } label: {
+                Label("Open Command Center", systemImage: "square.grid.2x2")
+            }
+        }
         .accessibilityLabel(Text("Connections, " + chip.label))
         .accessibilityHint(Text("Opens gateways and notifications"))
+        .accessibilityAction(named: Text("Open Command Center")) {
+            model.requestCommandCenter(gatewayID: model.activeGatewayID)
+        }
     }
 
     private var chipFont: Font {

@@ -37,7 +37,6 @@ struct GatewayOperatorConfig: Equatable, Sendable {
 
     static let imageModes = ["auto", "native", "text"]
 }
-
 public struct GatewayCommandAction: Equatable, Sendable {
     var name: String
     var ok: Bool
@@ -1358,4 +1357,3 @@ public extension CopyPack {
         return t == .control ? "DELETED \(names.uppercased())" : "Deleted \(names)."
     }
 }
-

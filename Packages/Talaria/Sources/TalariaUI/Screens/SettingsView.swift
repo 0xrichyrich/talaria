@@ -2,7 +2,7 @@ import SwiftUI
 import TalariaKit
 import TalariaTheme
 
-private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
+enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
     case connections
     case appearance
     case intelligence
@@ -21,7 +21,7 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .intelligence: "Models, Voice & Memory"
         case .agents: "Agents & Profiles"
         case .operations: "Gateway Operations"
-        case .workspace: "Files & Git"
+        case .workspace: "Command Center"
         case .localData: "On-device & Privacy"
         case .about: "About & Diagnostics"
         }
@@ -34,7 +34,7 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .intelligence: "Inference providers, OAuth, voice and memory"
         case .agents: "Rename, delete and manage Hermes profiles"
         case .operations: "Restart, update, usage, runtime and logs"
-        case .workspace: "Gateway files, git status and read-only previews"
+        case .workspace: "Projects, files, review, commands and system"
         case .localData: "Solo mode, storage, exports and deletion"
         case .about: "Versions, health, links and desktop-only boundaries"
         }
@@ -47,7 +47,7 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .intelligence: "cpu.fill"
         case .agents: "person.2.fill"
         case .operations: "slider.horizontal.3"
-        case .workspace: "folder"
+        case .workspace: "square.grid.2x2"
         case .localData: "lock.iphone"
         case .about: "info.circle.fill"
         }
@@ -60,11 +60,13 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .intelligence: "model provider oauth endpoint api key voice speech memory stt tts"
         case .agents: "bot profile rename delete lifecycle"
         case .operations: "operator config logs debug level"
-        case .workspace: "files git workspace directory preview pty terminal project"
+        case .workspace: "command center projects files git review commands system workspace directory preview pty terminal"
         case .localData: "solo offline storage cache privacy export delete reset"
         case .about: "version gateway health diagnostics source docs desktop"
         }
     }
+
+    var presentsCommandCenter: Bool { self == .workspace }
 }
 
 // Settings — roadmap Phase 2.
@@ -107,13 +109,33 @@ public struct SettingsView: View {
             List {
                 Section {
                     ForEach(filteredDestinations) { destination in
-                        NavigationLink(value: destination) {
-                            SettingsIndexRow(destination: destination, theme: theme)
+                        if destination.presentsCommandCenter {
+                            Button {
+                                model.requestCommandCenter()
+                            } label: {
+                                HStack(spacing: 10) {
+                                    SettingsIndexRow(destination: destination, theme: theme)
+                                    Spacer(minLength: 0)
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(theme.faint)
+                                        .accessibilityHidden(true)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityHint(Text("Opens the source-qualified workspace controls"))
+                            .listRowBackground(theme.panel)
+                        } else {
+                            NavigationLink(value: destination) {
+                                SettingsIndexRow(destination: destination, theme: theme)
+                            }
+                            .listRowBackground(theme.panel)
                         }
-                        .listRowBackground(theme.panel)
                     }
                 } footer: {
-                    Text("Settings are grouped by task. Nothing was removed; each row opens a focused page.")
+                    Text("Settings are grouped by task. Nothing was removed; each row opens a focused surface.")
                         .foregroundStyle(theme.sub)
                 }
             }
@@ -231,7 +253,10 @@ private struct SettingsDetailPage: View {
                 case .operations:
                     OperatorSettingsSection(model: model)
                 case .workspace:
-                    WorkspaceSettingsSection(model: model)
+                    // The index renders this destination as a modal action, not
+                    // a NavigationLink. Keep the switch exhaustive without
+                    // mounting the legacy Files/Git page as a second entry.
+                    EmptyView()
                 case .localData:
                     SoloSettingsSection(model: model)
                     PrivacySettingsSection(model: model)
@@ -692,17 +717,17 @@ extension CopyPack {
         case .soft:
             return [("Environment variables", "hermes config env — on the machine running the gateway"),
                     ("Raw config.yaml", "Provider keys and host paths stay on the gateway host"),
-                    ("Interactive terminal / PTY", "A phone is not a shell. Files & Git in Settings is the portable equivalent."),
+                    ("Interactive terminal / PTY", "A phone is not a shell. Command Center provides bounded, noninteractive workspace controls."),
                     ("Electron windows and overlays", "Desktop chrome such as window placement has no mobile analogue")]
         case .control:
             return [("ENV VARS", "HERMES CONFIG ENV — GATEWAY HOST ONLY"),
                     ("RAW CONFIG.YAML", "HOST KEYS AND PATHS STAY ON THE GATEWAY"),
-                    ("PTY / TERMINAL", "NOT ON DEVICE. FILES & GIT IN SETTINGS IS THE PORTABLE SURFACE."),
+                    ("PTY / TERMINAL", "NOT ON DEVICE. COMMAND CENTER PROVIDES BOUNDED, NONINTERACTIVE CONTROLS."),
                     ("ELECTRON WINDOWS", "NO MOBILE ANALOGUE")]
         case .ink:
             return [("the environment", "set where the gateway itself runs"),
                     ("the raw config", "keys and paths remain with the house"),
-                    ("the terminal", "a pocket is no shell; Files & Git is the ledger instead"),
+                    ("the terminal", "a pocket is no shell; Command Center keeps bounded workspace controls instead"),
                     ("the windows", "desktop chrome has no counterpart here")]
         }
     }
