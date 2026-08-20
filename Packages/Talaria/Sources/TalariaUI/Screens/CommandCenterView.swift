@@ -1042,6 +1042,14 @@ private struct WorkspaceCommandsSection: View {
             }
             if !model.workspaceProcessTargets.isEmpty {
                 Section {
+                    Picker("Process target", selection: processSelection) {
+                        ForEach(model.workspaceProcessTargets) { target in
+                            Text(target.discriminator).tag(target.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(runtime.mutationBusy || runtime.commandRunning
+                              || runtime.systemActionRunning)
                     if let selectedTarget, ownsSelectedProcesses {
                         if runtime.processes.isEmpty {
                             Text("No background processes in \(selectedTarget.discriminator).")

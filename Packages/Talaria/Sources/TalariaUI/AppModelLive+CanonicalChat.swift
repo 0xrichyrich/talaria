@@ -59,41 +59,138 @@ final class CanonicalChatRuntime {
     /// The exact birth operation currently allowed to clean up a newly-created
     /// chat. A canceled/late kickoff must never erase a replacement pin.
     var kickoffs: [String: UUID] = [:]
+    /// Full lease metadata for the active kickoff. `kickoffs` remains as the
+    /// small compatibility/ownership index, while this table lets a reconnect
+    /// migrate the runtime sid without ever changing the source route.
+    var kickoffLeases: [String: CanonicalKickoffLease] = [:]
     var ambiguousKickoffs: [String: CanonicalKickoffLease] = [:]
 
     /// True when `pins[botID]` is newer than a roster answer taken at
     /// `sampled`, and the server block must not be allowed to overwrite it.
+    /// Failed persistence keeps this authority dirty until the server echoes
+    /// the same pin or an explicit source reset clears it.
+    var dirtyPins: Set<String> = []
+
     func hasLocalPinWrite(_ botID: String, since sampled: [String: Int]) -> Bool {
-        writing.contains(botID) || writeCount[botID] != sampled[botID]
+        dirtyPins.contains(botID) || writing.contains(botID) || writeCount[botID] != sampled[botID]
     }
 
     /// Clear bare ids owned by the primary gateway while retaining qualified
     /// remote chats whose clients remain connected.
-    func resetPrimaryScope() {
-        let primary = pins.keys.filter { GatewayBotRoute(qualifiedID: $0) == nil }
-        for key in primary { pins.removeValue(forKey: key) }
-        writing = Set(writing.filter { GatewayBotRoute(qualifiedID: $0) != nil })
-        writeCount = writeCount.filter { GatewayBotRoute(qualifiedID: $0.key) != nil }
+    func resetPrimaryScope(retainAmbiguousForReconnect: Bool = false,
+                           retainLocalPins: Bool = false) {
+        let primary = Set(pins.keys.filter { GatewayBotRoute(qualifiedID: $0) == nil })
+            .union(dirtyPins.filter { GatewayBotRoute(qualifiedID: $0) == nil })
+        if !retainLocalPins {
+            for key in primary { pins.removeValue(forKey: key) }
+            dirtyPins.subtract(primary)
+            writing = Set(writing.filter { GatewayBotRoute(qualifiedID: $0) != nil })
+            writeCount = writeCount.filter { GatewayBotRoute(qualifiedID: $0.key) != nil }
+        }
         let primaryOpens = opens.filter { GatewayBotRoute(qualifiedID: $0.key) == nil }
         for task in primaryOpens.values { task.cancel() }
         for key in primaryOpens.keys { opens.removeValue(forKey: key) }
+        let primaryLeases = kickoffLeases.filter {
+            GatewayBotRoute(qualifiedID: $0.key) == nil
+        }
+        for key in primaryLeases.keys where ambiguousKickoffs[key] == nil {
+            kickoffLeases.removeValue(forKey: key)
+        }
         for key in primary where ambiguousKickoffs[key] == nil {
             kickoffs.removeValue(forKey: key)
+        }
+        if !retainAmbiguousForReconnect {
+            let ambiguousPrimary = ambiguousKickoffs.keys.filter {
+                GatewayBotRoute(qualifiedID: $0) == nil
+            }
+            for key in ambiguousPrimary {
+                ambiguousKickoffs.removeValue(forKey: key)
+                kickoffs.removeValue(forKey: key)
+                kickoffLeases.removeValue(forKey: key)
+            }
         }
     }
 
     func resetRoutedScope(gatewayID: String) {
         let prefix = gatewayID + GatewayBotRoute.separator
-        let keys = pins.keys.filter { $0.hasPrefix(prefix) }
+        let keys = Set(pins.keys.filter { $0.hasPrefix(prefix) })
+            .union(dirtyPins.filter { $0.hasPrefix(prefix) })
         for key in keys { pins.removeValue(forKey: key) }
+        dirtyPins = Set(dirtyPins.filter { !$0.hasPrefix(prefix) })
         writing = Set(writing.filter { !$0.hasPrefix(prefix) })
         writeCount = writeCount.filter { !$0.key.hasPrefix(prefix) }
         let tasks = opens.filter { $0.key.hasPrefix(prefix) }
         for task in tasks.values { task.cancel() }
         for key in tasks.keys { opens.removeValue(forKey: key) }
+        let leases = kickoffLeases.filter { $0.key.hasPrefix(prefix) }
+        for key in leases.keys where ambiguousKickoffs[key] == nil {
+            kickoffLeases.removeValue(forKey: key)
+        }
         for key in keys where ambiguousKickoffs[key] == nil {
             kickoffs.removeValue(forKey: key)
         }
+    }
+
+    /// Migrate a kickoff across a runtime-sid rotation only when every stable
+    /// identity agrees. The route is immutable: a same-named profile on a new
+    /// source is a replacement chat, never a continuation of this birth.
+    @discardableResult
+    func migrateKickoff(botID: String, route: GatewayBotRoute,
+                        sessionID: String, storedID: String,
+                        chatID: ObjectIdentifier) -> Bool {
+        var migrated = false
+        if var lease = kickoffLeases[botID], kickoffs[botID] == lease.id,
+           lease.chatID == chatID, lease.storedID == storedID,
+           lease.route.map({ $0 == route }) ?? true {
+            lease.sessionID = sessionID
+            kickoffLeases[botID] = lease
+            migrated = true
+        }
+        if var lease = ambiguousKickoffs[botID], kickoffs[botID] == lease.id,
+           lease.chatID == chatID, lease.storedID == storedID,
+           lease.route.map({ $0 == route }) ?? true {
+            lease.sessionID = sessionID
+            ambiguousKickoffs[botID] = lease
+            migrated = true
+        }
+        return migrated
+    }
+
+    /// Retire a kickoff only for the exact source/durable/chat binding. This is
+    /// the fail-closed counterpart used by profile lifecycle recovery.
+    @discardableResult
+    func retireKickoff(botID: String, route: GatewayBotRoute,
+                       storedID: String?, chatID: ObjectIdentifier?,
+                       operationID: UUID? = nil) -> Bool {
+        let active = kickoffLeases[botID]
+        let ambiguous = ambiguousKickoffs[botID]
+        let owns: (CanonicalKickoffLease?) -> Bool = { lease in
+            guard let lease else { return false }
+            // Missing identity is not an ownership proof. In particular, a
+            // lifecycle caller that has already lost its ChatState or durable
+            // key must not retire a replacement birth merely because the bot
+            // id was reused. Empty is a valid stored id for an ephemeral
+            // create, but it must be supplied explicitly and match exactly.
+            guard let storedID, let chatID,
+                  lease.storedID == storedID,
+                  lease.chatID == chatID,
+                  lease.route.map({ $0 == route }) ?? true,
+                  self.kickoffs[botID] == lease.id else { return false }
+            return operationID.map { $0 == lease.id } ?? false
+        }
+        let owned: CanonicalKickoffLease?
+        if let active, owns(active) {
+            owned = active
+        } else if let ambiguous, owns(ambiguous) {
+            owned = ambiguous
+        } else {
+            owned = nil
+        }
+        guard let owned else { return false }
+        if self.kickoffLeases[botID]?.id == owned.id { self.kickoffLeases[botID] = nil }
+        if self.ambiguousKickoffs[botID]?.id == owned.id { self.ambiguousKickoffs[botID] = nil }
+        if self.kickoffs[botID] == owned.id { self.kickoffs[botID] = nil }
+        return true
     }
 }
 
@@ -105,6 +202,10 @@ struct CanonicalKickoffLease: Equatable {
     var rowID: UUID?
     var chatID: ObjectIdentifier
     var submitStarted = false
+    /// The source profile is immutable for the lifetime of this birth. A
+    /// default keeps older focused tests/source callers source-compatible;
+    /// production always supplies it at claim time.
+    var route: GatewayBotRoute? = nil
     /// Durable transcript identity/count sampled before the optimistic kickoff
     /// row. An old duplicate prompt is not proof that this birth was accepted.
     var baselineDurableRowIDs: Set<Int> = []
@@ -405,12 +506,23 @@ extension AppModel {
         let chat = chat(for: botID)
         let runtime = CanonicalChatRuntime.shared
         let profile = route.profile
+        guard let lifecycleToken = profileLifecycleGenerationToken(for: botID),
+              profileLifecycleAccepts(lifecycleToken) else {
+            throw CancellationError()
+        }
+        let gatewayGeneration = LiveRuntime.shared.generation
+        func acceptsSnapshot() -> Bool {
+            profileLifecycleAcceptsGatewaySnapshot(
+                route: route, client: client, generation: gatewayGeneration)
+        }
 
         // An explicit binding wins: the user named this conversation (sessions
         // sheet, artifact jump, inbox jump), or a reconnect is re-attaching it.
         if let bound = chat.storedSessionID, !bound.isEmpty {
             switch await attach(bound, botID: botID, route: route,
-                                hydrate: hydrate, client: client) {
+                                hydrate: hydrate, client: client,
+                                lifecycleToken: lifecycleToken,
+                                gatewayGeneration: gatewayGeneration) {
             case .attached(let sid, _): return sid
             case .missing: break            // vanished under us — re-resolve
             case .failed(let error): throw error
@@ -425,7 +537,9 @@ extension AppModel {
         //     the answer describes the exact operation we care about.
         if let pin = runtime.pins[botID], !pin.isEmpty, pin != chat.storedSessionID {
             switch await attach(pin, botID: botID, route: route,
-                                hydrate: hydrate, client: client) {
+                                hydrate: hydrate, client: client,
+                                lifecycleToken: lifecycleToken,
+                                gatewayGeneration: gatewayGeneration) {
             case .attached(let sid, _): return sid
             case .missing: break            // definitively gone → recover below
             case .failed(let error): throw error
@@ -440,8 +554,13 @@ extension AppModel {
         //     cron delivery become the forever chat, which is the hijack the
         //     pin exists to prevent.
         switch await attach(Self.canonicalChatTitle, botID: botID, route: route,
-                            hydrate: hydrate, client: client) {
+                            hydrate: hydrate, client: client,
+                            lifecycleToken: lifecycleToken,
+                            gatewayGeneration: gatewayGeneration) {
         case .attached(let sid, let stored):
+            guard acceptsSnapshot() else {
+                throw CancellationError()
+            }
             await pinCanonicalChat(stored, botID: botID)
             return sid
         case .missing: break
@@ -471,16 +590,29 @@ extension AppModel {
         // (methods_session.py:180-186), so without it this "does the bot have
         // history?" probe reads a desktop-born forever chat as no history at
         // all — and answers by minting a second one.
-        if let newest = (try? await client.listSessions(limit: 20, profile: profile,
-                                                        includeHidden: true))?
-            .first(where: { !$0.id.isEmpty })?.id, !candidates.contains(newest) {
+        let listedSessions: [StoredSession]
+        do {
+            listedSessions = try await client.listSessions(limit: 20, profile: profile,
+                                                            includeHidden: true)
+        } catch {
+            // A failed history probe is not authoritative emptiness. Do not
+            // birth a second canonical session behind a transient list error.
+            throw error
+        }
+        if let newest = listedSessions.first(where: { !$0.id.isEmpty })?.id,
+           !candidates.contains(newest) {
             candidates.append(newest)
         }
         try Task.checkCancellation()
         for candidate in candidates {
             switch await attach(candidate, botID: botID, route: route,
-                                hydrate: hydrate, client: client) {
-            case .attached(let sid, let stored):
+                                hydrate: hydrate, client: client,
+                                lifecycleToken: lifecycleToken,
+                                gatewayGeneration: gatewayGeneration) {
+        case .attached(let sid, let stored):
+                guard acceptsSnapshot() else {
+                    throw CancellationError()
+                }
                 await pinCanonicalChat(stored, botID: botID)
                 return sid
             case .missing:
@@ -509,17 +641,35 @@ extension AppModel {
         let live = try await client.createSession(profile: profile,
                                                   title: Self.canonicalChatTitle,
                                                   hidden: true)
+        guard acceptsSnapshot() else {
+            throw CancellationError()
+        }
         guard !live.sessionID.isEmpty else {
             throw GatewayError(code: -8, message: "session.create returned no id")
         }
         let stored = live.storedSessionID
         var lease = claimCanonicalKickoff(sessionID: live.sessionID, storedID: stored,
-                                          botID: botID)
+                                          botID: botID, route: route)
         do {
             try Task.checkCancellation()
+            guard acceptsSnapshot() else {
+                throw CancellationError()
+            }
             adopt(live, storedID: stored.isEmpty ? nil : stored, botID: botID,
                   sourceGatewayID: route.gatewayID)
-            if !stored.isEmpty { await pinCanonicalChat(stored, botID: botID) }
+            if let migrated = CanonicalChatRuntime.shared.kickoffLeases[botID],
+               migrated.id == lease.id {
+                // `adopt` may have rotated the runtime sid while this birth
+                // was being created. Keep the route immutable, but submit to
+                // the newly-authoritative runtime address.
+                lease = migrated
+            }
+            if !stored.isEmpty {
+                guard acceptsSnapshot() else {
+                    throw CancellationError()
+                }
+                await pinCanonicalChat(stored, botID: botID)
+            }
             try Task.checkCancellation()
             let shouldSubmitKickoff = beginCanonicalKickoff(&lease)
             if shouldSubmitKickoff {
@@ -547,7 +697,7 @@ extension AppModel {
     /// Desktop's first turn for a brand-new forever-chat. Bind first, then
     /// submit, so the intro reply is visible without reopening.
     private func claimCanonicalKickoff(sessionID: String, storedID: String,
-                                       botID: String) -> CanonicalKickoffLease {
+                                       botID: String, route: GatewayBotRoute) -> CanonicalKickoffLease {
         let chat = chat(for: botID)
         let baselineDurableRowIDs = Set(chat.messages.compactMap(\.rowID))
         let baselineDurableUserTexts: Set<String> = Set(chat.messages.compactMap { message -> String? in
@@ -556,11 +706,12 @@ extension AppModel {
         })
         let lease = CanonicalKickoffLease(id: UUID(), botID: botID, sessionID: sessionID,
                                           storedID: storedID, rowID: nil,
-                                          chatID: ObjectIdentifier(chat),
+                                          chatID: ObjectIdentifier(chat), route: route,
                                           baselineDurableRowIDs: baselineDurableRowIDs,
                                           baselineDurableRowCount: baselineDurableRowIDs.count,
                                           baselineDurableUserTexts: baselineDurableUserTexts)
         CanonicalChatRuntime.shared.kickoffs[botID] = lease.id
+        CanonicalChatRuntime.shared.kickoffLeases[botID] = lease
         return lease
     }
 
@@ -576,6 +727,9 @@ extension AppModel {
         let row = ChatMessage(author: .user, time: AppModel.clock(), text: text)
         chat.messages.append(row)
         lease.rowID = row.id
+        if CanonicalChatRuntime.shared.kickoffLeases[lease.botID]?.id == lease.id {
+            CanonicalChatRuntime.shared.kickoffLeases[lease.botID] = lease
+        }
         chat.isRunning = true
         if CanonicalChatRuntime.shared.kickoffs[lease.botID] == lease.id {
             CanonicalChatRuntime.shared.ambiguousKickoffs[lease.botID] = nil
@@ -602,6 +756,9 @@ extension AppModel {
         if runtime.kickoffs[lease.botID] == lease.id { runtime.kickoffs[lease.botID] = nil }
         if runtime.ambiguousKickoffs[lease.botID]?.id == lease.id {
             runtime.ambiguousKickoffs[lease.botID] = nil
+        }
+        if runtime.kickoffLeases[lease.botID]?.id == lease.id {
+            runtime.kickoffLeases[lease.botID] = nil
         }
     }
 
@@ -642,6 +799,7 @@ extension AppModel {
             if chat.storedSessionID == lease.storedID { chat.storedSessionID = nil }
         }
         runtime.kickoffs[lease.botID] = nil
+        runtime.kickoffLeases[lease.botID] = nil
         runtime.ambiguousKickoffs[lease.botID] = nil
         return true
     }
@@ -650,25 +808,31 @@ extension AppModel {
         storedID: String, botID: String, route: GatewayBotRoute, client: GatewayClient
     ) async {
         guard !storedID.isEmpty, CanonicalChatRuntime.shared.pins[botID] == nil else { return }
+        let generation = LiveRuntime.shared.generation
+        CanonicalChatRuntime.shared.dirtyPins.insert(botID)
+        CanonicalChatRuntime.shared.writeCount[botID, default: 0] &+= 1
         _ = try? await withBotModeMetaMutation(route: route) {
             let runtime = CanonicalChatRuntime.shared
             runtime.writing.insert(botID)
             defer { runtime.writing.remove(botID) }
             let profiles = try await client.listProfiles(includeSessions: false)
-            guard runtime.pins[botID] == nil,
+            guard LiveRuntime.shared.generation == generation,
+                  runtime.pins[botID] == nil,
                   let row = profiles.first(where: { $0.name == route.profile }) else { return }
             var block = row.uiMeta?["hermes-bots"]?.objectValue ?? [:]
             guard block["chat"]?.stringValue == storedID else { return }
             block["chat"] = nil
-            try await client.applyProfileEdit(
+            let applied = try await client.applyProfileEdit(
                 name: route.profile,
                 ProfileEdit(uiMeta: .object(["hermes-bots": .object(block)])))
+            if applied["ui_meta"] == true { runtime.dirtyPins.remove(botID) }
         }
     }
 
     func reconcileAmbiguousCanonicalKickoff(
         _ lease: CanonicalKickoffLease, route: GatewayBotRoute, client: GatewayClient
     ) async {
+        guard lease.route.map({ $0 == route }) ?? true else { return }
         guard !ChatRuntime.shared.reconcilingBots.contains(lease.botID) else {
             ChatRuntime.shared.deferredReconciliationBots.insert(lease.botID)
             return
@@ -706,6 +870,30 @@ extension AppModel {
         hydrate: @MainActor (LiveSession) async throws -> Void,
         accepts: @MainActor () -> Bool
     ) async {
+        if let leaseRoute = lease.route, leaseRoute.gatewayID != sourceGatewayID {
+            // The compatibility overload carries only a gateway id; it still
+            // must reject a caller that tries to reconcile a lease from a
+            // different source.
+            return
+        }
+        let sourceRoute = lease.route ?? GatewayBotRoute(
+            gatewayID: sourceGatewayID,
+            profile: GatewayBotRoute(qualifiedID: lease.botID)?.profile ?? lease.botID)
+        await reconcileAmbiguousCanonicalKickoff(
+            lease, sourceRoute: sourceRoute, resume: resume,
+            hydrate: hydrate, accepts: accepts)
+    }
+
+    /// Test/recovery seam with the complete immutable source identity. The
+    /// older gateway-id-only overload remains for callers built before
+    /// source-qualified routes existed, but production should use this shape.
+    func reconcileAmbiguousCanonicalKickoff(
+        _ lease: CanonicalKickoffLease, sourceRoute: GatewayBotRoute,
+        resume: @MainActor () async throws -> LiveSession,
+        hydrate: @MainActor (LiveSession) async throws -> Void,
+        accepts: @MainActor () -> Bool
+    ) async {
+        guard lease.route.map({ $0 == sourceRoute }) ?? true else { return }
         guard CanonicalChatRuntime.shared.kickoffs[lease.botID] == lease.id else { return }
         do {
             let live = try await resume()
@@ -713,12 +901,13 @@ extension AppModel {
                 && live.storedSessionID == lease.storedID
             guard CanonicalChatRuntime.shared.kickoffs[lease.botID] == lease.id,
                   accepts(),
+                  lease.route.map({ $0 == sourceRoute }) ?? true,
                   (live.sessionID == lease.sessionID || sameDurableSession),
                   live.storedSessionID == lease.storedID,
                   let chat = chats[lease.botID], ObjectIdentifier(chat) == lease.chatID,
                   lease.storedID.isEmpty || chat.storedSessionID == lease.storedID else { return }
             adopt(live, storedID: live.storedSessionID.isEmpty ? lease.storedID : live.storedSessionID,
-                  botID: lease.botID, sourceGatewayID: sourceGatewayID)
+                  botID: lease.botID, sourceGatewayID: sourceRoute.gatewayID)
             replayInflight(live, botID: lease.botID)
             try await hydrate(live)
             guard CanonicalChatRuntime.shared.kickoffs[lease.botID] == lease.id,
@@ -763,7 +952,9 @@ extension AppModel {
     /// Resume `target` — a durable key or the canonical title — and bind the
     /// bot's chat to whatever it resolved to.
     private func attach(_ target: String, botID: String, route: GatewayBotRoute, hydrate: Bool,
-                        client: GatewayClient) async -> CanonicalAttach {
+                        client: GatewayClient,
+                        lifecycleToken: ProfileLifecycleGenerationToken,
+                        gatewayGeneration: Int) async -> CanonicalAttach {
         let chat = chat(for: botID)
         let rebinding = chat.storedSessionID != target
         do {
@@ -776,6 +967,10 @@ extension AppModel {
             let live = try await client.resumeSession(target, profile: route.profile,
                                                       deferHistory: false)
             try Task.checkCancellation()
+            guard profileLifecycleAcceptsGatewaySnapshot(
+                route: route, client: client, generation: gatewayGeneration) else {
+                throw CancellationError()
+            }
             guard !live.sessionID.isEmpty else {
                 return .failed(GatewayError(code: -8, message: "session.resume returned no id"))
             }
@@ -790,6 +985,10 @@ extension AppModel {
             if hydrate {
                 try await hydrateCanonical(live, botID: botID, profile: route.profile,
                                            client: client, clearWhenEmpty: rebinding)
+                guard profileLifecycleAcceptsGatewaySnapshot(
+                    route: route, client: client, generation: gatewayGeneration) else {
+                    throw CancellationError()
+                }
             }
             replayPendingPrompts(live, sourceGatewayID: route.gatewayID)
             return .attached(sessionID: live.sessionID, storedID: stored)
@@ -815,6 +1014,8 @@ extension AppModel {
         // in that window; otherwise `oldSessionID == nil` skips migration and
         // leaves unresolved mutation/kickoff leases attached to a dead sid.
         let oldSessionID = chat.sessionID ?? runtime.reconnectParkedSessionIDs[botID]
+        let oldStoredID = chat.storedSessionID
+        let oldRoute = gatewayRoute(for: botID) ?? stateRoute(for: botID)
         if let old = oldSessionID, old != live.sessionID {
             if runtime.sessionToBot[old] == botID {
                 runtime.sessionToBot.removeValue(forKey: old)
@@ -842,6 +1043,19 @@ extension AppModel {
             chatID: ObjectIdentifier(chat))
         if bindingChanged {
             let route = bindingRoute
+            if let oldSessionID, let oldRoute {
+                if let oldStoredID, oldStoredID == durableID, oldRoute == route {
+                    _ = migrateQueuedState(
+                        fromBotID: botID, toBotID: botID, route: route,
+                        oldSessionID: oldSessionID, newSessionID: live.sessionID,
+                        storedID: oldStoredID)
+                } else {
+                    // A changed durable key or source is a replacement chat;
+                    // never let A's visible queue or pending ack drain into B.
+                    _ = retireQueuedState(botID: botID, route: oldRoute,
+                                          storedID: oldStoredID)
+                }
+            }
             ChatRuntime.shared.migrateMutationState(
                 botID: botID, route: route, sessionID: live.sessionID,
                 storedID: durableID, generation: runtime.generation,
@@ -853,14 +1067,23 @@ extension AppModel {
                 // stop fence was protecting.
                 ChatRuntime.shared.stopFences[botID] = nil
             }
-            if var kickoff = CanonicalChatRuntime.shared.ambiguousKickoffs[botID] {
-                if kickoff.chatID == ObjectIdentifier(chat), kickoff.storedID == (durableID ?? ""),
-                   route.gatewayID == sourceGatewayID {
-                    kickoff.sessionID = live.sessionID
-                    CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = kickoff
-                } else {
-                    CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = nil
-                    CanonicalChatRuntime.shared.kickoffs[botID] = nil
+            if let kickoffStored = durableID ?? oldStoredID,
+               CanonicalChatRuntime.shared.migrateKickoff(
+                   botID: botID, route: route, sessionID: live.sessionID,
+                   storedID: kickoffStored, chatID: ObjectIdentifier(chat)) == false {
+                // The old birth belongs to another route/durable row (or a
+                // replacement ChatState). Retire only that exact owner; do not
+                // let a late kickoff receipt clean up this adopted session.
+                let priorRoute = CanonicalChatRuntime.shared.ambiguousKickoffs[botID]?.route
+                    ?? CanonicalChatRuntime.shared.kickoffLeases[botID]?.route
+                    ?? route
+                if let priorLease = CanonicalChatRuntime.shared.kickoffLeases[botID]
+                    ?? CanonicalChatRuntime.shared.ambiguousKickoffs[botID],
+                   let oldStoredID {
+                    _ = CanonicalChatRuntime.shared.retireKickoff(
+                        botID: botID, route: priorRoute,
+                        storedID: oldStoredID,
+                        chatID: ObjectIdentifier(chat), operationID: priorLease.id)
                 }
             }
             if ChatRuntime.shared.transcriptActions[botID] != nil {
@@ -911,6 +1134,8 @@ extension AppModel {
     private func unbindChat(botID: String) {
         let chat = chat(for: botID)
         let runtime = LiveRuntime.shared
+        retireComposeQueue(botID: botID, storedID: chat.storedSessionID,
+                           chatID: ObjectIdentifier(chat))
         if let sid = chat.sessionID, let route = gatewayRoute(for: botID) {
             if route.gatewayID == runtime.gatewayID {
                 runtime.sessionToBot.removeValue(forKey: sid)
@@ -996,8 +1221,22 @@ extension AppModel {
            fence.acceptsAuthoritativeHydration(
                gatewayID: sourceGatewayID, profile: profile, storedID: storedID,
                generation: hydrationGeneration,
-               currentGeneration: LiveRuntime.shared.generation) {
+               currentGeneration: LiveRuntime.shared.generation),
+           (fence.chatID == nil || fence.chatID == ObjectIdentifier(chat)),
+           let proof = fence.effectProof,
+           proof.proves(chat.messages) || proof.proves(live) {
             ChatRuntime.shared.transcriptFences[botID] = nil
+        }
+        let hydratedRows = chat.messages
+        for (itemID, fence) in ChatRuntime.shared.offlineComposeFences {
+            guard fence.botID == botID, fence.route.gatewayID == sourceGatewayID,
+                  fence.route.profile == profile,
+                  fence.storedID == (chat.storedSessionID ?? ""),
+                  fence.chatID == ObjectIdentifier(chat),
+                  hydratedRows.contains(where: {
+                      $0.author == .user && $0.rowID != nil && $0.text == fence.text
+                  }) else { continue }
+            ChatRuntime.shared.offlineComposeFences[itemID] = nil
         }
     }
 
@@ -1038,21 +1277,30 @@ extension AppModel {
     /// ui_meta["talaria"] included — are untouched by that merge.
     func pinCanonicalChat(_ storedID: String, botID: String) async {
         guard !storedID.isEmpty else { return }
+        guard let lifecycleToken = profileLifecycleGenerationToken(for: botID),
+              profileLifecycleAccepts(lifecycleToken) else { return }
         let runtime = CanonicalChatRuntime.shared
         let previous = runtime.pins[botID]
         // Local first, unconditionally: the pin has to hold even when the
         // gateway cannot store it (older gateway, read-only profile), which is
         // exactly what desktop's plugin-local store buys (plugin.js:205-212).
         runtime.pins[botID] = storedID
+        if previous != storedID { runtime.dirtyPins.insert(botID) }
         // Counted before the early return too: a local-only pin (offline, or a
         // gateway that cannot store ui_meta) still has to outrank the stale
         // roster answer that a poll already in flight is about to deliver.
         runtime.writeCount[botID, default: 0] += 1
-        guard previous != storedID, mode == .live,
-              let route = gatewayRoute(for: botID),
-              let client = try? await routedClient(for: route) else { return }
+        guard mode == .live,
+              let route = gatewayRoute(for: botID) else { return }
+        let gatewayGeneration = LiveRuntime.shared.generation
+        guard let client = try? await routedClient(for: route) else { return }
+        guard profileLifecycleAcceptsGatewaySnapshot(
+            route: route, client: client, generation: gatewayGeneration) else { return }
 
+        var persisted = false
         _ = try? await withBotModeMetaMutation(route: route) {
+            guard self.profileLifecycleAcceptsGatewaySnapshot(
+                route: route, client: client, generation: gatewayGeneration) else { return }
             runtime.writing.insert(botID)
             defer { runtime.writing.remove(botID) }
             do {
@@ -1060,18 +1308,26 @@ extension AppModel {
                 // have rewritten the block since the last roster poll. Sessions are
                 // not needed here and cost a per-profile db scan.
                 let profiles = try await client.listProfiles(includeSessions: false)
+                guard self.profileLifecycleAcceptsGatewaySnapshot(
+                    route: route, client: client, generation: gatewayGeneration) else { return }
                 guard let row = profiles.first(where: { $0.name == route.profile }) else { return }
                 var block = row.uiMeta?["hermes-bots"]?.objectValue ?? [:]
                 block["chat"] = .string(storedID)
-                try await client.applyProfileEdit(
+                let applied = try await client.applyProfileEdit(
                     name: route.profile,
                     ProfileEdit(uiMeta: .object(["hermes-bots": .object(block)])))
+                persisted = applied["ui_meta"] == true
             } catch {
                 // Desktop's three-valued outcome (plugin.js:250-270) exists so an
                 // older gateway that does not speak the contract produces no toast
                 // at all. Neither outcome is actionable here: the chat is already
                 // open and the pin holds locally, so nothing is surfaced.
             }
+        }
+        if persisted,
+           self.profileLifecycleAcceptsGatewaySnapshot(
+               route: route, client: client, generation: gatewayGeneration) {
+            runtime.dirtyPins.remove(botID)
         }
     }
 

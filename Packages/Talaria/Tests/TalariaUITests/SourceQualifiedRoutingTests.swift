@@ -1069,21 +1069,268 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         primaryOpen.cancel()
     }
 
+    func testSecondaryProfileRenameMigratesA2ASenderRecipientAndWatchOwnership() {
+        let runtime = A2ARuntime.shared
+        runtime.reset()
+        defer { runtime.reset() }
+
+        let source = GatewayBotRoute(gatewayID: "homelab", profile: "worker")
+        let destination = GatewayBotRoute(gatewayID: "homelab", profile: "renamed")
+        let primary = GatewayBotRoute(gatewayID: "primary", profile: "ops")
+        let sibling = GatewayBotRoute(gatewayID: "homelab", profile: "sibling")
+        let sourceEndpoint = A2AEndpoint(
+            rosterID: source.qualifiedID, route: source,
+            displayTitle: "Worker", handle: "worker",
+            attributionHandle: "worker", connectionLabel: "Homelab")
+        let primaryEndpoint = A2AEndpoint(
+            rosterID: "ops", route: primary,
+            displayTitle: "Ops", handle: "ops",
+            attributionHandle: "ops", connectionLabel: "Primary")
+        let siblingEndpoint = A2AEndpoint(
+            rosterID: sibling.qualifiedID, route: sibling,
+            displayTitle: "Sibling", handle: "sibling",
+            attributionHandle: "sibling", connectionLabel: "Homelab")
+
+        let incomingID = UUID()
+        let incomingKey = AppModel.deliveryKey(route: source, body: "in", attemptID: incomingID)
+        runtime.deliveries[incomingKey] = A2ADelivery(
+            to: source.qualifiedID, route: source, senderRoute: primary,
+            senderRosterID: "ops", attemptID: incomingID,
+            bodyHash: AppModel.stableHash("in"), queuedBehindRun: false,
+            state: .waiting, at: Date())
+        let outgoingID = UUID()
+        let outgoingKey = AppModel.deliveryKey(route: sibling, body: "out", attemptID: outgoingID)
+        runtime.deliveries[outgoingKey] = A2ADelivery(
+            to: sibling.qualifiedID, route: sibling, senderRoute: source,
+            senderRosterID: source.qualifiedID, attemptID: outgoingID,
+            bodyHash: AppModel.stableHash("out"), queuedBehindRun: false,
+            state: .waiting, at: Date())
+        let siblingID = UUID()
+        let siblingKey = AppModel.deliveryKey(route: sibling, body: "sibling", attemptID: siblingID)
+        runtime.deliveries[siblingKey] = A2ADelivery(
+            to: sibling.qualifiedID, route: sibling, senderRoute: primary,
+            senderRosterID: "ops", attemptID: siblingID,
+            bodyHash: AppModel.stableHash("sibling"), queuedBehindRun: false,
+            state: .waiting, at: Date())
+
+        let incomingWatchGeneration = runtime.installWatcher(
+            key: incomingKey, target: sourceEndpoint, sender: primaryEndpoint)
+        let outgoingWatchGeneration = runtime.installWatcher(
+            key: outgoingKey, target: siblingEndpoint, sender: sourceEndpoint)
+        runtime.watchers[incomingKey] = Task { try? await Task.sleep(for: .seconds(60)) }
+        runtime.watchers[outgoingKey] = Task { try? await Task.sleep(for: .seconds(60)) }
+        let oldGeneration = runtime.routeGeneration(for: source)
+
+        runtime.retireProfileRoute(source, sourceBotIDs: [source.qualifiedID],
+                                   preserveForRename: true)
+        XCTAssertTrue(runtime.watcherIsPaused(key: incomingKey,
+                                               generation: incomingWatchGeneration))
+        XCTAssertTrue(runtime.watcherIsPaused(key: outgoingKey,
+                                               generation: outgoingWatchGeneration))
+        XCTAssertFalse(runtime.accepts(route: source, generation: oldGeneration))
+
+        runtime.migrateProfileRoute(from: source, to: destination,
+                                    sourceBotIDs: [source.qualifiedID],
+                                    destinationBotID: destination.qualifiedID)
+
+        XCTAssertEqual(runtime.deliveries[incomingKey]?.route, destination)
+        XCTAssertEqual(runtime.deliveries[incomingKey]?.to, destination.qualifiedID)
+        XCTAssertEqual(runtime.deliveries[outgoingKey]?.senderRoute, destination)
+        XCTAssertEqual(runtime.deliveries[outgoingKey]?.senderRosterID,
+                       destination.qualifiedID)
+        XCTAssertEqual(runtime.deliveries[siblingKey]?.route, sibling)
+        XCTAssertEqual(runtime.deliveries[siblingKey]?.senderRoute, primary)
+        let incomingOwner = runtime.watcherRegistration(
+            key: incomingKey, generation: incomingWatchGeneration)
+        XCTAssertEqual(incomingOwner?.target.route, destination)
+        XCTAssertEqual(incomingOwner?.target.rosterID, destination.qualifiedID)
+        let outgoingOwner = runtime.watcherRegistration(
+            key: outgoingKey, generation: outgoingWatchGeneration)
+        XCTAssertEqual(outgoingOwner?.sender.route, destination)
+        XCTAssertEqual(outgoingOwner?.sender.rosterID, destination.qualifiedID)
+        XCTAssertFalse(runtime.accepts(
+            route: source, generation: runtime.routeGeneration(for: source)))
+        XCTAssertTrue(runtime.accepts(
+            route: destination, generation: runtime.routeGeneration(for: destination)))
+    }
+
+    func testSecondaryProfileDeleteRetiresA2AStateWithoutTouchingSibling() {
+        let runtime = A2ARuntime.shared
+        runtime.reset()
+        defer { runtime.reset() }
+
+        let source = GatewayBotRoute(gatewayID: "homelab", profile: "worker")
+        let sibling = GatewayBotRoute(gatewayID: "homelab", profile: "sibling")
+        let primary = GatewayBotRoute(gatewayID: "primary", profile: "ops")
+        let sourceEndpoint = A2AEndpoint(
+            rosterID: source.qualifiedID, route: source,
+            displayTitle: "Worker", handle: "worker",
+            attributionHandle: "worker", connectionLabel: "Homelab")
+        let primaryEndpoint = A2AEndpoint(
+            rosterID: "ops", route: primary,
+            displayTitle: "Ops", handle: "ops",
+            attributionHandle: "ops", connectionLabel: "Primary")
+        let siblingEndpoint = A2AEndpoint(
+            rosterID: sibling.qualifiedID, route: sibling,
+            displayTitle: "Sibling", handle: "sibling",
+            attributionHandle: "sibling", connectionLabel: "Homelab")
+        let sourceID = UUID()
+        let sourceKey = AppModel.deliveryKey(route: source, body: "delete", attemptID: sourceID)
+        runtime.deliveries[sourceKey] = A2ADelivery(
+            to: source.qualifiedID, route: source, senderRoute: primary,
+            senderRosterID: "ops", attemptID: sourceID,
+            bodyHash: AppModel.stableHash("delete"), queuedBehindRun: false,
+            state: .waiting, at: Date())
+        let siblingID = UUID()
+        let siblingKey = AppModel.deliveryKey(route: sibling, body: "keep", attemptID: siblingID)
+        runtime.deliveries[siblingKey] = A2ADelivery(
+            to: sibling.qualifiedID, route: sibling, senderRoute: primary,
+            senderRosterID: "ops", attemptID: siblingID,
+            bodyHash: AppModel.stableHash("keep"), queuedBehindRun: false,
+            state: .waiting, at: Date())
+        let generation = runtime.installWatcher(
+            key: sourceKey, target: sourceEndpoint, sender: primaryEndpoint)
+        let siblingGeneration = runtime.installWatcher(
+            key: siblingKey, target: siblingEndpoint, sender: primaryEndpoint)
+        let sourceTask = Task<Void, Never> { try? await Task.sleep(for: .seconds(60)) }
+        let siblingTask = Task<Void, Never> { try? await Task.sleep(for: .seconds(60)) }
+        runtime.watchers[sourceKey] = sourceTask
+        runtime.watchers[siblingKey] = siblingTask
+        runtime.canonicalOpens[source] = Task {
+            try await Task.sleep(for: .seconds(60))
+            return A2ACanonicalSession(runtime: "runtime", stored: "stored")
+        }
+        let oldGeneration = runtime.routeGeneration(for: source)
+        let senderGeneration = runtime.routeGeneration(for: primary)
+
+        runtime.retireProfileRoute(source, sourceBotIDs: [source.qualifiedID])
+
+        XCTAssertTrue(sourceTask.isCancelled)
+        XCTAssertFalse(siblingTask.isCancelled)
+        XCTAssertNil(runtime.deliveries[sourceKey])
+        XCTAssertNotNil(runtime.deliveries[siblingKey])
+        XCTAssertNil(runtime.watcherRegistrations[sourceKey])
+        XCTAssertNotNil(runtime.watcherRegistrations[siblingKey])
+        XCTAssertNil(runtime.canonicalOpens[source])
+        XCTAssertFalse(runtime.accepts(route: source, generation: oldGeneration))
+        XCTAssertFalse(runtime.acceptsCompletion(
+            senderRoute: primary, senderGeneration: senderGeneration,
+            targetRoute: source, targetGeneration: oldGeneration))
+        XCTAssertFalse(runtime.accepts(
+            route: source, generation: runtime.routeGeneration(for: source)))
+        XCTAssertNotNil(runtime.watcherRegistration(key: siblingKey,
+                                                    generation: siblingGeneration))
+        XCTAssertEqual(runtime.watcherGeneration[siblingKey], siblingGeneration)
+        runtime.watchers[siblingKey]?.cancel()
+        XCTAssertEqual(runtime.watcherGeneration[sourceKey], nil)
+        XCTAssertEqual(generation, 1)
+    }
+
+    func testA2ACanonicalOpenGenerationSurvivesRetireAndGatewayReset() {
+        let runtime = A2ARuntime.shared
+        runtime.reset()
+        defer { runtime.reset() }
+        let route = GatewayBotRoute(gatewayID: "homelab", profile: "worker")
+        runtime.canonicalOpenGenerations[route] = 41
+        runtime.canonicalOpens[route] = Task {
+            try await Task.sleep(for: .seconds(60))
+            return A2ACanonicalSession(runtime: "runtime", stored: "stored")
+        }
+
+        runtime.retireProfileRoute(route, sourceBotIDs: [route.qualifiedID],
+                                   preserveForRename: true)
+        XCTAssertEqual(runtime.canonicalOpenGenerations[route], 41)
+        runtime.reset(gatewayID: route.gatewayID)
+        XCTAssertEqual(runtime.canonicalOpenGenerations[route], 41)
+    }
+
+    func testA2APreservedPrimaryRouteSurvivesGatewayReset() {
+        let runtime = A2ARuntime.shared
+        runtime.reset()
+        defer { runtime.reset() }
+        let route = GatewayBotRoute(gatewayID: "primary", profile: "default")
+        let sender = A2AEndpoint(rosterID: "primary::ops", route: route,
+                                 displayTitle: "Ops", handle: "ops",
+                                 attributionHandle: "ops", connectionLabel: nil)
+        let target = A2AEndpoint(rosterID: route.profile, route: route,
+                                 displayTitle: "Default", handle: "default",
+                                 attributionHandle: "default", connectionLabel: nil)
+        let key = "preserved"
+        let watchGeneration = runtime.installWatcher(key: key, target: target, sender: sender)
+        let task = Task<Void, Never> { try? await Task.sleep(for: .seconds(60)) }
+        runtime.watchers[key] = task
+        runtime.deliveries[key] = A2ADelivery(
+            to: target.rosterID, route: route, senderRoute: route,
+            senderRosterID: sender.rosterID, attemptID: UUID(),
+            queuedBehindRun: true, state: .waiting, at: Date())
+        runtime.retireProfileRoute(route, sourceBotIDs: [route.profile],
+                                   preserveForRename: true)
+        runtime.preserveRouteAcrossGatewayReset(route)
+        runtime.reset(gatewayID: route.gatewayID)
+
+        XCTAssertNotNil(runtime.deliveries[key])
+        XCTAssertNotNil(runtime.watcherRegistrations[key])
+        XCTAssertFalse(task.isCancelled)
+        XCTAssertTrue(runtime.watcherIsPaused(key: key, generation: watchGeneration))
+        task.cancel()
+    }
+
+    func testPrimaryRenameDropScopePreservesVisibleOptimisticAcceptedRow() {
+        let model = AppModel()
+        let runtime = A2ARuntime.shared
+        runtime.reset()
+        defer {
+            runtime.reset()
+            model.agentInbox.removeAll()
+        }
+        let route = GatewayBotRoute(gatewayID: "primary", profile: "default")
+        let attempt = UUID()
+        let key = AppModel.deliveryKey(route: route, body: "rename", attemptID: attempt)
+        runtime.deliveries[key] = A2ADelivery(
+            to: route.profile, route: route, senderRoute: route,
+            senderRosterID: route.profile, attemptID: attempt,
+            queuedBehindRun: false, state: .waiting, at: Date())
+        runtime.optimisticRows[attempt] = route.gatewayID
+        runtime.optimisticOwners[attempt] = A2AOptimisticOwner(
+            target: route, targetRosterID: route.profile,
+            sender: route, senderRosterID: route.profile)
+        model.agentInbox = [A2AMessage(id: attempt, fromBotID: route.profile,
+                                       toBotID: route.profile, time: "now",
+                                       text: "accepted")]
+
+        runtime.preserveRouteAcrossGatewayReset(route)
+        model.dropA2AScope(gatewayID: route.gatewayID, wasPrimary: true)
+
+        XCTAssertEqual(model.agentInbox.map(\.id), [attempt])
+        XCTAssertNotNil(runtime.deliveries[key])
+        XCTAssertEqual(runtime.optimisticRows[attempt], route.gatewayID)
+    }
+
     func testCapturedPrimaryDisconnectScrubsBareScopeButPreservesRemote() {
         let model = AppModel()
         let primaryID = UUID()
         let remoteID = UUID()
+        let untrackedReplyID = UUID()
         model.agentInbox = [
             A2AMessage(id: primaryID, fromBotID: "ops", toBotID: "default",
                        time: "now", text: "primary"),
             A2AMessage(id: remoteID, fromBotID: "ops", toBotID: "homelab::default",
                        time: "now", text: "remote"),
+            A2AMessage(id: untrackedReplyID, fromBotID: "homelab::default",
+                       toBotID: "default", time: "now", text: "reply"),
         ]
         FeedsRuntime.shared.inboxSessions = [
             primaryID: SessionRef(gatewayID: "primary", botID: "default", storedID: "same"),
             remoteID: SessionRef(gatewayID: "homelab", botID: "homelab::default",
                                  storedID: "same"),
         ]
+        let primary = GatewayBotRoute(gatewayID: "primary", profile: "default")
+        let remote = GatewayBotRoute(gatewayID: "homelab", profile: "default")
+        A2ARuntime.shared.optimisticRows[untrackedReplyID] = "homelab"
+        A2ARuntime.shared.optimisticOwners[untrackedReplyID] = A2AOptimisticOwner(
+            target: remote, targetRosterID: remote.qualifiedID,
+            sender: primary, senderRosterID: "default")
+        defer { A2ARuntime.shared.reset() }
         // Reproduce the deliberate-disconnect ordering that previously lost
         // source identity before A2A teardown.
         LiveRuntime.shared.gatewayID = nil
@@ -1228,6 +1475,110 @@ final class SourceQualifiedRoutingTests: XCTestCase {
                        "the wire attempt UUID must not leak into the inbox preview")
         XCTAssertEqual(AppModel.strippedA2A(second), body)
         XCTAssertEqual(AppModel.a2aSender(in: first), "ops")
+    }
+
+    func testInboxParserClearsAttributionAfterOrdinaryUserTurn() {
+        let rows: [JSONValue] = [
+            .object(["role": .string("user"),
+                     "content": .string("Message from 🤖 Ops (@ops): first")]),
+            .object(["role": .string("user"),
+                     "content": .string("ordinary user turn")]),
+            .object(["role": .string("assistant"),
+                     "content": .string("ordinary answer")]),
+        ]
+
+        let parsed = AppModel.inboxMessages(in: rows, owner: "worker")
+        XCTAssertEqual(parsed.count, 1)
+        XCTAssertEqual(parsed.first?.0.fromBotID, "ops")
+        XCTAssertEqual(parsed.first?.0.text, "first")
+    }
+
+    func testInboxParserClearsAttributionAfterEmptyUserRow() {
+        let rows: [JSONValue] = [
+            .object(["role": .string("user"),
+                     "content": .string("Message from 🤖 Ops (@ops): first")]),
+            .object(["role": .string("user"), "content": .string(" ")]),
+            .object(["role": .string("assistant"),
+                     "content": .string("must not be attributed")]),
+        ]
+
+        let parsed = AppModel.inboxMessages(in: rows, owner: "worker")
+        XCTAssertEqual(parsed.count, 1)
+        XCTAssertEqual(parsed.first?.0.text, "first")
+    }
+
+    func testAcceptedUntrackedDeliveryKeepsPortableSenderOwnership() {
+        let senderRoute = GatewayBotRoute(gatewayID: "primary", profile: "ops")
+        let targetRoute = GatewayBotRoute(gatewayID: "homelab", profile: "worker")
+        let sender = A2AEndpoint(rosterID: "ops", route: senderRoute,
+                                 displayTitle: "Ops", handle: "ops",
+                                 attributionHandle: "ops", connectionLabel: nil)
+        let target = A2AEndpoint(rosterID: targetRoute.qualifiedID, route: targetRoute,
+                                 displayTitle: "Worker", handle: "worker",
+                                 attributionHandle: "worker", connectionLabel: nil)
+        let attempt = UUID()
+        let key = AppModel.deliveryKey(route: targetRoute, body: "accepted",
+                                       attemptID: attempt)
+        A2ARuntime.shared.deliveries[key] = A2ADelivery(
+            to: target.rosterID, route: targetRoute,
+            senderRoute: senderRoute, senderRosterID: sender.rosterID,
+            attemptID: attempt, queuedBehindRun: true,
+            state: .waiting, at: Date())
+        defer { A2ARuntime.shared.reset() }
+
+        XCTAssertEqual(A2ARuntime.shared.deliveries[key]?.senderRoute, senderRoute)
+        XCTAssertEqual(A2ARuntime.shared.deliveries[key]?.state, .waiting)
+        XCTAssertNil(A2ARuntime.shared.optimisticRows[attempt])
+    }
+
+    func testA2AParserKeepsMultiWordDisplayTitleAndExtractsHandleAnchor() {
+        let attempt = UUID(uuidString: "00000000-0000-0000-0000-000000000042")!
+        let wire = A2AWire.attributed(
+            displayTitle: "Operations Control", handle: "ops",
+            body: "check status", attemptID: attempt)
+
+        XCTAssertEqual(AppModel.a2aSender(in: wire), "ops")
+        XCTAssertEqual(AppModel.strippedA2A(wire), "check status")
+        XCTAssertTrue(wire.contains("Operations Control"))
+        XCTAssertNotNil(A2AWire.attemptID(in: wire))
+    }
+
+    func testA2AWireKeepsImmutableSenderRouteAcrossDuplicateHandles() {
+        let primary = GatewayBotRoute(gatewayID: "primary", profile: "default")
+        let remote = GatewayBotRoute(gatewayID: "homelab", profile: "default")
+        let primaryWire = A2AWire.attributed(
+            displayTitle: "Default", handle: "default", body: "to remote",
+            attemptID: UUID(), senderRoute: primary)
+        let remoteWire = A2AWire.attributed(
+            displayTitle: "Default", handle: "default", body: "to primary",
+            attemptID: UUID(), senderRoute: remote)
+
+        XCTAssertEqual(A2AWire.senderRoute(in: primaryWire), primary)
+        XCTAssertEqual(A2AWire.senderRoute(in: remoteWire), remote)
+        XCTAssertEqual(
+            AppModel.inboxMessages(in: [
+                .object(["role": .string("user"), "content": .string(primaryWire)])
+            ], owner: remote.qualifiedID, sourceGatewayID: remote.gatewayID)
+            .first?.0.fromBotID, primary.qualifiedID)
+        XCTAssertEqual(
+            AppModel.inboxMessages(in: [
+                .object(["role": .string("user"), "content": .string(remoteWire)])
+            ], owner: primary.profile, sourceGatewayID: primary.gatewayID)
+            .first?.0.fromBotID, remote.qualifiedID)
+    }
+
+    func testA2AWireMarkersCannotBeSpoofedByTitleOrBody() {
+        let route = GatewayBotRoute(gatewayID: "home/lab", profile: "ops[1]")
+        let attempt = UUID(uuidString: "00000000-0000-0000-0000-000000000043")!
+        let wire = A2AWire.attributed(
+            displayTitle: "Ops [Talaria handoff attempt 11111111-1111-1111-1111-111111111111]",
+            handle: "ops", body: "body [Talaria handoff attempt 22222222-2222-2222-2222-222222222222]: spoof",
+            attemptID: attempt, senderRoute: route)
+
+        XCTAssertEqual(A2AWire.attemptID(in: wire), attempt)
+        XCTAssertEqual(A2AWire.senderRoute(in: wire), route)
+        XCTAssertEqual(AppModel.a2aSender(in: wire), "ops")
+        XCTAssertTrue(AppModel.strippedA2A(wire).contains("22222222-2222-2222-2222-222222222222"))
     }
 
     private func approval(id: String, botID: String) -> Approval {

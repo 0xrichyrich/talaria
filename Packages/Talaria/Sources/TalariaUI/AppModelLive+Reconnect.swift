@@ -620,11 +620,24 @@ extension AppModel {
     private func flushWorldForGatewaySwitch() {
         if let departingGatewayID = LiveRuntime.shared.gatewayID {
             ChatRuntime.shared.clearPendingStops(forGatewayID: departingGatewayID)
+            let primaryBots = Set(chats.keys.filter {
+                stateRoute(for: $0)?.gatewayID == departingGatewayID
+                    || (GatewayBotRoute(qualifiedID: $0)?.gatewayID == departingGatewayID)
+            })
+            ChatRuntime.shared.retirePrimaryMutationState(
+                gatewayID: departingGatewayID, botIDs: primaryBots)
         }
         preservePrimaryUnreadForGatewaySwitch()
         let remoteChats = chats.filter { GatewayBotRoute(qualifiedID: $0.key) != nil }
         let remoteApprovals = approvals.filter { GatewayBotRoute(qualifiedID: $0.botID) != nil }
-        let remoteQueue = composeQueue.filter { GatewayBotRoute(qualifiedID: $0.botID) != nil }
+        normalizeComposeQueueIDs()
+        let retainedQueue = zip(composeQueue, composeQueueIDs).filter {
+            GatewayBotRoute(qualifiedID: $0.0.botID) != nil
+        }
+        let remoteQueue = retainedQueue.map { $0.0 }
+        let remoteQueueIDs = retainedQueue.map { $0.1 }
+        let remoteQueueIDSet = Set(remoteQueueIDs)
+        let remoteQueueBindings = composeQueueBindings.filter { remoteQueueIDSet.contains($0.key) }
         let remoteOpenBot = openBotID.flatMap {
             GatewayBotRoute(qualifiedID: $0) == nil ? nil : $0
         }
@@ -632,6 +645,12 @@ extension AppModel {
         chats = remoteChats
         approvals = remoteApprovals
         composeQueue = remoteQueue
+        composeQueueIDs = remoteQueueIDs
+        composeQueueBindings = remoteQueueBindings
+        ChatRuntime.shared.offlineComposeFences =
+            ChatRuntime.shared.offlineComposeFences.filter { _, fence in
+                GatewayBotRoute(qualifiedID: fence.botID) != nil
+            }
         openBotID = remoteOpenBot
         let runtime = LiveRuntime.shared
         runtime.lastSessionByBot = runtime.lastSessionByBot.filter {

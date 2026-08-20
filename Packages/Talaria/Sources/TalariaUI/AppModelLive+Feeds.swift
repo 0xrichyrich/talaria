@@ -1088,23 +1088,39 @@ public extension AppModel {
     }
 
     /// Split one inbox transcript into attributed A2A rows.
-    static func inboxMessages(in rows: [JSONValue], owner: String) -> [(A2AMessage, Date)] {
+    static func inboxMessages(in rows: [JSONValue], owner: String,
+                              sourceGatewayID: String? = nil) -> [(A2AMessage, Date)] {
         var out: [(A2AMessage, Date)] = []
         var lastSender: String?
         var lastAttemptID: UUID?
-        for row in rows {
+        let orderedRows = rows.enumerated().sorted { left, right in
+            let lhs = HermesTime.date(left.element["timestamp"]) ?? .distantPast
+            let rhs = HermesTime.date(right.element["timestamp"]) ?? .distantPast
+            return lhs == rhs ? left.offset < right.offset : lhs < rhs
+        }.map(\.element)
+        for row in orderedRows {
             let role = row["role"]?.stringValue ?? ""
             guard role == "user" || role == "assistant" else { continue }
             let text = ArtifactScan.text(of: row).trimmingCharacters(in: .whitespacesAndNewlines)
+            if role == "user" {
+                // Even an empty ordinary user row terminates the prior
+                // attributed turn; never let a later assistant inherit it.
+                lastSender = nil
+                lastAttemptID = nil
+            }
             guard !text.isEmpty else { continue }
             let at = HermesTime.date(row["timestamp"]) ?? Date()
             let time = shortTime(at.timeIntervalSince1970)
             if role == "user" {
                 guard let sender = a2aSender(in: text) else { continue }
-                lastSender = sender
+                let immutableSenderRoute = A2AWire.senderRoute(in: text)
+                lastSender = immutableSenderRoute?.qualifiedID ?? sourceGatewayID.flatMap { gatewayID in
+                    guard gatewayID != LiveRuntime.shared.gatewayID else { return sender }
+                    return GatewayBotRoute(gatewayID: gatewayID, profile: sender).qualifiedID
+                } ?? sender
                 lastAttemptID = A2AWire.attemptID(in: text)
                 out.append((A2AMessage(id: lastAttemptID ?? UUID(),
-                                       fromBotID: sender, toBotID: owner, time: time,
+                                       fromBotID: lastSender ?? sender, toBotID: owner, time: time,
                                        text: strippedA2A(text)), at))
             } else if let sender = lastSender {
                 // The owner's reply goes back to whoever last wrote in.
@@ -1140,25 +1156,73 @@ public extension AppModel {
     /// Sender handle from "Message from 🤖 <name> (@<handle>): …" or the older
     /// "Message from agent '<name>'" form.
     static func a2aSender(in text: String) -> String? {
-        guard let range = text.range(of: #"^Message from (?:agent '[^']+'|🤖\s*[^\s(@:]+)"#,
-                                     options: [.regularExpression, .caseInsensitive]) else { return nil }
+        guard text.range(of: #"^Message from (?:agent '[^']+'|🤖)"#,
+                         options: [.regularExpression, .caseInsensitive]) != nil else {
+            return nil
+        }
+        // Restrict identity markers to the attributed prefix. This prevents a
+        // body mentioning another handle from changing sender ownership.
+        let attributionPrefix: String = {
+            guard let marker = text.range(
+                of: #"^Message from .*?\[Talaria handoff attempt [0-9a-fA-F-]{36}\]:"#,
+                options: .regularExpression) else { return text }
+            guard let markerStart = text[..<marker.upperBound].lastIndex(of: "[") else {
+                return text
+            }
+            return String(text[..<markerStart])
+        }()
+        if let handleRange = attributionPrefix.range(of: #"\(@[^)\s]+\)"#,
+                                        options: .regularExpression) {
+            let marker = attributionPrefix[handleRange]
+            return String(marker.dropFirst(2).dropLast()).lowercased()
+        }
+        if text.range(of: #"^Message from agent '"#,
+                      options: [.regularExpression, .caseInsensitive]) != nil {
+            return legacyA2ASender(in: text)
+        }
+        guard let emoji = attributionPrefix.range(of: "🤖") else { return nil }
+        var display = String(attributionPrefix[emoji.upperBound...]).trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        for delimiter in ["(@", "[Talaria handoff attempt", ":"] {
+            if let boundary = display.range(of: delimiter) {
+                display = String(display[..<boundary.lowerBound])
+                break
+            }
+        }
+        return display.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func legacyA2ASender(in text: String) -> String? {
+        guard let range = text.range(of: #"^Message from agent '[^']+'"#,
+                                     options: [.regularExpression, .caseInsensitive]) else {
+            return nil
+        }
         let head = String(text[range])
         if let quoted = head.range(of: #"'[^']+'"#, options: .regularExpression) {
             return String(head[quoted]).trimmingCharacters(in: CharacterSet(charactersIn: "'")).lowercased()
         }
-        let name = head.replacingOccurrences(of: "Message from", with: "", options: .caseInsensitive)
-            .replacingOccurrences(of: "🤖", with: "")
-            .trimmingCharacters(in: .whitespaces)
-        return name.isEmpty ? nil : name.lowercased()
+        return nil
     }
 
     /// The message with its attribution prefix removed.
     static func strippedA2A(_ text: String) -> String {
-        guard let range = text.range(of: #"^Message from (?:agent '[^']+'|🤖[^:]+):\s*"#,
-                                     options: [.regularExpression, .caseInsensitive]) else {
+        guard text.range(of: #"^Message from (?:agent '[^']+'|🤖)"#,
+                         options: [.regularExpression, .caseInsensitive]) != nil else {
             return previewLine(text)
         }
-        return String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if let marker = text.range(of: #"^Message from .*?\[Talaria handoff attempt [0-9a-fA-F-]{36}\]:\s*"#,
+                                   options: .regularExpression) {
+            return String(text[marker.upperBound...]).trimmingCharacters(
+                in: .whitespacesAndNewlines)
+        }
+        if let handle = text.range(of: #"\(@[^)\s]+\)\s*:\s*"#,
+                                   options: .regularExpression) {
+            return String(text[handle.upperBound...]).trimmingCharacters(
+                in: .whitespacesAndNewlines)
+        }
+        guard let colon = text.firstIndex(of: ":") else { return previewLine(text) }
+        return String(text[text.index(after: colon)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

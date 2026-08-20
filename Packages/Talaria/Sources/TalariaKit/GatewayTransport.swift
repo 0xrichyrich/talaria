@@ -116,24 +116,27 @@ public actor GatewayTransport {
             throw GatewayError(code: -4, message: "encode failure")
         }
 
-        try await task.send(.string(text))
-
-        return try await withThrowingTaskGroup(of: JSONValue.self) { group in
-            group.addTask {
-                try await withCheckedThrowingContinuation { cont in
-                    Task { await self.registerPending(id: id, cont) }
+        // Install the continuation before the socket send. A fast response
+        // (or a send failure) must always find and settle its exact waiter.
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<JSONValue, Error>) in
+                pending[id] = cont
+                Task {
+                    do {
+                        try await task.send(.string(text))
+                    } catch {
+                        await self.failPending(id: id, error: error)
+                    }
+                }
+                Task {
+                    try? await Task.sleep(for: .seconds(timeout))
+                    await self.failPending(id: id, error: GatewayError(
+                        code: -5, message: "request timed out: \(method)"))
                 }
             }
-            group.addTask {
-                try await Task.sleep(for: .seconds(timeout))
-                await self.failPending(id: id, error: GatewayError(code: -5, message: "request timed out: \(method)"))
-                throw GatewayError(code: -5, message: "request timed out: \(method)")
-            }
-            guard let first = try await group.next() else {
-                throw GatewayError(code: -6, message: "request cancelled")
-            }
-            group.cancelAll()
-            return first
+        } onCancel: {
+            Task { await self.failPending(id: id,
+                                          error: GatewayError(code: -6, message: "request cancelled")) }
         }
     }
 

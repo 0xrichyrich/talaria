@@ -91,6 +91,17 @@ public final class WorkspaceRuntime {
         self.gatewayID == gatewayID && self.generation == generation
     }
 
+    /// A process-kill completion may mutate the visible list only while the
+    /// exact gateway generation, list request, selected target, and published
+    /// target are still the ones captured before the RPC began.
+    func matchesProcessKill(gatewayID: String, generation: UInt64,
+                            request: UInt64, targetID: String) -> Bool {
+        matches(gatewayID, generation)
+            && processRequest == request
+            && processTargetID == targetID
+            && processesTargetID == targetID
+    }
+
     func beginFileRequest() -> UInt64 { fileRequest &+= 1; return fileRequest }
     func beginGitRequest() -> UInt64 { gitRequest &+= 1; return gitRequest }
     func beginProcessRequest() -> UInt64 { processRequest &+= 1; return processRequest }
@@ -1336,14 +1347,29 @@ public extension AppModel {
         }
         defer { runtime.releaseMutation(owner) }
         let generation = runtime.generation
+        // The process list is a separately requested, target-qualified read.
+        // Capture its request before the kill awaits: a target picker change
+        // can invalidate the list while the POST is in flight, and an accepted
+        // response must never remove a row from the replacement target or
+        // trigger a refresh that publishes against a newer request.
+        let processRequest = runtime.processRequest
         do {
             try await routedClient(for: target.route)
                 .killProcess(sessionID: target.sessionID, processID: process.id)
-            guard runtime.matches(target.route.gatewayID, generation) else { return }
+            guard runtime.matchesProcessKill(gatewayID: target.route.gatewayID,
+                                             generation: generation,
+                                             request: processRequest,
+                                             targetID: id) else { return }
             runtime.processes.removeAll { $0.id == process.id }
+            // Refresh using the exact target captured at acceptance. The
+            // helper increments processRequest, so any completion from this
+            // operation remains fenced from a subsequent picker selection.
             await refreshWorkspaceProcesses(targetID: id)
         } catch {
-            guard runtime.matches(target.route.gatewayID, generation) else { return }
+            guard runtime.matchesProcessKill(gatewayID: target.route.gatewayID,
+                                             generation: generation,
+                                             request: processRequest,
+                                             targetID: id) else { return }
             if workspaceMutationOutcomeIsUncertain(error) {
                 runtime.commandUncertain = "stop process \(process.id) on \(target.discriminator)"
             }

@@ -35,6 +35,7 @@ final class MultiGatewayRuntime {
     }
 
     var routedEvents: [String: RoutedEvents] = [:]
+    var routedEventGenerations: [String: UInt64] = [:]
     /// Unread counts for bots whose gateway is not currently primary.
     /// Primary rows keep the existing `Bot.unread` storage for compatibility;
     /// gateway switches move counts between the two representations.
@@ -152,9 +153,18 @@ public extension AppModel {
         } else {
             await detachRoutedEvents(gatewayID: gatewayID)
         }
+        runtime.routedEventGenerations[gatewayID, default: 0] &+= 1
+        let generation = runtime.routedEventGenerations[gatewayID, default: 0]
 
         let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
         let handlerID = await client.addEventHandler { continuation.yield($0) }
+        let currentClient = await ConnectionRegistry.shared.clientPool.client(for: gatewayID)
+        guard runtime.routedEventGenerations[gatewayID] == generation,
+              runtime.routedEvents[gatewayID] == nil,
+              currentClient.map(ObjectIdentifier.init) == ObjectIdentifier(client) else {
+            await client.removeEventHandler(handlerID)
+            return
+        }
         let pump = Task { @MainActor [weak self] in
             for await event in stream {
                 guard let self else { return }
@@ -209,7 +219,8 @@ public extension AppModel {
         SessionsRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
     }
 
-    private func removeRoutedEventSubscription(gatewayID: String) async {
+    func removeRoutedEventSubscription(gatewayID: String) async {
+        MultiGatewayRuntime.shared.routedEventGenerations[gatewayID, default: 0] &+= 1
         if let subscription = MultiGatewayRuntime.shared.routedEvents.removeValue(
             forKey: gatewayID) {
             subscription.pump.cancel()

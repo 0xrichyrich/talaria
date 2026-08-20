@@ -506,6 +506,57 @@ final class WorkspaceCommandCenterTests: XCTestCase {
         runtime.resetProcesses(targetID: nil)
     }
 
+    @MainActor
+    func testProcessKillCompletionFenceRequiresExactRequestGatewayAndTargets() {
+        let runtime = WorkspaceRuntime.shared
+        let previousGatewayID = runtime.gatewayID
+        let previousGeneration = runtime.generation
+        let previousRequest = runtime.processRequest
+        let previousTargetID = runtime.processTargetID
+        let previousProcessesTargetID = runtime.processesTargetID
+        let previousProcesses = runtime.processes
+        defer {
+            runtime.gatewayID = previousGatewayID
+            runtime.generation = previousGeneration
+            runtime.processRequest = previousRequest
+            runtime.processTargetID = previousTargetID
+            runtime.processesTargetID = previousProcessesTargetID
+            runtime.processes = previousProcesses
+        }
+
+        runtime.gatewayID = "gateway-a"
+        runtime.generation = 23
+        let request = runtime.resetProcesses(targetID: "target-a")
+        runtime.processesTargetID = "target-a"
+
+        XCTAssertTrue(runtime.matchesProcessKill(
+            gatewayID: "gateway-a", generation: 23,
+            request: request, targetID: "target-a"
+        ))
+        XCTAssertFalse(runtime.matchesProcessKill(
+            gatewayID: "gateway-b", generation: 23,
+            request: request, targetID: "target-a"
+        ))
+        XCTAssertFalse(runtime.matchesProcessKill(
+            gatewayID: "gateway-a", generation: 24,
+            request: request, targetID: "target-a"
+        ))
+        XCTAssertFalse(runtime.matchesProcessKill(
+            gatewayID: "gateway-a", generation: 23,
+            request: request &+ 1, targetID: "target-a"
+        ))
+        XCTAssertFalse(runtime.matchesProcessKill(
+            gatewayID: "gateway-a", generation: 23,
+            request: request, targetID: "target-b"
+        ))
+
+        runtime.processesTargetID = "target-b"
+        XCTAssertFalse(runtime.matchesProcessKill(
+            gatewayID: "gateway-a", generation: 23,
+            request: request, targetID: "target-a"
+        ))
+    }
+
     func testCommandCenterDispatchSurfaceStaysUnavailableDespiteCatalogCapability() {
         XCTAssertFalse(WorkspaceCommandSurfacePolicy.exposesDispatch(capability: nil))
         XCTAssertFalse(WorkspaceCommandSurfacePolicy.exposesDispatch(capability: false))

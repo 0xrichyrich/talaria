@@ -492,6 +492,43 @@ final class RoomStoreTests: XCTestCase {
         _ = try await fresh.loadAll()
     }
 
+    func testProfileRouteRetirementMovesSeatAndSettlesDurableWork() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let source = GatewayBotRoute(gatewayID: "mini", profile: "old")
+        let sibling = GatewayBotRoute(gatewayID: "lab", profile: "peer")
+        let thread = RoomThread()
+        let attempt = RoomAttempt(threadID: thread.id, member: source, epoch: 1,
+                                  promptText: "pending", storedSessionID: "stored",
+                                  runtimeSessionID: "runtime", state: .working)
+        let room = RoomRecord(name: "Fleet", members: [
+            RoomMember(route: source), RoomMember(route: sibling)
+        ], threads: [thread], entries: [
+            RoomEntry(threadID: thread.id, speaker: .user, speakerName: "You", text: "go")
+        ], attempts: [attempt], drives: [
+            RoomDriveState(threadID: thread.id, epoch: 1,
+                           roundMembers: [source, sibling], nextMemberIndex: 1)
+        ], epoch: 1)
+        let mutation = RoomMetadataMutation(route: source, kind: .rename,
+                                            oldName: "Fleet", newName: "Fleet 2")
+        let store = RoomStore(baseDirectory: base)
+        try await store.upsert(room, metadataMutations: [mutation])
+
+        _ = try await store.retireProfileRoute(source)
+        let retiredValue = try await store.room(id: room.id)
+        let retired = try XCTUnwrap(retiredValue)
+        XCTAssertEqual(retired.members.map(\.route), [sibling])
+        XCTAssertEqual(retired.formerMembers.map(\.route), [source])
+        XCTAssertEqual(retired.attempts.first?.state, .cancelled)
+        XCTAssertNotNil(retired.attempts.first?.finishedAt)
+        XCTAssertTrue(retired.drives.isEmpty)
+        let pending = try await store.metadataOutbox()
+        XCTAssertTrue(pending.isEmpty)
+        let retiredRoutes = try await store.retiredMetadataRoutes()
+        XCTAssertEqual(retiredRoutes, [source])
+        XCTAssertNoThrow(try RoomEngine.validate(retired))
+    }
+
     func testMetadataRenamePreservesOrderedLegacyProjectionAndDedupes() {
         let renamed = BotModeMeta.replacingGroup("A", with: "C", in: ["A", "B"])
         XCTAssertEqual(renamed, ["C", "B"])

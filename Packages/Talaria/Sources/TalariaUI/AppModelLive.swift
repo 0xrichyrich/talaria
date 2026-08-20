@@ -140,19 +140,28 @@ extension AppModel {
         if !ConnectionSupervisor.shared.isReconnecting {
             runtime.reconnectParkedSessionIDs.removeAll()
         }
+        let departingGatewayID = runtime.gatewayID
+        if !ConnectionSupervisor.shared.isReconnecting, let departingGatewayID {
+            let primaryBots = Set(chats.keys.filter {
+                stateRoute(for: $0)?.gatewayID == departingGatewayID
+                    || GatewayBotRoute(qualifiedID: $0)?.gatewayID == departingGatewayID
+            })
+            ChatRuntime.shared.clearPendingStops(forGatewayID: departingGatewayID)
+            ChatRuntime.shared.retirePrimaryMutationState(
+                gatewayID: departingGatewayID, botIDs: primaryBots)
+            reconcileComposeQueueIDs(sources: primaryBots, destination: nil)
+        }
         runtime.generation += 1
         runtime.reconnectTask?.cancel(); runtime.reconnectTask = nil
         runtime.monitorTask?.cancel(); runtime.monitorTask = nil
         runtime.eventPump?.cancel(); runtime.eventPump = nil
         if let gatewayID = runtime.gatewayID { dropApprovalScope(gatewayID: gatewayID) }
-        if !ConnectionSupervisor.shared.isReconnecting,
-           let departingGatewayID = runtime.gatewayID {
-            ChatRuntime.shared.clearPendingStops(forGatewayID: departingGatewayID)
-        }
         runtime.resetSessionState()
         // Session ids are per-gateway; a pin from the previous one resolves to
         // nothing (or worse, something else) here.
-        CanonicalChatRuntime.shared.resetPrimaryScope()
+        CanonicalChatRuntime.shared.resetPrimaryScope(
+            retainAmbiguousForReconnect: ConnectionSupervisor.shared.isReconnecting,
+            retainLocalPins: ConnectionSupervisor.shared.isReconnecting)
         // Switching gateways reaches here WITHOUT going through
         // disconnectGateway (switchGateway calls connectGateway directly), so
         // the per-gateway caches have to be dropped on both paths. Done before
@@ -215,13 +224,20 @@ extension AppModel {
     public func disconnectGateway() async {
         let runtime = LiveRuntime.shared
         let departingGatewayID = runtime.gatewayID
+        let departingPrimaryBots = Set(chats.keys.filter {
+            stateRoute(for: $0)?.gatewayID == departingGatewayID
+                || (GatewayBotRoute(qualifiedID: $0)?.gatewayID == departingGatewayID)
+        })
         runtime.generation += 1
         runtime.reconnectTask?.cancel(); runtime.reconnectTask = nil
         runtime.monitorTask?.cancel(); runtime.monitorTask = nil
         runtime.eventPump?.cancel(); runtime.eventPump = nil
         if let gatewayID = departingGatewayID { dropApprovalScope(gatewayID: gatewayID) }
-        if let departingGatewayID {
+        if let departingGatewayID,
+           !ConnectionSupervisor.shared.isReconnecting {
             ChatRuntime.shared.clearPendingStops(forGatewayID: departingGatewayID)
+            ChatRuntime.shared.retirePrimaryMutationState(
+                gatewayID: departingGatewayID, botIDs: departingPrimaryBots)
         }
         runtime.resetSessionState()
         // Teardown while both the captured source id and its client still
@@ -238,7 +254,9 @@ extension AppModel {
         }
         runtime.baseURL = nil
         runtime.gatewayID = nil
-        runtime.reconnectParkedSessionIDs.removeAll()
+        if !ConnectionSupervisor.shared.isReconnecting {
+            runtime.reconnectParkedSessionIDs.removeAll()
+        }
         client = nil
         isOffline = false
         // Each area's router owns state belonging to *that* gateway. Without
@@ -258,7 +276,9 @@ extension AppModel {
         // Canonical-chat pins name sessions in THIS gateway's per-profile
         // state.db; carrying them to the next gateway would resume ids that
         // mean nothing there.
-        CanonicalChatRuntime.shared.resetPrimaryScope()
+        CanonicalChatRuntime.shared.resetPrimaryScope(
+            retainAmbiguousForReconnect: ConnectionSupervisor.shared.isReconnecting,
+            retainLocalPins: ConnectionSupervisor.shared.isReconnecting)
         // ~11 MB of decoded spritesheets and a per-profile pet cache belong to
         // the gateway that served them, not to the next one.
         detachPetEventRouter()
@@ -336,11 +356,18 @@ extension AppModel {
     /// Ask the gateway for the roster and fold the answer in.
     public func refreshRoster() async throws {
         guard let client else { return }
+        let capturedClient = client
+        let capturedGeneration = LiveRuntime.shared.generation
+        let capturedGatewayID = LiveRuntime.shared.gatewayID
         // Sampled BEFORE the await: any pin written while this poll was in
         // flight makes the block it returns stale, and the merge below reads a
         // missing `chat` key as an authoritative deletion.
         let pinWrites = CanonicalChatRuntime.shared.writeCount
-        let profiles = try await client.listProfiles()
+        let profiles = try await capturedClient.listProfiles()
+        guard LiveRuntime.shared.generation == capturedGeneration,
+              LiveRuntime.shared.gatewayID == capturedGatewayID,
+              self.client.map(ObjectIdentifier.init) == ObjectIdentifier(capturedClient)
+        else { return }
         applyRosterAnswer(profiles, pinWrites: pinWrites)
     }
 
@@ -406,8 +433,14 @@ extension AppModel {
             // out — is skipped: that answer predates the write, and reading it
             // as a deletion would drop the pin just made.
             let canonical = CanonicalChatRuntime.shared
-            if let deskMeta, !canonical.hasLocalPinWrite(profile.name, since: pinWrites) {
-                canonical.pins[profile.name] = deskMeta.pinnedChat
+            if let deskMeta {
+                if canonical.dirtyPins.contains(profile.name),
+                   deskMeta.pinnedChat == canonical.pins[profile.name] {
+                    canonical.dirtyPins.remove(profile.name)
+                }
+                if !canonical.hasLocalPinWrite(profile.name, since: pinWrites) {
+                    canonical.pins[profile.name] = deskMeta.pinnedChat
+                }
             }
             // `stripPreviewMarkdown` (plugin.js:2991-3007): without it a bot
             // that answers with a bulleted list puts literal asterisks in the
@@ -542,12 +575,12 @@ extension AppModel {
         // same durable operation leases migrate instead of being silently
         // orphaned by the nil gap.
         let oldSessionID = chat.sessionID ?? runtime.reconnectParkedSessionIDs[botID]
+        let oldStoredID = chat.storedSessionID
+        let oldRoute = gatewayRoute(for: botID) ?? stateRoute(for: botID)
         let newStoredID = live.storedSessionID.isEmpty ? nil : live.storedSessionID
         let durableID = newStoredID ?? chat.storedSessionID
         let gatewayID = sourceGatewayID ?? gatewayRoute(for: botID)?.gatewayID
             ?? runtime.gatewayID
-        let bindingChanged = oldSessionID != nil && oldSessionID != live.sessionID
-            || (newStoredID != nil && chat.storedSessionID != newStoredID)
         let bindingRoute = gatewayID.map { gatewayID in
             gatewayRoute(for: botID).flatMap { existing in
                 existing.gatewayID == gatewayID ? existing : nil
@@ -555,26 +588,62 @@ extension AppModel {
                 gatewayID: gatewayID,
                 profile: GatewayBotRoute(qualifiedID: botID)?.profile ?? botID)
         }
+        let routeChanged = oldRoute != nil && bindingRoute != nil && oldRoute != bindingRoute
+        let bindingChanged = (oldSessionID != nil && oldSessionID != live.sessionID)
+            || (newStoredID != nil && chat.storedSessionID != newStoredID)
+            || routeChanged
+        if routeChanged, let oldRoute, let bindingRoute, let oldStoredID,
+           oldStoredID == durableID {
+            ChatRuntime.shared.migrateProfileRouteState(
+                from: oldRoute, to: bindingRoute,
+                sourceBotID: botID, destinationBotID: botID,
+                storedID: oldStoredID, chatID: ObjectIdentifier(chat),
+                sessionID: oldSessionID)
+        }
         if let bindingRoute {
             ChatRuntime.shared.migratePendingStop(
                 botID: botID, route: bindingRoute, sessionID: live.sessionID,
                 storedID: durableID, generation: runtime.generation,
                 chatID: ObjectIdentifier(chat))
+            if bindingChanged, let oldSessionID, let oldRoute {
+                if let oldStoredID, oldStoredID == durableID, oldRoute == bindingRoute {
+                    _ = migrateQueuedState(
+                        fromBotID: botID, toBotID: botID, route: bindingRoute,
+                        oldSessionID: oldSessionID, newSessionID: live.sessionID,
+                        storedID: oldStoredID)
+                    migrateComposeQueueSession(
+                        botID: botID, route: bindingRoute,
+                        oldSessionID: oldSessionID, newSessionID: live.sessionID,
+                        storedID: oldStoredID, chatID: ObjectIdentifier(chat))
+                } else {
+                    _ = retireQueuedState(botID: botID, route: oldRoute,
+                                          storedID: oldStoredID)
+                }
+            }
         }
         if bindingChanged, let gatewayID, let route = bindingRoute {
             ChatRuntime.shared.migrateMutationState(
                 botID: botID, route: route, sessionID: live.sessionID,
                 storedID: durableID, generation: runtime.generation,
                 chatID: ObjectIdentifier(chat))
-            if var kickoff = CanonicalChatRuntime.shared.ambiguousKickoffs[botID] {
-                if kickoff.chatID == ObjectIdentifier(chat),
-                   kickoff.storedID == (durableID ?? ""),
-                   route.gatewayID == gatewayID {
-                    kickoff.sessionID = live.sessionID
-                    CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = kickoff
-                } else {
-                    CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = nil
-                    CanonicalChatRuntime.shared.kickoffs[botID] = nil
+            if let kickoffStored = durableID ?? oldStoredID,
+               CanonicalChatRuntime.shared.migrateKickoff(
+                   botID: botID, route: route, sessionID: live.sessionID,
+                   storedID: kickoffStored, chatID: ObjectIdentifier(chat)) == false {
+                // A legacy bind can cross a same-gateway profile switch too;
+                // gateway id alone is not ownership. Retire only the exact
+                // old route/durable/chat lease and never carry it to the new
+                // profile directory.
+                let priorRoute = CanonicalChatRuntime.shared.ambiguousKickoffs[botID]?.route
+                    ?? CanonicalChatRuntime.shared.kickoffLeases[botID]?.route
+                    ?? route
+                if let priorLease = CanonicalChatRuntime.shared.kickoffLeases[botID]
+                    ?? CanonicalChatRuntime.shared.ambiguousKickoffs[botID],
+                   let oldStoredID {
+                    _ = CanonicalChatRuntime.shared.retireKickoff(
+                        botID: botID, route: priorRoute,
+                        storedID: oldStoredID,
+                        chatID: ObjectIdentifier(chat), operationID: priorLease.id)
                 }
             }
             if ChatRuntime.shared.transcriptActions[botID] != nil {
@@ -1013,28 +1082,154 @@ extension AppModel {
 
     // MARK: - Live actions (called from AppModel's mode dispatch)
 
-    func liveSend(text: String, botID: String, chat: ChatState) {
+    enum LiveSendResult: Equatable {
+        case accepted
+        /// The exact ChatState/route/fence changed while an await was
+        /// suspended. The optimistic row remains visible and the caller must
+        /// retain its queue item; it is not safe to retry automatically.
+        case retained
+        case failed
+    }
+
+    /// Fire-and-forget entry point used by normal compose paths. The actual
+    /// work is awaitable so offline flush can remove one queue row only after
+    /// that exact operation has settled.
+    func liveSend(text: String, botID: String, chat: ChatState,
+                  optimisticID: UUID? = nil) {
         Task { @MainActor in
-            do {
-                let sid = try await ensureSession(botID: botID, hydrate: false)
-                guard let route = gatewayRoute(for: botID) else { throw GatewayRouteError.noRoute }
-                let client = try await routedClient(for: route)
-                try await client.submitPrompt(sessionID: sid, text: text)
-            } catch let error as GatewayError where error.code == -3 || error.code == -7 {
-                if GatewayBotRoute(qualifiedID: botID) == nil {
-                    // Primary link died mid-send — the bubble stays, the text
-                    // queues, and the supervised reconnect retries it.
-                    isOffline = true
-                    composeQueue.append((botID, text))
-                } else {
-                    // A secondary failure must not mark the primary gateway
-                    // offline or silently enqueue work behind its reconnect.
-                    chat.messages.append(ChatMessage(author: .system, text: error.message))
-                }
-            } catch {
-                let detail = (error as? GatewayError)?.message ?? error.localizedDescription
-                chat.messages.append(ChatMessage(author: .system, text: detail))
+            _ = await liveSendAwaiting(text: text, botID: botID, chat: chat,
+                                       optimisticID: optimisticID)
+        }
+    }
+
+    /// Submit one prompt while preserving the exact mutation/chat/route
+    /// binding captured at the operation boundary. Every await is followed by
+    /// the same ownership check; a lifecycle rename, reconnect, fence, or
+    /// ChatState replacement therefore leaves the optimistic row/queue item
+    /// intact instead of silently dropping it or submitting into B.
+    @discardableResult
+    func liveSendAwaiting(text: String, botID: String, chat: ChatState,
+                          optimisticID: UUID? = nil,
+                          composeItemID: UUID? = nil) async -> LiveSendResult {
+        guard mode == .live,
+              let route = stateRoute(for: botID) ?? gatewayRoute(for: botID),
+              !mutationIsFenced(botID: botID) else {
+            return .retained
+        }
+        let chatID = ObjectIdentifier(chat)
+        let capturedStoredID = chat.storedSessionID
+        let capturedGeneration = LiveRuntime.shared.generation
+        guard let lifecycleToken = profileLifecycleGenerationToken(for: botID) else {
+            return .retained
+        }
+        let operationComposeID = composeItemID ?? UUID()
+        func retainComposeItem() -> LiveSendResult {
+            normalizeComposeQueueIDs()
+            guard !composeQueueIDs.contains(operationComposeID) else { return .retained }
+            appendComposeQueue(botID: botID, text: text, id: operationComposeID,
+                               route: route, storedID: expectedStoredID,
+                               sessionID: expectedSessionID, chatID: chatID)
+            return .retained
+        }
+        var expectedStoredID = capturedStoredID
+        var expectedSessionID: String?
+
+        func owns(_ sessionID: String? = nil) -> Bool {
+            guard mode == .live,
+                  let current = chats[botID], ObjectIdentifier(current) == chatID,
+                  !mutationIsFenced(botID: botID),
+                  bindingRouteMatches(route, botID: botID),
+                  current.storedSessionID == expectedStoredID,
+                  LiveRuntime.shared.generation >= capturedGeneration,
+                  profileLifecycleAccepts(lifecycleToken) else { return false }
+            if let expectedSessionID, current.sessionID != expectedSessionID {
+                return false
             }
+            if let sessionID {
+                guard bindingSessionID(for: botID) == sessionID,
+                      current.sessionID == sessionID else { return false }
+            }
+            if let optimisticID {
+                guard current.messages.contains(where: { $0.id == optimisticID }) else {
+                    return false
+                }
+            }
+            return true
+        }
+
+        var submitStarted = false
+        do {
+            let sid = try await ensureSession(botID: botID, hydrate: false)
+            guard let boundStoredID = chats[botID]?.storedSessionID,
+                  !boundStoredID.isEmpty else { return retainComposeItem() }
+            expectedStoredID = boundStoredID
+            expectedSessionID = sid
+            guard owns(sid) else { return retainComposeItem() }
+            let client = try await routedClient(for: route)
+            guard owns(sid) else { return retainComposeItem() }
+            submitStarted = true
+            let receipt = try await client.submitPrompt(sessionID: sid, text: text)
+            guard owns(sid) else {
+                // The gateway may have accepted while the route changed. Do
+                // not append a duplicate queue row or remove the visible
+                // optimistic bubble; authoritative reattach owns recovery.
+                if let storedID = expectedStoredID {
+                    ChatRuntime.shared.offlineComposeFences[operationComposeID] =
+                        OfflineComposeFence(itemID: operationComposeID, botID: botID, text: text,
+                                            route: route, sessionID: sid, storedID: storedID,
+                                            chatID: chatID)
+                }
+                return retainComposeItem()
+            }
+            try PromptSubmitReceipt.requireAccepted(receipt, operation: "Prompt")
+            guard owns(sid) else {
+                if let storedID = expectedStoredID {
+                    ChatRuntime.shared.offlineComposeFences[operationComposeID] =
+                        OfflineComposeFence(itemID: operationComposeID, botID: botID, text: text,
+                                            route: route, sessionID: sid, storedID: storedID,
+                                            chatID: chatID)
+                }
+                return retainComposeItem()
+            }
+            ChatRuntime.shared.offlineComposeFences[operationComposeID] = nil
+            return .accepted
+        } catch let error as GatewayError where error.code == -3 || error.code == -7 {
+            if submitStarted, let storedID = expectedStoredID {
+                ChatRuntime.shared.offlineComposeFences[operationComposeID] =
+                    OfflineComposeFence(itemID: operationComposeID, botID: botID, text: text,
+                                       route: route, sessionID: expectedSessionID ?? "",
+                                       storedID: storedID, chatID: chatID)
+                return retainComposeItem()
+            }
+            guard owns() else { return retainComposeItem() }
+            if GatewayBotRoute(qualifiedID: botID) == nil {
+                // Primary link died mid-send — the bubble stays, the text
+                // queues, and the supervised reconnect retries it. The queue
+                // row is added only while the original binding still owns it.
+                isOffline = true
+                appendComposeQueue(botID: botID, text: text, id: operationComposeID,
+                                   route: route, storedID: expectedStoredID,
+                                   sessionID: expectedSessionID, chatID: chatID)
+            } else {
+                // A secondary failure must not mark the primary gateway
+                // offline or silently enqueue work behind its reconnect.
+                guard owns() else { return .retained }
+                chat.messages.append(ChatMessage(author: .system, text: error.message))
+            }
+            return .failed
+        } catch {
+            if submitStarted, PromptMutationFailure.isAmbiguous(error),
+               let storedID = expectedStoredID {
+                ChatRuntime.shared.offlineComposeFences[operationComposeID] =
+                    OfflineComposeFence(itemID: operationComposeID, botID: botID, text: text,
+                                       route: route, sessionID: expectedSessionID ?? "",
+                                       storedID: storedID, chatID: chatID)
+                return retainComposeItem()
+            }
+            guard owns() else { return retainComposeItem() }
+            let detail = (error as? GatewayError)?.message ?? error.localizedDescription
+            chat.messages.append(ChatMessage(author: .system, text: detail))
+            return .failed
         }
     }
 
@@ -1291,10 +1486,66 @@ extension AppModel {
     /// send() again would duplicate them.
     public func flushComposeQueue() async {
         guard !composeQueue.isEmpty, mode == .live, !isOffline else { return }
-        let queued = composeQueue
-        composeQueue.removeAll()
-        for item in queued {
-            liveSend(text: item.text, botID: item.botID, chat: chat(for: item.botID))
+        guard !composeFlushActive else { return }
+        composeFlushActive = true
+        defer { composeFlushActive = false }
+        normalizeComposeQueueIDs()
+        // Process one exact tuple at a time. Removing the whole array before
+        // the first await used to lose every row when a route/fence changed or
+        // the socket failed; a successful send now removes only the tuple that
+        // is still at that index with the same identity.
+        let index = 0
+        while index < composeQueue.count {
+            guard mode == .live, !isOffline else { return }
+            let item = composeQueue[index]
+            let itemID = composeQueueIDs[index]
+            if ChatRuntime.shared.offlineComposeFences[itemID] != nil {
+                return
+            }
+            guard let chat = chats[item.botID] else {
+                // An absent ChatState cannot prove the optimistic owner. Keep
+                // the row quarantined for the next authoritative bind.
+                return
+            }
+            if let binding = composeQueueBindings[itemID] {
+                let currentRoute = stateRoute(for: item.botID) ?? gatewayRoute(for: item.botID)
+                guard binding.botID == item.botID,
+                      (binding.route.map { bindingRouteMatches($0, botID: item.botID) }
+                       ?? (currentRoute != nil)),
+                      binding.storedID == chat.storedSessionID,
+                      binding.sessionID == nil || binding.sessionID == chat.sessionID,
+                      binding.chatID == nil || binding.chatID == ObjectIdentifier(chat) else {
+                    return
+                }
+            } else {
+                // Rows created by legacy callers have no proof of ownership.
+                // Do not submit them into a newly replaced ChatState.
+                guard chat.messages.contains(where: { $0.author == .user && $0.text == item.text }) else {
+                    return
+                }
+            }
+            let result = await liveSendAwaiting(
+                text: item.text, botID: item.botID, chat: chat,
+                composeItemID: itemID)
+            guard composeQueue.indices.contains(index),
+                  composeQueueIDs.indices.contains(index),
+                  composeQueueIDs[index] == itemID,
+                  composeQueue[index].botID == item.botID,
+                  composeQueue[index].text == item.text else {
+                // Lifecycle/reconnect may have re-keyed or replaced the
+                // queue while the RPC was suspended. Never remove a row we
+                // did not submit under the exact captured binding.
+                if result == .accepted { continue }
+                return
+            }
+            switch result {
+            case .accepted:
+                composeQueue.remove(at: index)
+                composeQueueIDs.remove(at: index)
+                composeQueueBindings[itemID] = nil
+            case .retained, .failed:
+                return
+            }
         }
     }
 }

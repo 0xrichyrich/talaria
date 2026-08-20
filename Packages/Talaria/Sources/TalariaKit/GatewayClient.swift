@@ -401,7 +401,13 @@ public actor GatewayClient {
             params = .object(fields)
         }
         let result = try await rpc("profiles.list", params)
-        let rows = result["profiles"]?.arrayValue?.map(HermesProfile.init) ?? []
+        guard let rawRows = result["profiles"]?.arrayValue else {
+            throw GatewayError(code: -8, message: "profiles.list malformed response")
+        }
+        let rows = rawRows.map(HermesProfile.init)
+        guard rows.allSatisfy({ !$0.name.isEmpty }) else {
+            throw GatewayError(code: -8, message: "profiles.list contained malformed profile")
+        }
         if !rows.isEmpty { rememberPins(from: rows) }
         return rows.map { $0.foldingCanonicalPreview() }
     }
@@ -493,7 +499,14 @@ public actor GatewayClient {
         if let profile { params["profile"] = .string(profile) }
         if includeHidden { params["include_hidden"] = .bool(true) }
         let result = try await rpc("session.list", .object(params))
-        return result["sessions"]?.arrayValue?.map(StoredSession.init) ?? []
+        guard let rawRows = result["sessions"]?.arrayValue else {
+            throw GatewayError(code: -8, message: "session.list malformed response")
+        }
+        let rows = rawRows.map(StoredSession.init)
+        guard rows.allSatisfy({ !$0.id.isEmpty }) else {
+            throw GatewayError(code: -8, message: "session.list contained malformed session")
+        }
+        return rows
     }
 
     /// `hidden` marks a session plugin-owned: it stays out of shared lists

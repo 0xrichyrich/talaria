@@ -362,13 +362,13 @@ final class PushDeviceMutationQueueTests: XCTestCase {
     }
 
     @MainActor
-    func testProfileLifecycleFenceRejectsVoiceReconnectBeforePoolMutation() {
+    func testProfileLifecycleFenceRejectsVoiceReconnectBeforePoolMutation() async throws {
         let model = AppModel()
         let route = GatewayBotRoute(gatewayID: "homelab", profile: "worker")
         let target = ProfileLifecycleTarget(rosterID: route.qualifiedID, route: route)
 
-        model.activateProfileLifecycleRoute(gatewayID: route.gatewayID,
-                                            profile: route.profile)
+        try await model.activateProfileLifecycleRoute(gatewayID: route.gatewayID,
+                                                      profile: route.profile)
         XCTAssertNotNil(model.voiceReconnectLifecycleToken(for: route))
 
         // Rename/delete raises this block before awaiting client retirement.
@@ -378,8 +378,8 @@ final class PushDeviceMutationQueueTests: XCTestCase {
         XCTAssertNil(model.voiceReconnectLifecycleToken(for: route))
 
         // Leave shared lifecycle state usable for subsequent serialized tests.
-        model.activateProfileLifecycleRoute(gatewayID: route.gatewayID,
-                                            profile: route.profile)
+        try await model.activateProfileLifecycleRoute(gatewayID: route.gatewayID,
+                                                      profile: route.profile)
     }
 
 
