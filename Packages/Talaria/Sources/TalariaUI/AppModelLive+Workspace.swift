@@ -74,7 +74,9 @@ public final class WorkspaceRuntime {
             projectUncertain = ""; fileUncertain = ""; gitUncertain = ""
             commandUncertain = ""; systemUncertain = ""
             commandPrefill = ""; commandPrefillTargetID = nil; commandPrefillDisplay = nil
-            mutationBusy = false; mutationOwner = nil
+            if !GatewayMaintenanceRuntime.shared.preservesWorkspaceMutation(owner: mutationOwner) {
+                mutationBusy = false; mutationOwner = nil
+            }
             commandRunning = false; systemActionRunning = false
         }
         clearPublishedData()
@@ -151,7 +153,7 @@ public final class WorkspaceRuntime {
     }
 
     func claimMutation() -> UUID? {
-        guard mutationOwner == nil else { return nil }
+        guard mutationOwner == nil, GatewayMaintenanceRuntime.shared.fence == nil else { return nil }
         let owner = UUID()
         mutationOwner = owner
         mutationBusy = true
@@ -1264,165 +1266,6 @@ public extension AppModel {
 
     private func workspaceMutationOutcomeIsUncertain(_ error: Error) -> Bool {
         WorkspaceMutationUncertainty.isAmbiguous(error)
-    }
-
-    func runWorkspaceCommand(name: String, argument: String, targetID: String) async {
-        let runtime = WorkspaceRuntime.shared
-        guard let target = workspaceProcessTargets.first(where: { $0.id == targetID }),
-              target.route.gatewayID == runtime.gatewayID else {
-            runtime.error = "Choose an exact live Hermes session."
-            return
-        }
-        guard let command = WorkspaceCommandPolicy.catalogCommand(named: name, in: runtime.commands) else {
-            runtime.error = "Command Center will not dispatch a manually entered command that is absent from the current Hermes catalog."
-            return
-        }
-        let disposition = WorkspaceCommandPolicy.disposition(for: command, argument: argument)
-        if case .unsupported(let reason) = disposition {
-            runtime.error = reason
-            return
-        }
-        guard !runtime.commandRunning, !runtime.systemActionRunning,
-              runtime.commandUncertain.isEmpty, runtime.commandPrefill.isEmpty,
-              let owner = runtime.claimMutation() else {
-            if !runtime.commandPrefill.isEmpty {
-                runtime.error = "Send or discard the recovered command draft before running another command."
-            }
-            return
-        }
-        defer { runtime.releaseMutation(owner) }
-        let gatewayID = target.route.gatewayID
-        let generation = runtime.generation
-        runtime.commandRunning = true; runtime.commandOutput = ""; runtime.error = ""
-        do {
-            let result = try await dispatchWorkspaceCommand(
-                command: command, argument: argument, disposition: disposition,
-                target: target, generation: generation
-            )
-            guard runtime.matches(gatewayID, generation) else { return }
-            runtime.commandOutput = result
-        } catch {
-            guard runtime.matches(gatewayID, generation) else { return }
-            if workspaceMutationOutcomeIsUncertain(error) {
-                runtime.commandUncertain = "/\(name) on \(target.title)"
-            }
-            runtime.error = workspaceMessage(error)
-        }
-        if runtime.matches(gatewayID, generation) { runtime.commandRunning = false }
-    }
-
-    private func dispatchWorkspaceCommand(command: HermesCommand, argument: String,
-                                          disposition: WorkspaceCommandDisposition,
-                                          target: WorkspaceProcessTarget,
-                                          generation: UInt64) async throws -> String {
-        let client = try await routedClient(for: target.route)
-        let result = try await client.dispatchHermesCommand(sessionID: target.sessionID,
-                                                            name: command.name, argument: argument)
-        guard WorkspaceRuntime.shared.matches(target.route.gatewayID, generation) else {
-            throw CancellationError()
-        }
-        let chat = chat(for: target.botID)
-        switch result {
-        case .exec(let output):
-            guard disposition == .readOnly else {
-                throw GatewayError(code: -83, message: "Hermes returned executable output for a prompt-draft command; Talaria refused the result.")
-            }
-            return output.isEmpty ? "Command completed with no output." : Self.cap(output: output)
-        case .plugin:
-            throw GatewayError(code: -83, message: "Plugin command results are not supported in Command Center’s safe command surface.")
-        case .alias:
-            throw GatewayError(code: -83, message: "Quick-command aliases are not followed by Command Center.")
-        case .prefill(let message, let notice):
-            guard disposition == .recoverablePromptDraft else {
-                throw GatewayError(code: -83, message: "Hermes returned a prompt draft for a read-only command.")
-            }
-            if let notice {
-                chat.messages.append(ChatMessage(author: .system, time: AppModel.clock(), text: notice))
-            }
-            preserveWorkspaceCommandDraft(message: message, display: nil, target: target)
-            return "Hermes prepared an editable draft for \(target.title). Review it below before sending."
-        case .skill(_, let message, let display):
-            guard command.origin == .skill, disposition == .recoverablePromptDraft else {
-                throw GatewayError(code: -83, message: "Hermes returned an unapproved skill directive.")
-            }
-            preserveWorkspaceCommandDraft(message: message, display: display, target: target)
-            return "Hermes prepared a skill prompt for \(target.title). Review it below before sending."
-        case .send(let message, let notice, let display):
-            guard disposition == .recoverablePromptDraft else {
-                throw GatewayError(code: -83, message: "Hermes returned an unapproved prompt submission directive.")
-            }
-            if let notice {
-                chat.messages.append(ChatMessage(author: .system, time: AppModel.clock(), text: notice))
-            }
-            let fallback = "/\(WorkspaceCommandPolicy.canonicalName(command.name))\(argument.isEmpty ? "" : " \(argument)")"
-            preserveWorkspaceCommandDraft(message: message, display: display ?? fallback, target: target)
-            return "Hermes prepared a command prompt for \(target.title). Review it below before sending."
-        }
-    }
-
-    private func preserveWorkspaceCommandDraft(message: String, display: String?,
-                                               target: WorkspaceProcessTarget) {
-        let runtime = WorkspaceRuntime.shared
-        runtime.commandPrefill = message
-        runtime.commandPrefillTargetID = target.id
-        runtime.commandPrefillDisplay = display
-    }
-
-    private func requirePromptAccepted(_ response: JSONValue, operation: String) throws {
-        if response["ok"]?.boolValue == false
-            || ["error", "rejected", "refused"].contains(response["status"]?.stringValue ?? "") {
-            throw GatewayError(code: 409, message: "Hermes refused \(operation.lowercased()).")
-        }
-        guard let status = response["status"]?.stringValue,
-              ["streaming", "queued"].contains(status) else {
-            throw AckValidationError(operation: operation,
-                                     detail: "Hermes did not return an accepted prompt status.")
-        }
-    }
-
-    func submitWorkspaceCommandPrefill() async {
-        let runtime = WorkspaceRuntime.shared
-        guard let targetID = runtime.commandPrefillTargetID,
-              let target = workspaceProcessTargets.first(where: { $0.id == targetID }),
-              target.route.gatewayID == runtime.gatewayID,
-              !runtime.commandPrefill.isEmpty, !runtime.commandRunning,
-              !runtime.systemActionRunning, runtime.commandUncertain.isEmpty,
-              let owner = runtime.claimMutation() else { return }
-        defer { runtime.releaseMutation(owner) }
-        let text = runtime.commandPrefill
-        let gatewayID = target.route.gatewayID
-        let generation = runtime.generation
-        runtime.commandRunning = true; runtime.error = ""
-        defer {
-            if runtime.matches(gatewayID, generation) { runtime.commandRunning = false }
-        }
-        do {
-            let client = try await routedClient(for: target.route)
-            let response = try await client.submitPrompt(
-                sessionID: target.sessionID, text: text, queued: true
-            )
-            try requirePromptAccepted(response, operation: "Submit recovered command draft")
-            guard runtime.matches(gatewayID, generation) else { return }
-            chat(for: target.botID).messages.append(
-                ChatMessage(author: .user, time: AppModel.clock(),
-                            text: runtime.commandPrefillDisplay ?? text)
-            )
-            runtime.commandPrefill = ""; runtime.commandPrefillTargetID = nil
-            runtime.commandPrefillDisplay = nil
-            runtime.commandOutput = "Recovered draft submitted to \(target.title)."
-        } catch {
-            guard runtime.matches(gatewayID, generation) else { return }
-            if workspaceMutationOutcomeIsUncertain(error) {
-                runtime.commandUncertain = "recovered draft on \(target.title)"
-            }
-            runtime.error = workspaceMessage(error)
-        }
-    }
-
-    func discardWorkspaceCommandPrefill() {
-        WorkspaceRuntime.shared.commandPrefill = ""
-        WorkspaceRuntime.shared.commandPrefillTargetID = nil
-        WorkspaceRuntime.shared.commandPrefillDisplay = nil
     }
 
     func refreshWorkspaceProcesses(targetID: String? = nil) async {

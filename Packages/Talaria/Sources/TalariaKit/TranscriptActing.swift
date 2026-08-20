@@ -84,10 +84,11 @@ public enum TranscriptActing {
               messages[sourceIndex].author == .user else { return nil }
         let sourceText = messages[sourceIndex].text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !sourceText.isEmpty else { return nil }
+        guard let truncate = address(for: messages, at: sourceIndex) else { return nil }
         return Plan(sourceIndex: sourceIndex,
                     sourceText: sourceText,
                     text: sourceText,
-                    truncate: address(for: messages, at: sourceIndex),
+                    truncate: truncate,
                     dropsFromIndex: sourceIndex)
     }
 
@@ -100,10 +101,11 @@ public enum TranscriptActing {
               !trimmed.isEmpty else { return nil }
         let sourceText = messages[sourceIndex].text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard sourceText != trimmed else { return nil }
+        guard let truncate = address(for: messages, at: sourceIndex) else { return nil }
         return Plan(sourceIndex: sourceIndex,
                     sourceText: sourceText,
                     text: trimmed,
-                    truncate: address(for: messages, at: sourceIndex),
+                    truncate: truncate,
                     dropsFromIndex: sourceIndex)
     }
 
@@ -132,11 +134,12 @@ public enum TranscriptActing {
         Array(messages.prefix(plan.dropsFromIndex))
     }
 
-    private static func address(for messages: [ChatMessage], at sourceIndex: Int) -> TruncateAddress {
+    private static func address(for messages: [ChatMessage], at sourceIndex: Int) -> TruncateAddress? {
         let source = messages[sourceIndex]
-        // A user bubble with no durable id never reached SQLite. Truncating by
-        // ordinal would mis-aim, so resubmit plainly instead.
-        guard source.rowID != nil else { return TruncateAddress() }
+        // A user bubble with no durable id never established a safe destructive
+        // address. An ordinary prompt.submit here would look like rewind/edit
+        // while leaving the old turn intact, so the action must be unavailable.
+        guard source.rowID != nil else { return nil }
         let ordinal = visibleUserOrdinal(messages, before: sourceIndex)
         return TruncateAddress(ordinal: ordinal, rowID: source.rowID, confirmEmpty: ordinal == 0)
     }

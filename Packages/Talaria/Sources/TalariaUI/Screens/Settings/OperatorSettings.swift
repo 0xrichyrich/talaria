@@ -90,6 +90,174 @@ public struct GatewayCommandAction: Equatable, Sendable {
     var isFinished: Bool { !running && (exitCode != nil || !ok) }
 }
 
+enum GatewayOperationsPolicy {
+    static func canApplyUpdate(_ check: GatewayCommandAction) -> Bool {
+        check.canApply == true
+    }
+
+    static func acceptedReceipt(_ value: JSONValue, expectedName: String) throws
+        -> GatewayCommandAction {
+        guard value["ok"]?.boolValue == true,
+              value["name"]?.stringValue == expectedName,
+              let pid = value["pid"]?.intValue,
+              pid > 0 else {
+            throw AckValidationError(
+                operation: expectedName,
+                detail: "Hermes omitted or changed the exact accepted action receipt.")
+        }
+        return GatewayCommandAction(value)
+    }
+
+    static func statusReceipt(_ value: JSONValue, expectedName: String,
+                              expectedPID: Int) throws -> GatewayCommandAction {
+        guard expectedPID > 0,
+              value["name"]?.stringValue == expectedName,
+              value["pid"]?.intValue == expectedPID,
+              value["running"]?.boolValue != nil else {
+            throw AckValidationError(
+                operation: expectedName,
+                detail: "Hermes changed or omitted the exact action/PID status identity.")
+        }
+        if value["running"]?.boolValue == false,
+           value["exit_code"]?.intValue == nil {
+            throw AckValidationError(
+                operation: expectedName,
+                detail: "Hermes returned a terminal action without an exit code.")
+        }
+        return GatewayCommandAction(value)
+    }
+
+    static func requireBooleanReceipt(_ value: JSONValue, operation: String,
+                                      field: String, expected: Bool) throws {
+        guard value["ok"]?.boolValue == true,
+              value[field]?.boolValue == expected else {
+            throw AckValidationError(operation: operation,
+                                     detail: "Hermes omitted the exact mutation receipt.")
+        }
+    }
+
+    static func requireOKReceipt(_ value: JSONValue, operation: String) throws {
+        guard value["ok"]?.boolValue == true else {
+            throw AckValidationError(
+                operation: operation, detail: "Hermes omitted the exact success receipt.")
+        }
+    }
+
+    static func requireMemoryResetReceipt(_ value: JSONValue) throws -> GatewayMemoryResetResult {
+        guard value["ok"]?.boolValue == true,
+              value["deleted"]?.arrayValue?.allSatisfy({ $0.stringValue != nil }) == true else {
+            throw AckValidationError(operation: "Memory reset",
+                                     detail: "Hermes omitted the exact reset receipt.")
+        }
+        return GatewayMemoryResetResult(value)
+    }
+
+    static func requireDebugShareReceipt(_ value: JSONValue) throws -> GatewayDebugShare {
+        guard value["ok"]?.boolValue == true,
+              value["urls"]?.objectValue != nil,
+              value["failures"]?.objectValue != nil,
+              value["redacted"]?.boolValue == true,
+              value["auto_delete_seconds"]?.intValue != nil else {
+            throw AckValidationError(operation: "Debug share",
+                                     detail: "Hermes omitted the exact redacted share receipt.")
+        }
+        return GatewayDebugShare(value)
+    }
+
+    static func isAmbiguous(_ error: Error) -> Bool {
+        WorkspaceMutationUncertainty.isAmbiguous(error)
+    }
+
+    static func shouldFence(postStarted: Bool, error: Error) -> Bool {
+        postStarted && (error is CancellationError || isAmbiguous(error))
+    }
+
+    static func canIssuePost(source: GatewayMaintenanceSource,
+                             capturedScopeKey: String, capturedGeneration: Int,
+                             currentGatewayID: String?, currentProfile: String?,
+                             currentScopeKey: String, currentGeneration: Int) -> Bool {
+        source.matches(gatewayID: currentGatewayID, profile: currentProfile)
+            && capturedScopeKey == currentScopeKey
+            && capturedGeneration == currentGeneration
+    }
+}
+
+struct GatewayMaintenanceSource: Hashable, Sendable {
+    var gatewayID: String
+    var profile: String?
+
+    var label: String {
+        if let profile { return "gateway \(gatewayID) · profile @\(profile)" }
+        return "gateway \(gatewayID) · gateway default"
+    }
+
+    func matches(gatewayID: String?, profile: String?) -> Bool {
+        self.gatewayID == gatewayID && self.profile == profile
+    }
+}
+
+enum GatewayMaintenanceOutcome: Equatable, Sendable {
+    case pending
+    case accepted(pid: Int)
+    case uncertain
+}
+
+struct GatewayMaintenanceFence: Equatable, Sendable {
+    var source: GatewayMaintenanceSource
+    var action: String
+    var outcome: GatewayMaintenanceOutcome
+}
+
+/// Gateway operations are no-replay mutations. Their fence outlives this view and
+/// its selected scope so navigating away and back can never make an accepted
+/// or ambiguous request look runnable again.
+@MainActor
+@Observable
+final class GatewayMaintenanceRuntime {
+    static let shared = GatewayMaintenanceRuntime()
+
+    private(set) var fence: GatewayMaintenanceFence?
+    @ObservationIgnored private var sharedOwner: UUID?
+
+    func begin(source: GatewayMaintenanceSource, action: String) -> Bool {
+        guard fence == nil, sharedOwner == nil,
+              let owner = WorkspaceRuntime.shared.claimMutation() else { return false }
+        sharedOwner = owner
+        fence = GatewayMaintenanceFence(source: source, action: action, outcome: .pending)
+        return true
+    }
+
+    func accept(source: GatewayMaintenanceSource, action: String, pid: Int) {
+        guard pid > 0, fence?.source == source, fence?.action == action else { return }
+        fence?.outcome = .accepted(pid: pid)
+    }
+
+    func markUncertain(source: GatewayMaintenanceSource, action: String) {
+        guard fence?.source == source, fence?.action == action else { return }
+        fence?.outcome = .uncertain
+    }
+
+    /// Safe only when the POST was never sent or Hermes definitively refused.
+    func releaseDefinite(source: GatewayMaintenanceSource, action: String) {
+        guard fence?.source == source, fence?.action == action else { return }
+        clear()
+    }
+
+    /// Explicit user reconciliation is the only way accepted/uncertain state
+    /// leaves the ledger.
+    func acknowledge() { clear() }
+
+    func preservesWorkspaceMutation(owner: UUID?) -> Bool {
+        fence != nil && owner != nil && owner == sharedOwner
+    }
+
+    private func clear() {
+        if let sharedOwner { WorkspaceRuntime.shared.releaseMutation(sharedOwner) }
+        sharedOwner = nil
+        fence = nil
+    }
+}
+
 public struct GatewayUsageModel: Equatable, Sendable {
     var name: String
     var tokens: Int
@@ -256,9 +424,10 @@ extension GatewayClient {
         if let profile, !profile.isEmpty {
             query.append(URLQueryItem(name: "profile", value: profile))
         }
-        return GatewayCommandAction(
-            try await restJSON(path: "api/gateway/restart", method: "POST", query: query, timeout: 30),
-            fallbackName: "gateway-restart")
+        let value = try await restJSON(path: "api/gateway/restart", method: "POST",
+                                       query: query, timeout: 30)
+        return try GatewayOperationsPolicy.acceptedReceipt(
+            value, expectedName: "gateway-restart")
     }
 
     func hermesUpdateCheck() async throws -> GatewayCommandAction {
@@ -268,17 +437,17 @@ extension GatewayClient {
     }
 
     func startHermesUpdate() async throws -> GatewayCommandAction {
-        GatewayCommandAction(
-            try await restJSON(path: "api/hermes/update", method: "POST", timeout: 30),
-            fallbackName: "hermes-update")
+        let value = try await restJSON(path: "api/hermes/update", method: "POST", timeout: 30)
+        return try GatewayOperationsPolicy.acceptedReceipt(value, expectedName: "hermes-update")
     }
 
-    func actionStatus(name: String, lines: Int = 80) async throws -> GatewayCommandAction {
-        GatewayCommandAction(
-            try await restJSON(path: "api/actions/\(name)/status",
-                               query: [URLQueryItem(name: "lines", value: String(lines))],
-                               timeout: 20),
-            fallbackName: name)
+    func actionStatus(name: String, pid: Int, lines: Int = 80) async throws
+        -> GatewayCommandAction {
+        let value = try await restJSON(path: "api/actions/\(name)/status",
+                                       query: [URLQueryItem(name: "lines", value: String(lines))],
+                                       timeout: 20)
+        return try GatewayOperationsPolicy.statusReceipt(
+            value, expectedName: name, expectedPID: pid)
     }
 
     func usageAnalytics(days: Int, profile: String?) async throws -> GatewayUsageSnapshot {
@@ -293,21 +462,21 @@ extension GatewayClient {
     }
 
     func startDoctor() async throws -> GatewayCommandAction {
-        GatewayCommandAction(
-            try await restJSON(path: "api/ops/doctor", method: "POST", body: .object([:]), timeout: 30),
-            fallbackName: "doctor")
+        let value = try await restJSON(path: "api/ops/doctor", method: "POST",
+                                       body: .object([:]), timeout: 30)
+        return try GatewayOperationsPolicy.acceptedReceipt(value, expectedName: "doctor")
     }
 
     func startSecurityAudit() async throws -> GatewayCommandAction {
-        GatewayCommandAction(
-            try await restJSON(path: "api/ops/security-audit", method: "POST", body: .object([:]), timeout: 30),
-            fallbackName: "security-audit")
+        let value = try await restJSON(path: "api/ops/security-audit", method: "POST",
+                                       body: .object([:]), timeout: 30)
+        return try GatewayOperationsPolicy.acceptedReceipt(value, expectedName: "security-audit")
     }
 
     func startBackup() async throws -> GatewayCommandAction {
-        GatewayCommandAction(
-            try await restJSON(path: "api/ops/backup", method: "POST", body: .object([:]), timeout: 30),
-            fallbackName: "backup")
+        let value = try await restJSON(path: "api/ops/backup", method: "POST",
+                                       body: .object([:]), timeout: 30)
+        return try GatewayOperationsPolicy.acceptedReceipt(value, expectedName: "backup")
     }
 
     func curatorStatus(profile: String?) async throws -> GatewayCuratorStatus {
@@ -316,16 +485,17 @@ extension GatewayClient {
     }
 
     func setCuratorPaused(_ paused: Bool, profile: String?) async throws {
-        _ = try await restJSON(path: "api/curator/paused", method: "PUT",
-                               query: profileQuery(profile),
-                               body: .object(["paused": .bool(paused)]), timeout: 30)
+        let value = try await restJSON(path: "api/curator/paused", method: "PUT",
+                                       query: profileQuery(profile),
+                                       body: .object(["paused": .bool(paused)]), timeout: 30)
+        try GatewayOperationsPolicy.requireBooleanReceipt(
+            value, operation: "Curator pause", field: "paused", expected: paused)
     }
 
     func startCuratorRun(profile: String?) async throws -> GatewayCommandAction {
-        GatewayCommandAction(
-            try await restJSON(path: "api/curator/run", method: "POST",
-                               query: profileQuery(profile), body: .object([:]), timeout: 30),
-            fallbackName: "curator-run")
+        let value = try await restJSON(path: "api/curator/run", method: "POST",
+                                       query: profileQuery(profile), body: .object([:]), timeout: 30)
+        return try GatewayOperationsPolicy.acceptedReceipt(value, expectedName: "curator-run")
     }
 
     func memoryStoreStatus(profile: String?) async throws -> GatewayMemoryStoreStatus {
@@ -334,17 +504,19 @@ extension GatewayClient {
     }
 
     func resetMemoryStore(target: String, profile: String?) async throws -> GatewayMemoryResetResult {
-        GatewayMemoryResetResult(try await restJSON(
+        let value = try await restJSON(
             path: "api/memory/reset", method: "POST",
             query: profileQuery(profile),
-            body: .object(["target": .string(target)]), timeout: 30))
+            body: .object(["target": .string(target)]), timeout: 30)
+        return try GatewayOperationsPolicy.requireMemoryResetReceipt(value)
     }
 
     func shareDebugReport() async throws -> GatewayDebugShare {
-        GatewayDebugShare(try await restJSON(
+        let value = try await restJSON(
             path: "api/ops/debug-share", method: "POST",
             body: .object(["redact": .bool(true), "lines": .number(200)]),
-            timeout: 120))
+            timeout: 120)
+        return try GatewayOperationsPolicy.requireDebugShareReceipt(value)
     }
 
     private func profileQuery(_ profile: String?) -> [URLQueryItem] {
@@ -354,6 +526,8 @@ extension GatewayClient {
 }
 
 private enum MaintenancePrompt: Equatable {
+    case restartGateway
+    case updateHermes
     case backup
     case debugShare
     case resetMemory(String)
@@ -361,12 +535,14 @@ private enum MaintenancePrompt: Equatable {
     var role: ButtonRole? {
         switch self {
         case .backup, .debugShare: nil
-        case .resetMemory: .destructive
+        case .restartGateway, .updateHermes, .resetMemory: .destructive
         }
     }
 
     func title(_ copy: CopyPack, _ theme: ThemeID) -> String {
         switch self {
+        case .restartGateway: copy.settingsRestartConfirmTitle(theme)
+        case .updateHermes: copy.settingsUpdateConfirmTitle(theme)
         case .backup: copy.settingsBackupConfirmTitle(theme)
         case .debugShare: copy.settingsDebugShareConfirmTitle(theme)
         case .resetMemory: copy.settingsResetMemoryConfirmTitle(theme)
@@ -375,6 +551,8 @@ private enum MaintenancePrompt: Equatable {
 
     func message(_ copy: CopyPack, _ theme: ThemeID) -> String {
         switch self {
+        case .restartGateway: copy.settingsRestartConfirmMessage(theme)
+        case .updateHermes: copy.settingsUpdateConfirmMessage(theme)
         case .backup: copy.settingsBackupConfirmMessage(theme)
         case .debugShare: copy.settingsDebugShareConfirmMessage(theme)
         case .resetMemory(let target): copy.settingsResetMemoryConfirmMessage(theme, target: target)
@@ -383,11 +561,20 @@ private enum MaintenancePrompt: Equatable {
 
     func confirmTitle(_ copy: CopyPack, _ theme: ThemeID) -> String {
         switch self {
+        case .restartGateway: copy.settingsRestartGateway(theme)
+        case .updateHermes: copy.settingsUpdateHermes(theme)
         case .backup: copy.settingsBackup(theme)
         case .debugShare: copy.settingsDebugShare(theme)
         case .resetMemory: copy.settingsResetMemoryConfirm(theme)
         }
     }
+}
+
+private struct OperatorMutationCapture {
+    let source: GatewayMaintenanceSource
+    let scopeKey: String
+    let generation: Int
+    let action: String
 }
 
 public struct OperatorSettingsSection: View {
@@ -434,6 +621,9 @@ public struct OperatorSettingsSection: View {
     @State private var debugShare = GatewayDebugShare.empty
     @State private var isSharingDebug = false
     @State private var pendingMaintenance: MaintenancePrompt?
+    @State private var maintenanceOwner: UUID?
+
+    private var maintenanceRuntime: GatewayMaintenanceRuntime { .shared }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -571,14 +761,33 @@ public struct OperatorSettingsSection: View {
                 SettingsActionRow(theme: theme, title: copy.settingsRestartGateway(theme.id),
                                   isBusy: actionName == "gateway-restart" && action.running,
                                   isLast: false) {
-                    Task { await runAction("gateway-restart") }
+                    pendingMaintenance = .restartGateway
                 }
+                .disabled(maintenanceOwner != nil || maintenanceRuntime.fence != nil)
                 SettingsActionRow(theme: theme, title: copy.settingsUpdateHermes(theme.id),
                                   isBusy: actionName == "hermes-update" && action.running,
                                   isLast: true) {
-                    Task { await runAction("hermes-update") }
+                    pendingMaintenance = .updateHermes
                 }
-                .disabled(!updateCheck.canApply && updateCheck.installMethod.isEmpty == false && !updateCheck.updateAvailable)
+                .disabled(!GatewayOperationsPolicy.canApplyUpdate(updateCheck)
+                          || maintenanceOwner != nil || maintenanceRuntime.fence != nil)
+            }
+            if let fence = maintenanceRuntime.fence {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(maintenanceFenceMessage(fence))
+                        .font(theme.mono(10)).foregroundStyle(theme.warn)
+                    if fence.outcome != .pending {
+                        Button("I reconciled this exact gateway action; allow another") {
+                            maintenanceRuntime.acknowledge()
+                            action = .empty
+                            actionName = nil
+                            Task { await loadUpdateCheck(scopeKey: scopeKey) }
+                        }
+                        .font(theme.body(12, weight: .semibold))
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 2)
             }
             if !updateCheck.message.isEmpty || updateCheck.updateAvailable || !updateCheck.updateCommand.isEmpty {
                 Text(copy.settingsUpdateStatus(theme.id, check: updateCheck))
@@ -651,6 +860,7 @@ public struct OperatorSettingsSection: View {
                     pendingMaintenance = .debugShare
                 }
             }
+            .disabled(maintenanceRuntime.fence != nil)
             if let archive = action.message.isEmpty ? nil : action.message, actionName == "backup" {
                 Text(archive).font(theme.mono(10)).foregroundStyle(theme.sub)
                     .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 2)
@@ -702,6 +912,7 @@ public struct OperatorSettingsSection: View {
                     Task { await runAction("curator-run") }
                 }
             }
+            .disabled(maintenanceRuntime.fence != nil)
             if let curatorError {
                 Text(curatorError).font(theme.mono(10)).foregroundStyle(theme.warn)
                     .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 2)
@@ -720,7 +931,7 @@ public struct OperatorSettingsSection: View {
                                   isLast: false) {
                     pendingMaintenance = .resetMemory("memory")
                 }
-                .disabled(memoryStore.memoryBytes <= 0)
+                .disabled(memoryStore.memoryBytes <= 0 || maintenanceRuntime.fence != nil)
                 SettingsActionRow(theme: theme, title: copy.settingsResetUserFile(theme.id),
                                   subtitle: copy.settingsMemoryFileSize(theme.id, bytes: memoryStore.userBytes),
                                   isDestructive: true,
@@ -728,7 +939,7 @@ public struct OperatorSettingsSection: View {
                                   isLast: true) {
                     pendingMaintenance = .resetMemory("user")
                 }
-                .disabled(memoryStore.userBytes <= 0)
+                .disabled(memoryStore.userBytes <= 0 || maintenanceRuntime.fence != nil)
             }
             if let memoryStoreError {
                 Text(memoryStoreError).font(theme.mono(10)).foregroundStyle(theme.warn)
@@ -760,6 +971,7 @@ public struct OperatorSettingsSection: View {
                     Task { await saveMaxTurns() }
                 }
                 .disabled(config == nil || draftMaxTurns == config?.maxTurns)
+                .disabled(maintenanceRuntime.fence != nil)
             }
         }
     }
@@ -793,7 +1005,7 @@ public struct OperatorSettingsSection: View {
                                           keyPath: \.memoryWriteApproval) }
                 }
             }
-            .disabled(config == nil || busyField != nil)
+            .disabled(config == nil || busyField != nil || maintenanceRuntime.fence != nil)
             .opacity(config == nil ? 0.55 : 1)
         }
     }
@@ -814,6 +1026,7 @@ public struct OperatorSettingsSection: View {
                     Task { await saveImageMode() }
                 }
                 .disabled(config == nil || draftImageMode == config?.imageInputMode)
+                .disabled(maintenanceRuntime.fence != nil)
             }
         }
     }
@@ -897,6 +1110,7 @@ public struct OperatorSettingsSection: View {
         debugShare = GatewayDebugShare.empty
         isSharingDebug = false
         pendingMaintenance = nil
+        maintenanceOwner = nil
     }
 
     private func isCurrent(_ key: String, generation captured: Int) -> Bool {
@@ -1044,18 +1258,28 @@ public struct OperatorSettingsSection: View {
 
     private func toggleCuratorPaused() async {
         guard busyField == nil else { return }
-        let key = scopeKey
-        let captured = generation
         let next = !curator.paused
+        let name = next ? "curator-pause" : "curator-resume"
+        guard let capture = beginMutation(name) else { return }
+        let key = capture.scopeKey
+        let captured = capture.generation
         busyField = "curator.paused"
         defer { if isCurrent(key, generation: captured) { busyField = nil } }
+        var postStarted = false
         do {
-            let client = try await targetClient(gatewayID: targetGatewayID)
-            try await client.setCuratorPaused(next, profile: targetProfile)
+            let client = try await targetClient(gatewayID: capture.source.gatewayID)
+            guard canPost(capture) else {
+                maintenanceRuntime.releaseDefinite(source: capture.source, action: name)
+                return
+            }
+            postStarted = true
+            try await client.setCuratorPaused(next, profile: capture.source.profile)
+            maintenanceRuntime.releaseDefinite(source: capture.source, action: name)
             guard isCurrent(key, generation: captured) else { return }
             curator.paused = next
             curatorError = nil
         } catch {
+            finishFailedMutation(capture, postStarted: postStarted, error: error)
             guard isCurrent(key, generation: captured) else { return }
             curatorError = error.localizedDescription
         }
@@ -1064,6 +1288,10 @@ public struct OperatorSettingsSection: View {
     private func confirmMaintenance(_ prompt: MaintenancePrompt) async {
         pendingMaintenance = nil
         switch prompt {
+        case .restartGateway:
+            await runAction("gateway-restart")
+        case .updateHermes:
+            await runAction("hermes-update")
         case .backup:
             await runAction("backup")
         case .debugShare:
@@ -1075,17 +1303,26 @@ public struct OperatorSettingsSection: View {
 
     private func shareDebug() async {
         guard !isSharingDebug else { return }
-        let key = scopeKey
-        let captured = generation
+        guard let capture = beginMutation("debug-share") else { return }
+        let key = capture.scopeKey
+        let captured = capture.generation
         isSharingDebug = true
         defer { if isCurrent(key, generation: captured) { isSharingDebug = false } }
+        var postStarted = false
         do {
-            let client = try await targetClient(gatewayID: targetGatewayID)
+            let client = try await targetClient(gatewayID: capture.source.gatewayID)
+            guard canPost(capture) else {
+                maintenanceRuntime.releaseDefinite(source: capture.source, action: capture.action)
+                return
+            }
+            postStarted = true
             let result = try await client.shareDebugReport()
+            maintenanceRuntime.releaseDefinite(source: capture.source, action: capture.action)
             guard isCurrent(key, generation: captured) else { return }
             debugShare = result
             setNotice(copy.settingsDebugShareDone(theme.id, share: result), warning: !result.ok)
         } catch {
+            finishFailedMutation(capture, postStarted: postStarted, error: error)
             guard isCurrent(key, generation: captured) else { return }
             setNotice(error.localizedDescription, warning: true)
         }
@@ -1093,72 +1330,185 @@ public struct OperatorSettingsSection: View {
 
     private func resetMemoryStore(target: String) async {
         guard busyField == nil else { return }
-        let key = scopeKey
-        let captured = generation
+        guard let capture = beginMutation("memory-reset-\(target)") else { return }
+        let key = capture.scopeKey
+        let captured = capture.generation
         busyField = "memory.reset.\(target)"
         defer { if isCurrent(key, generation: captured) { busyField = nil } }
+        var postStarted = false
         do {
-            let client = try await targetClient(gatewayID: targetGatewayID)
-            let result = try await client.resetMemoryStore(target: target, profile: targetProfile)
+            let client = try await targetClient(gatewayID: capture.source.gatewayID)
+            guard canPost(capture) else {
+                maintenanceRuntime.releaseDefinite(source: capture.source, action: capture.action)
+                return
+            }
+            postStarted = true
+            let result = try await client.resetMemoryStore(
+                target: target, profile: capture.source.profile)
+            maintenanceRuntime.releaseDefinite(source: capture.source, action: capture.action)
             guard isCurrent(key, generation: captured) else { return }
             setNotice(copy.settingsResetMemoryDone(theme.id, result: result), warning: !result.ok)
             await loadMemoryStore(scopeKey: key)
         } catch {
+            finishFailedMutation(capture, postStarted: postStarted, error: error)
             guard isCurrent(key, generation: captured) else { return }
             setNotice(error.localizedDescription, warning: true)
         }
     }
 
     private func runAction(_ name: String) async {
-        guard busyField == nil else { return }
-        let key = scopeKey
-        let captured = generation
+        if name == "hermes-update",
+           !GatewayOperationsPolicy.canApplyUpdate(updateCheck) {
+            setNotice(updateCheck.updateCommand.isEmpty
+                      ? "Hermes did not authorize an in-app update."
+                      : "This installation is externally managed. Use: \(updateCheck.updateCommand)",
+                      warning: true)
+            return
+        }
+        guard busyField == nil, maintenanceOwner == nil,
+              let capture = beginMutation(name) else { return }
+        let key = capture.scopeKey
+        let captured = capture.generation
+        let owner = UUID()
+        maintenanceOwner = owner
+        defer {
+            if isCurrent(key, generation: captured), maintenanceOwner == owner {
+                maintenanceOwner = nil
+            }
+        }
         actionName = name
         action = GatewayCommandAction.empty
+        var postStarted = false
         do {
-            let client = try await targetClient(gatewayID: targetGatewayID)
+            let client = try await targetClient(gatewayID: capture.source.gatewayID)
+            // Resolving a retained gateway can suspend. Recheck immediately
+            // before the POST and use only the captured source values below.
+            guard canPost(capture),
+                  name != "hermes-update"
+                    || GatewayOperationsPolicy.canApplyUpdate(updateCheck) else {
+                maintenanceRuntime.releaseDefinite(source: capture.source, action: name)
+                return
+            }
             let started: GatewayCommandAction
             switch name {
             case "gateway-restart":
-                started = try await client.restartGateway(profile: targetProfile)
+                postStarted = true
+                started = try await client.restartGateway(profile: capture.source.profile)
             case "doctor":
+                postStarted = true
                 started = try await client.startDoctor()
             case "security-audit":
+                postStarted = true
                 started = try await client.startSecurityAudit()
             case "backup":
+                postStarted = true
                 started = try await client.startBackup()
             case "curator-run":
-                started = try await client.startCuratorRun(profile: targetProfile)
-            default:
+                postStarted = true
+                started = try await client.startCuratorRun(profile: capture.source.profile)
+            case "hermes-update":
+                postStarted = true
                 started = try await client.startHermesUpdate()
+            default:
+                throw GatewayError(code: 400, message: "Unsupported gateway operation.")
+            }
+            guard let pid = started.pid, pid > 0 else {
+                throw AckValidationError(
+                    operation: name, detail: "Hermes did not return a positive PID.")
+            }
+            maintenanceRuntime.accept(source: capture.source, action: name, pid: pid)
+            if name == "gateway-restart" || name == "hermes-update" {
+                if isCurrent(key, generation: captured) {
+                    action = started
+                    action.message = "Accepted by \(capture.source.label) with PID \(pid). Talaria will not replay it until you explicitly reconcile this receipt."
+                }
+                return
             }
             guard isCurrent(key, generation: captured) else { return }
             action = started
-            if started.ok || started.alreadyRunning || started.pid != nil {
-                await pollAction(name, scopeKey: key, generation: captured)
-            }
+            await pollAction(name, pid: pid, source: capture.source, client: client,
+                             scopeKey: key, generation: captured)
         } catch {
+            if GatewayOperationsPolicy.shouldFence(postStarted: postStarted, error: error) {
+                maintenanceRuntime.markUncertain(source: capture.source, action: name)
+                if isCurrent(key, generation: captured) {
+                    action.message = "Talaria could not prove the outcome on \(capture.source.label). It will not retry this action."
+                    action.ok = false
+                }
+                return
+            }
+            maintenanceRuntime.releaseDefinite(source: capture.source, action: name)
             guard isCurrent(key, generation: captured) else { return }
             action.message = error.localizedDescription
             action.ok = false
         }
     }
 
-    private func pollAction(_ name: String, scopeKey key: String, generation captured: Int) async {
+    private func maintenanceFenceMessage(_ fence: GatewayMaintenanceFence) -> String {
+        switch fence.outcome {
+        case .pending:
+            return "Starting \(fence.action) on \(fence.source.label). Other maintenance actions are blocked."
+        case .accepted(let pid):
+            return "Accepted \(fence.action) on \(fence.source.label), PID \(pid). Talaria will not replay or overlap it until you reconcile this exact action."
+        case .uncertain:
+            return "Outcome uncertain for \(fence.action) on \(fence.source.label). Talaria will not replay or overlap it until you reconcile this exact action."
+        }
+    }
+
+    private func pollAction(_ name: String, pid: Int, source: GatewayMaintenanceSource,
+                            client: GatewayClient, scopeKey key: String,
+                            generation captured: Int) async {
         for _ in 0..<20 {
             try? await Task.sleep(for: .milliseconds(1200))
             guard isCurrent(key, generation: captured) else { return }
             do {
-                let client = try await targetClient(gatewayID: targetGatewayID)
-                let status = try await client.actionStatus(name: name)
+                let status = try await client.actionStatus(name: name, pid: pid)
                 guard isCurrent(key, generation: captured) else { return }
                 action = status
-                if !status.running { return }
+                if !status.running {
+                    maintenanceRuntime.releaseDefinite(source: source, action: name)
+                    return
+                }
             } catch {
                 guard isCurrent(key, generation: captured) else { return }
                 action.message = error.localizedDescription
                 return
             }
+        }
+    }
+
+    private func beginMutation(_ action: String) -> OperatorMutationCapture? {
+        guard let gatewayID = targetGatewayID else {
+            setNotice("Select an exact gateway before starting this action.", warning: true)
+            return nil
+        }
+        let capture = OperatorMutationCapture(
+            source: GatewayMaintenanceSource(gatewayID: gatewayID, profile: targetProfile),
+            scopeKey: scopeKey, generation: generation, action: action)
+        guard maintenanceRuntime.begin(source: capture.source, action: action) else {
+            setNotice("Wait for the unresolved gateway action before starting another.", warning: true)
+            return nil
+        }
+        return capture
+    }
+
+    private func canPost(_ capture: OperatorMutationCapture) -> Bool {
+        GatewayOperationsPolicy.canIssuePost(
+            source: capture.source,
+            capturedScopeKey: capture.scopeKey,
+            capturedGeneration: capture.generation,
+            currentGatewayID: targetGatewayID,
+            currentProfile: targetProfile,
+            currentScopeKey: scopeKey,
+            currentGeneration: generation)
+    }
+
+    private func finishFailedMutation(_ capture: OperatorMutationCapture,
+                                      postStarted: Bool, error: Error) {
+        if GatewayOperationsPolicy.shouldFence(postStarted: postStarted, error: error) {
+            maintenanceRuntime.markUncertain(source: capture.source, action: capture.action)
+        } else {
+            maintenanceRuntime.releaseDefinite(source: capture.source, action: capture.action)
         }
     }
 
@@ -1182,26 +1532,34 @@ public struct OperatorSettingsSection: View {
 
     private func save(path: [String], field: String, value: JSONValue,
                       apply: (inout GatewayOperatorConfig) -> Void) async {
-        guard busyField == nil, var next = config else { return }
-        let key = scopeKey
-        let captured = generation
-        let gatewayID = targetGatewayID
-        let profile = targetProfile
+        guard busyField == nil, var next = config,
+              let capture = beginMutation("config-\(field)") else { return }
+        let key = capture.scopeKey
+        let captured = capture.generation
         busyField = field
         setNotice(nil, warning: false)
         defer { if isCurrent(key, generation: captured) { busyField = nil } }
+        var postStarted = false
         do {
-            let client = try await targetClient(gatewayID: gatewayID)
+            let client = try await targetClient(gatewayID: capture.source.gatewayID)
             // Client resolution may dial a secondary gateway. Revalidate before
             // issuing the mutation, and keep the target values captured above so
             // a picker change can never retarget an in-flight save.
-            guard isCurrent(key, generation: captured) else { return }
-            try await client.setGatewayConfigValue(path: path, value: value, profile: profile)
+            guard canPost(capture) else {
+                maintenanceRuntime.releaseDefinite(
+                    source: capture.source, action: capture.action)
+                return
+            }
+            postStarted = true
+            try await client.setGatewayConfigValue(
+                path: path, value: value, profile: capture.source.profile)
+            maintenanceRuntime.releaseDefinite(source: capture.source, action: capture.action)
             guard isCurrent(key, generation: captured) else { return }
             apply(&next)
             config = next
             setNotice(copy.settingsOperatorSaved(theme.id, field: field), warning: false)
         } catch {
+            finishFailedMutation(capture, postStarted: postStarted, error: error)
             guard isCurrent(key, generation: captured) else { return }
             setNotice(error.localizedDescription, warning: true)
         }
@@ -1267,8 +1625,29 @@ public extension CopyPack {
     }
     func settingsRestartGateway(_ t: ThemeID) -> String { t == .control ? "RESTART GATEWAY" : "Restart gateway" }
     func settingsUpdateHermes(_ t: ThemeID) -> String { t == .control ? "UPDATE HERMES" : "Update Hermes" }
+    func settingsRestartConfirmTitle(_ t: ThemeID) -> String {
+        t == .control ? "RESTART THIS GATEWAY?" : "Restart this gateway?"
+    }
+    func settingsRestartConfirmMessage(_ t: ThemeID) -> String {
+        t == .control
+            ? "THE CONNECTION MAY CLOSE AFTER ACCEPTANCE. TALARIA WILL NOT RETRY."
+            : "The selected gateway may disconnect immediately after accepting this request. Talaria will not retry it."
+    }
+    func settingsUpdateConfirmTitle(_ t: ThemeID) -> String {
+        t == .control ? "UPDATE HERMES NOW?" : "Update Hermes now?"
+    }
+    func settingsUpdateConfirmMessage(_ t: ThemeID) -> String {
+        t == .control
+            ? "REQUIRES CAN_APPLY. THE CONNECTION MAY CLOSE. TALARIA WILL NOT RETRY."
+            : "Hermes reported that this installation supports managed updates. The connection may close after acceptance, and Talaria will not retry."
+    }
     func settingsUpdateStatus(_ t: ThemeID, check: GatewayCommandAction) -> String {
         if !check.message.isEmpty { return check.message }
+        if !check.canApply, !check.updateCommand.isEmpty {
+            return t == .control
+                ? "MANAGED UPDATE UNAVAILABLE · \(check.updateCommand.uppercased())"
+                : "Managed update unavailable. Recommended: \(check.updateCommand)"
+        }
         if check.updateAvailable {
             let behind = check.behind.map(String.init) ?? "?"
             return t == .control ? "UPDATE AVAILABLE · \(behind) COMMITS BEHIND" : "Update available · \(behind) commits behind."
@@ -1282,6 +1661,7 @@ public extension CopyPack {
         let state: String
         if action.running { state = t == .control ? "RUNNING" : "running" }
         else if action.exitCode == 0 { state = t == .control ? "DONE" : "done" }
+        else if action.ok, action.pid != nil { state = t == .control ? "ACCEPTED" : "accepted" }
         else { state = t == .control ? "FAILED" : "failed" }
         let tail = action.lines.suffix(3).joined(separator: "\n")
         let body = action.message.isEmpty ? tail : action.message

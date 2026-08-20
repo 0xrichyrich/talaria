@@ -814,13 +814,32 @@ public extension AppModel {
     /// artifacts RPC — desktop derives the same index client-side from
     /// transcripts, and so does this (artifact-utils.ts parity).
     func refreshArtifacts(force: Bool = false) async {
-        guard mode == .live, let client, !bots.isEmpty else { return }
+        guard mode == .live, !bots.isEmpty,
+              let sourceGatewayID = LiveRuntime.shared.gatewayID else { return }
+        let sourceGeneration = LiveRuntime.shared.generation
         let runtime = FeedsRuntime.shared
         if runtime.artifactsScanning { return }
         if !force, let last = runtime.lastArtifactScan, last.timeIntervalSinceNow > -120 { return }
-        guard let (base, credential) = gatewayRESTContext() else {
+        guard let (base, credential) = gatewayRESTContext(gatewayID: sourceGatewayID) else {
             runtime.artifactsNote = theme.copy.needsRESTNote(theme.themeID)
             return
+        }
+        let sourceClient: GatewayClient
+        do {
+            sourceClient = try await routedClient(gatewayID: sourceGatewayID)
+        } catch {
+            runtime.artifactsNote = error.localizedDescription
+            return
+        }
+        guard LiveRuntime.shared.gatewayID == sourceGatewayID,
+              LiveRuntime.shared.generation == sourceGeneration else { return }
+
+        // `bots` can momentarily contain retained/qualified rows while a
+        // gateway switch reconciles. Bind each sweep row to the captured source
+        // and pass Hermes only its raw profile name.
+        let sourceProfiles: [String] = bots.compactMap { bot in
+            Self.artifactSweepProfile(route: stateRoute(for: bot.id),
+                                      sourceGatewayID: sourceGatewayID)
         }
 
         runtime.artifactsScanning = true
@@ -833,12 +852,12 @@ public extension AppModel {
 
         // One transcript resident at a time: recent sessions run to thousands
         // of rows and the phone pays for every one of them.
-        for bot in bots.prefix(8) {
+        for profile in sourceProfiles.prefix(8) {
             // The forever chat is where a bot does most of its work, and it is
             // hidden — scanning without the flag indexes artifacts from every
             // session EXCEPT the one that matters (methods_session.py:180-186).
-            guard let sessions = try? await client.listSessions(limit: 6, profile: bot.id,
-                                                                includeHidden: true) else {
+            guard let sessions = try? await sourceClient.listSessions(
+                limit: 6, profile: profile, includeHidden: true) else {
                 failures += 1
                 continue
             }
@@ -847,18 +866,17 @@ public extension AppModel {
                 do {
                     let rows = try await GatewayREST.sessionMessages(
                         baseURL: base, credential: credential,
-                        storedID: session.id, profile: bot.id, limit: 150)
+                        storedID: session.id, profile: profile, limit: 150)
                     scanned += 1
                     let title = session.title.isEmpty ? (session.preview ?? "session") : session.title
-                    let harvest = Self.artifacts(in: rows, botID: bot.id,
+                    let harvest = Self.artifacts(in: rows, botID: profile,
                                                  sessionID: session.id, sessionTitle: title,
-                                                 sessionStart: session.startedAt)
+                                                 sessionStart: session.startedAt,
+                                                 sourceGatewayID: sourceGatewayID)
                     for artifact in harvest {
-                        if let gatewayID = LiveRuntime.shared.gatewayID {
-                            refs[artifact.id] = SessionRef(gatewayID: gatewayID,
-                                                           botID: bot.id,
-                                                           storedID: session.id)
-                        }
+                        refs[artifact.id] = SessionRef(gatewayID: sourceGatewayID,
+                                                       botID: profile,
+                                                       storedID: session.id)
                     }
                     found.append(contentsOf: harvest)
                 } catch {
@@ -871,18 +889,35 @@ public extension AppModel {
         // see (the transcript row is written after the event). Keep those, but
         // match on bot + value, not id: the same file ingested live and swept
         // from the transcript carries two different timestamps.
-        let swept = Set(found.map { "\($0.botID)|\(Self.artifactValue($0.id))" })
+        let swept = Set(found.map {
+            Self.artifactSourceKey(gatewayID: sourceGatewayID, botID: $0.botID,
+                                   value: Self.artifactValue($0.id))
+        })
+        let foreign = artifacts.filter {
+            runtime.artifactSessions[$0.id]?.gatewayID != sourceGatewayID
+        }
         let liveOnly = artifacts.filter {
-            runtime.artifactSessions[$0.id] != nil
-                && !swept.contains("\($0.botID)|\(Self.artifactValue($0.id))")
+            guard let ref = runtime.artifactSessions[$0.id], ref.gatewayID == sourceGatewayID else {
+                return false
+            }
+            return !swept.contains(Self.artifactSourceKey(
+                gatewayID: ref.gatewayID, botID: ref.botID,
+                value: Self.artifactValue($0.id)))
         }
         for artifact in liveOnly { refs[artifact.id] = runtime.artifactSessions[artifact.id] }
 
-        runtime.artifactSessions = refs
-        artifacts = (found + liveOnly)
+        guard !Task.isCancelled,
+              LiveRuntime.shared.gatewayID == sourceGatewayID,
+              LiveRuntime.shared.generation == sourceGeneration else { return }
+        var combinedRefs = runtime.artifactSessions.filter { $0.value.gatewayID != sourceGatewayID }
+        combinedRefs.merge(refs) { _, fresh in fresh }
+        let published = (found + liveOnly + foreign)
             .sorted { Self.sortKey($0) > Self.sortKey($1) }
             .prefix(150)
             .map { $0 }
+        let publishedIDs = Set(published.map(\.id))
+        runtime.artifactSessions = combinedRefs.filter { publishedIDs.contains($0.key) }
+        artifacts = published
         runtime.artifactsNote = theme.copy.artifactsDerivationNote(theme.themeID,
                                                                   sessions: scanned,
                                                                   failures: failures)
@@ -928,20 +963,29 @@ public extension AppModel {
         let producer = ArtifactScan.isProducer(tool.name.lowercased())
         guard producer || text.contains("MEDIA:") || text.contains("Screenshot path:") else { return }
 
+        let route = stateRoute(for: botID)
         let stored = chats[botID]?.storedSessionID
+        let artifactBotID = route?.profile ?? botID
         // Same file, same bot, twice in a turn is one artifact.
-        let known = Set(artifacts.filter { $0.botID == botID }
+        let known = Set(artifacts.filter {
+            guard $0.botID == artifactBotID else { return false }
+            guard let route else { return true }
+            return FeedsRuntime.shared.artifactSessions[$0.id]?.gatewayID == route.gatewayID
+        }
             .map { Self.artifactValue($0.id) })
         var added = false
         for value in ArtifactScan.values(inToolText: text, producer: producer).prefix(6)
         where !known.contains(value) {
-            let artifact = Self.artifact(from: value, botID: botID,
-                                         sessionID: stored ?? sessionID,
+            let identitySession = route.map {
+                "\($0.gatewayID)\u{1f}\(stored ?? sessionID)"
+            } ?? (stored ?? sessionID)
+            let artifact = Self.artifact(from: value, botID: artifactBotID,
+                                         sessionID: identitySession,
                                          sessionTitle: tool.name, at: Date())
-            if let stored, let gatewayID = stateRoute(for: botID)?.gatewayID {
+            if let stored, let route {
                 FeedsRuntime.shared.artifactSessions[artifact.id] =
-                    SessionRef(gatewayID: gatewayID,
-                               botID: botID, storedID: stored)
+                    SessionRef(gatewayID: route.gatewayID,
+                               botID: route.profile, storedID: stored)
             }
             artifacts.insert(artifact, at: 0)
             added = true
@@ -951,7 +995,8 @@ public extension AppModel {
 
     /// Extract every artifact value from one session's transcript rows.
     static func artifacts(in rows: [JSONValue], botID: String, sessionID: String,
-                          sessionTitle: String, sessionStart: Double?) -> [Artifact] {
+                          sessionTitle: String, sessionStart: Double?,
+                          sourceGatewayID: String? = nil) -> [Artifact] {
         var seen = Set<String>()
         var out: [Artifact] = []
         for row in rows {
@@ -971,7 +1016,9 @@ public extension AppModel {
                 values = ArtifactScan.values(inToolText: text, producer: producer)
             }
             for value in values where seen.insert(value).inserted {
-                out.append(artifact(from: value, botID: botID, sessionID: sessionID,
+                let identitySession = sourceGatewayID.map { "\($0)\u{1f}\(sessionID)" }
+                    ?? sessionID
+                out.append(artifact(from: value, botID: botID, sessionID: identitySession,
                                     sessionTitle: sessionTitle, at: when))
             }
         }
@@ -1002,6 +1049,18 @@ public extension AppModel {
     static func artifactValue(_ id: String) -> String {
         let parts = id.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
         return parts.count == 3 ? String(parts[2]) : id
+    }
+
+    static func artifactSourceKey(gatewayID: String, botID: String, value: String) -> String {
+        [gatewayID, botID, value].joined(separator: "\u{1f}")
+    }
+
+    static func artifactSweepProfile(route: GatewayBotRoute?,
+                                     sourceGatewayID: String) -> String? {
+        guard let route, route.gatewayID == sourceGatewayID, !route.profile.isEmpty else {
+            return nil
+        }
+        return route.profile
     }
 }
 

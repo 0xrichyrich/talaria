@@ -965,7 +965,7 @@ public struct ChatView: View {
                             .lineLimit(2)
                         Spacer(minLength: 8)
                         Button {
-                            model.dequeuePrompt(id: item.id)
+                            model.dismissQueuedPrompt(id: item.id)
                         } label: {
                             Text(copy.promptQueueRemove(theme.id))
                                 .font(theme.body(12, weight: .semibold))
@@ -977,6 +977,9 @@ public struct ChatView: View {
                     .padding(.horizontal, 10)
                     .background(theme.inset, in: RoundedRectangle(cornerRadius: theme.buttonRadius, style: .continuous))
                 }
+                Text(copy.promptQueueNotice(theme.id))
+                    .font(theme.body(10.5))
+                    .foregroundStyle(theme.faint)
             }
         }
     }
@@ -1272,19 +1275,23 @@ public struct ChatView: View {
             showCommands = true
             return
         }
-        draft = ""
         // Slash commands are not prompts: they go to slash.exec, which appends
         // its own user echo and leaves anything staged in the tray alone for
         // the next real turn.
         if text.hasPrefix("/") {
+            draft = ""
+            editingMessage = nil
             Task { await model.runSlash(text, botID: botID) }
             return
         }
         if let editing = editingMessage {
+            guard model.canActOnTranscript(editing, in: botID) else { return }
+            draft = ""
             editingMessage = nil
             model.editMessage(editing, in: botID, to: text)
             return
         }
+        draft = ""
         model.sendOrSteer(text: text, to: botID)
     }
 }
@@ -1361,9 +1368,17 @@ extension CopyPack {
     }
     func promptQueueRemove(_ theme: ThemeID) -> String {
         switch theme {
-        case .soft: "Remove"
-        case .control: "DROP"
-        case .ink: "set aside"
+        case .soft: "Dismiss"
+        case .control: "DISMISS"
+        case .ink: "hide this note"
+        }
+    }
+
+    func promptQueueNotice(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Dismiss only hides this notice; Hermes still runs the queued prompt."
+        case .control: "DISMISS HIDES LOCAL MIRROR ONLY — GATEWAY EXECUTION CONTINUES"
+        case .ink: "Hiding the note does not unspeak the waiting words."
         }
     }
 

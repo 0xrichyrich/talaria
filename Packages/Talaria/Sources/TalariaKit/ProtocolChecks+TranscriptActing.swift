@@ -30,7 +30,7 @@ extension ProtocolChecks {
 
         let localOnly = ChatMessage(author: .user, text: "never sent")
         let failed = TranscriptActing.planRestore([first, reply, localOnly], from: localOnly.id)
-        try expect(failed?.truncate.isEmpty == true, "undurable user turn does not truncate")
+        try expect(failed == nil, "undurable user turn cannot masquerade as rewind")
 
         let params = TranscriptActing.truncateParams(restore!.truncate)
         try expect(params["confirm_truncate"]?.boolValue == true, "confirm_truncate required")

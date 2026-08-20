@@ -409,6 +409,7 @@ private struct ArtifactDetailSheet: View {
     @State private var exported: ExportedFile?
     @State private var exporting = false
     @State private var note: String?
+    @State private var shareTask: Task<Void, Never>?
 
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
@@ -445,9 +446,12 @@ private struct ArtifactDetailSheet: View {
         .background(theme.bg.ignoresSafeArea())
         .presentationBackground(theme.bg)
         .presentationDetents([.large])
-        .sheet(item: $exported) { file in
+        .sheet(item: $exported, onDismiss: cleanupExport) { file in
             #if os(iOS)
-            TalariaShareSheet(items: [file.url]) { exported = nil }
+            TalariaShareSheet(items: [file.url]) {
+                file.removeOwnedShareCopy()
+                exported = nil
+            }
             #else
             EmptyView()
             #endif
@@ -456,6 +460,11 @@ private struct ArtifactDetailSheet: View {
             // Links are never fetched — see AppModelLive+Artifacts.swift. An
             // image URL is, because opening the card IS the user asking for it.
             fetched = await model.loadArtifact(artifact, allowRemote: artifact.kind == .image || artifact.kind == .media)
+        }
+        .onDisappear {
+            shareTask?.cancel()
+            shareTask = nil
+            cleanupExport()
         }
     }
 
@@ -486,7 +495,7 @@ private struct ArtifactDetailSheet: View {
         case .binary(_, let mime):
             noticeCard(copy.artifactBinaryBody(theme.id), tone: theme.sub, detail: mime)
         case .media(let url):
-            VideoPlayer(player: AVPlayer(url: url))
+            ArtifactMediaPlayer(url: url)
                 .frame(height: 280)
                 .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: theme.cardRadius, style: .continuous)
@@ -647,7 +656,8 @@ private struct ArtifactDetailSheet: View {
     /// and a failed fetch must not offer an export that cannot happen.
     private var canShare: Bool {
         switch fetched {
-        case .image, .text, .binary, .media: return true
+        case .image, .text, .binary: return true
+        case .media(let url): return FileManager.default.fileExists(atPath: url.path)
         case .none, .unavailable: return false
         }
     }
@@ -685,8 +695,13 @@ private struct ArtifactDetailSheet: View {
     private func share() {
         guard !exporting else { return }
         exporting = true
-        Task { @MainActor in
+        shareTask = Task { @MainActor in
             let result = await model.artifactShareFile(artifact)
+            guard !Task.isCancelled else {
+                if case .success(let url) = result { TalariaExportBox.removeOwned(url) }
+                exporting = false
+                return
+            }
             exporting = false
             switch result {
             case .success(let url):
@@ -702,7 +717,32 @@ private struct ArtifactDetailSheet: View {
                     note = copy.artifactUnavailable(theme.id, why)
                 }
             }
+            shareTask = nil
         }
+    }
+
+    private func cleanupExport() {
+        exported?.removeOwnedShareCopy()
+        exported = nil
+    }
+}
+
+private struct ArtifactMediaPlayer: View {
+    let url: URL
+    @State private var player: AVPlayer
+
+    init(url: URL) {
+        self.url = url
+        _player = State(initialValue: AVPlayer(url: url))
+    }
+
+    var body: some View {
+        VideoPlayer(player: player)
+            .onChange(of: url) { _, next in
+                player.pause()
+                player.replaceCurrentItem(with: AVPlayerItem(url: next))
+            }
+            .onDisappear { player.pause() }
     }
 }
 

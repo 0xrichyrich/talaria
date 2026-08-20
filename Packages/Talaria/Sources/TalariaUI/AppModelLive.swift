@@ -89,6 +89,8 @@ struct ApprovalResponseTarget: Equatable {
     var bot: GatewayBotRoute
     var session: GatewaySessionRoute
     var requestID: String
+    var storedID: String? = nil
+    var botID: String? = nil
 }
 
 extension AppModel {
@@ -808,7 +810,10 @@ extension AppModel {
         runtime.approvalTargets[approvalID] = ApprovalResponseTarget(
             bot: botRoute,
             session: GatewaySessionRoute(gatewayID: gatewayID, sessionID: request.sessionID),
-            requestID: request.requestID)
+            requestID: request.requestID,
+            storedID: chats[owner].flatMap {
+                $0.sessionID == request.sessionID ? $0.storedSessionID : nil
+            }, botID: owner)
         if approvals.contains(where: { $0.id == approvalID }) { return approvalID }
         approvals.append(Approval(
             id: approvalID,

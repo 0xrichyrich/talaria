@@ -171,62 +171,79 @@ final class WorkspaceCommandCenterTests: XCTestCase {
         XCTAssertEqual(listing.parent, "/work")
     }
 
-    func testCommandDispatchParsesEveryPortableDirective() throws {
-        XCTAssertEqual(try HermesCommandDispatch(.object([
-            "type": .string("exec"), "output": .string("done"),
-        ])), .exec("done"))
-        XCTAssertEqual(try HermesCommandDispatch(.object([
-            "type": .string("plugin"), "output": .string("unsafe"),
-        ])), .plugin("unsafe"))
-        XCTAssertEqual(try HermesCommandDispatch(.object([
-            "type": .string("alias"), "target": .string("goal"),
-        ])), .alias("goal"))
-        XCTAssertEqual(try HermesCommandDispatch(.object([
-            "type": .string("skill"), "name": .string("review"),
-            "message": .string("model scaffold"), "display": .string("/review"),
-        ])), .skill(name: "review", message: "model scaffold", display: "/review"))
-        XCTAssertEqual(try HermesCommandDispatch(.object([
-            "type": .string("send"), "message": .string("model body"),
-            "display": .string("/goal ship"), "notice": .string("Goal set"),
-        ])), .send(message: "model body", notice: "Goal set", display: "/goal ship"))
-        XCTAssertEqual(try HermesCommandDispatch(.object([
-            "type": .string("prefill"), "message": .string("restore me"),
-        ])), .prefill(message: "restore me", notice: nil))
-        XCTAssertThrowsError(try HermesCommandDispatch(.object(["type": .string("picker")])))
-        XCTAssertThrowsError(try HermesCommandDispatch(.object(["type": .string("exec")])))
-        XCTAssertThrowsError(try HermesCommandDispatch(.object([
-            "type": .string("skill"), "message": .string("missing identity"),
-        ])))
+    func testCommandCenterDispatchRejectsEveryCatalogOriginAndNameCollision() {
+        for origin in [HermesCommandOrigin.builtIn, .skill, .quickCommand, .unclassified] {
+            for name in ["/status", "/help", "/review", "/plugin-shadow"] {
+                XCTAssertFalse(WorkspaceCommandPolicy.permitsCommandCenterDispatch(
+                    HermesCommand(name: name, summary: "", origin: origin)
+                ), "Command Center must not dispatch \(origin) \(name)")
+            }
+        }
     }
 
-    func testCommandPolicyRejectsUntrustedOriginsAndDestructiveSemantics() {
-        let safe = HermesCommand(name: "/status", summary: "", origin: .builtIn)
-        XCTAssertEqual(WorkspaceCommandPolicy.disposition(for: safe, argument: ""), .readOnly)
-        guard case .unsupported = WorkspaceCommandPolicy.disposition(for: safe, argument: "extra")
-        else { return XCTFail("read-only commands must reject arguments") }
+    func testProjectTreeRejectsMalformedNestedSessionMetadata() throws {
+        let validPreview: JSONValue = .object([
+            "id": .string("session-1"), "profile": .string("work"),
+            "title": .string("Session"), "preview": .string("hello"),
+        ])
+        let validProject: JSONValue = .object([
+            "id": .string("project-1"), "sessionCount": .number(1),
+            "previewSessions": .array([validPreview]),
+        ])
+        XCTAssertNotNil(HermesProjectTree(validProject))
 
-        for origin in [HermesCommandOrigin.quickCommand, .unclassified] {
-            let command = HermesCommand(name: "/status", summary: "", origin: origin)
-            guard case .unsupported = WorkspaceCommandPolicy.disposition(for: command, argument: "")
-            else { return XCTFail("untrusted catalog origins must be blocked") }
-        }
-        for name in ["retry", "undo", "goal", "moa"] {
-            let command = HermesCommand(name: name, summary: "", origin: .builtIn)
-            guard case .unsupported = WorkspaceCommandPolicy.disposition(for: command, argument: "ship")
-            else { return XCTFail("state-changing semantic command /\(name) must be blocked") }
-        }
+        XCTAssertNil(HermesProjectSessionPreview(.object([
+            "id": .string("session-1"), "title": .string("No provenance"),
+        ])))
+        XCTAssertNil(HermesProjectSessionPreview(.object([
+            "id": .string("session-1"), "profile": .string("   "),
+        ])))
+        XCTAssertNil(HermesProjectTree(.object([
+            "id": .string("project-1"), "previewSessions": .array([]),
+        ])), "sessionCount must be explicit")
+        XCTAssertNil(HermesProjectTree(.object([
+            "id": .string("project-1"), "sessionCount": .number(-1),
+            "previewSessions": .array([]),
+        ])), "sessionCount must be nonnegative")
+        XCTAssertNil(HermesProjectTree(.object([
+            "id": .string("project-1"), "sessionCount": .number(0),
+        ])), "previewSessions must be an explicit array")
+        XCTAssertNil(HermesProjectTree(.object([
+            "id": .string("project-1"), "sessionCount": .number(1),
+            "previewSessions": .array([.object(["id": .string("missing-profile")])]),
+        ])), "a malformed nested preview must invalidate its project")
+        XCTAssertNil(HermesProjectTree(.object([
+            "id": .string("project-1"), "sessionCount": .number(0),
+            "previewSessions": .array([validPreview]),
+        ])), "preview rows cannot exceed the explicit session count")
 
-        let skill = HermesCommand(name: "/review", summary: "", origin: .skill)
-        XCTAssertEqual(WorkspaceCommandPolicy.disposition(for: skill, argument: "this"),
-                       .recoverablePromptDraft)
-        XCTAssertNil(WorkspaceCommandPolicy.catalogCommand(named: "manual", in: [safe, skill]))
-        XCTAssertTrue(WorkspaceCommandPolicy.isCatalogEligible(safe))
-        XCTAssertTrue(WorkspaceCommandPolicy.isCatalogEligible(skill))
-        XCTAssertFalse(WorkspaceCommandPolicy.isCatalogEligible(
-            HermesCommand(name: "/status", summary: "", origin: .quickCommand)
+        XCTAssertThrowsError(try HermesProjectTree.validatedList(from: .object([
+            "projects": .array([validProject, .object([
+                "id": .string("bad"), "sessionCount": .number(1),
+                "previewSessions": .array([.object(["id": .string("missing-profile")])]),
+            ])]),
+        ])), "a malformed project must not be compactMap-dropped")
+        XCTAssertThrowsError(try HermesProjectTree.validatedList(from: .object([
+            "projects": .array([validProject]),
+            "errors": .array([.string("profile unavailable")]),
+        ])), "a partial all-profile response must not publish clickable rows")
+    }
+
+    func testProjectSessionWindowRejectsSaturationBoundary() {
+        XCTAssertTrue(WorkspaceProjectSessionWindowPolicy.isProvablyComplete(
+            totalReportedSessions: 4_999,
+            selectedReportedSessions: 12,
+            selectedPreviewCount: 12
         ))
-        XCTAssertFalse(WorkspaceCommandPolicy.isCatalogEligible(
-            HermesCommand(name: "/undo", summary: "", origin: .builtIn)
+        XCTAssertFalse(WorkspaceProjectSessionWindowPolicy.isProvablyComplete(
+            totalReportedSessions: 5_000,
+            selectedReportedSessions: 12,
+            selectedPreviewCount: 12
+        ))
+        XCTAssertFalse(WorkspaceProjectSessionWindowPolicy.isProvablyComplete(
+            totalReportedSessions: 4_999,
+            selectedReportedSessions: 12,
+            selectedPreviewCount: 11
         ))
     }
 
@@ -466,10 +483,10 @@ final class WorkspaceCommandCenterTests: XCTestCase {
         runtime.resetProcesses(targetID: nil)
     }
 
-    func testCommandDispatchSurfaceRequiresAuthoritativeCatalogCapability() {
+    func testCommandCenterDispatchSurfaceStaysUnavailableDespiteCatalogCapability() {
         XCTAssertFalse(WorkspaceCommandSurfacePolicy.exposesDispatch(capability: nil))
         XCTAssertFalse(WorkspaceCommandSurfacePolicy.exposesDispatch(capability: false))
-        XCTAssertTrue(WorkspaceCommandSurfacePolicy.exposesDispatch(capability: true))
+        XCTAssertFalse(WorkspaceCommandSurfacePolicy.exposesDispatch(capability: true))
     }
 
     @MainActor
@@ -601,6 +618,32 @@ final class WorkspaceCommandCenterTests: XCTestCase {
         XCTAssertFalse(runtime.backupDownloadRunning)
         XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
         _ = runtime.begin(gatewayID: nil)
+    }
+
+    @MainActor
+    func testWorkspaceScopeSwitchPreservesAndConsultsOperatorMaintenanceFence() {
+        let maintenance = GatewayMaintenanceRuntime.shared
+        let workspace = WorkspaceRuntime.shared
+        maintenance.acknowledge()
+        _ = workspace.begin(gatewayID: "gateway-a")
+        defer {
+            maintenance.acknowledge()
+            _ = workspace.begin(gatewayID: nil)
+        }
+
+        let source = GatewayMaintenanceSource(gatewayID: "gateway-a", profile: "worker")
+        XCTAssertTrue(maintenance.begin(source: source, action: "backup"))
+        maintenance.accept(source: source, action: "backup", pid: 73)
+        let owner = workspace.mutationOwner
+
+        _ = workspace.begin(gatewayID: "gateway-b")
+
+        XCTAssertEqual(workspace.mutationOwner, owner,
+                       "scope changes must not clear another surface's no-replay owner")
+        XCTAssertTrue(workspace.mutationBusy)
+        XCTAssertNil(workspace.claimMutation(),
+                     "Command Center must not overlap a persistent operator action")
+        XCTAssertEqual(maintenance.fence?.outcome, .accepted(pid: 73))
     }
 
 }

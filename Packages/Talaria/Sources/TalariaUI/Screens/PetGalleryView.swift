@@ -495,6 +495,13 @@ public struct PetGalleryView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(isActive ? .isSelected : [])
+        .accessibilityValue(Text(
+            stagedSlug == entry.slug
+                ? "Staged. Save to make this the live face."
+                : (surface.enabled && surface.pet?.slug == entry.slug
+                   ? "Active live face" : "Not selected")
+        ))
         .contextMenu {
             if entry.installed {
                 Button(copy.petRename(themeID)) {

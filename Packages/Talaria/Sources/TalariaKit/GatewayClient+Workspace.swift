@@ -437,9 +437,11 @@ public struct HermesProjectSessionPreview: Identifiable, Hashable, Sendable {
     public var lastActive: Double
 
     init?(_ value: JSONValue) {
-        guard let id = value["id"]?.stringValue?.nilIfEmpty else { return nil }
+        guard let id = value["id"]?.stringValue?.nilIfEmpty,
+              let profile = value["profile"]?.stringValue,
+              !profile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         storedID = id
-        profile = value["profile"]?.stringValue?.nilIfEmpty ?? "default"
+        self.profile = profile
         title = value["title"]?.stringValue?.nilIfEmpty ?? "Untitled session"
         preview = value["preview"]?.stringValue ?? ""
         lastActive = value["last_active"]?.doubleValue ?? value["started_at"]?.doubleValue ?? 0
@@ -456,14 +458,45 @@ public struct HermesProjectTree: Identifiable, Hashable, Sendable {
     public var previews: [HermesProjectSessionPreview]
 
     init?(_ value: JSONValue) {
-        guard let id = value["id"]?.stringValue?.nilIfEmpty else { return nil }
+        guard let id = value["id"]?.stringValue?.nilIfEmpty,
+              let sessionCountValue = value["sessionCount"]?.doubleValue,
+              let sessionCount = Int(exactly: sessionCountValue),
+              sessionCount >= 0,
+              let rawPreviews = value["previewSessions"]?.arrayValue else { return nil }
+        let previews = rawPreviews.compactMap(HermesProjectSessionPreview.init)
+        guard previews.count == rawPreviews.count,
+              previews.count <= sessionCount,
+              Set(previews.map(\.id)).count == previews.count else { return nil }
         self.id = id
         label = value["label"]?.stringValue?.nilIfEmpty ?? id
         path = value["path"]?.stringValue?.nilIfEmpty
-        sessionCount = value["sessionCount"]?.intValue ?? 0
+        self.sessionCount = sessionCount
         totalTokens = value["totalTokens"]?.intValue ?? 0
         totalCostUSD = value["totalCostUsd"]?.doubleValue ?? 0
-        previews = value["previewSessions"]?.arrayValue?.compactMap(HermesProjectSessionPreview.init) ?? []
+        self.previews = previews
+    }
+
+    static func validatedList(from response: JSONValue) throws -> [HermesProjectTree] {
+        if let errorsValue = response["errors"] {
+            guard let errors = errorsValue.arrayValue else {
+                throw GatewayError(code: 502,
+                                   message: "Hermes returned invalid project-tree error metadata.")
+            }
+            guard errors.isEmpty else {
+                throw GatewayError(code: 502,
+                                   message: "Hermes returned only a partial all-profile project tree.")
+            }
+        }
+        guard let rawProjects = response["projects"]?.arrayValue else {
+            throw GatewayError(code: 502,
+                               message: "Hermes omitted the project-tree array.")
+        }
+        let projects = rawProjects.compactMap(HermesProjectTree.init)
+        guard projects.count == rawProjects.count else {
+            throw GatewayError(code: 502,
+                               message: "Hermes returned malformed nested project-session metadata.")
+        }
+        return projects
     }
 }
 
@@ -556,139 +589,37 @@ public struct HermesCommand: Identifiable, Hashable, Sendable {
     public var origin: HermesCommandOrigin
 }
 
-public enum WorkspaceCommandDisposition: Equatable, Sendable {
-    case readOnly
-    case recoverablePromptDraft
-    case unsupported(String)
-}
-
-/// Command Center never asks `command.dispatch` to classify an arbitrary
-/// name: a user quick command can execute a shell before its result type is
-/// returned. Eligibility therefore comes from this app-owned policy plus the
-/// catalog's authoritative origin metadata.
 public enum WorkspaceCommandPolicy {
-    private static let noArgumentReadOnly: Set<String> = [
-        "agents", "bundles", "gateway", "insights", "platforms", "plugins",
-        "profile", "status", "tasks", "toolsets", "usage", "version", "whoami",
-    ]
-    private static let destructiveSemantic: Set<String> = ["goal", "moa", "retry", "undo"]
-
     public static func canonicalName(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return String(trimmed.drop(while: { $0 == "/" })).lowercased()
     }
 
-    public static func catalogCommand(named raw: String, in catalog: [HermesCommand]) -> HermesCommand? {
-        let name = canonicalName(raw)
-        guard !name.isEmpty else { return nil }
-        return catalog.first { canonicalName($0.name) == name }
-    }
-
-    public static func isCatalogEligible(_ command: HermesCommand) -> Bool {
-        let name = canonicalName(command.name)
-        guard !destructiveSemantic.contains(name) else { return false }
-        switch command.origin {
-        case .skill:
-            return true
-        case .quickCommand, .unclassified:
-            return false
-        case .builtIn:
-            return noArgumentReadOnly.contains(name)
-                || ["help", "context", "egress", "queue"].contains(name)
-        }
-    }
-
-    public static func disposition(for command: HermesCommand,
-                                   argument rawArgument: String) -> WorkspaceCommandDisposition {
-        let name = canonicalName(command.name)
-        let argument = rawArgument.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if destructiveSemantic.contains(name) {
-            return .unsupported("/\(name) changes session or agent state and has no Command Center-specific confirmation design.")
-        }
-        switch command.origin {
-        case .quickCommand:
-            return .unsupported("User quick commands are not dispatched because they can execute arbitrary shell or plugin code before returning a type.")
-        case .unclassified:
-            return .unsupported("Hermes did not classify this command as a built-in or skill.")
-        case .skill:
-            return .recoverablePromptDraft
-        case .builtIn:
-            break
-        }
-
-        if name == "queue" {
-            return argument.isEmpty
-                ? .unsupported("/queue requires a prompt.")
-                : .recoverablePromptDraft
-        }
-        if name == "help" { return .readOnly }
-        if name == "context" {
-            return argument.isEmpty || argument.lowercased() == "all"
-                ? .readOnly
-                : .unsupported("Command Center supports only /context or /context all.")
-        }
-        if name == "egress" {
-            return argument.isEmpty || argument.lowercased() == "status"
-                ? .readOnly
-                : .unsupported("Command Center exposes only read-only egress status.")
-        }
-        if noArgumentReadOnly.contains(name) {
-            return argument.isEmpty
-                ? .readOnly
-                : .unsupported("/\(name) is read-only here and does not accept arguments.")
-        }
-        return .unsupported("This built-in is outside Command Center’s code-owned safe allowlist.")
+    /// Catalog origin metadata cannot make `command.dispatch` safe for Command
+    /// Center because Hermes resolves shadowing plugins and quick commands
+    /// before its built-ins.
+    /// Keep this invariant explicit so a future catalog UI cannot accidentally
+    /// re-enable Command Center dispatch based on a name or claimed origin.
+    public static func permitsCommandCenterDispatch(_ command: HermesCommand) -> Bool {
+        _ = command
+        return false
     }
 }
 
-public enum HermesCommandDispatch: Sendable, Equatable {
-    case exec(String)
-    case plugin(String)
-    case alias(String)
-    case skill(name: String, message: String, display: String?)
-    case send(message: String, notice: String?, display: String?)
-    case prefill(message: String, notice: String?)
+public enum WorkspaceProjectSessionWindowPolicy {
+    public static let maximumRows = 5_000
 
-    init(_ value: JSONValue) throws {
-        switch value["type"]?.stringValue {
-        case "exec":
-            guard let output = value["output"]?.stringValue else {
-                throw GatewayError(code: -83, message: "Hermes returned an invalid command output directive.")
-            }
-            self = .exec(output)
-        case "plugin":
-            guard let output = value["output"]?.stringValue else {
-                throw GatewayError(code: -83, message: "Hermes returned an invalid plugin directive.")
-            }
-            self = .plugin(output)
-        case "alias":
-            guard let target = value["target"]?.stringValue?.nilIfEmpty else {
-                throw GatewayError(code: -83, message: "Hermes returned an invalid alias directive.")
-            }
-            self = .alias(target)
-        case "skill":
-            guard let name = value["name"]?.stringValue?.nilIfEmpty,
-                  let message = value["message"]?.stringValue?.nilIfEmpty else {
-                throw GatewayError(code: -83, message: "Hermes returned an invalid skill directive.")
-            }
-            self = .skill(name: name, message: message,
-                          display: value["display"]?.stringValue?.nilIfEmpty)
-        case "send":
-            guard let message = value["message"]?.stringValue?.nilIfEmpty else {
-                throw GatewayError(code: -83, message: "Hermes returned a command without its model message.")
-            }
-            self = .send(message: message,
-                         notice: value["notice"]?.stringValue?.nilIfEmpty,
-                         display: value["display"]?.stringValue?.nilIfEmpty)
-        case "prefill":
-            guard let message = value["message"]?.stringValue else {
-                throw GatewayError(code: -83, message: "Hermes returned an invalid prefill directive.")
-            }
-            self = .prefill(message: message, notice: value["notice"]?.stringValue?.nilIfEmpty)
-        default:
-            throw GatewayError(code: -83, message: "Hermes returned an unsupported command directive.")
-        }
+    /// Hermes derives project counts after applying a global per-profile row
+    /// limit and returns neither a total nor a cursor. Any saturated aggregate
+    /// is therefore ambiguous, even when the selected project's own previews
+    /// appear complete.
+    public static func isProvablyComplete(totalReportedSessions: Int,
+                                          selectedReportedSessions: Int,
+                                          selectedPreviewCount: Int) -> Bool {
+        totalReportedSessions >= 0
+            && totalReportedSessions < maximumRows
+            && selectedReportedSessions >= 0
+            && selectedPreviewCount >= selectedReportedSessions
     }
 }
 
@@ -902,11 +833,7 @@ public extension GatewayClient {
             URLQueryItem(name: "preview_limit", value: "100"),
             URLQueryItem(name: "session_limit", value: "5000"),
         ], timeout: 60)
-        if let errors = value["errors"]?.arrayValue, !errors.isEmpty,
-           (value["projects"]?.arrayValue ?? []).isEmpty {
-            throw GatewayError(code: 500, message: "Hermes could not read any profile project tree.")
-        }
-        return value["projects"]?.arrayValue?.compactMap(HermesProjectTree.init) ?? []
+        return try HermesProjectTree.validatedList(from: value)
     }
 
     /// On-demand all-profile drill-in. Hermes' overview is preview-bounded;
@@ -918,19 +845,23 @@ public extension GatewayClient {
             URLQueryItem(name: "preview_limit", value: "5000"),
             URLQueryItem(name: "session_limit", value: "5000"),
         ], timeout: 120)
-        if let errors = value["errors"]?.arrayValue, !errors.isEmpty {
-            throw GatewayError(code: 502,
-                               message: "Hermes could not hydrate every profile for this project.")
-        }
-        guard let project = value["projects"]?.arrayValue?
-            .compactMap(HermesProjectTree.init)
-            .first(where: { $0.id == id }) else {
+        let projects = try HermesProjectTree.validatedList(from: value)
+        guard let project = projects.first(where: { $0.id == id }) else {
             throw GatewayError(code: 404, message: "Hermes no longer reports this project.")
         }
-        guard project.previews.count >= project.sessionCount else {
+        let totalReportedSessions = projects.reduce(0) { partial, item in
+            min(WorkspaceProjectSessionWindowPolicy.maximumRows,
+                partial + min(WorkspaceProjectSessionWindowPolicy.maximumRows,
+                              max(0, item.sessionCount)))
+        }
+        guard WorkspaceProjectSessionWindowPolicy.isProvablyComplete(
+            totalReportedSessions: totalReportedSessions,
+            selectedReportedSessions: project.sessionCount,
+            selectedPreviewCount: project.previews.count
+        ) else {
             throw GatewayError(
                 code: 501,
-                message: "This project exceeds Hermes’ bounded all-profile drill-in window; Talaria will not present a partial session list as authoritative."
+                message: "Hermes’ bounded project-session response may be truncated. Talaria requires an upstream total or cursor before it can present this drill-in as complete."
             )
         }
         return project
@@ -1192,20 +1123,6 @@ public extension GatewayClient {
             return HermesCommand(name: name, summary: parts.dropFirst().first?.stringValue ?? "",
                                  origin: origin)
         } ?? []
-    }
-
-    func dispatchHermesCommand(sessionID: String, name: String, argument: String) async throws
-        -> HermesCommandDispatch {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let canonical = String(trimmed.drop(while: { $0 == "/" }))
-        guard !canonical.isEmpty,
-              canonical.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else {
-            throw GatewayError(code: -82, message: "Choose a Hermes command.")
-        }
-        return try HermesCommandDispatch(try await rpc("command.dispatch", .object([
-            "session_id": .string(sessionID), "name": .string(canonical),
-            "arg": .string(argument),
-        ]), timeout: 120))
     }
 
     func processes(sessionID: String) async throws -> [HermesProcess] {

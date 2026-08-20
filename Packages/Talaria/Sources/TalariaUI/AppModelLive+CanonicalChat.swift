@@ -56,6 +56,11 @@ final class CanonicalChatRuntime {
     /// canonical chats (plugin.js:2742, `canonicalCreations`).
     var opens: [String: Task<Void, Never>] = [:]
 
+    /// The exact birth operation currently allowed to clean up a newly-created
+    /// chat. A canceled/late kickoff must never erase a replacement pin.
+    var kickoffs: [String: UUID] = [:]
+    var ambiguousKickoffs: [String: CanonicalKickoffLease] = [:]
+
     /// True when `pins[botID]` is newer than a roster answer taken at
     /// `sampled`, and the server block must not be allowed to overwrite it.
     func hasLocalPinWrite(_ botID: String, since sampled: [String: Int]) -> Bool {
@@ -72,6 +77,9 @@ final class CanonicalChatRuntime {
         let primaryOpens = opens.filter { GatewayBotRoute(qualifiedID: $0.key) == nil }
         for task in primaryOpens.values { task.cancel() }
         for key in primaryOpens.keys { opens.removeValue(forKey: key) }
+        for key in primary where ambiguousKickoffs[key] == nil {
+            kickoffs.removeValue(forKey: key)
+        }
     }
 
     func resetRoutedScope(gatewayID: String) {
@@ -83,7 +91,20 @@ final class CanonicalChatRuntime {
         let tasks = opens.filter { $0.key.hasPrefix(prefix) }
         for task in tasks.values { task.cancel() }
         for key in tasks.keys { opens.removeValue(forKey: key) }
+        for key in keys where ambiguousKickoffs[key] == nil {
+            kickoffs.removeValue(forKey: key)
+        }
     }
+}
+
+struct CanonicalKickoffLease: Equatable {
+    var id: UUID
+    var botID: String
+    var sessionID: String
+    var storedID: String
+    var rowID: UUID?
+    var chatID: ObjectIdentifier
+    var submitStarted = false
 }
 
 extension GatewayError {
@@ -285,9 +306,31 @@ extension AppModel {
 
             let chat = self.chat(for: botID)
             let canonical = CanonicalChatRuntime.shared.pins[botID]
+            if let lease = self.ambiguousCanonicalKickoffOwning(botID: botID, chat: chat) {
+                // `ensureSession` intentionally trusts an existing runtime SID,
+                // but an ambiguous kickoff needs stronger evidence: resume the
+                // exact durable target and hydrate it. Never submit kickoff a
+                // second time while acceptance is unresolved.
+                do {
+                    guard let route = self.gatewayRoute(for: botID) else {
+                        throw GatewayRouteError.noRoute
+                    }
+                    let client = try await self.routedClient(for: route)
+                    await self.reconcileAmbiguousCanonicalKickoff(
+                        lease, route: route, client: client)
+                    if CanonicalChatRuntime.shared.ambiguousKickoffs[botID] == nil {
+                        await self.refreshContext(botID: botID)
+                    }
+                } catch {
+                    self.reportCanonicalFailure(error, botID: botID)
+                }
+                return
+            }
             // Already there with a live binding — nothing to resolve.
-            if chat.storedSessionID == canonical, chat.sessionID != nil { return }
-            if chat.storedSessionID != nil, chat.storedSessionID != canonical {
+            if self.canonicalTapCanFastReturn(botID: botID, chat: chat,
+                                              canonical: canonical) { return }
+            if self.canonicalTapShouldUnbind(botID: botID, chat: chat,
+                                             canonical: canonical) {
                 // Drop the scratch binding: the resolver honors an explicit
                 // binding, and this tap is explicitly asking for the forever
                 // chat instead.
@@ -309,6 +352,32 @@ extension AppModel {
         // done nothing, leaving that tap on whatever chat was bound.
         defer { if runtime.opens[botID] == task { runtime.opens[botID] = nil } }
         await task.value
+    }
+
+    func canonicalTapCanFastReturn(botID: String, chat: ChatState,
+                                   canonical: String?) -> Bool {
+        chat.storedSessionID == canonical && chat.sessionID != nil
+            && CanonicalChatRuntime.shared.ambiguousKickoffs[botID] == nil
+    }
+
+    func ambiguousCanonicalKickoffOwning(botID: String,
+                                         chat: ChatState) -> CanonicalKickoffLease? {
+        guard let lease = CanonicalChatRuntime.shared.ambiguousKickoffs[botID],
+              CanonicalChatRuntime.shared.kickoffs[botID] == lease.id,
+              ObjectIdentifier(chat) == lease.chatID,
+              chat.sessionID == lease.sessionID,
+              lease.storedID.isEmpty || chat.storedSessionID == lease.storedID else { return nil }
+        return lease
+    }
+
+    func canonicalTapShouldUnbind(botID: String, chat: ChatState,
+                                  canonical: String?) -> Bool {
+        guard chat.storedSessionID != nil, chat.storedSessionID != canonical else { return false }
+        guard let lease = CanonicalChatRuntime.shared.ambiguousKickoffs[botID] else { return true }
+        let ownsBinding = ObjectIdentifier(chat) == lease.chatID
+            && chat.sessionID == lease.sessionID
+            && (lease.storedID.isEmpty || chat.storedSessionID == lease.storedID)
+        return !ownsBinding
     }
 
     /// Resolve and attach the session a send/open should land in, in desktop's
@@ -428,22 +497,34 @@ extension AppModel {
         let live = try await client.createSession(profile: profile,
                                                   title: Self.canonicalChatTitle,
                                                   hidden: true)
-        try Task.checkCancellation()
         guard !live.sessionID.isEmpty else {
             throw GatewayError(code: -8, message: "session.create returned no id")
         }
         let stored = live.storedSessionID
-        adopt(live, storedID: stored.isEmpty ? nil : stored, botID: botID,
-              sourceGatewayID: route.gatewayID)
-        if !stored.isEmpty { await pinCanonicalChat(stored, botID: botID) }
-        try Task.checkCancellation()
+        var lease = claimCanonicalKickoff(sessionID: live.sessionID, storedID: stored,
+                                          botID: botID)
         do {
-            try await submitCanonicalKickoff(sessionID: live.sessionID, botID: botID,
-                                             client: client)
+            try Task.checkCancellation()
+            adopt(live, storedID: stored.isEmpty ? nil : stored, botID: botID,
+                  sourceGatewayID: route.gatewayID)
+            if !stored.isEmpty { await pinCanonicalChat(stored, botID: botID) }
+            try Task.checkCancellation()
+            beginCanonicalKickoff(&lease)
+            lease.submitStarted = true
+            try await submitCanonicalKickoff(lease: lease, client: client)
+            finishCanonicalKickoff(lease)
         } catch let kickoffError {
-            // Desktop clears the pin if kickoff never persisted the row
-            // (plugin.js:2394-2396). The helper below refuses an empty id.
-            CanonicalChatRuntime.shared.pins[botID] = nil
+            if lease.submitStarted && PromptMutationFailure.isAmbiguous(kickoffError) {
+                CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = lease
+                await reconcileAmbiguousCanonicalKickoff(
+                    lease, route: route, client: client)
+            } else {
+                if rollbackCanonicalKickoffIfOwned(lease) {
+                    await clearPersistedCanonicalPinIfUnreplaced(
+                        storedID: lease.storedID, botID: lease.botID,
+                        route: route, client: client)
+                }
+            }
             throw kickoffError
         }
         return live.sessionID
@@ -451,15 +532,154 @@ extension AppModel {
 
     /// Desktop's first turn for a brand-new forever-chat. Bind first, then
     /// submit, so the intro reply is visible without reopening.
-    private func submitCanonicalKickoff(sessionID: String, botID: String,
-                                        client: GatewayClient) async throws {
-        let chat = chat(for: botID)
+    private func claimCanonicalKickoff(sessionID: String, storedID: String,
+                                       botID: String) -> CanonicalKickoffLease {
+        let lease = CanonicalKickoffLease(id: UUID(), botID: botID, sessionID: sessionID,
+                                          storedID: storedID, rowID: nil,
+                                          chatID: ObjectIdentifier(chat(for: botID)))
+        CanonicalChatRuntime.shared.kickoffs[botID] = lease.id
+        return lease
+    }
+
+    private func beginCanonicalKickoff(_ lease: inout CanonicalKickoffLease) {
+        let chat = chat(for: lease.botID)
         let text = Self.canonicalKickoffPrompt
         if chat.messages.isEmpty {
-            chat.messages.append(ChatMessage(author: .user, time: AppModel.clock(), text: text))
+            let row = ChatMessage(author: .user, time: AppModel.clock(), text: text)
+            chat.messages.append(row)
+            lease.rowID = row.id
         }
         chat.isRunning = true
-        _ = try await client.submitPrompt(sessionID: sessionID, text: text)
+        if CanonicalChatRuntime.shared.kickoffs[lease.botID] == lease.id {
+            CanonicalChatRuntime.shared.ambiguousKickoffs[lease.botID] = nil
+        }
+    }
+
+    private func submitCanonicalKickoff(lease: CanonicalKickoffLease,
+                                        client: GatewayClient) async throws {
+        let result = try await client.submitPrompt(sessionID: lease.sessionID,
+                                                   text: Self.canonicalKickoffPrompt)
+        try PromptSubmitReceipt.requireAccepted(result, operation: "Canonical kickoff")
+    }
+
+    private func finishCanonicalKickoff(_ lease: CanonicalKickoffLease) {
+        let runtime = CanonicalChatRuntime.shared
+        if runtime.kickoffs[lease.botID] == lease.id { runtime.kickoffs[lease.botID] = nil }
+        if runtime.ambiguousKickoffs[lease.botID]?.id == lease.id {
+            runtime.ambiguousKickoffs[lease.botID] = nil
+        }
+    }
+
+    /// Roll back only the birth state this exact operation still owns. This is
+    /// intentionally identity-heavy: every await above permits a replacement
+    /// attach, pin, transcript, or session to become authoritative.
+    @discardableResult
+    func rollbackCanonicalKickoffIfOwned(_ lease: CanonicalKickoffLease) -> Bool {
+        let runtime = CanonicalChatRuntime.shared
+        guard runtime.kickoffs[lease.botID] == lease.id,
+              let chat = chats[lease.botID], ObjectIdentifier(chat) == lease.chatID,
+              runtime.pins[lease.botID] == nil || runtime.pins[lease.botID] == lease.storedID,
+              lease.rowID == nil || chat.messages.contains(where: { $0.id == lease.rowID }) else { return false }
+        let ownsBinding = chat.sessionID == lease.sessionID
+            && (lease.storedID.isEmpty || chat.storedSessionID == lease.storedID)
+        guard ownsBinding || chat.sessionID == nil else { return false }
+        if let rowID = lease.rowID {
+            chat.messages.removeAll { $0.id == rowID }
+        }
+        if ownsBinding {
+            chat.isRunning = false
+            chat.isTyping = false
+        }
+        if runtime.pins[lease.botID] == lease.storedID { runtime.pins[lease.botID] = nil }
+        if LiveRuntime.shared.lastSessionByBot[lease.botID] == lease.storedID {
+            LiveRuntime.shared.lastSessionByBot[lease.botID] = nil
+        }
+        if ownsBinding, let route = gatewayRoute(for: lease.botID) {
+            if route.gatewayID == LiveRuntime.shared.gatewayID {
+                LiveRuntime.shared.sessionToBot.removeValue(forKey: lease.sessionID)
+            } else {
+                LiveRuntime.shared.routedSessionToBot.removeValue(forKey: GatewaySessionRoute(
+                    gatewayID: route.gatewayID, sessionID: lease.sessionID))
+            }
+        }
+        if ownsBinding {
+            chat.sessionID = nil
+            if chat.storedSessionID == lease.storedID { chat.storedSessionID = nil }
+        }
+        runtime.kickoffs[lease.botID] = nil
+        runtime.ambiguousKickoffs[lease.botID] = nil
+        return true
+    }
+
+    private func clearPersistedCanonicalPinIfUnreplaced(
+        storedID: String, botID: String, route: GatewayBotRoute, client: GatewayClient
+    ) async {
+        guard !storedID.isEmpty, CanonicalChatRuntime.shared.pins[botID] == nil else { return }
+        _ = try? await withBotModeMetaMutation(route: route) {
+            let runtime = CanonicalChatRuntime.shared
+            runtime.writing.insert(botID)
+            defer { runtime.writing.remove(botID) }
+            let profiles = try await client.listProfiles(includeSessions: false)
+            guard runtime.pins[botID] == nil,
+                  let row = profiles.first(where: { $0.name == route.profile }) else { return }
+            var block = row.uiMeta?["hermes-bots"]?.objectValue ?? [:]
+            guard block["chat"]?.stringValue == storedID else { return }
+            block["chat"] = nil
+            try await client.applyProfileEdit(
+                name: route.profile,
+                ProfileEdit(uiMeta: .object(["hermes-bots": .object(block)])))
+        }
+    }
+
+    private func reconcileAmbiguousCanonicalKickoff(
+        _ lease: CanonicalKickoffLease, route: GatewayBotRoute, client: GatewayClient
+    ) async {
+        let target = lease.storedID.isEmpty ? lease.sessionID : lease.storedID
+        let generation = LiveRuntime.shared.generation
+        await reconcileAmbiguousCanonicalKickoff(
+            lease, sourceGatewayID: route.gatewayID,
+            resume: {
+                try await client.resumeSession(target, profile: route.profile,
+                                               deferHistory: false)
+            },
+            hydrate: { live in
+                try await self.hydrateCanonical(
+                    live, botID: lease.botID, profile: route.profile,
+                    client: client, clearWhenEmpty: false)
+            },
+            accepts: {
+                LiveRuntime.shared.generation == generation
+                    && self.gatewayRoute(for: lease.botID) == route
+            })
+    }
+
+    /// Ownership-fenced reconciliation core. Factoring the two authoritative
+    /// operations makes the tap ordering testable without a mock WebSocket;
+    /// production supplies `session.resume` and transcript hydration above.
+    func reconcileAmbiguousCanonicalKickoff(
+        _ lease: CanonicalKickoffLease, sourceGatewayID: String,
+        resume: @MainActor () async throws -> LiveSession,
+        hydrate: @MainActor (LiveSession) async throws -> Void,
+        accepts: @MainActor () -> Bool
+    ) async {
+        guard CanonicalChatRuntime.shared.kickoffs[lease.botID] == lease.id else { return }
+        do {
+            let live = try await resume()
+            guard CanonicalChatRuntime.shared.kickoffs[lease.botID] == lease.id,
+                  accepts(),
+                  live.storedSessionID == lease.storedID,
+                  let chat = chats[lease.botID], ObjectIdentifier(chat) == lease.chatID,
+                  chat.sessionID == lease.sessionID,
+                  lease.storedID.isEmpty || chat.storedSessionID == lease.storedID else { return }
+            adopt(live, storedID: live.storedSessionID.isEmpty ? lease.storedID : live.storedSessionID,
+                  botID: lease.botID, sourceGatewayID: sourceGatewayID)
+            replayInflight(live, botID: lease.botID)
+            try await hydrate(live)
+            finishCanonicalKickoff(lease)
+        } catch {
+            // Keep the lease and visible state: acceptance is unresolved, so a
+            // blind rollback or retry could duplicate the first turn.
+        }
     }
 
     /// Resume `target` — a durable key or the canonical title — and bind the
@@ -508,8 +728,8 @@ extension AppModel {
     /// Bind the chat to a resolved session. Message history is left alone —
     /// the hydration step owns it, so a message typed before the chat finished
     /// opening keeps its optimistic bubble.
-    private func adopt(_ live: LiveSession, storedID: String?, botID: String,
-                       sourceGatewayID: String) {
+    func adopt(_ live: LiveSession, storedID: String?, botID: String,
+               sourceGatewayID: String) {
         let chat = chat(for: botID)
         let runtime = LiveRuntime.shared
         if let old = chat.sessionID, old != live.sessionID {
@@ -519,6 +739,10 @@ extension AppModel {
                 runtime.routedSessionToBot.removeValue(forKey: GatewaySessionRoute(
                     gatewayID: sourceGatewayID, sessionID: old))
             }
+        }
+        if let fence = ChatRuntime.shared.transcriptFences[botID],
+           let storedID, !storedID.isEmpty, storedID != fence.storedID {
+            ChatRuntime.shared.transcriptFences[botID] = nil
         }
         if let storedID, !storedID.isEmpty {
             chat.storedSessionID = storedID
@@ -575,8 +799,13 @@ extension AppModel {
     private func hydrateCanonical(_ live: LiveSession, botID: String, profile: String,
                                   client: GatewayClient,
                                   clearWhenEmpty: Bool) async throws {
+        let chat = chat(for: botID)
+        let chatID = ObjectIdentifier(chat)
+        let hydrationGeneration = LiveRuntime.shared.generation
+        let sourceGatewayID = gatewayRoute(for: botID)?.gatewayID
+        let storedID = live.storedSessionID.isEmpty ? chat.storedSessionID : live.storedSessionID
         try await Self.hydrateTranscript(
-            chat: chat(for: botID),
+            chat: chat,
             resumeMessages: live.messages,
             clearWhenEmpty: clearWhenEmpty,
             fallback: {
@@ -584,7 +813,34 @@ extension AppModel {
                 return try? await client.latestSessionMessages(
                     storedID: live.storedSessionID, profile: profile)
             },
-            accepts: { true })
+            accepts: {
+                guard LiveRuntime.shared.generation == hydrationGeneration,
+                      let owner = chats[botID], ObjectIdentifier(owner) == chatID,
+                      owner.sessionID == live.sessionID,
+                      owner.storedSessionID == storedID,
+                      let route = gatewayRoute(for: botID) else { return false }
+                return route.gatewayID == sourceGatewayID && route.profile == profile
+            })
+        settleAmbiguousCanonicalKickoff(botID: botID, live: live)
+        if let fence = ChatRuntime.shared.transcriptFences[botID],
+           let sourceGatewayID,
+           let storedID = chat.storedSessionID,
+           fence.acceptsAuthoritativeHydration(
+               gatewayID: sourceGatewayID, profile: profile, storedID: storedID,
+               generation: hydrationGeneration,
+               currentGeneration: LiveRuntime.shared.generation) {
+            ChatRuntime.shared.transcriptFences[botID] = nil
+        }
+    }
+
+    private func settleAmbiguousCanonicalKickoff(botID: String, live: LiveSession) {
+        let runtime = CanonicalChatRuntime.shared
+        guard let lease = runtime.ambiguousKickoffs[botID],
+              runtime.kickoffs[botID] == lease.id,
+              let chat = chats[botID], ObjectIdentifier(chat) == lease.chatID,
+              chat.sessionID == live.sessionID,
+              lease.storedID.isEmpty || chat.storedSessionID == lease.storedID else { return }
+        finishCanonicalKickoff(lease)
     }
 
     /// Shared by canonical and explicit stored-session opens, and deliberately

@@ -47,6 +47,10 @@ public struct BlockingPrompt: Identifiable, Sendable, Equatable {
     public var sessionID: String
     /// Bot whose turn is parked, when the sid is bound to one.
     public var botID: String?
+    /// Exact profile and durable conversation captured while the request was
+    /// bound. Runtime SIDs can collide across profiles and can later be reused.
+    public var profile: String?
+    public var storedID: String?
     /// clarify: the question. secret: the human-readable prompt. sudo: empty
     /// (the gateway sends no payload beyond request_id).
     public var question: String
@@ -58,10 +62,12 @@ public struct BlockingPrompt: Identifiable, Sendable, Equatable {
     public init(kind: Kind, gatewayID: String, requestID: String,
                 sessionID: String, botID: String?,
                 question: String, choices: [String] = [], multiSelect: Bool = false,
-                envVar: String? = nil) {
+                envVar: String? = nil, profile: String? = nil,
+                storedID: String? = nil) {
         self.kind = kind; self.gatewayID = gatewayID
         self.requestID = requestID; self.sessionID = sessionID
-        self.botID = botID; self.question = question; self.choices = choices
+        self.botID = botID; self.profile = profile; self.storedID = storedID
+        self.question = question; self.choices = choices
         self.multiSelect = multiSelect; self.envVar = envVar
     }
 
@@ -604,7 +610,14 @@ extension AppModel {
 
     // MARK: Blocking prompts
 
-    private func present(_ prompt: BlockingPrompt) {
+    private func present(_ incoming: BlockingPrompt) {
+        var prompt = incoming
+        if let botID = prompt.botID,
+           let route = stateRoute(for: botID), route.gatewayID == prompt.gatewayID,
+           let chat = chats[botID], chat.sessionID == prompt.sessionID {
+            prompt.profile = route.profile
+            prompt.storedID = chat.storedSessionID
+        }
         let bridges = ApprovalBridges.shared
         guard !prompt.requestID.isEmpty,
               !bridges.prompts.contains(where: { $0.id == prompt.id }) else { return }

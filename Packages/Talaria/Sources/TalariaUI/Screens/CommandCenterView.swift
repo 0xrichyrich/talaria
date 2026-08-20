@@ -99,7 +99,12 @@ public struct CommandCenterView: View {
 }
 
 enum WorkspaceCommandSurfacePolicy {
-    static func exposesDispatch(capability: Bool?) -> Bool { capability == true }
+    static let unavailableReason = "Hermes resolves plugins and quick commands before built-ins, and its catalog does not provide a non-shadowable resolved-handler contract. Command Center therefore does not dispatch slash commands."
+
+    static func exposesDispatch(capability: Bool?) -> Bool {
+        _ = capability
+        return false
+    }
 
     static func ownsProcesses(selectedTargetID: String?, processesTargetID: String?) -> Bool {
         guard let selectedTargetID else { return false }
@@ -238,16 +243,16 @@ private struct WorkspaceProjectsSection: View {
                                 }
                                 if project.sessionCount > 0 {
                                     Button(project.sessionCount > project.previews.count
-                                           ? "Load authoritative session list"
-                                           : "View all sessions") {
+                                           ? "Load bounded session list"
+                                           : "View session list") {
                                         sessionProject = project
                                     }
                                 }
                                 if project.sessionCount > project.previews.count {
-                                    Text("The overview is preview-bounded. Entering the project requests an authoritative all-profile session window from Hermes instead of filling from Talaria’s cache.")
+                                    Text("The overview is preview-bounded. Entering the project requests Hermes’ largest all-profile window; Talaria rejects it if the response reaches the limit or otherwise appears partial.")
                                         .font(.caption2).foregroundStyle(.secondary)
                                 } else if project.sessionCount > 0, project.previews.count <= 3 {
-                                    Text("All authoritative sessions returned above.")
+                                    Text("No additional sessions are represented in this bounded overview.")
                                         .font(.caption2).foregroundStyle(.secondary)
                                 }
                             }
@@ -345,14 +350,14 @@ private struct WorkspaceProjectSessionsSheet: View {
                             }
                         }.buttonStyle(.plain)
                     }
-                    Text("All \(hydrated.sessionCount) sessions above came from Hermes’ on-demand all-profile project response.")
+                    Text("\(hydrated.sessionCount) sessions shown from Hermes’ on-demand all-profile response. Talaria verified that the bounded response did not reach its truncation limit.")
                         .font(.footnote).foregroundStyle(.secondary)
                 } else if !error.isEmpty {
-                    ContentUnavailableView("Authoritative drill-in unavailable",
+                    ContentUnavailableView("Project drill-in unavailable",
                                            systemImage: "folder.badge.questionmark",
                                            description: Text(error))
                 } else {
-                    HStack { Spacer(); ProgressView("Loading authoritative sessions…"); Spacer() }
+                    HStack { Spacer(); ProgressView("Loading project sessions…"); Spacer() }
                 }
             }
             .navigationTitle(project.label).modifier(CommandInlineTitle())
@@ -975,20 +980,8 @@ private struct WorkspaceCommandsSection: View {
     }
 
     let model: AppModel
-    @State private var commandName = ""
-    @State private var argument = ""
-    @State private var query = ""
     @State private var pendingKill: PendingProcessKill?
     private var runtime: WorkspaceRuntime { .shared }
-
-    private var shown: [HermesCommand] {
-        let eligible = runtime.commands.filter(WorkspaceCommandPolicy.isCatalogEligible)
-        let needle = query.lowercased().trimmingCharacters(in: .whitespaces)
-        guard !needle.isEmpty else { return Array(eligible.prefix(80)) }
-        return eligible.filter {
-            $0.name.lowercased().contains(needle) || $0.summary.lowercased().contains(needle)
-        }
-    }
 
     private var selectedTarget: WorkspaceProcessTarget? {
         let id = runtime.processTargetID ?? model.workspaceProcessTargets.first?.id
@@ -1002,18 +995,6 @@ private struct WorkspaceCommandsSection: View {
         )
     }
 
-    private var commandBlockReason: String? {
-        let raw = commandName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return nil }
-        guard let command = WorkspaceCommandPolicy.catalogCommand(named: raw, in: runtime.commands) else {
-            return "Choose a command from the current safe catalog."
-        }
-        if case .unsupported(let reason) = WorkspaceCommandPolicy.disposition(
-            for: command, argument: argument
-        ) { return reason }
-        return nil
-    }
-
     var body: some View {
         List {
             workspaceError(runtime.error)
@@ -1021,116 +1002,22 @@ private struct WorkspaceCommandsSection: View {
                 Section {
                     Label("Outcome uncertain: \(runtime.commandUncertain)", systemImage: "exclamationmark.shield.fill")
                         .foregroundStyle(.orange)
-                    Button("I reviewed the target session; allow another command") {
+                    Button("I reviewed the target session; allow another process action") {
                         runtime.commandUncertain = ""
                         Task { await model.refreshWorkspaceProcesses() }
                     }
                 } footer: {
-                    Text("The gateway connection ended before Talaria could prove the command or its generated prompt was accepted. It will not be replayed.")
+                    Text("The gateway connection ended before Talaria could prove the process action completed. It will not be replayed.")
                 }
             }
-            if !WorkspaceCommandSurfacePolicy.exposesDispatch(
-                capability: runtime.capability["commands"]
-            ) {
-                if runtime.loading {
-                    HStack { Spacer(); ProgressView("Loading Hermes commands…"); Spacer() }
-                } else {
-                    ContentUnavailableView(
-                        "Hermes commands unavailable",
-                        systemImage: "command.circle",
-                        description: Text("This gateway did not return commands.catalog. Talaria will not offer or dispatch slash commands without the authoritative catalog.")
-                    )
-                }
-            } else {
-                if model.workspaceProcessTargets.isEmpty {
-                    ContentUnavailableView("Open an agent session", systemImage: "command",
-                                           description: Text("Slash commands dispatch only into an exact live Hermes session."))
-                } else {
-                    Section {
-                        Picker("Agent session", selection: processSelection) {
-                            ForEach(model.workspaceProcessTargets) {
-                                Text("\($0.title) · \($0.discriminator)").tag($0.id)
-                            }
-                        }
-                        .disabled(runtime.mutationBusy || runtime.commandRunning || runtime.systemActionRunning)
-                        TextField("Command", text: $commandName).modifier(CommandLiteralInput())
-                        TextField("Optional argument", text: $argument).modifier(CommandLiteralInput())
-                        if let commandBlockReason {
-                            Label(commandBlockReason, systemImage: "hand.raised.fill")
-                                .font(.caption).foregroundStyle(.orange)
-                        }
-                        Button(runtime.commandRunning ? "Running…" : "Run slash command") {
-                            let target = runtime.processTargetID ?? model.workspaceProcessTargets.first?.id ?? ""
-                            Task { await model.runWorkspaceCommand(name: commandName,
-                                                                   argument: argument,
-                                                                   targetID: target) }
-                        }
-                        .disabled(runtime.commandRunning
-                                  || runtime.mutationBusy || runtime.systemActionRunning
-                                  || !runtime.commandUncertain.isEmpty
-                                  || !runtime.commandPrefill.isEmpty
-                                  || commandBlockReason != nil
-                                  || commandName.trimmingCharacters(in: .whitespaces).isEmpty)
-                    } header: { Text("Session command") } footer: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Only code-allowlisted read-only built-ins and review-before-send skill/queue drafts are eligible. Quick commands, plugins, aliases and unclassified commands are blocked before dispatch.")
-                            if let selectedTarget { Text("Target: \(selectedTarget.discriminator)") }
-                        }
-                    }
-                }
-                Section("Command catalog") {
-                    TextField("Filter commands", text: $query)
-                    ForEach(shown) { command in
-                        Button {
-                            commandName = command.name
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(command.name).font(.system(.body, design: .monospaced))
-                                Text(command.summary).font(.caption).foregroundStyle(.secondary)
-                                Text(command.origin == .skill
-                                     || WorkspaceCommandPolicy.canonicalName(command.name) == "queue"
-                                     ? "Review-before-send prompt" : "Read-only built-in")
-                                    .font(.caption2).foregroundStyle(.secondary)
-                            }
-                        }.buttonStyle(.plain)
-                    }
-                }
-            }
-            if !runtime.commandPrefill.isEmpty {
-                Section {
-                    TextEditor(text: Binding(
-                        get: { runtime.commandPrefill },
-                        set: { runtime.commandPrefill = $0 }
-                    ))
-                    .font(.system(.body, design: .monospaced))
-                    .frame(minHeight: 140)
-                    Button(runtime.commandRunning ? "Sending…" : "Send to the exact session") {
-                        Task { await model.submitWorkspaceCommandPrefill() }
-                    }
-                    .disabled(runtime.commandRunning || !runtime.commandUncertain.isEmpty
-                              || runtime.mutationBusy || runtime.systemActionRunning
-                              || runtime.commandPrefill.isEmpty)
-                    Button("Discard draft", role: .destructive) {
-                        model.discardWorkspaceCommandPrefill()
-                    }
-                    .disabled(runtime.commandRunning)
-                } header: {
-                    Text("Hermes command draft")
-                } footer: {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("A send/skill directive is preserved as an editable draft and is never auto-submitted. It remains source/session-qualified until Hermes authoritatively accepts it.")
-                        if let display = runtime.commandPrefillDisplay, !display.isEmpty {
-                            Text("Invocation: \(display)")
-                        }
-                    }
-                }
-            }
-            if !runtime.commandOutput.isEmpty {
-                Section("Output") {
-                    ScrollView(.horizontal) {
-                        Text(runtime.commandOutput).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                    }
-                }
+            Section {
+                ContentUnavailableView(
+                    "Slash commands unavailable in Command Center",
+                    systemImage: "command.circle",
+                    description: Text(WorkspaceCommandSurfacePolicy.unavailableReason)
+                )
+            } footer: {
+                Text("Command Center’s process monitor and confirmed stop action use direct, session-qualified process RPCs instead of command.dispatch.")
             }
             if !model.workspaceProcessTargets.isEmpty {
                 Section {
