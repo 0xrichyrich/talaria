@@ -31,7 +31,7 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .appearance: "Theme, text, motion and transcript detail"
         case .intelligence: "Inference providers, OAuth, voice and memory"
         case .agents: "Rename, delete and manage Hermes profiles"
-        case .operations: "Typed configuration and gateway logs"
+        case .operations: "Restart, update, usage, runtime and logs"
         case .localData: "Solo mode, storage, exports and deletion"
         case .about: "Versions, health, links and desktop-only boundaries"
         }
