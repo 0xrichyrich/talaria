@@ -76,6 +76,10 @@ public struct ChatView: View {
     @State private var showModelSheet = false
     @State private var showCommands = false
     @State private var transcriptAnchoredBotID: String?
+    @State private var followingLatest = true
+    @State private var jumpToLatestToken = 0
+    @State private var transcriptBottomMinY: CGFloat = 0
+    @State private var transcriptViewportHeight: CGFloat = 0
     @FocusState private var composerFocused: Bool
 
     /// Tapback set, matching desktop's reaction picker.
@@ -127,7 +131,15 @@ public struct ChatView: View {
     public var body: some View {
         VStack(spacing: 0) {
             header
-            messageList
+            ZStack(alignment: .bottomTrailing) {
+                messageList
+                if showsJumpToLatest {
+                    jumpToLatestButton
+                        .padding(.trailing, 16)
+                        .padding(.bottom, 10)
+                        .transition(.scale.combined(with: .opacity))
+                }
+            }
             if transcriptPolicy.detail == .advanced { modelStrip }
             if !quickReplies.isEmpty {
                 quickReplyRow
@@ -275,13 +287,30 @@ public struct ChatView: View {
             // rather than vanishing at some threshold.
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
+            .coordinateSpace(name: "talaria.chat.transcript")
+            .background(
+                GeometryReader { viewport in
+                    Color.clear.preference(
+                        key: TranscriptViewportHeightKey.self,
+                        value: viewport.size.height)
+                }
+            )
+            .onPreferenceChange(TranscriptBottomInsetKey.self) { minY in
+                transcriptBottomMinY = minY
+                refreshFollowingLatest()
+            }
+            .onPreferenceChange(TranscriptViewportHeightKey.self) { height in
+                transcriptViewportHeight = height
+                refreshFollowingLatest()
+            }
             .task(id: initialTranscriptAnchorKey) {
                 guard transcriptAnchoredBotID != botID, !messages.isEmpty else { return }
                 await anchorTranscript(proxy)
+                followingLatest = true
                 transcriptAnchoredBotID = botID
             }
             .onChange(of: messages.count) {
-                guard transcriptAnchoredBotID == botID else { return }
+                guard transcriptAnchoredBotID == botID, followingLatest else { return }
                 withAnimation(ChatComposerLayoutPolicy.animation(
                     reducedMotion: reducedMotion, duration: 0.25
                 )) {
@@ -289,6 +318,17 @@ public struct ChatView: View {
                 }
             }
             .onChange(of: chat?.isTyping ?? false) {
+                guard followingLatest else { return }
+                withAnimation(ChatComposerLayoutPolicy.animation(
+                    reducedMotion: reducedMotion, duration: 0.25
+                )) {
+                    proxy.scrollTo(transcriptAnchorID, anchor: .bottom)
+                }
+            }
+            .onChange(of: botID) {
+                followingLatest = true
+            }
+            .onChange(of: jumpToLatestToken) {
                 withAnimation(ChatComposerLayoutPolicy.animation(
                     reducedMotion: reducedMotion, duration: 0.25
                 )) {
@@ -296,6 +336,28 @@ public struct ChatView: View {
                 }
             }
         }
+    }
+
+    private var showsJumpToLatest: Bool {
+        ChatTranscriptLayoutPolicy.showsJumpControl(
+            isFollowingLatest: followingLatest, messageCount: messages.count)
+    }
+
+    private var jumpToLatestButton: some View {
+        Button {
+            followingLatest = true
+            jumpToLatestToken += 1
+        } label: {
+            Image(systemName: "chevron.down")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(theme.id == .ink ? theme.bg : theme.accentFg)
+                .frame(width: 36, height: 36)
+                .background(theme.id == .ink ? theme.ink : theme.accent)
+                .clipShape(Circle())
+                .shadow(color: theme.ink.opacity(0.18), radius: 6, y: 2)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Jump to latest"))
     }
 
     private var initialTranscriptAnchorKey: String {
@@ -327,6 +389,20 @@ public struct ChatView: View {
                 .modifier(ChatEntrance())
         }
         Color.clear.frame(height: 1).id("chat-bottom")
+            .background(
+                GeometryReader { geo in
+                    let frame = geo.frame(in: .named("talaria.chat.transcript"))
+                    Color.clear.preference(
+                        key: TranscriptBottomInsetKey.self,
+                        value: frame.minY)
+                }
+            )
+    }
+
+    private func refreshFollowingLatest() {
+        let distance = transcriptBottomMinY - transcriptViewportHeight
+        followingLatest = ChatTranscriptLayoutPolicy.isFollowingLatest(
+            distanceFromBottom: distance)
     }
 
     private func anchorTranscript(_ proxy: ScrollViewProxy) async {
@@ -1276,5 +1352,20 @@ struct ThoughtBlock: View {
                     }
             }
         }
+    }
+}
+
+
+private struct TranscriptBottomInsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct TranscriptViewportHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }

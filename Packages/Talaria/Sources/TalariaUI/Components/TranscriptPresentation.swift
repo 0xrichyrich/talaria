@@ -106,6 +106,17 @@ public enum ChatTranscriptLayoutPolicy {
         if let lastMessageID { return lastMessageID.uuidString }
         return "chat-bottom"
     }
+
+    /// How far from the latest row still counts as "following" the live turn.
+    public static let followBottomSlop: CGFloat = 120
+
+    public static func isFollowingLatest(distanceFromBottom: CGFloat) -> Bool {
+        distanceFromBottom <= followBottomSlop
+    }
+
+    public static func showsJumpControl(isFollowingLatest: Bool, messageCount: Int) -> Bool {
+        !isFollowingLatest && messageCount > 0
+    }
 }
 
 /// Interactive pop for the custom chat overlay. Talaria does not use a

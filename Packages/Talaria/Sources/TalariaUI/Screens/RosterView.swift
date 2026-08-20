@@ -424,9 +424,9 @@ public struct RosterView: View {
 
     private var headerControls: some View {
         HStack(spacing: 8) {
-            bellButton
+            HeaderIconButton(theme: theme, action: { model.requestSettings() }) { settingsGlyph }
+                .accessibilityLabel(Text("Settings"))
             HeaderIconButton(theme: theme, action: onSearch) { searchGlyph }
-            HeaderIconButton(theme: theme, action: { model.theme.cycle() }) { themeGlyph }
             netChip
             plusButton
         }
@@ -476,6 +476,12 @@ public struct RosterView: View {
             }
         }
         .frame(width: 14, height: 14)
+    }
+
+    private var settingsGlyph: some View {
+        Image(systemName: "gearshape")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(theme.ink)
     }
 
     /// Hand-drawn magnifier, matching the prototype's ring + handle.
@@ -530,6 +536,8 @@ public struct RosterView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(Text("Connections, " + chip.label))
+        .accessibilityHint(Text("Opens gateways and notifications"))
     }
 
     private var chipFont: Font {

@@ -405,14 +405,45 @@ public enum TalariaVoice {
             }
         }
         let primary = connections.first { $0.state == .connected } ?? connections.first
-        if let primary, primary.kind == .cloud {
-            switch theme {
-            case .ink: return ("BY CLOUD", .cloud)
-            case .control, .soft: return ("cloud", .cloud)
+        let label = friendlyGatewayLabel(primary, theme)
+        let tone: NetTone = {
+            if primary?.kind == .cloud { return .cloud }
+            return .up
+        }()
+        return (label, tone)
+    }
+
+    /// Never show a raw host/IP in the roster header. A saved display name
+    /// wins; otherwise Tailscale/LAN/Cloud become human words, and an address
+    /// that looks like an IP or hostname collapses to Home.
+    public static func friendlyGatewayLabel(_ connection: GatewayConnection?,
+                                            _ theme: ThemeID) -> String {
+        if let connection {
+            let trimmed = connection.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if connection.kind == .cloud {
+                return theme == .ink ? "BY CLOUD" : "Cloud"
+            }
+            if !trimmed.isEmpty, !looksLikeNetworkAddress(trimmed) {
+                return theme == .ink ? trimmed.uppercased() : trimmed
+            }
+            switch connection.kind {
+            case .cloud:
+                return theme == .ink ? "BY CLOUD" : "Cloud"
+            case .tailscale:
+                return theme == .ink ? "HOME" : "Home"
+            case .lan:
+                return theme == .ink ? "NEARBY" : "Nearby"
             }
         }
-        let name = primary?.name ?? "homelab"
-        return (theme == .ink ? name.uppercased() : name, .up)
+        return theme == .ink ? "HOME" : "Home"
+    }
+
+    public static func looksLikeNetworkAddress(_ value: String) -> Bool {
+        let host = value.split(separator: ":", maxSplits: 1).first.map(String.init) ?? value
+        if host.isEmpty { return true }
+        if host.contains(".") { return true }
+        if host.allSatisfy({ $0.isNumber || $0 == ":" }) { return true }
+        return false
     }
 
     /// Dot/label color for a net tone.

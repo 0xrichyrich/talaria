@@ -107,6 +107,34 @@ final class TranscriptComposerPolicyTests: XCTestCase {
         XCTAssertEqual(ChatTranscriptLayoutPolicy.layoutPassesMs, [16, 120, 360])
     }
 
+    func testRosterHeaderHidesRawGatewayAddresses() {
+        let ip = GatewayConnection(id: "a", name: "100.87.108.5", kind: .tailscale,
+                                   address: "100.87.108.5:9119", state: .connected,
+                                   ping: "12ms", botCount: 6)
+        XCTAssertTrue(TalariaVoice.looksLikeNetworkAddress("100.87.108.5"))
+        XCTAssertTrue(TalariaVoice.looksLikeNetworkAddress("100.87.108.5:9119"))
+        XCTAssertFalse(TalariaVoice.looksLikeNetworkAddress("Home"))
+        XCTAssertEqual(TalariaVoice.friendlyGatewayLabel(ip, .soft), "Home")
+        let named = GatewayConnection(id: "b", name: "Studio", kind: .lan,
+                                      address: "studio.local", state: .connected,
+                                      ping: "4ms", botCount: 2)
+        XCTAssertEqual(TalariaVoice.friendlyGatewayLabel(named, .soft), "Studio")
+        let cloud = GatewayConnection(id: "c", name: "org", kind: .cloud,
+                                      address: "acme", state: .connected,
+                                      ping: "", botCount: 1)
+        XCTAssertEqual(TalariaVoice.netChip(offline: false, connections: [cloud], .soft).label, "Cloud")
+        XCTAssertEqual(TalariaVoice.netChip(offline: true, connections: [ip], .soft).label, "offline")
+    }
+
+    func testJumpToLatestAppearsOnlyAfterLeavingTheLiveEdge() {
+        XCTAssertTrue(ChatTranscriptLayoutPolicy.isFollowingLatest(distanceFromBottom: 0))
+        XCTAssertTrue(ChatTranscriptLayoutPolicy.isFollowingLatest(distanceFromBottom: 120))
+        XCTAssertFalse(ChatTranscriptLayoutPolicy.isFollowingLatest(distanceFromBottom: 121))
+        XCTAssertFalse(ChatTranscriptLayoutPolicy.showsJumpControl(isFollowingLatest: true, messageCount: 40))
+        XCTAssertTrue(ChatTranscriptLayoutPolicy.showsJumpControl(isFollowingLatest: false, messageCount: 40))
+        XCTAssertFalse(ChatTranscriptLayoutPolicy.showsJumpControl(isFollowingLatest: false, messageCount: 0))
+    }
+
     func testChatSwipeBackOnlyCommitsFromTheLeadingEdge() {
         XCTAssertTrue(ChatSwipeBackPolicy.shouldBegin(startX: 8))
         XCTAssertTrue(ChatSwipeBackPolicy.shouldBegin(startX: 28))
