@@ -108,5 +108,40 @@ final class CommandCenterContractTests: XCTestCase {
         XCTAssertTrue(reset.ok)
         XCTAssertEqual(reset.deleted, ["MEMORY.md", "USER.md"])
     }
+
+    func testWorkspaceParsesFilesAndGitContracts() {
+        let listing = GatewayFileListing(.object([
+            "path": .string("/tmp/work"),
+            "parent": .string("/tmp"),
+            "locked_root": .string("/tmp"),
+            "entries": .array([
+                .object(["name": .string("src"), "path": .string("/tmp/work/src"),
+                         "is_directory": .bool(true)]),
+                .object(["name": .string("README.md"), "path": .string("/tmp/work/README.md"),
+                         "is_directory": .bool(false), "size": .number(12)]),
+            ]),
+        ]))
+        XCTAssertEqual(listing.path, "/tmp/work")
+        XCTAssertEqual(listing.parent, "/tmp")
+        XCTAssertEqual(listing.entries.map { $0.name }, ["src", "README.md"])
+        XCTAssertTrue(listing.entries[0].isDirectory)
+
+        let git = GatewayGitStatus(.object([
+            "branch": .string("main"),
+            "ahead": .number(1),
+            "behind": .number(0),
+            "staged": .number(2),
+            "unstaged": .number(1),
+            "untracked": .number(3),
+            "changed": .number(4),
+            "files": .array([
+                .object(["path": .string("Packages/Talaria/Package.swift")]),
+            ]),
+        ]))
+        XCTAssertEqual(git.branch, "main")
+        XCTAssertEqual(git.ahead, 1)
+        XCTAssertEqual(git.changed, 4)
+        XCTAssertEqual(git.files, ["Packages/Talaria/Package.swift"])
+    }
 }
 #endif

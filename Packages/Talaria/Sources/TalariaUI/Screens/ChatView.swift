@@ -201,7 +201,14 @@ public struct ChatView: View {
                     .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
                     .padding(.bottom, 2)
             }
-            AvatarView(bot: bot, size: 36, theme: theme)
+            ZStack {
+                BotPortraitView(model: model, bot: bot, size: 36, theme: theme)
+            }
+            .frame(width: 36, height: 36)
+            .overlay(alignment: .bottomTrailing) {
+                PetCompanionView(model: model, bot: bot)
+                    .offset(x: 3, y: 2)
+            }
             Button(action: onOpenProfile) {
                 VStack(alignment: .leading, spacing: 1) {
                     nameLine

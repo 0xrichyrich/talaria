@@ -46,6 +46,7 @@ public struct PetGalleryView: View {
     @State private var renameText = ""
     @State private var pendingRemoval: PetGalleryEntry?
     @State private var adopting = false
+    @State private var stagedSlug: String?
     /// Gallery filter + window. petdex is thousands of pets and every rendered
     /// tile costs a `pet.thumb` round trip, so the grid is explicitly windowed
     /// (desktop does the same for the same reason: mounting an image per pet
@@ -93,6 +94,9 @@ public struct PetGalleryView: View {
                         gallerySection
                         sectionLabel(copy.petHatchSec(themeID))
                         hatchSection
+                        if stagedSlug != nil {
+                            saveStagedPet
+                        }
                         Text(copy.petFootnote(themeID))
                             .font(footnoteFont)
                             .foregroundStyle(theme.faint)
@@ -127,9 +131,10 @@ public struct PetGalleryView: View {
         }
         .task { await load() }
         .onChange(of: surface.gallery.pets) { _, _ in rerank() }
-        .onChange(of: surface.pet?.slug) { _, _ in
+        .onChange(of: surface.pet?.slug) { _, slug in
             scaleDraft = surface.pet?.scale ?? Pet.defaultScale
             preview = .idle
+            if stagedSlug == slug { stagedSlug = nil }
         }
         .onChange(of: surface.generation.phase) { _, phase in
             if phase == .preview { celebrate() }
@@ -411,12 +416,53 @@ public struct PetGalleryView: View {
             .strokeBorder(theme.line, lineWidth: 1))
     }
 
+    private var saveStagedPet: some View {
+        let name = surface.gallery.pets.first(where: { $0.slug == stagedSlug })?.displayName
+            ?? stagedSlug ?? ""
+        return VStack(alignment: .leading, spacing: 8) {
+            Text(copy.petStaged(themeID, name))
+                .font(themeID == .control ? theme.mono(10.5) : theme.body(13))
+                .foregroundStyle(theme.sub)
+            HStack(spacing: 10) {
+                Button {
+                    stagedSlug = nil
+                } label: {
+                    Text(copy.cancel)
+                        .font(theme.body(13, weight: .semibold))
+                        .foregroundStyle(theme.sub)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.plain)
+                Button {
+                    guard let slug = stagedSlug, !adopting else { return }
+                    adopting = true
+                    Task {
+                        _ = await model.selectPet(slug: slug, profile: botID)
+                        adopting = false
+                    }
+                } label: {
+                    Text(adopting ? copy.petAdopting(themeID) : copy.petSaveFace(themeID))
+                        .font(theme.body(13, weight: .semibold))
+                        .foregroundStyle(theme.accentFg)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(theme.accent, in: RoundedRectangle(cornerRadius: theme.buttonRadius, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .disabled(adopting)
+            }
+        }
+        .padding(12)
+        .modifier(PetCardChrome(theme: theme))
+    }
+
     private func galleryCell(_ entry: PetGalleryEntry) -> some View {
-        let isActive = entry.slug == surface.pet?.slug && surface.enabled
+        let isActive = (stagedSlug ?? (surface.enabled ? surface.pet?.slug : nil)) == entry.slug
         let busy = surface.isBusy("select:\(entry.slug)")
         return Button {
             guard !busy else { return }
-            Task { await model.selectPet(slug: entry.slug, profile: botID) }
+            stagedSlug = entry.slug == surface.pet?.slug && surface.enabled ? nil : entry.slug
         } label: {
             VStack(spacing: 6) {
                 ZStack {
@@ -1188,7 +1234,7 @@ public extension CopyPack {
 
     func petNone(_ t: ThemeID) -> String {
         switch t {
-        case .soft: "No pet on duty. Adopt one below and it appears beside this bot while it works."
+        case .soft: "No pet on duty. Stage one below, then Save to make it this bot's live face."
         case .control: "NO ACTIVE SPRITE. ADOPT ONE — IT RIDES THE ROSTER WHILE THE AGENT RUNS."
         case .ink: "No familiar attends this one. Choose below, and it will keep watch as the work is done."
         }
@@ -1477,6 +1523,20 @@ public extension CopyPack {
         }
     }
 
+    func petStaged(_ t: ThemeID, _ name: String) -> String {
+        switch t {
+        case .soft: "\(name) is staged. Save to make it this bot's live face."
+        case .control: "STAGED \(name.uppercased()) — SAVE TO COMMIT display.pet."
+        case .ink: "\(name) waits. Seal it and the familiar takes the face."
+        }
+    }
+    func petSaveFace(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Save as live face"
+        case .control: "COMMIT SPRITE"
+        case .ink: "seal the familiar"
+        }
+    }
     func petAdopt(_ t: ThemeID) -> String {
         switch t {
         case .soft: "Adopt it"

@@ -8,6 +8,7 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
     case intelligence
     case agents
     case operations
+    case workspace
     case localData
     case about
 
@@ -20,6 +21,7 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .intelligence: "Models, Voice & Memory"
         case .agents: "Agents & Profiles"
         case .operations: "Gateway Operations"
+        case .workspace: "Files & Git"
         case .localData: "On-device & Privacy"
         case .about: "About & Diagnostics"
         }
@@ -32,6 +34,7 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .intelligence: "Inference providers, OAuth, voice and memory"
         case .agents: "Rename, delete and manage Hermes profiles"
         case .operations: "Restart, update, usage, runtime and logs"
+        case .workspace: "Gateway files, git status and read-only previews"
         case .localData: "Solo mode, storage, exports and deletion"
         case .about: "Versions, health, links and desktop-only boundaries"
         }
@@ -44,6 +47,7 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .intelligence: "cpu.fill"
         case .agents: "person.2.fill"
         case .operations: "slider.horizontal.3"
+        case .workspace: "folder"
         case .localData: "lock.iphone"
         case .about: "info.circle.fill"
         }
@@ -56,6 +60,7 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .intelligence: "model provider oauth endpoint api key voice speech memory stt tts"
         case .agents: "bot profile rename delete lifecycle"
         case .operations: "operator config logs debug level"
+        case .workspace: "files git workspace directory preview pty terminal project"
         case .localData: "solo offline storage cache privacy export delete reset"
         case .about: "version gateway health diagnostics source docs desktop"
         }
@@ -225,6 +230,8 @@ private struct SettingsDetailPage: View {
                     ProfileLifecycleSettingsSection(model: model)
                 case .operations:
                     OperatorSettingsSection(model: model)
+                case .workspace:
+                    WorkspaceSettingsSection(model: model)
                 case .localData:
                     SoloSettingsSection(model: model)
                     PrivacySettingsSection(model: model)
