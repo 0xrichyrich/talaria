@@ -18,6 +18,31 @@ enum RosterRoomPolicy {
     }
 }
 
+/// Immutable destructive-dialog authority. The row and its exact gateway
+/// lifecycle target are resolved together before presentation, so a route
+/// disappearing between the long-press and the dialog cannot leave a
+/// cancel-only sheet or redirect the eventual confirmation.
+struct RosterDeleteCandidate: Identifiable, Equatable {
+    let bot: Bot
+    let target: ProfileLifecycleTarget
+
+    var id: String { target.rosterID }
+
+    private init(bot: Bot, target: ProfileLifecycleTarget) {
+        self.bot = bot
+        self.target = target
+    }
+
+    static func resolve(bot: Bot, target: ProfileLifecycleTarget?) -> Self? {
+        guard bot.id != "default",
+              let target,
+              target.rosterID == bot.id,
+              target.route.profile != "default"
+        else { return nil }
+        return Self(bot: bot, target: target)
+    }
+}
+
 // The roster — the app's home screen. Themed kicker+title header with the
 // search glyph, theme cycler, network chip and "+" (new bot); an offline
 // banner when the gateway is unreachable; staggered-entrance bot rows with
@@ -53,7 +78,7 @@ public struct RosterView: View {
     /// roster is where desktop puts Edit Profile too (plugin.js:4051-4111);
     /// before this the only way in was to open the bot first.
     @State private var editing: Bot?
-    @State private var deleting: Bot?
+    @State private var deleting: RosterDeleteCandidate?
     /// The in-place roster filter (plugin.js:7831-7842). Deliberately NOT the
     /// palette's query: the palette is a cross-surface jump (bots, sessions,
     /// artifacts, actions) and replaces the screen, where this narrows the list
@@ -304,31 +329,35 @@ public struct RosterView: View {
         .sheet(item: $editing) { bot in
             CreateBotView(model: model, editing: bot)
         }
-        .confirmationDialog(CopyPack.rosterDeleteTitle(theme.id, name: deleting.map { TalariaVoice.displayName(for: $0, theme.id) } ?? ""),
-                            isPresented: Binding(
-                                get: { deleting != nil },
-                                set: { if !$0 { deleting = nil } }),
-                            titleVisibility: .visible) {
-            if let bot = deleting, let target = model.profileLifecycleTarget(rosterID: bot.id) {
-                Button(CopyPack.rosterDelete(theme.id), role: .destructive) {
-                    let doomed = bot
-                    deleting = nil
-                    Task {
-                        let outcome = await model.deleteProfile(target, confirmed: true)
-                        if case .deleted = outcome {
-                            model.toast(kind: .success,
-                                        title: CopyPack.rosterDeleted(theme.id, name: TalariaVoice.displayName(for: doomed, theme.id)),
-                                        botID: doomed.id)
-                        } else if case .refused(let reason) = outcome {
-                            model.toast(kind: .failure,
-                                        title: CopyPack.rosterDeleteFailed(theme.id),
-                                        message: reason, botID: doomed.id)
-                        }
+        .confirmationDialog(
+            CopyPack.rosterDeleteTitle(
+                theme.id,
+                name: deleting.map { TalariaVoice.displayName(for: $0.bot, theme.id) } ?? ""),
+            isPresented: Binding(
+                get: { deleting != nil },
+                set: { if !$0 { deleting = nil } }),
+            titleVisibility: .visible,
+            presenting: deleting
+        ) { candidate in
+            Button(CopyPack.rosterDelete(theme.id), role: .destructive) {
+                let doomed = candidate.bot
+                let target = candidate.target
+                deleting = nil
+                Task {
+                    let outcome = await model.deleteProfile(target, confirmed: true)
+                    if case .deleted = outcome {
+                        model.toast(kind: .success,
+                                    title: CopyPack.rosterDeleted(theme.id, name: TalariaVoice.displayName(for: doomed, theme.id)),
+                                    botID: doomed.id)
+                    } else if case .refused(let reason) = outcome {
+                        model.toast(kind: .failure,
+                                    title: CopyPack.rosterDeleteFailed(theme.id),
+                                    message: reason, botID: doomed.id)
                     }
                 }
             }
             Button("Cancel", role: .cancel) { deleting = nil }
-        } message: {
+        } message: { _ in
             Text(CopyPack.rosterDeleteBody(theme.id))
         }
         // Ranking, the 90 s liveness window and the unread watermark all come
@@ -823,9 +852,11 @@ public struct RosterView: View {
         } label: {
             Label(CopyPack.rosterNewChat(theme.id), systemImage: "plus.bubble")
         }
-        if bot.id != "default", GatewayBotRoute(qualifiedID: bot.id)?.profile != "default" {
+        if let candidate = RosterDeleteCandidate.resolve(
+            bot: bot, target: model.profileLifecycleTarget(rosterID: bot.id)
+        ) {
             Button(role: .destructive) {
-                deleting = bot
+                deleting = candidate
             } label: {
                 Label(CopyPack.rosterDelete(theme.id), systemImage: "trash")
             }
