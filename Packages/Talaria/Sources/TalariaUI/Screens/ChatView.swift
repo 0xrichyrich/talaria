@@ -75,7 +75,7 @@ public struct ChatView: View {
     @ScaledMetric(relativeTo: .body) private var inkComposerSize = 15
     @State private var showModelSheet = false
     @State private var showCommands = false
-    @State private var initialTranscriptAnchored = false
+    @State private var transcriptAnchoredBotID: String?
     @FocusState private var composerFocused: Bool
 
     /// Tapback set, matching desktop's reaction picker.
@@ -283,7 +283,7 @@ public struct ChatView: View {
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
             .task(id: initialTranscriptAnchorKey) {
-                guard !initialTranscriptAnchored, !messages.isEmpty else { return }
+                guard transcriptAnchoredBotID != botID, !messages.isEmpty else { return }
                 // A long LazyVStack does not have its final bottom geometry on
                 // the first paint. Anchor once after the initial layout, then
                 // again after the first lazy measurement pass. Subsequent
@@ -294,10 +294,10 @@ public struct ChatView: View {
                 try? await Task.sleep(for: .milliseconds(60))
                 guard !Task.isCancelled else { return }
                 proxy.scrollTo("chat-bottom", anchor: .bottom)
-                initialTranscriptAnchored = true
+                transcriptAnchoredBotID = botID
             }
             .onChange(of: messages.count) {
-                guard initialTranscriptAnchored else { return }
+                guard transcriptAnchoredBotID == botID else { return }
                 withAnimation(ChatComposerLayoutPolicy.animation(
                     reducedMotion: reducedMotion, duration: 0.25
                 )) {
@@ -311,7 +311,6 @@ public struct ChatView: View {
                     proxy.scrollTo("chat-bottom", anchor: .bottom)
                 }
             }
-            .onChange(of: botID) { _, _ in initialTranscriptAnchored = false }
         }
     }
 
