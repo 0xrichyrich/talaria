@@ -70,6 +70,8 @@ public final class AppModel {
     public var isOffline: Bool = false
     /// Messages composed while unreachable; flushed on reconnect.
     public var composeQueue: [(botID: String, text: String)] = []
+    /// Live prompts the gateway parked behind the current turn (`queued: true`).
+    public var promptQueue: [(id: UUID, botID: String, text: String)] = []
 
     // Live mode
     public var client: GatewayClient?
@@ -166,6 +168,7 @@ public final class AppModel {
         sessions = [:]
         contextMeter = []
         composeQueue = []
+        promptQueue = []
         openBotID = nil
         selectedTab = .home
         // A toast is an answer about a world that no longer exists once this

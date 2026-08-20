@@ -346,12 +346,16 @@ extension AppModel {
             guard let route = gatewayRoute(for: botID),
                   let client = try? await routedClient(for: route) else { return }
             let steered = (try? await client.steerTurn(sessionID: sessionID, text: text)) ?? ""
-            if steered == "queued" { return }
+            if steered == "queued" { enqueuePrompt(text, botID: botID); return }
             // Too late to steer: re-aim the turn, and failing that queue the
             // text behind it rather than interrupting what is running.
             let redirected = (try? await client.redirectTurn(sessionID: sessionID, text: text)) ?? ""
-            if redirected == "redirected" || redirected == "queued" { return }
+            if redirected == "redirected" || redirected == "queued" {
+                if redirected == "queued" { enqueuePrompt(text, botID: botID) }
+                return
+            }
             _ = try? await client.submitPrompt(sessionID: sessionID, text: text, queued: true)
+            enqueuePrompt(text, botID: botID)
         }
     }
 
@@ -557,6 +561,21 @@ extension AppModel {
         }
     }
 
+
+    private func enqueuePrompt(_ text: String, botID: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if promptQueue.contains(where: { $0.botID == botID && $0.text == trimmed }) { return }
+        promptQueue.append((id: UUID(), botID: botID, text: trimmed))
+    }
+
+    public func dequeuePrompt(id: UUID) {
+        promptQueue.removeAll { $0.id == id }
+    }
+
+    public func queuedPrompts(for botID: String) -> [(id: UUID, botID: String, text: String)] {
+        promptQueue.filter { $0.botID == botID }
+    }
     // MARK: - Stop (session.interrupt)
 
     /// Halt the running turn. The gateway also cancels queued prompts, releases
@@ -587,6 +606,7 @@ extension AppModel {
                 try await client.interruptSession(sessionID)
                 chat.messages.append(ChatMessage(author: .system, text: note))
                 self.approvals.removeAll { $0.botID == botID }
+                promptQueue.removeAll { $0.botID == botID }
             } catch {
                 let detail = (error as? GatewayError)?.message ?? error.localizedDescription
                 chat.messages.append(ChatMessage(author: .system, text: detail))

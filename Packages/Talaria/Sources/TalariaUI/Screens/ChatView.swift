@@ -949,12 +949,45 @@ public struct ChatView: View {
         }
     }
 
+
+    @ViewBuilder private var queuedPromptStrip: some View {
+        let items = model.queuedPrompts(for: botID)
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(copy.promptQueueTitle(theme.id, count: items.count))
+                    .font(theme.id == .control ? theme.mono(9.5, weight: .semibold) : theme.body(11.5, weight: .semibold))
+                    .foregroundStyle(theme.sub)
+                ForEach(items, id: \.id) { item in
+                    HStack(spacing: 8) {
+                        Text(item.text)
+                            .font(theme.body(13))
+                            .foregroundStyle(theme.ink)
+                            .lineLimit(2)
+                        Spacer(minLength: 8)
+                        Button {
+                            model.dequeuePrompt(id: item.id)
+                        } label: {
+                            Text(copy.promptQueueRemove(theme.id))
+                                .font(theme.body(12, weight: .semibold))
+                                .foregroundStyle(theme.accent)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 10)
+                    .background(theme.inset, in: RoundedRectangle(cornerRadius: theme.buttonRadius, style: .continuous))
+                }
+            }
+        }
+    }
+
     // MARK: - Composer
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 6) {
             // Staged attachments (attachments agent owns the tray + picker).
             AttachmentTray(model: model, botID: botID)
+            queuedPromptStrip
             if turnRunning, model.mode == .live {
                 steerHint
             }
@@ -1316,6 +1349,21 @@ extension CopyPack {
         case .soft: "Attach a file"
         case .control: "ATTACH PAYLOAD"
         case .ink: "enclose something"
+        }
+    }
+
+    func promptQueueTitle(_ theme: ThemeID, count: Int) -> String {
+        switch theme {
+        case .soft: "Queued · \(count)"
+        case .control: "QUEUED \(count)"
+        case .ink: "waiting · \(count)"
+        }
+    }
+    func promptQueueRemove(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Remove"
+        case .control: "DROP"
+        case .ink: "set aside"
         }
     }
 
