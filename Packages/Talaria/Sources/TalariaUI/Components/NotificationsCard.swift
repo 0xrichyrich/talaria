@@ -123,11 +123,11 @@ public struct NotificationsCard: View {
     private var detail: String {
         switch stage {
         case .ready(let devices):
-            return "Approvals, mentions, finished routines and long tasks push from your gateway. \(devices) device\(devices == 1 ? "" : "s") registered."
+            return "Approvals, agent replies, mentions, finished routines and long tasks push from your gateway. \(devices) device\(devices == 1 ? "" : "s") registered."
         case .denied:
             return "iOS is blocking Talaria's notifications. Turn them back on in Settings → Talaria → Notifications."
         case .noRelay:
-            return "This gateway has no talaria-push relay plugin, so it can't send pushes. Install app/relay on the gateway host, then recheck."
+            return "This gateway has no talaria-push relay plugin, so it can't send pushes. Install relay/talaria-push on the gateway host, then recheck."
         case .relayMisconfigured(let reason):
             return "This gateway registered the phone, but its APNs relay is not ready: \(reason)"
         case .unregistered:

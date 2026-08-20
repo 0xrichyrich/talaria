@@ -133,7 +133,7 @@ public struct CopyPack: Sendable {
         kickerConn: "UPLINKS", titleConn: "Connections", appearance: "Appearance",
         gatewaysSec: "Gateways", addGateway: "+ Add gateway — URL or Hermes Cloud",
         notifySec: "Notify me when",
-        pushNote: "Delivered over APNs by the gateway’s push relay; Time Sensitive approvals can break through Focus when iOS allows it.",
+        pushNote: "Agent replies, mentions and finished work arrive over APNs from the gateway’s push relay; Time Sensitive approvals can break through Focus when iOS allows it.",
         tag: "NEEDS APPROVAL", unto: "to",
         approve: "Approve", approveSend: "Approve & send", deny: "Deny", pendChip: "PENDING",
         digestHead: "DIGEST · 3 OF 6", digestLink: "Open full digest →",
@@ -166,7 +166,7 @@ public struct CopyPack: Sendable {
         obNote2: "OAuth for anything beyond your own network; basic auth only on a trusted LAN or tailnet.",
         obTitle3: "6 bots found on homelab", obLook: "Pick a look",
         obNotifT: "Notifications",
-        obNotifS: "Approvals, mentions, finished runs — the gateway pushes, your phone pings.",
+        obNotifS: "Approvals, agent replies, mentions, finished runs — the gateway pushes, your phone pings.",
         obAllow: "Allow", obAllowed: "Enabled ✓", obCta3: "Enter the roster",
         tabs: [("Bots", .home), ("Activity", .activity), ("Approvals", .approvals),
                ("Inbox", .a2a), ("Artifacts", .artifacts)],
@@ -221,7 +221,7 @@ public struct CopyPack: Sendable {
         c.kickerConn = "GATEWAYS & TIDINGS"; c.titleConn = "The Ways"; c.appearance = "THE GUISE"
         c.gatewaysSec = "THE WAYS"; c.addGateway = "+ open a new way — url or hermes cloud"
         c.notifySec = "SEND TIDINGS WHEN"
-        c.pushNote = "Tidings travel by APNs through the gateway’s push relay; a waiting seal may break through Focus."
+        c.pushNote = "Replies, mentions and finished work travel by APNs through the gateway’s push relay; a waiting seal may break through Focus."
         c.tag = "AWAITING YOUR SEAL"; c.unto = "unto"
         c.approve = "grant the seal"; c.approveSend = "grant the seal"; c.deny = "refuse"; c.pendChip = ""
         c.digestHead = "THE MORNING DIGEST · FIG. I–III"; c.digestLink = "open the full digest →"

@@ -30,7 +30,8 @@ Payload contract (shared with the Talaria iOS client — see HANDOFF spec):
       "deeplink": "talaria://approvals"
     }
 
-``kind`` is one of ``approval | long_task | mention | routine | gateway``.
+``kind`` is one of ``approval | long_task | response | mention | routine |
+gateway``.
 Deep-link routing follows the HANDOFF spec: approval -> Approvals screen,
 gateway -> Connections screen, everything else -> that bot's chat.
 """
@@ -38,6 +39,7 @@ gateway -> Connections screen, everything else -> that bot's chat.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import queue
 import threading
@@ -54,7 +56,11 @@ logger = logging.getLogger("talaria_push")
 
 _QUEUE_MAX = 256
 _TITLE_MAX = 120
-_BODY_MAX = 900  # APNs payload cap is 4 KB; keep well under it.
+_BODY_MAX = 900  # Readability ceiling; the serialized byte budget is authoritative.
+# APNs rejects payloads at 4096 bytes. Keep a margin for provider-side JSON
+# framing/encoding changes; response bodies are duplicated in aps.alert.body
+# and the top-level body, so a character-only cap is not sufficient.
+APNS_PAYLOAD_SAFE_BYTES = 3800
 
 # APNs category per event kind (the iOS client registers matching
 # UNNotificationCategory actions — TALARIA_APPROVAL carries the
@@ -62,6 +68,7 @@ _BODY_MAX = 900  # APNs payload cap is 4 KB; keep well under it.
 CATEGORIES = {
     "approval": "TALARIA_APPROVAL",
     "long_task": "TALARIA_TASK",
+    "response": "TALARIA_RESPONSE",
     "mention": "TALARIA_MENTION",
     "routine": "TALARIA_ROUTINE",
     "gateway": "TALARIA_GATEWAY",
@@ -73,6 +80,7 @@ CATEGORIES = {
 INTERRUPTION_LEVELS = {
     "approval": "time-sensitive",
     "gateway": "time-sensitive",
+    "response": "active",
     "mention": "active",
     "long_task": "active",
     "routine": "active",
@@ -88,19 +96,104 @@ _EXPIRATION_TTL_S = {
     "approval": 5 * 60,
     "gateway": 10 * 60,
     "mention": 60 * 60,
+    "response": 60 * 60,
     "long_task": 24 * 60 * 60,
     "routine": 24 * 60 * 60,
 }
 
 
-def _truncate(text: str, limit: int) -> str:
-    text = (text or "").strip()
+def _safe_text(value: Any) -> str:
+    """Return APNs-safe text without letting malformed hook data leak out.
+
+    Hermes normally supplies strings, but provider output can contain lone
+    UTF-16 surrogates and a plugin hook should never turn an unusual response
+    object into an APNs/JSON failure. Preserve normal whitespace used by
+    markdown while dropping non-printing controls and replacing surrogates.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = str(value)
+        except Exception:
+            return ""
+    out = []
+    for char in text:
+        code = ord(char)
+        if 0xD800 <= code <= 0xDFFF:
+            out.append("\ufffd")
+        elif code in (9, 10, 13) or (code >= 0x20 and code != 0x7F):
+            out.append(char)
+    return "".join(out)
+
+
+def _truncate(text: Any, limit: int) -> str:
+    text = _safe_text(text).strip()
+    if limit <= 0:
+        return ""
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
 
 
-def build_deeplink(kind: str, bot: str, session_id: str = "") -> str:
+def _payload_size(payload: Dict[str, Any]) -> int:
+    """Return a conservative compact JSON size for an APNs payload.
+
+    Hermes/httpx currently emits UTF-8 JSON directly, but measuring with
+    ``ensure_ascii=True`` also covers transports that escape CJK/emoji before
+    sending. The resulting budget is intentionally conservative.
+    """
+    try:
+        return len(json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8"))
+    except (TypeError, ValueError):
+        # Keep payload construction fail-open for legacy/custom event extras;
+        # APNsClient remains the final delivery boundary and will report an
+        # unserialisable payload without taking down the hook worker.
+        return APNS_PAYLOAD_SAFE_BYTES + 1
+
+
+def _fit_payload_body(payload: Dict[str, Any], source_body: Any) -> None:
+    """Fit duplicated alert/top-level body text under the APNs byte budget."""
+    if _payload_size(payload) <= APNS_PAYLOAD_SAFE_BYTES:
+        return
+
+    text = _safe_text(source_body).strip()
+    aps = payload.get("aps")
+    alert = aps.get("alert") if isinstance(aps, dict) else None
+    if not isinstance(alert, dict):
+        return
+
+    def set_body(value: str) -> None:
+        alert["body"] = value
+        payload["body"] = value
+
+    # Find the largest Unicode-character prefix that fits. `_payload_size`
+    # measures encoded bytes, so this handles CJK, emoji, and mixed output
+    # without splitting a UTF-8 sequence or relying on a worst-case multiplier.
+    low, high = 0, min(len(text), _BODY_MAX)
+    best = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = _truncate(text, mid)
+        set_body(candidate)
+        if _payload_size(payload) <= APNS_PAYLOAD_SAFE_BYTES:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    set_body(best)
+
+
+def build_deeplink(
+    kind: str, bot: str, session_id: str = "", gateway_id: str = "",
+) -> str:
     """Deep-link routing data per the HANDOFF spec.
 
     Route space matches the iOS client's DeepLink parser exactly:
@@ -111,8 +204,13 @@ def build_deeplink(kind: str, bot: str, session_id: str = "") -> str:
     if kind == "gateway":
         return "talaria://connections"
     base = f"talaria://bot/{urllib.parse.quote(bot or 'default', safe='')}"
+    query: list[str] = []
     if session_id:
-        return f"{base}?session_id={urllib.parse.quote(session_id, safe='')}"
+        query.append(f"session_id={urllib.parse.quote(session_id, safe='')}")
+    if kind == "response" and gateway_id:
+        query.append(f"gateway_id={urllib.parse.quote(gateway_id, safe='')}")
+    if query:
+        return base + "?" + "&".join(query)
     return base
 
 
@@ -120,7 +218,7 @@ def build_deeplink(kind: str, bot: str, session_id: str = "") -> str:
 class PushEvent:
     """One logical notification, before device fan-out."""
 
-    kind: str                       # approval | long_task | mention | routine | gateway
+    kind: str                       # approval | long_task | response | mention | routine | gateway
     bot: str                        # hermes profile ("default" for the root profile)
     title: str
     body: str
@@ -163,6 +261,7 @@ class PushEvent:
             # Custom keys must not collide with the reserved contract keys.
             if key not in payload:
                 payload[key] = value
+        _fit_payload_body(payload, self.body)
         return payload
 
 
@@ -172,6 +271,13 @@ def payload_for_device(event: PushEvent, device: Dict[str, Any]) -> Dict[str, An
     gateway_id = str(device.get("gateway_id") or "").strip()
     if gateway_id:
         payload["gateway_id"] = gateway_id
+        if event.kind == "response":
+            payload["deeplink"] = build_deeplink(
+                event.kind, event.bot, event.session_id, gateway_id,
+            )
+    # Source stamping (especially the response deeplink) changes the JSON
+    # size, so budget once more after binding the concrete device identity.
+    _fit_payload_body(payload, event.body)
     return payload
 
 
@@ -212,6 +318,15 @@ class PushDispatcher:
         settings = relay_settings()
         if not settings.event_enabled(event.kind):
             logger.debug("talaria-push: kind %r disabled; dropping", event.kind)
+            return False
+        # A final response is the completion notification for a normal
+        # non-interrupted turn. When that kind is enabled, the legacy duration-based event
+        # would buzz for the same turn as well. Keep this guard in the shared
+        # dispatcher so sidecar and hook mode cannot reintroduce the duplicate.
+        if event.kind == "long_task" and settings.event_enabled("response"):
+            logger.debug(
+                "talaria-push: long_task suppressed while response events are enabled"
+            )
             return False
         if not self._apns_ready():
             return False
@@ -378,7 +493,7 @@ def get_dispatcher() -> PushDispatcher:
 
 def stable_hash(*parts: str) -> str:
     """Short stable hash for dedupe/collapse keys."""
-    joined = "\x1f".join(p or "" for p in parts)
+    joined = "\x1f".join(_safe_text(p) for p in parts)
     return hashlib.sha256(joined.encode("utf-8", "replace")).hexdigest()[:16]
 
 
@@ -429,6 +544,48 @@ def long_task_event(
         session_id=session_id,
         collapse_id=f"task-{stable_hash(bot, session_id)}",
         dedupe_key=f"long_task:{stable_hash(bot, session_id, str(int(duration_s)))}",
+    )
+
+
+def response_event(
+    *,
+    bot: str,
+    session_id: str,
+    turn_id: str = "",
+    task_id: str = "",
+    response: str = "",
+    assistant_response: Optional[str] = None,
+) -> PushEvent:
+    """Build the final assistant-response notification.
+
+    ``post_llm_call`` calls this with ``assistant_response`` in the pinned
+    Hermes shape; ``response`` remains the concise builder-facing name and is
+    useful to sidecar/tests. The full identity tuple is part of the dedupe key
+    so two turns with the same text never suppress one another.
+    """
+    if assistant_response is not None:
+        response = assistant_response
+    bot_text = _safe_text(bot).strip()
+    session_text = _safe_text(session_id).strip()
+    turn_text = _safe_text(turn_id).strip()
+    task_text = _safe_text(task_id).strip()
+    response_text = _safe_text(response)
+    identity = stable_hash(
+        bot_text,
+        session_text,
+        turn_text,
+        task_text,
+        response_text,
+    )
+    return PushEvent(
+        kind="response",
+        bot=bot_text,
+        title=f"{bot_text}: response ready",
+        body=response_text,
+        session_id=session_text,
+        collapse_id=f"response-{stable_hash(bot_text, session_text)}",
+        dedupe_key=f"response:{identity}",
+        extra={"task_id": task_text, "turn_id": turn_text},
     )
 
 

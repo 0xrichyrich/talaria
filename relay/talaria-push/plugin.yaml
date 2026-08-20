@@ -2,8 +2,9 @@ name: talaria-push
 version: 0.1.0
 description: >-
   APNs push relay for the Talaria iOS client. Registers observer hooks that
-  fan out pushes for approval requests, long-task completion (>10 min),
-  cron/routine completion, and @mentions in inbound gateway messages
+  fan out pushes for approval requests, final assistant responses,
+  long-task completion (>10 min), cron/routine completion, and @mentions in
+  inbound gateway messages
   (including A2A agent-to-agent traffic), and mounts device-registration
   REST routes at /api/plugins/talaria-push/. A standalone sidecar mode
   (talaria-push-sidecar) adds gateway offline/recovered detection and
@@ -17,6 +18,7 @@ hooks:
   - pre_approval_request
   - post_approval_response
   - pre_llm_call
+  - post_llm_call
   - on_session_end
   - pre_gateway_dispatch
 # Surfaced by `hermes plugins show` — hermes never auto-installs these.

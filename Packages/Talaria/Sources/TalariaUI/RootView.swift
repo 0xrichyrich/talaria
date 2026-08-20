@@ -278,9 +278,6 @@ public struct TalariaRootView: View {
             if scenePhase == .active { model.applicationDidBecomeActive() }
         }
         .onAppear { wireUp() }
-        .onOpenURL { url in
-            _ = PushCoordinator.shared.handleDeepLink(url)
-        }
         .onReceive(NotificationCenter.default.publisher(for: .talariaOpenConnections)) { _ in
             // talaria://connections deep links and gateway pushes; this view
             // owns the Connections navigation push.

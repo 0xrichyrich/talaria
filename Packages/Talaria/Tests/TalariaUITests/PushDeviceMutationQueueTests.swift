@@ -303,6 +303,26 @@ final class PushDeviceMutationQueueTests: XCTestCase {
         XCTAssertEqual(calls, [.resume("stored-1", "default")])
     }
 
+    func testColdApprovalRejectsResumeWithoutDurableStoredSession() async {
+        let fake = ColdApprovalFake()
+        await fake.setResume(PushApprovalResumeSnapshot(sessionID: "live-1",
+                                                        storedSessionID: "",
+                                                        profile: "default"))
+        let identity = PushApprovalIdentity(gatewayID: "homelab", profile: "default",
+                                            storedSessionID: "stored-1", requestID: nil)
+        await fake.setPending([[approvalDetail("wanted")]])
+
+        do {
+            _ = try await PushApprovalOrchestrator.approve(identity: identity,
+                                                            actions: approvalActions(fake))
+            XCTFail("an empty resumed stored session must fail closed")
+        } catch {
+            XCTAssertEqual((error as? GatewayError)?.code, -20)
+        }
+        let calls = await fake.snapshot
+        XCTAssertEqual(calls, [.resume("stored-1", "default")])
+    }
+
     func testColdHookFIFOAdvanceBetweenReadsNeverMutates() async {
         let fake = ColdApprovalFake()
         await fake.setPending([[approvalDetail("first")], [approvalDetail("second")]])

@@ -49,7 +49,7 @@ import TalariaKit
 //     gateway HOST's own microphone/speakers — never this phone's.
 //
 //   POST /api/plugins/talaria-push/devices
-//     app/relay/talaria-push/dashboard/plugin_api.py:125 — idempotent upsert
+//     relay/talaria-push/dashboard/plugin_api.py:125 — idempotent upsert
 //     of {device_token, platform, environment, profile_filter}.
 //     `profile_filter` is a per-BOT allow-list ([] = every bot); the relay
 //     honors it in `DeviceStore.for_bot` (talaria_push_relay/devices.py:160).
@@ -156,10 +156,11 @@ public struct PushRelayStatus: Sendable, Equatable {
     public var apnsConfigured: Bool
     /// APNs env vars the relay is still missing.
     public var missingEnv: [String]
-    /// Master kill switch (`TALARIA_PUSH_DISABLED`).
+    /// Master kill switch (`TALARIA_PUSH_DISABLE`).
     public var disabled: Bool
-    /// Wire kinds this gateway will send: approval | long_task | mention |
-    /// routine | gateway. Gateway-wide config, not a per-device choice.
+    /// Wire kinds this gateway will send: approval | long_task | response |
+    /// mention | routine | gateway. Gateway-wide config, not a per-device
+    /// choice.
     public var enabledEvents: [String]
     /// Minimum turn length before a "long task" push (seconds).
     public var longTaskMinSeconds: Int

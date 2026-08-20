@@ -93,6 +93,35 @@ workspace/command-center surfaces:
   current-run activity feed; tours and transcript activity remain queued with
   the transcript batch rather than being mistaken for management API drift.
 
+### Push status: implemented, not yet certified
+
+The gateway relay, device registration/filtering, APNs fan-out, notification
+actions, and source-qualified payloads are implemented. The filter contract is
+deliberately split: `TALARIA_PUSH_EVENTS` is a process-wide event-kind
+allow-list, while a device's `profile_filter` is a per-bot/profile allow-list;
+neither is a per-device event-kind preference. The dashboard `/test` endpoint
+is a synthetic presentation probe and intentionally bypasses both filters, so
+it cannot establish real-event parity.
+
+The pinned Hermes source also has a `post_llm_call` observer: it fires once when
+a non-interrupted turn has any non-empty final response (including a
+fallback/error summary) and includes `assistant_response`; it is not the
+session-bound WebSocket `message.complete` event. The current relay registers
+that hook and emits a source-qualified `response` push; cron turns remain
+`routine` notifications, and the legacy duration-only `long_task` push is
+suppressed while `response` is enabled. The current plugin should therefore
+log six hook registrations per process. A sidecar has no response producer and
+must explicitly disable `response` if it needs polling-based long-task
+notifications.
+
+Debug and TestFlight are separate APNs environments (`dev`/sandbox versus
+`prod`/production), and every Hermes process that can own an event needs its
+own inherited environment. A real-device Debug + TestFlight matrix, event
+negative cases, profile-filter check, and honest sidecar limitations are still
+required. Follow [TESTING.md §5](../TESTING.md#5-live-gateway-and-push-certification)
+and the [relay certification procedure](../relay/README.md#live-gatewaydevice-certification)
+before moving push rows from partial to complete.
+
 ## Delivery ledger
 
 Local combined follow-up (`codex/command-center-ops`, not yet on GitHub):
@@ -124,6 +153,9 @@ written.
       plugins, routines, messaging, memory, and agents.
 - [ ] Add gateway-backed files, artifacts, projects, git, terminal, and command-center UI.
 - [ ] Finish push, background, offline, reconciliation, and capability/version reliability.
+      Push specifically remains implemented-but-uncertified until the Debug /
+      TestFlight, real-event, filter, and sidecar matrix in TESTING.md is
+      recorded.
 - [ ] Certify the complete matrix against the pinned gateway and document only
       the remaining true platform exceptions.
 

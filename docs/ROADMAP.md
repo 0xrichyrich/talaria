@@ -123,8 +123,9 @@ to desktop for the rest:
 
 - **Gateways** — the connection registry (exists in Connections; move/merge).
 - **Appearance** — themes (exists), plus text size and reduce-motion.
-- **Notifications** — the card that exists, plus per-kind prefs wired to the
-  relay's `profile_filter`.
+- **Notifications** — the card that exists, plus per-bot preferences wired to
+  the relay's `profile_filter`; event-kind filtering remains a gateway-process
+  setting (`TALARIA_PUSH_EVENTS`), not a device preference.
 - **Models & providers** — default model, reasoning effort, API keys
   (`model.save_key`), provider connect/disconnect.
 - **Voice** — input/output device behavior, TTS on/off, wake settings.
@@ -274,6 +275,36 @@ Phase 1's own item 4 — kill the socket mid-turn, confirm the ~20 s park/reatta
 and the `inflight` replay — is unchanged from the original plan and is still the
 single best test of the client.
 
+### Push relay certification gate
+
+The relay implementation and its APNs contract are source-reviewed, but push
+is not complete until it has real gateway and real-device evidence. A green
+build or the Settings **Send test push** button is insufficient: `/test` is a
+synthetic display probe that intentionally bypasses `TALARIA_PUSH_EVENTS` and
+`profile_filter`.
+
+Use [TESTING.md §5](../TESTING.md#5-live-gateway-and-push-certification) and
+the relay's [certification order](../relay/README.md#live-gatewaydevice-certification)
+to record, against the pinned Hermes revision:
+
+- one Debug/sandbox pass (`aps-environment=development`, registration
+  `environment: "dev"`) and one TestFlight/production pass
+  (`aps-environment=production`, registration `environment: "prod"`);
+- one `registered 6 hooks` log line from each process that should observe
+  events, with environment inheritance checked separately for `hermes serve`,
+  messaging gateway, and cron;
+- approval, final-response-ready (including fallback/error-summary), mention,
+  and routine events, including the interrupted negative case and
+  source-qualified deep links; legacy long-task polling is tested separately
+  with `response` disabled;
+- an allowed and disallowed real profile for `profile_filter`, plus the
+  intentionally different `/test` result; and
+- sidecar polling/offline/recovered evidence, with its session-bound event,
+  mention, polling, and profile-attribution limitations called out.
+
+Until that matrix is recorded, keep push/background rows partial and describe
+them as implemented-but-uncertified rather than production-ready.
+
 ### 2. Bot Mode gaps that survived Phase 4
 
 - **Group rooms / multi-bot chats — implemented, certification pending.** The
@@ -304,11 +335,14 @@ mint one, which is the safe asymmetry to keep unless it proves annoying.
 ### 4. Known-latent, not yet a bug
 
 - **APNs environment now follows the signed configuration.** Debug uses the
-  sandbox entitlement and sends `dev`; Release uses the production entitlement
-  and sends `prod`. Both carry the Time Sensitive entitlement used by approval
-  and gateway alerts; current Apple SDKs no longer require a separate
-  authorization option. The relay source-stamps every multi-gateway payload
-  and bounds APNs storage with per-kind expiration.
+  sandbox entitlement and registers/sends `dev`; Release uses the production
+  entitlement and registers/sends `prod`. `TALARIA_APNS_ENV` is only the relay
+  fallback when a device registration omits its environment. Both builds carry
+  the Time Sensitive entitlement used by approval and gateway alerts; current
+  Apple SDKs no longer require a separate authorization option. The relay
+  source-stamps every multi-gateway payload and bounds APNs storage with
+  per-kind expiration. Live gateway/device certification remains open; follow
+  the dedicated gate above.
 - **`ConnectionRegistry.startAutoProbe` is still dead code** (PARITY.md row on
   backstop polling). Harmless, but it is a probe nobody calls.
 - **Solo's `BridgedTool` silently drops any tool whose parameters are not a flat

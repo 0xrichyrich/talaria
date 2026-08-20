@@ -1,5 +1,6 @@
 import UserNotifications
 import Intents
+import TalariaKit
 
 // TalariaNotificationService — the mutable-content hook for pushes from the
 // gateway relay. The relay sends `mutable-content: 1` with a data payload
@@ -7,12 +8,15 @@ import Intents
 //
 //     { kind, gateway_id, bot, title, body, approval_request_id, session_id }
 //
-// where `kind` is one of approval | routine | mention | task | gateway.
+// where `kind` is one of approval | response | routine | mention | task |
+// gateway.
 // This extension:
 //   - prefers the payload's display strings over the aps alert (the relay may
 //     ship a generic placeholder alert and carry the real text in data),
 //   - stamps the TALARIA_APPROVAL actionable category on approval pushes so
 //     Approve / Later appear on the banner and lock screen,
+//   - stamps the TALARIA_RESPONSE display-only category on completed agent
+//     replies; response pushes never gain approval actions,
 //   - threads notifications per bot,
 //   - dresses mentions as communication-style notifications when the intent
 //     machinery cooperates, and passes through untouched otherwise.
@@ -34,7 +38,8 @@ final class NotificationService: UNNotificationServiceExtension {
     }
 
     private enum Identifier {
-        static let approvalCategory = "TALARIA_APPROVAL"
+        static let approvalCategory = PushNotificationPolicy.approvalCategory
+        static let responseCategory = PushNotificationPolicy.responseCategory
     }
 
     private var contentHandler: ((UNNotificationContent) -> Void)?
@@ -52,7 +57,8 @@ final class NotificationService: UNNotificationServiceExtension {
         bestAttempt = content
 
         let info = request.content.userInfo
-        let kind = info[Key.kind] as? String
+        let wireKind = info[Key.kind] as? String
+        let kind = PushNotificationPolicy.kind(for: wireKind)
         let bot = info[Key.bot] as? String
 
         // Display strings from the data payload win over the aps alert.
@@ -68,15 +74,29 @@ final class NotificationService: UNNotificationServiceExtension {
             content.threadIdentifier = bot
         }
 
+        // APNs can carry a stale or forged category independently of `kind`.
+        // Clear the approval category before handling every non-approval so
+        // only an explicitly decoded approval can expose Approve / Later.
+        if kind != .approval {
+            content.categoryIdentifier = ""
+        }
+
         switch kind {
-        case "approval":
+        case .approval:
             // Actionable Approve / Later; bots are blocked on the user, so
             // ask for time-sensitive delivery (silently downgraded when the
             // app lacks the entitlement).
             content.categoryIdentifier = Identifier.approvalCategory
             content.interruptionLevel = .timeSensitive
             contentHandler(content)
-        case "mention":
+        case .response:
+            // A completed agent reply is a normal, active notification. Keep
+            // this category action-free: response readiness is informational,
+            // never authority to answer or approve work.
+            content.categoryIdentifier = Identifier.responseCategory
+            content.interruptionLevel = .active
+            contentHandler(content)
+        case .mention:
             // A bot speaking to you — try the communication style; any
             // failure delivers the undecorated content.
             deliverAsCommunication(content, from: bot)

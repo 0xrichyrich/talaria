@@ -16,7 +16,14 @@ from typing import List, Optional
 logger = logging.getLogger("talaria_push")
 
 # Event kinds the relay knows how to emit.
-ALL_EVENT_KINDS = ("approval", "long_task", "mention", "routine", "gateway")
+ALL_EVENT_KINDS = (
+    "approval",
+    "long_task",
+    "response",
+    "mention",
+    "routine",
+    "gateway",
+)
 
 APNS_HOSTS = {
     "dev": "https://api.sandbox.push.apple.com",
@@ -56,7 +63,21 @@ def current_bot() -> str:
     override = os.environ.get("TALARIA_PUSH_BOT_NAME", "").strip()
     if override:
         return override
-    home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+
+    # Hermes multiplexes profile work in one process by installing a
+    # context-local HERMES_HOME override. Resolve through the pinned helper,
+    # rather than reading the process environment directly, or pushes from a
+    # secondary profile will be attributed to whichever profile launched the
+    # process. Keep this import optional for the standalone sidecar.
+    home: Optional[Path] = None
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+
+        home = Path(get_hermes_home())
+    except Exception:
+        pass
+    if home is None:
+        home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
     if home.parent.name == "profiles":
         return home.name
     return "default"
