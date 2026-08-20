@@ -25,6 +25,7 @@ public struct GatewayStatus: Sendable {
     public var authFlows: [String]
     public var gatewayRunning: Bool
     public var activeAgents: Int
+    public var activeSessions: Int
     public var overall: String
     public var raw: JSONValue?
 
@@ -35,6 +36,7 @@ public struct GatewayStatus: Sendable {
         authFlows = v?["auth_flows"]?.arrayValue?.compactMap(\.stringValue) ?? []
         gatewayRunning = v?["gateway_running"]?.boolValue ?? false
         activeAgents = v?["active_agents"]?.intValue ?? 0
+        activeSessions = v?["active_sessions"]?.intValue ?? 0
         overall = v?["overall"]?.stringValue ?? "unknown"
         raw = v
     }

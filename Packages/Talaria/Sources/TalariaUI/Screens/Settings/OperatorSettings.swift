@@ -10,6 +10,11 @@ import TalariaTheme
 //   GET /api/config[?profile=]          hermes_cli/web_server.py:6794
 //   PUT /api/config {config, profile}   hermes_cli/web_server.py:7595
 //   GET /api/logs                       hermes_cli/web_server.py:12298
+//   POST /api/gateway/restart           hermes_cli/web_server.py:4575
+//   POST /api/hermes/update             hermes_cli/web_server.py:4665
+//   GET /api/hermes/update/check        hermes_cli/web_server.py:4794
+//   GET /api/actions/{name}/status      hermes_cli/web_server.py:5349
+//   GET /api/analytics/usage            hermes_cli/web_server.py:15265
 //   agent.max_turns default             hermes_cli/config_defaults.py:46
 //   agent.image_input_mode semantics    hermes_cli/config_defaults.py:309
 //   persistent-memory switches          hermes_cli/config_defaults.py:1796
@@ -31,6 +36,101 @@ struct GatewayOperatorConfig: Equatable, Sendable {
     }
 
     static let imageModes = ["auto", "native", "text"]
+}
+
+public struct GatewayCommandAction: Equatable, Sendable {
+    var name: String
+    var ok: Bool
+    var running: Bool
+    var alreadyRunning: Bool
+    var pid: Int?
+    var exitCode: Int?
+    var message: String
+    var lines: [String]
+    var canApply: Bool
+    var updateAvailable: Bool
+    var behind: Int?
+    var updateCommand: String
+    var installMethod: String
+
+    static let empty = GatewayCommandAction(
+        name: "", ok: false, running: false, alreadyRunning: false,
+        pid: nil, exitCode: nil, message: "", lines: [], canApply: false,
+        updateAvailable: false, behind: nil, updateCommand: "", installMethod: "")
+
+    init(name: String, ok: Bool, running: Bool, alreadyRunning: Bool,
+         pid: Int?, exitCode: Int?, message: String, lines: [String],
+         canApply: Bool, updateAvailable: Bool, behind: Int?,
+         updateCommand: String, installMethod: String) {
+        self.name = name; self.ok = ok; self.running = running
+        self.alreadyRunning = alreadyRunning; self.pid = pid; self.exitCode = exitCode
+        self.message = message; self.lines = lines; self.canApply = canApply
+        self.updateAvailable = updateAvailable; self.behind = behind
+        self.updateCommand = updateCommand; self.installMethod = installMethod
+    }
+
+    init(_ value: JSONValue, fallbackName: String = "") {
+        name = value["name"]?.stringValue ?? fallbackName
+        ok = value["ok"]?.boolValue ?? (value["running"]?.boolValue == true || value["exit_code"]?.intValue == 0)
+        running = value["running"]?.boolValue ?? false
+        alreadyRunning = value["already_running"]?.boolValue ?? false
+        pid = value["pid"]?.intValue
+        exitCode = value["exit_code"]?.intValue
+        message = value["message"]?.stringValue
+            ?? value["error"]?.stringValue
+            ?? value["detail"]?.stringValue
+            ?? ""
+        lines = value["lines"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        canApply = value["can_apply"]?.boolValue ?? false
+        updateAvailable = value["update_available"]?.boolValue ?? false
+        behind = value["behind"]?.intValue
+        updateCommand = value["update_command"]?.stringValue ?? ""
+        installMethod = value["install_method"]?.stringValue ?? ""
+    }
+
+    var isFinished: Bool { !running && (exitCode != nil || !ok) }
+}
+
+public struct GatewayUsageModel: Equatable, Sendable {
+    var name: String
+    var tokens: Int
+}
+
+public struct GatewayUsageSnapshot: Equatable, Sendable {
+    var days: Int
+    var sessions: Int
+    var apiCalls: Int
+    var inputTokens: Int
+    var outputTokens: Int
+    var estimatedCost: Double
+    var topModels: [GatewayUsageModel]
+
+    static let empty = GatewayUsageSnapshot(days: 30, sessions: 0, apiCalls: 0,
+                                            inputTokens: 0, outputTokens: 0,
+                                            estimatedCost: 0, topModels: [])
+    static let periods = [7, 30, 90]
+
+    init(days: Int, sessions: Int, apiCalls: Int, inputTokens: Int, outputTokens: Int,
+         estimatedCost: Double, topModels: [GatewayUsageModel]) {
+        self.days = days; self.sessions = sessions; self.apiCalls = apiCalls
+        self.inputTokens = inputTokens; self.outputTokens = outputTokens
+        self.estimatedCost = estimatedCost; self.topModels = topModels
+    }
+
+    init(_ value: JSONValue, days: Int) {
+        let totals = value["totals"]
+        self.days = value["period_days"]?.intValue ?? days
+        sessions = totals?["total_sessions"]?.intValue ?? 0
+        apiCalls = totals?["total_api_calls"]?.intValue ?? 0
+        inputTokens = totals?["total_input"]?.intValue ?? 0
+        outputTokens = totals?["total_output"]?.intValue ?? 0
+        estimatedCost = totals?["total_estimated_cost"]?.doubleValue ?? 0
+        topModels = (value["by_model"]?.arrayValue ?? []).prefix(6).compactMap { row in
+            guard let name = row["model"]?.stringValue, !name.isEmpty else { return nil }
+            let tokens = (row["input_tokens"]?.intValue ?? 0) + (row["output_tokens"]?.intValue ?? 0)
+            return GatewayUsageModel(name: name, tokens: tokens)
+        }
+    }
 }
 
 struct GatewayLogSnapshot: Equatable, Sendable {
@@ -66,6 +166,47 @@ extension GatewayClient {
             try await restJSON(path: "api/logs", query: query, timeout: 30),
             fallbackFile: file)
     }
+
+    func restartGateway(profile: String?) async throws -> GatewayCommandAction {
+        var query: [URLQueryItem] = []
+        if let profile, !profile.isEmpty {
+            query.append(URLQueryItem(name: "profile", value: profile))
+        }
+        return GatewayCommandAction(
+            try await restJSON(path: "api/gateway/restart", method: "POST", query: query, timeout: 30),
+            fallbackName: "gateway-restart")
+    }
+
+    func hermesUpdateCheck() async throws -> GatewayCommandAction {
+        GatewayCommandAction(
+            try await restJSON(path: "api/hermes/update/check", timeout: 30),
+            fallbackName: "hermes-update")
+    }
+
+    func startHermesUpdate() async throws -> GatewayCommandAction {
+        GatewayCommandAction(
+            try await restJSON(path: "api/hermes/update", method: "POST", timeout: 30),
+            fallbackName: "hermes-update")
+    }
+
+    func actionStatus(name: String, lines: Int = 80) async throws -> GatewayCommandAction {
+        GatewayCommandAction(
+            try await restJSON(path: "api/actions/\(name)/status",
+                               query: [URLQueryItem(name: "lines", value: String(lines))],
+                               timeout: 20),
+            fallbackName: name)
+    }
+
+    func usageAnalytics(days: Int, profile: String?) async throws -> GatewayUsageSnapshot {
+        let clamped = GatewayUsageSnapshot.periods.contains(days) ? days : 30
+        var query = [URLQueryItem(name: "days", value: String(clamped))]
+        if let profile, !profile.isEmpty {
+            query.append(URLQueryItem(name: "profile", value: profile))
+        }
+        return GatewayUsageSnapshot(
+            try await restJSON(path: "api/analytics/usage", query: query, timeout: 30),
+            days: clamped)
+    }
 }
 
 public struct OperatorSettingsSection: View {
@@ -95,11 +236,21 @@ public struct OperatorSettingsSection: View {
     @State private var logError: String?
     @State private var isLoadingLogs = false
     @State private var logGeneration = 0
+    @State private var usageDays = 30
+    @State private var usage = GatewayUsageSnapshot.empty
+    @State private var usageError: String?
+    @State private var isLoadingUsage = false
+    @State private var usageGeneration = 0
+    @State private var updateCheck = GatewayCommandAction.empty
+    @State private var action = GatewayCommandAction.empty
+    @State private var actionName: String?
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             if gatewayChoices.count > 1 { gatewayPickerSection }
             if !profileChoices.isEmpty { profilePickerSection }
+            systemSection
+            usageSection
             runtimeSection
             memorySection
             imageSection
@@ -119,6 +270,8 @@ public struct OperatorSettingsSection: View {
             await loadConfig(scopeKey: key)
             guard stateScopeKey == key else { return }
             await loadLogs(scopeKey: key)
+            await loadUsage(scopeKey: key)
+            await loadUpdateCheck(scopeKey: key)
         }
     }
 
@@ -184,6 +337,77 @@ public struct OperatorSettingsSection: View {
                 .padding(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
             }
         }
+    }
+
+    private var systemSection: some View {
+        let status = model.gatewayStatus
+        return SettingsSection(theme: theme, title: copy.settingsCommandCenter(theme.id),
+                               footnote: copy.settingsCommandCenterNote(theme.id)) {
+            SettingsGroup(theme: theme) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(copy.settingsGatewayRunning(theme.id, running: status?.gatewayRunning == true))
+                        .font(SettingsType.rowTitle(theme))
+                    Text(copy.settingsGatewaySessions(theme.id,
+                                                      version: status?.version ?? "—",
+                                                      sessions: status?.activeSessions ?? 0,
+                                                      agents: status?.activeAgents ?? 0))
+                        .font(SettingsType.rowSubtitle(theme)).foregroundStyle(theme.sub)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .modifier(SettingsRowChrome(theme: theme, isLast: false))
+                SettingsActionRow(theme: theme, title: copy.settingsRestartGateway(theme.id),
+                                  isBusy: actionName == "gateway-restart" && action.running,
+                                  isLast: false) {
+                    Task { await runAction("gateway-restart") }
+                }
+                SettingsActionRow(theme: theme, title: copy.settingsUpdateHermes(theme.id),
+                                  isBusy: actionName == "hermes-update" && action.running,
+                                  isLast: true) {
+                    Task { await runAction("hermes-update") }
+                }
+                .disabled(!updateCheck.canApply && updateCheck.installMethod.isEmpty == false && !updateCheck.updateAvailable)
+            }
+            if !updateCheck.message.isEmpty || updateCheck.updateAvailable || !updateCheck.updateCommand.isEmpty {
+                Text(copy.settingsUpdateStatus(theme.id, check: updateCheck))
+                    .font(theme.mono(10)).foregroundStyle(theme.sub)
+                    .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 2)
+            }
+            if let actionName, !action.message.isEmpty || !action.lines.isEmpty || action.running {
+                Text(copy.settingsActionStatus(theme.id, action: action, name: actionName))
+                    .font(theme.mono(10)).foregroundStyle(action.exitCode == nil || action.exitCode == 0 ? theme.sub : theme.warn)
+                    .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 2)
+            }
+        }
+    }
+
+    private var usageSection: some View {
+        SettingsSection(theme: theme, title: copy.settingsUsageSection(theme.id),
+                        footnote: copy.settingsUsageNote(theme.id)) {
+            SettingsGroup(theme: theme) {
+                Picker(copy.settingsUsageSection(theme.id), selection: $usageDays) {
+                    ForEach(GatewayUsageSnapshot.periods, id: \.self) { days in
+                        Text(copy.settingsUsagePeriod(theme.id, days: days)).tag(days)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .padding(12)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(copy.settingsUsageTotals(theme.id, usage: usage))
+                        .font(SettingsType.rowSubtitle(theme)).foregroundStyle(theme.sub)
+                    ForEach(usage.topModels, id: \.name) { row in
+                        Text("\(row.name) · \(row.tokens)")
+                            .font(theme.mono(10)).foregroundStyle(theme.faint)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12).padding(.bottom, 10)
+            }
+            if let usageError {
+                Text(usageError).font(theme.mono(10)).foregroundStyle(theme.warn)
+                    .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 2)
+            }
+        }
+        .onChange(of: usageDays) { _, _ in Task { await loadUsage(scopeKey: scopeKey) } }
     }
 
     private var runtimeSection: some View {
@@ -330,6 +554,13 @@ public struct OperatorSettingsSection: View {
         logError = nil
         isLoadingLogs = false
         logGeneration &+= 1
+        usage = GatewayUsageSnapshot.empty
+        usageError = nil
+        isLoadingUsage = false
+        usageGeneration &+= 1
+        updateCheck = GatewayCommandAction.empty
+        action = GatewayCommandAction.empty
+        actionName = nil
     }
 
     private func isCurrent(_ key: String, generation captured: Int) -> Bool {
@@ -394,6 +625,92 @@ public struct OperatorSettingsSection: View {
             guard isCurrent(key, generation: captured),
                   logGeneration == capturedLogGeneration else { return }
             logError = error.localizedDescription
+        }
+    }
+
+    private func loadUsage(scopeKey key: String) async {
+        guard stateScopeKey == key else { return }
+        usageGeneration &+= 1
+        let capturedUsage = usageGeneration
+        let captured = generation
+        let gatewayID = targetGatewayID
+        let profile = targetProfile
+        let days = usageDays
+        isLoadingUsage = true
+        defer {
+            if isCurrent(key, generation: captured), usageGeneration == capturedUsage {
+                isLoadingUsage = false
+            }
+        }
+        guard model.mode == .live else { return }
+        do {
+            let client = try await targetClient(gatewayID: gatewayID)
+            guard isCurrent(key, generation: captured), usageGeneration == capturedUsage else { return }
+            let loaded = try await client.usageAnalytics(days: days, profile: profile)
+            guard isCurrent(key, generation: captured), usageGeneration == capturedUsage else { return }
+            usage = loaded
+            usageError = nil
+        } catch {
+            guard isCurrent(key, generation: captured), usageGeneration == capturedUsage else { return }
+            usageError = error.localizedDescription
+        }
+    }
+
+    private func loadUpdateCheck(scopeKey key: String) async {
+        guard stateScopeKey == key, model.mode == .live else { return }
+        let captured = generation
+        do {
+            let client = try await targetClient(gatewayID: targetGatewayID)
+            let loaded = try await client.hermesUpdateCheck()
+            guard isCurrent(key, generation: captured) else { return }
+            updateCheck = loaded
+        } catch {
+            guard isCurrent(key, generation: captured) else { return }
+            updateCheck.message = error.localizedDescription
+        }
+    }
+
+    private func runAction(_ name: String) async {
+        guard busyField == nil else { return }
+        let key = scopeKey
+        let captured = generation
+        actionName = name
+        action = GatewayCommandAction.empty
+        do {
+            let client = try await targetClient(gatewayID: targetGatewayID)
+            let started: GatewayCommandAction
+            if name == "gateway-restart" {
+                started = try await client.restartGateway(profile: targetProfile)
+            } else {
+                started = try await client.startHermesUpdate()
+            }
+            guard isCurrent(key, generation: captured) else { return }
+            action = started
+            if started.ok || started.alreadyRunning || started.pid != nil {
+                await pollAction(name, scopeKey: key, generation: captured)
+            }
+        } catch {
+            guard isCurrent(key, generation: captured) else { return }
+            action.message = error.localizedDescription
+            action.ok = false
+        }
+    }
+
+    private func pollAction(_ name: String, scopeKey key: String, generation captured: Int) async {
+        for _ in 0..<20 {
+            try? await Task.sleep(for: .milliseconds(1200))
+            guard isCurrent(key, generation: captured) else { return }
+            do {
+                let client = try await targetClient(gatewayID: targetGatewayID)
+                let status = try await client.actionStatus(name: name)
+                guard isCurrent(key, generation: captured) else { return }
+                action = status
+                if !status.running { return }
+            } catch {
+                guard isCurrent(key, generation: captured) else { return }
+                action.message = error.localizedDescription
+                return
+            }
         }
     }
 
@@ -491,4 +808,44 @@ public extension CopyPack {
     func settingsLogsRefresh(_ t: ThemeID) -> String { t == .control ? "REFRESH LOGS" : "Refresh logs" }
     func settingsLogsEmpty(_ t: ThemeID) -> String { t == .control ? "NO MATCHING LINES" : "No matching log lines." }
     func settingsOperatorSaved(_ t: ThemeID, field: String) -> String { t == .control ? "SAVED \(field)" : "Saved \(field)." }
+    func settingsCommandCenter(_ t: ThemeID) -> String { t == .control ? "GATEWAY SYSTEM" : "Gateway system" }
+    func settingsCommandCenterNote(_ t: ThemeID) -> String { t == .control ? "POST /api/gateway/restart + /api/hermes/update · POLL /api/actions/*/status." : "Restart this gateway or apply a Hermes update, then watch the action log." }
+    func settingsGatewayRunning(_ t: ThemeID, running: Bool) -> String {
+        if t == .control { return running ? "GATEWAY RUNNING" : "GATEWAY STOPPED" }
+        return running ? "Gateway running" : "Gateway stopped"
+    }
+    func settingsGatewaySessions(_ t: ThemeID, version: String, sessions: Int, agents: Int) -> String {
+        t == .control ? "HERMES \(version) · \(sessions) SESSIONS · \(agents) AGENTS" : "Hermes \(version) · \(sessions) active sessions · \(agents) agents"
+    }
+    func settingsRestartGateway(_ t: ThemeID) -> String { t == .control ? "RESTART GATEWAY" : "Restart gateway" }
+    func settingsUpdateHermes(_ t: ThemeID) -> String { t == .control ? "UPDATE HERMES" : "Update Hermes" }
+    func settingsUpdateStatus(_ t: ThemeID, check: GatewayCommandAction) -> String {
+        if !check.message.isEmpty { return check.message }
+        if check.updateAvailable {
+            let behind = check.behind.map(String.init) ?? "?"
+            return t == .control ? "UPDATE AVAILABLE · \(behind) COMMITS BEHIND" : "Update available · \(behind) commits behind."
+        }
+        if !check.updateCommand.isEmpty {
+            return t == .control ? check.updateCommand.uppercased() : check.updateCommand
+        }
+        return t == .control ? "UP TO DATE" : "Hermes is up to date."
+    }
+    func settingsActionStatus(_ t: ThemeID, action: GatewayCommandAction, name: String) -> String {
+        let state: String
+        if action.running { state = t == .control ? "RUNNING" : "running" }
+        else if action.exitCode == 0 { state = t == .control ? "DONE" : "done" }
+        else { state = t == .control ? "FAILED" : "failed" }
+        let tail = action.lines.suffix(3).joined(separator: "\n")
+        let body = action.message.isEmpty ? tail : action.message
+        return body.isEmpty ? "\(name) · \(state)" : "\(name) · \(state)\n\(body)"
+    }
+    func settingsUsageSection(_ t: ThemeID) -> String { t == .control ? "USAGE" : "Usage" }
+    func settingsUsageNote(_ t: ThemeID) -> String { t == .control ? "GET /api/analytics/usage · 7/30/90 DAYS." : "Account-level sessions, API calls and tokens for the selected gateway." }
+    func settingsUsagePeriod(_ t: ThemeID, days: Int) -> String { t == .control ? "\(days)D" : "\(days) days" }
+    func settingsUsageTotals(_ t: ThemeID, usage: GatewayUsageSnapshot) -> String {
+        let cost = String(format: "%.2f", usage.estimatedCost)
+        return t == .control
+            ? "\(usage.sessions) SESSIONS · \(usage.apiCalls) CALLS · \(usage.inputTokens)+\(usage.outputTokens) TOKENS · $\(cost)"
+            : "\(usage.sessions) sessions · \(usage.apiCalls) API calls · \(usage.inputTokens) in / \(usage.outputTokens) out · $\(cost)"
+    }
 }
