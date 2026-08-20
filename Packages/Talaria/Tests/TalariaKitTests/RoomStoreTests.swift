@@ -529,6 +529,29 @@ final class RoomStoreTests: XCTestCase {
         XCTAssertNoThrow(try RoomEngine.validate(retired))
     }
 
+    func testProfileRouteMigrationDedupesLiveDestinationDriveCursor() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let source = GatewayBotRoute(gatewayID: "mini", profile: "old")
+        let destination = GatewayBotRoute(gatewayID: "mini", profile: "new")
+        let peer = GatewayBotRoute(gatewayID: "lab", profile: "peer")
+        let thread = RoomThread()
+        let room = RoomRecord(name: "Fleet", members: [
+            RoomMember(route: source), RoomMember(route: destination), RoomMember(route: peer)
+        ], threads: [thread], entries: [
+            RoomEntry(threadID: thread.id, speaker: .user, speakerName: "You", text: "go")
+        ], drives: [RoomDriveState(threadID: thread.id, epoch: 1,
+                                   roundMembers: [source, destination, peer],
+                                   nextMemberIndex: 1)], epoch: 1)
+        let store = RoomStore(baseDirectory: base)
+        try await store.upsert(room)
+        let result = try await store.migrateProfileRoute(from: source, to: destination)
+        let migrated = try XCTUnwrap(result.rooms.first)
+        XCTAssertEqual(migrated.drives.first?.roundMembers, [destination, peer])
+        XCTAssertEqual(migrated.drives.first?.nextMemberIndex, 1)
+        XCTAssertNoThrow(try RoomEngine.validate(migrated))
+    }
+
     func testMetadataRenamePreservesOrderedLegacyProjectionAndDedupes() {
         let renamed = BotModeMeta.replacingGroup("A", with: "C", in: ["A", "B"])
         XCTAssertEqual(renamed, ["C", "B"])

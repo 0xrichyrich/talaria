@@ -688,8 +688,24 @@ public actor RoomStore {
             let mapped = room.drives[index].roundMembers.map {
                 $0 == source ? destination : $0
             }
-            if mapped != room.drives[index].roundMembers {
-                room.drives[index].roundMembers = mapped
+            var deduped: [GatewayBotRoute] = []
+            var seen = Set<GatewayBotRoute>()
+            var cursor = room.drives[index].nextMemberIndex
+            for (position, route) in mapped.enumerated() {
+                guard seen.insert(route).inserted else {
+                    // If the collapsed source was already consumed, keep the
+                    // cursor on the same logical next turn; otherwise simply
+                    // discard the duplicate future seat.
+                    if position < room.drives[index].nextMemberIndex { cursor -= 1 }
+                    continue
+                }
+                deduped.append(route)
+            }
+            cursor = max(0, min(cursor, deduped.count))
+            if deduped != room.drives[index].roundMembers
+                || cursor != room.drives[index].nextMemberIndex {
+                room.drives[index].roundMembers = deduped
+                room.drives[index].nextMemberIndex = cursor
                 changed = true
             }
         }
