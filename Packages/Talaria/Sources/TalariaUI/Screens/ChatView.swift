@@ -128,7 +128,7 @@ public struct ChatView: View {
         VStack(spacing: 0) {
             header
             messageList
-            modelStrip
+            if transcriptPolicy.detail == .advanced { modelStrip }
             if !quickReplies.isEmpty {
                 quickReplyRow
             }
