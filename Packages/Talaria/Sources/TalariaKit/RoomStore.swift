@@ -13,6 +13,22 @@ public enum RoomStoreError: Error, Equatable, Sendable {
 
 public enum RoomStoreDeletePhase: Sendable { case beforeEmptyCommit, afterEmptyCommit }
 
+/// Result of a source-qualified profile lifecycle mutation. The actor commits
+/// the room records and metadata outbox together, then returns the published
+/// snapshot for the MainActor cache to adopt without re-reading a stale copy.
+public struct RoomProfileRouteMutationResult: Equatable, Sendable {
+    public var rooms: [RoomRecord]
+    public var migratedMutationCount: Int
+    public var retiredMutationCount: Int
+
+    public init(rooms: [RoomRecord] = [], migratedMutationCount: Int = 0,
+                retiredMutationCount: Int = 0) {
+        self.rooms = rooms
+        self.migratedMutationCount = migratedMutationCount
+        self.retiredMutationCount = retiredMutationCount
+    }
+}
+
 public struct RoomStorageUsage: Equatable, Sendable {
     public var indexBytes: Int64
     public var blobBytes: Int64
@@ -32,18 +48,37 @@ public actor RoomStore {
         var version: Int
         var rooms: [RoomRecord]
         var metadataOutbox: [RoomMetadataMutation]
+        /// Route tombstones survive a profile delete. A later room mutation
+        /// carrying the reused profile id is ignored until an explicit
+        /// profile-create/activation clears this exact source route.
+        var retiredMetadataRoutes: [GatewayBotRoute]
+        /// Cancelled commands remain auditable in the append-only index but
+        /// are excluded from all retry reads, including after activation of a
+        /// reused route.
+        var ignoredMetadataMutationIDs: [UUID]
 
-        init(version: Int, rooms: [RoomRecord], metadataOutbox: [RoomMetadataMutation]) {
+        init(version: Int, rooms: [RoomRecord], metadataOutbox: [RoomMetadataMutation],
+             retiredMetadataRoutes: [GatewayBotRoute],
+             ignoredMetadataMutationIDs: [UUID]) {
             self.version = version; self.rooms = rooms; self.metadataOutbox = metadataOutbox
+            self.retiredMetadataRoutes = retiredMetadataRoutes
+            self.ignoredMetadataMutationIDs = ignoredMetadataMutationIDs
         }
 
-        private enum CodingKeys: String, CodingKey { case version, rooms, metadataOutbox }
+        private enum CodingKeys: String, CodingKey {
+            case version, rooms, metadataOutbox, retiredMetadataRoutes,
+                 ignoredMetadataMutationIDs
+        }
         init(from decoder: Decoder) throws {
             let values = try decoder.container(keyedBy: CodingKeys.self)
             version = try values.decode(Int.self, forKey: .version)
             rooms = try values.decode([RoomRecord].self, forKey: .rooms)
             metadataOutbox = try values.decodeIfPresent([RoomMetadataMutation].self,
                                                          forKey: .metadataOutbox) ?? []
+            retiredMetadataRoutes = try values.decodeIfPresent([GatewayBotRoute].self,
+                                                                forKey: .retiredMetadataRoutes) ?? []
+            ignoredMetadataMutationIDs = try values.decodeIfPresent([UUID].self,
+                                                                     forKey: .ignoredMetadataMutationIDs) ?? []
         }
     }
 
@@ -58,6 +93,8 @@ public actor RoomStore {
     public let protectsFiles: Bool
     private var cachedRooms: [RoomID: RoomRecord]?
     private var cachedMetadataOutbox: [RoomMetadataMutation]?
+    private var cachedRetiredMetadataRoutes: Set<GatewayBotRoute>?
+    private var cachedIgnoredMetadataMutationIDs: Set<UUID>?
 
     public init(baseDirectory: URL? = nil, fileManager: FileManager = .default,
                 protectsFiles: Bool? = nil,
@@ -90,6 +127,8 @@ public actor RoomStore {
         guard fileManager.fileExists(atPath: indexURL.path) else {
             cachedRooms = [:]
             cachedMetadataOutbox = []
+            cachedRetiredMetadataRoutes = []
+            cachedIgnoredMetadataMutationIDs = []
             return []
         }
         do {
@@ -121,8 +160,16 @@ public actor RoomStore {
             try validateAttachmentFiles(in: room)
         }
         try validateMetadataOutbox(envelope.metadataOutbox)
+        try validateRetiredMetadataRoutes(envelope.retiredMetadataRoutes)
+        try validateIgnoredMetadataMutationIDs(envelope.ignoredMetadataMutationIDs)
         cachedMetadataOutbox = envelope.metadataOutbox
-        if migrated { try persist(Array(rooms.values), outbox: envelope.metadataOutbox) }
+        cachedRetiredMetadataRoutes = Set(envelope.retiredMetadataRoutes)
+        cachedIgnoredMetadataMutationIDs = Set(envelope.ignoredMetadataMutationIDs)
+        if migrated {
+            try persist(Array(rooms.values), outbox: envelope.metadataOutbox,
+                        retiredRoutes: envelope.retiredMetadataRoutes,
+                        ignoredMutationIDs: envelope.ignoredMetadataMutationIDs)
+        }
         cachedRooms = rooms
         return sorted(rooms.values)
     }
@@ -133,21 +180,56 @@ public actor RoomStore {
 
     public func metadataOutbox() throws -> [RoomMetadataMutation] {
         _ = try ensureLoaded()
-        return cachedMetadataOutbox ?? []
+        let ignored = cachedIgnoredMetadataMutationIDs ?? []
+        return (cachedMetadataOutbox ?? []).filter { !ignored.contains($0.id) }
+    }
+
+    /// Routes retired by an authoritative profile deletion. The set is
+    /// intentionally exposed read-only for lifecycle tests and diagnostics;
+    /// mutations are made only through the actor APIs below.
+    public func retiredMetadataRoutes() throws -> Set<GatewayBotRoute> {
+        _ = try ensureLoaded()
+        return cachedRetiredMetadataRoutes ?? []
     }
 
     public func removeMetadataMutation(id: UUID) throws {
+        try removeMetadataMutation(id: id, matching: nil)
+    }
+
+    /// Remove an outbox item only when it is still byte-for-byte equal to the
+    /// snapshot that produced the network completion. A profile rename can
+    /// rewrite the same id to a new route while that completion is suspended;
+    /// an unconditional id delete would erase the committed destination row.
+    public func removeMetadataMutation(id: UUID,
+                                       matching expected: RoomMetadataMutation?) throws {
         let rooms = try ensureLoaded()
         var outbox = cachedMetadataOutbox ?? []
-        outbox.removeAll { $0.id == id }
-        try persist(Array(rooms.values), outbox: outbox)
+        outbox.removeAll { current in
+            guard current.id == id else { return false }
+            guard let expected else { return true }
+            return current == expected
+        }
+        try persist(Array(rooms.values), outbox: outbox,
+                    retiredRoutes: Array(cachedRetiredMetadataRoutes ?? []))
         cachedMetadataOutbox = outbox
+    }
+
+    /// Explicit profile creation/recreation is the only operation that can
+    /// clear a route tombstone. A stale roster refresh never activates it.
+    public func activateProfileRoute(_ route: GatewayBotRoute) throws {
+        _ = try ensureLoaded()
+        var retired = cachedRetiredMetadataRoutes ?? []
+        guard retired.remove(route) != nil else { return }
+        try persist(Array((cachedRooms ?? [:]).values),
+                    outbox: cachedMetadataOutbox ?? [], retiredRoutes: Array(retired))
+        cachedRetiredMetadataRoutes = retired
     }
 
     public func upsert(_ proposed: RoomRecord,
                        metadataMutations: [RoomMetadataMutation] = []) throws {
         var rooms = try ensureLoaded()
         var outbox = cachedMetadataOutbox ?? []
+        let retiredRoutes = cachedRetiredMetadataRoutes ?? []
         var room = proposed
         let previousBlobIDs = rooms[room.id].map(referencedBlobIDs) ?? []
         _ = RoomEngine.migrateLegacyThreads(in: &room)
@@ -156,10 +238,17 @@ public actor RoomStore {
         try validateAttachmentFiles(in: room)
         removedBlobIDs.formUnion(previousBlobIDs.subtracting(referencedBlobIDs(room)))
         rooms[room.id] = room
-        outbox.append(contentsOf: metadataMutations)
-        try persist(Array(rooms.values), outbox: outbox)
+        // A route tombstone is a durable anti-reuse fence. Ignore stale
+        // mutation snapshots for it; an explicit profile activation clears the
+        // tombstone before a fresh room add can enter the outbox.
+        outbox.append(contentsOf: metadataMutations.filter {
+            !retiredRoutes.contains($0.route)
+        })
+        try persist(Array(rooms.values), outbox: outbox,
+                    retiredRoutes: Array(retiredRoutes))
         cachedRooms = rooms
         cachedMetadataOutbox = outbox
+        cachedRetiredMetadataRoutes = retiredRoutes
         // Index first, deletion second: a crash can leave an unreferenced blob
         // but can never leave a freshly-committed index pointing at one we
         // deleted before the commit.
@@ -177,6 +266,7 @@ public actor RoomStore {
     ) throws -> RoomRecord {
         var rooms = try ensureLoaded()
         var outbox = cachedMetadataOutbox ?? []
+        let retiredRoutes = cachedRetiredMetadataRoutes ?? []
         guard var room = rooms[roomID] else { throw RoomStoreError.roomNotFound(roomID) }
         let previousBlobIDs = referencedBlobIDs(room)
         try body(&room)
@@ -186,10 +276,14 @@ public actor RoomStore {
         try validateAttachmentFiles(in: room)
         removedBlobIDs.formUnion(previousBlobIDs.subtracting(referencedBlobIDs(room)))
         rooms[roomID] = room
-        outbox.append(contentsOf: metadataMutations)
-        try persist(Array(rooms.values), outbox: outbox)
+        outbox.append(contentsOf: metadataMutations.filter {
+            !retiredRoutes.contains($0.route)
+        })
+        try persist(Array(rooms.values), outbox: outbox,
+                    retiredRoutes: Array(retiredRoutes))
         cachedRooms = rooms
         cachedMetadataOutbox = outbox
+        cachedRetiredMetadataRoutes = retiredRoutes
         try? removeBlobs(removedBlobIDs, roomID: room.id)
         return room
     }
@@ -198,17 +292,94 @@ public actor RoomStore {
                        metadataMutations: [RoomMetadataMutation] = []) throws {
         var rooms = try ensureLoaded()
         var outbox = cachedMetadataOutbox ?? []
+        let retiredRoutes = cachedRetiredMetadataRoutes ?? []
         guard rooms.removeValue(forKey: roomID) != nil else {
             throw RoomStoreError.roomNotFound(roomID)
         }
-        outbox.append(contentsOf: metadataMutations)
-        try persist(Array(rooms.values), outbox: outbox)
+        outbox.append(contentsOf: metadataMutations.filter {
+            !retiredRoutes.contains($0.route)
+        })
+        try persist(Array(rooms.values), outbox: outbox,
+                    retiredRoutes: Array(retiredRoutes))
         cachedRooms = rooms
         cachedMetadataOutbox = outbox
+        cachedRetiredMetadataRoutes = retiredRoutes
         let directory = blobDirectory(roomID: roomID)
         if fileManager.fileExists(atPath: directory.path) {
             try fileManager.removeItem(at: directory)
         }
+    }
+
+    /// Atomically migrate one exact profile route across every durable room
+    /// projection and pending metadata command. The source gateway is part of
+    /// the key, so same-named profiles on another gateway are untouched.
+    @discardableResult
+    public func migrateProfileRoute(from source: GatewayBotRoute,
+                                    to destination: GatewayBotRoute)
+        throws -> RoomProfileRouteMutationResult {
+        guard source != destination else {
+            return RoomProfileRouteMutationResult(rooms: sorted(try ensureLoaded().values))
+        }
+        var rooms = try ensureLoaded()
+        var outbox = cachedMetadataOutbox ?? []
+        var retired = cachedRetiredMetadataRoutes ?? []
+        var changed = false
+        var migratedMutations = 0
+        for id in rooms.keys {
+            guard var room = rooms[id] else { continue }
+            let before = room
+            migrate(&room, from: source, to: destination)
+            if room != before {
+                rooms[id] = room
+                changed = true
+            }
+        }
+        for index in outbox.indices where outbox[index].route == source {
+            outbox[index].route = destination
+            migratedMutations += 1
+            changed = true
+        }
+        changed = retired.remove(source) != nil || changed
+        changed = retired.remove(destination) != nil || changed
+        guard changed else {
+            return RoomProfileRouteMutationResult(rooms: sorted(rooms.values))
+        }
+        try validateMetadataOutbox(outbox)
+        try validateRetiredMetadataRoutes(Array(retired))
+        try persist(Array(rooms.values), outbox: outbox, retiredRoutes: Array(retired))
+        cachedRooms = rooms
+        cachedMetadataOutbox = outbox
+        cachedRetiredMetadataRoutes = retired
+        return RoomProfileRouteMutationResult(
+            rooms: sorted(rooms.values), migratedMutationCount: migratedMutations)
+    }
+
+    @discardableResult
+    public func migrateRoute(from source: GatewayBotRoute,
+                             to destination: GatewayBotRoute)
+        throws -> RoomProfileRouteMutationResult {
+        try migrateProfileRoute(from: source, to: destination)
+    }
+
+    @discardableResult
+    public func retireProfileRoute(_ route: GatewayBotRoute)
+        throws -> RoomProfileRouteMutationResult {
+        let rooms = try ensureLoaded()
+        let outbox = cachedMetadataOutbox ?? []
+        var retired = cachedRetiredMetadataRoutes ?? []
+        var ignored = cachedIgnoredMetadataMutationIDs ?? []
+        guard retired.insert(route).inserted else {
+            return RoomProfileRouteMutationResult(rooms: sorted(rooms.values))
+        }
+        let ids = outbox.filter { $0.route == route }.map(\.id)
+        ignored.formUnion(ids)
+        try persist(Array(rooms.values), outbox: outbox,
+                    retiredRoutes: Array(retired),
+                    ignoredMutationIDs: Array(ignored))
+        cachedRetiredMetadataRoutes = retired
+        cachedIgnoredMetadataMutationIDs = ignored
+        return RoomProfileRouteMutationResult(
+            rooms: sorted(rooms.values), retiredMutationCount: ids.count)
     }
 
     /// Atomically publish an empty index before removing the tree. If cleanup
@@ -219,10 +390,12 @@ public actor RoomStore {
         // it must not require decoding the data the user asked us to remove.
         do {
             try deleteFailure?(.beforeEmptyCommit)
-            try persist([], outbox: [])
+            try persist([], outbox: [], retiredRoutes: [], ignoredMutationIDs: [])
         } catch { throw RoomStoreError.deleteCommitFailed }
         cachedRooms = [:]
         cachedMetadataOutbox = []
+        cachedRetiredMetadataRoutes = []
+        cachedIgnoredMetadataMutationIDs = []
         do {
             try deleteFailure?(.afterEmptyCommit)
             if fileManager.fileExists(atPath: rootURL.path) {
@@ -327,12 +500,23 @@ public actor RoomStore {
     }
 
     private func persist(_ rooms: [RoomRecord],
-                         outbox: [RoomMetadataMutation]? = nil) throws {
+                         outbox: [RoomMetadataMutation]? = nil,
+                         retiredRoutes: [GatewayBotRoute]? = nil,
+                         ignoredMutationIDs: [UUID]? = nil) throws {
         try prepareDirectories()
         let metadataOutbox = outbox ?? cachedMetadataOutbox ?? []
+        let routes = retiredRoutes ?? Array(cachedRetiredMetadataRoutes ?? [])
+        let ignored = ignoredMutationIDs ?? Array(cachedIgnoredMetadataMutationIDs ?? [])
         try validateMetadataOutbox(metadataOutbox)
+        try validateRetiredMetadataRoutes(routes)
+        try validateIgnoredMetadataMutationIDs(ignored)
         let envelope = Envelope(version: Self.schemaVersion, rooms: sorted(rooms),
-                                metadataOutbox: metadataOutbox)
+                                metadataOutbox: metadataOutbox,
+                                retiredMetadataRoutes: routes.sorted {
+                                    $0.qualifiedID < $1.qualifiedID
+                                }, ignoredMetadataMutationIDs: ignored.sorted {
+                                    $0.uuidString < $1.uuidString
+                                })
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(envelope)
@@ -371,6 +555,96 @@ public actor RoomStore {
               outbox.allSatisfy({ $0.isStructurallyValid() }) else {
             throw RoomStoreError.corruptIndex
         }
+    }
+
+    private func validateRetiredMetadataRoutes(_ routes: [GatewayBotRoute]) throws {
+        guard Set(routes).count == routes.count,
+              routes.allSatisfy({ route in
+                  !route.gatewayID.isEmpty && !route.profile.isEmpty
+                      && route == GatewayBotRoute(qualifiedID: route.qualifiedID)
+              }) else { throw RoomStoreError.corruptIndex }
+    }
+
+    private func validateIgnoredMetadataMutationIDs(_ ids: [UUID]) throws {
+        guard Set(ids).count == ids.count else { throw RoomStoreError.corruptIndex }
+    }
+
+    /// Apply the route change to every identity-bearing projection in one
+    /// in-memory record before the enclosing actor persists its index.
+    private func migrate(_ room: inout RoomRecord,
+                         from source: GatewayBotRoute,
+                         to destination: GatewayBotRoute) {
+        var changed = false
+        if let index = room.members.firstIndex(where: { $0.route == source }),
+           !room.members.contains(where: { $0.route == destination }) {
+            let member = room.members[index]
+            room.members[index] = RoomMember(route: destination, title: member.title,
+                                             handle: member.handle,
+                                             sourceLabel: member.sourceLabel)
+            changed = true
+        }
+        if let index = room.formerMembers.firstIndex(where: { $0.route == source }),
+           !room.formerMembers.contains(where: { $0.route == destination }) {
+            let member = room.formerMembers[index]
+            room.formerMembers[index] = RoomMember(route: destination, title: member.title,
+                                                   handle: member.handle,
+                                                   sourceLabel: member.sourceLabel)
+            changed = true
+        }
+        for index in room.entries.indices where room.entries[index].memberRoute == source {
+            room.entries[index].memberRoute = destination
+            changed = true
+        }
+        for index in room.attempts.indices where room.attempts[index].member == source {
+            let attempt = room.attempts[index]
+            room.attempts[index] = RoomAttempt(
+                id: attempt.id, threadID: attempt.threadID, member: destination,
+                epoch: attempt.epoch, promptText: attempt.promptText,
+                storedSessionID: attempt.storedSessionID,
+                runtimeSessionID: attempt.runtimeSessionID,
+                stagedImagePaths: attempt.stagedImagePaths,
+                outboundAttachments: attempt.outboundAttachments,
+                state: attempt.state, baselineMessageCount: attempt.baselineMessageCount,
+                startedAt: attempt.startedAt, finishedAt: attempt.finishedAt)
+            changed = true
+        }
+        for index in room.drives.indices {
+            let mapped = room.drives[index].roundMembers.map {
+                $0 == source ? destination : $0
+            }
+            if mapped != room.drives[index].roundMembers {
+                room.drives[index].roundMembers = mapped
+                changed = true
+            }
+        }
+        for index in room.activity.indices where room.activity[index].member == source {
+            room.activity[index].member = destination
+            changed = true
+        }
+        let sourceSessionKey = source.qualifiedID
+        let destinationSessionKey = destination.qualifiedID
+        if let session = room.memberSessions.removeValue(forKey: sourceSessionKey) {
+            if room.memberSessions[destinationSessionKey] == nil {
+                room.memberSessions[destinationSessionKey] = session
+            }
+            changed = true
+        }
+        let sourceSuffix = "::\(source.qualifiedID)"
+        let destinationSuffix = "::\(destination.qualifiedID)"
+        var watermarks = room.watermarks
+        for (key, value) in room.watermarks where key.hasSuffix(sourceSuffix) {
+            let destinationKey = String(key.dropLast(sourceSuffix.count)) + destinationSuffix
+            watermarks.removeValue(forKey: key)
+            watermarks[destinationKey] = max(watermarks[destinationKey] ?? 0, value)
+            changed = true
+        }
+        room.watermarks = watermarks
+        if changed { room.updatedAt = Date() }
+    }
+
+    private func retire(_ room: inout RoomRecord, route: GatewayBotRoute) {
+        _ = room
+        _ = route
     }
 
     private func pruneTranscript(_ room: inout RoomRecord, limit: Int) -> Set<String> {

@@ -432,6 +432,66 @@ final class RoomStoreTests: XCTestCase {
         XCTAssertEqual(erasedOutbox, [])
     }
 
+    func testProfileRouteMigrationRekeysEveryRoomProjectionAndOnlyExactOutboxRoutes()
+        async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let source = GatewayBotRoute(gatewayID: "mini", profile: "old")
+        let destination = GatewayBotRoute(gatewayID: "mini", profile: "new")
+        let sibling = GatewayBotRoute(gatewayID: "lab", profile: "old")
+        let sourceMember = RoomMember(route: source, handle: "old")
+        let siblingMember = RoomMember(route: sibling, handle: "old-lab")
+        let thread = RoomThread()
+        let attempt = RoomAttempt(threadID: thread.id, member: source, epoch: 1,
+                                  promptText: "pending", storedSessionID: "stored-old",
+                                  runtimeSessionID: "runtime-old", state: .accepted)
+        let sourceWatermark = RoomEngine.watermarkKey(threadID: thread.id, member: source)
+        let siblingWatermark = RoomEngine.watermarkKey(threadID: thread.id, member: sibling)
+        let room = RoomRecord(name: "Fleet", members: [sourceMember, siblingMember],
+                              threads: [thread], entries: [
+                                  RoomEntry(threadID: thread.id, speaker: .member,
+                                            memberRoute: source, speakerName: "old",
+                                            text: "hello")
+                              ], attempts: [attempt], drives: [
+                                  RoomDriveState(threadID: thread.id, epoch: 1,
+                                                 roundMembers: [source, sibling],
+                                                 nextMemberIndex: 1)
+                              ], activity: [
+                                  RoomActivity(epoch: 1, kind: .working, member: source,
+                                               threadID: thread.id)
+                              ], memberSessions: [source.qualifiedID: "stored-old",
+                                                  sibling.qualifiedID: "stored-lab"],
+                              watermarks: [sourceWatermark: 1, siblingWatermark: 1], epoch: 1)
+        let sourceMutation = RoomMetadataMutation(route: source, kind: .rename,
+                                                  oldName: "Fleet", newName: "Fleet 2")
+        let siblingMutation = RoomMetadataMutation(route: sibling, kind: .rename,
+                                                   oldName: "Fleet", newName: "Fleet 2")
+        let store = RoomStore(baseDirectory: base)
+        try await store.upsert(room, metadataMutations: [sourceMutation, siblingMutation])
+
+        let result = try await store.migrateProfileRoute(from: source, to: destination)
+        let migrated = try XCTUnwrap(result.rooms.first)
+        XCTAssertEqual(migrated.members.map(\.route), [destination, sibling])
+        XCTAssertEqual(migrated.entries.first?.memberRoute, destination)
+        XCTAssertEqual(migrated.attempts.first?.member, destination)
+        XCTAssertEqual(migrated.drives.first?.roundMembers, [destination, sibling])
+        XCTAssertEqual(migrated.activity.first?.member, destination)
+        XCTAssertEqual(migrated.memberSessions[destination.qualifiedID], "stored-old")
+        XCTAssertNil(migrated.memberSessions[source.qualifiedID])
+        XCTAssertEqual(migrated.watermarks[RoomEngine.watermarkKey(threadID: thread.id,
+                                                                   member: destination)], 1)
+        XCTAssertEqual(migrated.watermarks[siblingWatermark], 1)
+        XCTAssertNil(migrated.watermarks[sourceWatermark])
+
+        let outbox = try await store.metadataOutbox()
+        XCTAssertEqual(outbox.map(\.route), [destination, sibling])
+        XCTAssertEqual(result.migratedMutationCount, 1)
+        let fresh = RoomStore(baseDirectory: base)
+        let freshOutbox = try await fresh.metadataOutbox()
+        XCTAssertEqual(freshOutbox.map(\.route), [destination, sibling])
+        _ = try await fresh.loadAll()
+    }
+
     func testMetadataRenamePreservesOrderedLegacyProjectionAndDedupes() {
         let renamed = BotModeMeta.replacingGroup("A", with: "C", in: ["A", "B"])
         XCTAssertEqual(renamed, ["C", "B"])

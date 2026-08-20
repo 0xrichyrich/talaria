@@ -30,7 +30,13 @@ public enum RoomEngine {
         guard !room.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw RoomValidationError.emptyName
         }
-        guard (minimumMembers...maximumMembers).contains(room.members.count) else {
+        // A profile deletion can retire the last one or more live seats while
+        // preserving the room transcript. `formerMembers` is the durable
+        // tombstone for those routes; such a room is inert until settings add
+        // enough live members again, but it must remain decodable so a later
+        // profile-id reuse cannot inherit its work.
+        let minimum = room.formerMembers.isEmpty ? minimumMembers : 0
+        guard (minimum...maximumMembers).contains(room.members.count) else {
             throw RoomValidationError.memberCount(room.members.count)
         }
         var routes = Set<GatewayBotRoute>()

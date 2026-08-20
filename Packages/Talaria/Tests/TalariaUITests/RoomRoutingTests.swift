@@ -23,6 +23,28 @@ private actor RoomSubmitProbe {
     func record(working: Bool) { calls += 1; sawWorking = sawWorking || working }
 }
 
+private actor RoomMetadataProbe {
+    private var started = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var release: CheckedContinuation<Void, Never>?
+
+    func execute(_ mutation: RoomMetadataMutation) async throws {
+        _ = mutation
+        started = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { release = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func resume() { release?.resume(); release = nil }
+}
+
 @MainActor
 final class RoomRoutingTests: XCTestCase {
     override func tearDown() {
@@ -33,6 +55,9 @@ final class RoomRoutingTests: XCTestCase {
         runtime.driveOperation = nil
         runtime.loadOperation = nil
         runtime.submitOperation = nil
+        runtime.metadataMutationOperation = nil
+        runtime.profileRouteGenerations.removeAll()
+        runtime.retiredProfileRoutes.removeAll()
         runtime.store = RoomStore.shared
         runtime.pollInterval = .seconds(2)
         runtime.rooms = []
@@ -548,6 +573,46 @@ final class RoomRoutingTests: XCTestCase {
         XCTAssertEqual(afterDisband.suffix(2).map(\.kind), [.remove, .remove])
         XCTAssertTrue(afterDisband.suffix(2).allSatisfy { $0.oldName == "Fleet" })
         try await fresh.deleteAll()
+    }
+
+    func testLateMetadataCompletionCannotRemoveRenamedDestinationMutation() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("talaria-room-late-metadata-\(UUID().uuidString)",
+                                   isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let source = GatewayBotRoute(gatewayID: "offline", profile: "old")
+        let destination = GatewayBotRoute(gatewayID: "offline", profile: "new")
+        let sibling = GatewayBotRoute(gatewayID: "other", profile: "old")
+        let room = RoomRecord(name: "Fleet", members: [
+            RoomMember(route: source), RoomMember(route: sibling)
+        ])
+        let mutation = RoomMetadataMutation(route: source, kind: .rename,
+                                            oldName: "Fleet", newName: "Fleet 2")
+        let store = RoomStore(baseDirectory: base)
+        try await store.upsert(room, metadataMutations: [mutation])
+        let runtime = RoomRuntime.shared
+        runtime.store = store
+        runtime.rooms = [room]
+        let probe = RoomMetadataProbe()
+        runtime.metadataMutationOperation = { mutation in
+            try await probe.execute(mutation)
+        }
+        let model = AppModel()
+        let flush = Task { @MainActor in await model.flushRoomMetadataOutbox() }
+        await probe.waitUntilStarted()
+
+        let token = model.prepareRoomProfileLifecycle(source: source)
+        try await model.commitRoomProfileRename(token, destination: destination)
+        await probe.resume()
+        await flush.value
+
+        let outbox = try await store.metadataOutbox()
+        XCTAssertEqual(outbox.count, 1)
+        XCTAssertEqual(outbox.first?.route, destination)
+        XCTAssertEqual(outbox.first?.newName, "Fleet 2")
+        let migrated = try await store.room(id: room.id)
+        XCTAssertEqual(migrated?.members.map(\.route), [destination, sibling])
     }
 
     func testSupersededWaitingAttemptCancelsWithoutSubmitting() async throws {
