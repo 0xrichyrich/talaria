@@ -15,6 +15,17 @@ private actor AdoptionTaskBox {
     }
 }
 
+@MainActor
+private func clearMaintenanceFenceForTest(_ runtime: GatewayMaintenanceRuntime) {
+    guard let fence = runtime.fence else { return }
+    switch fence.outcome {
+    case .pending:
+        runtime.releaseDefinite(source: fence.source, action: fence.action)
+    case .accepted, .uncertain:
+        _ = runtime.acknowledge(source: fence.source, action: fence.action)
+    }
+}
+
 final class WorkspaceCommandCenterTests: XCTestCase {
     func testWorkspaceRouteDoesNotCollideAcrossGatewayOrProfile() {
         let a = GatewayWorkspaceRoute(gatewayID: "mini", profile: "default")
@@ -711,10 +722,10 @@ final class WorkspaceCommandCenterTests: XCTestCase {
     func testWorkspaceScopeSwitchPreservesAndConsultsOperatorMaintenanceFence() {
         let maintenance = GatewayMaintenanceRuntime.shared
         let workspace = WorkspaceRuntime.shared
-        maintenance.acknowledge()
+        clearMaintenanceFenceForTest(maintenance)
         _ = workspace.begin(gatewayID: "gateway-a")
         defer {
-            maintenance.acknowledge()
+            clearMaintenanceFenceForTest(maintenance)
             _ = workspace.begin(gatewayID: nil)
         }
 
@@ -918,6 +929,61 @@ final class WorkspaceCommandCenterTests: XCTestCase {
         await model.detachRoutedEvents(gatewayID: gateway.id)
         await registry.clientPool.disconnect(gatewayID: gateway.id)
         _ = workspace.begin(gatewayID: nil)
+    }
+
+    @MainActor
+    func testSecondaryTeardownDisconnectsCapturedClientAfterMetadataRemoval() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let gateway = try XCTUnwrap(registry.upsert(
+            urlString: "https://registry-removed-" + UUID().uuidString + ".example",
+            name: "Removed registry row", credential: .sessionToken("unused")))
+        let baseURL = try XCTUnwrap(gateway.baseURL)
+        let client = GatewayClient(baseURL: baseURL, credential: .sessionToken("unused"))
+        await registry.clientPool.adopt(client, for: gateway.id)
+        let captured = try await registry.clientPool.connectWithGeneration(
+            gatewayID: gateway.id, baseURL: baseURL, credential: .sessionToken("unused"))
+
+        // Metadata can be deleted after the roster request captured its exact
+        // transport. The transport still needs the guarded teardown.
+        registry.remove(id: gateway.id)
+        let toreDown = await registry.teardownSecondaryConnection(
+            gatewayID: gateway.id, expected: captured)
+        let pooled = await registry.clientPool.client(for: gateway.id)
+        let connected = await client.isConnected
+        XCTAssertTrue(toreDown)
+        XCTAssertNil(pooled)
+        XCTAssertFalse(connected)
+        _ = model
+    }
+
+    @MainActor
+    func testRemovedMetadataCannotLetTeardownDisconnectAnActiveCapturedClient() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let gateway = try XCTUnwrap(registry.upsert(
+            urlString: "https://registry-removed-active-" + UUID().uuidString + ".example",
+            name: "Removed active row", credential: .sessionToken("unused")))
+        let baseURL = try XCTUnwrap(gateway.baseURL)
+        let client = GatewayClient(baseURL: baseURL, credential: .sessionToken("unused"))
+        await registry.clientPool.adopt(client, for: gateway.id)
+        let captured = try await registry.clientPool.connectWithGeneration(
+            gatewayID: gateway.id, baseURL: baseURL, credential: .sessionToken("unused"))
+        let wasConnected = await client.isConnected
+
+        registry.remove(id: gateway.id)
+        // `noteState` still records the live-source beacon even though the
+        // metadata row is gone; the stale secondary failure must not close it.
+        registry.noteState(.connected, forURL: baseURL)
+        let toreDown = await registry.teardownSecondaryConnection(
+            gatewayID: gateway.id, expected: captured)
+        let current = await registry.clientPool.client(for: gateway.id)
+        let connected = await client.isConnected
+        XCTAssertFalse(toreDown)
+        XCTAssertEqual(ObjectIdentifier(current!), ObjectIdentifier(client))
+        XCTAssertEqual(connected, wasConnected)
+        await registry.clientPool.disconnect(gatewayID: gateway.id)
+        _ = model
     }
 
     @MainActor

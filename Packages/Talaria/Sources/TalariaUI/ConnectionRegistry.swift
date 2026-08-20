@@ -561,15 +561,21 @@ public final class ConnectionRegistry {
     internal func teardownSecondaryConnection(
         gatewayID: String, expected: GatewayClientPool.ConnectionSnapshot
     ) async -> Bool {
-        guard let gateway = saved.first(where: { $0.id == gatewayID }),
-              gateway.urlString != liveGatewayURL?.absoluteString,
+        // The saved row is metadata, not the identity of the transport that
+        // failed. It can disappear while an enumeration error is unwinding
+        // (the user removed the connection, or a settings refresh replaced
+        // its metadata). The captured snapshot remains the authority for the
+        // guarded disconnect; use its client URL for the active-source fence
+        // so the row's absence cannot strand the old pooled client.
+        let expectedURL = await expected.client.baseURL.absoluteString
+        guard expectedURL != liveGatewayURL?.absoluteString,
               let lease = await clientPool.acquireLease(expected, for: gatewayID) else {
             return false
         }
         // Lease acquisition may have suspended while the user switched to
         // this gateway. Do not let a stale secondary failure tear down the
         // newly-active source.
-        guard gateway.urlString != liveGatewayURL?.absoluteString else {
+        guard expectedURL != liveGatewayURL?.absoluteString else {
             await clientPool.release(lease)
             return false
         }
@@ -580,7 +586,7 @@ public final class ConnectionRegistry {
         // switch. Revalidate before the guarded pool removal as well; the
         // lease protects replacement adoption, while this fence protects a
         // source that became active during the callback.
-        guard gateway.urlString != liveGatewayURL?.absoluteString else {
+        guard expectedURL != liveGatewayURL?.absoluteString else {
             await clientPool.release(lease)
             return false
         }

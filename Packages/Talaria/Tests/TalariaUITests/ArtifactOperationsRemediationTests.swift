@@ -4,6 +4,17 @@ import XCTest
 @testable import TalariaKit
 @testable import TalariaUI
 
+@MainActor
+private func clearMaintenanceFenceForTest(_ runtime: GatewayMaintenanceRuntime) {
+    guard let fence = runtime.fence else { return }
+    switch fence.outcome {
+    case .pending:
+        runtime.releaseDefinite(source: fence.source, action: fence.action)
+    case .accepted, .uncertain:
+        _ = runtime.acknowledge(source: fence.source, action: fence.action)
+    }
+}
+
 final class ArtifactOperationsRemediationTests: XCTestCase {
     @MainActor
     func testArtifactCacheSeparatesIdenticalPathsByExactGatewayProfileAndSession() {
@@ -50,6 +61,21 @@ final class ArtifactOperationsRemediationTests: XCTestCase {
         XCTAssertEqual(URLComponents(url: try XCTUnwrap(oauth.url),
                                      resolvingAgainstBaseURL: false)?.queryItems?.map(\.name),
                        ["path"])
+    }
+
+    func testManagedArtifactReadUsesPinnedHermesRouteAndExactPathQuery() throws {
+        let base = try XCTUnwrap(URL(string: "https://gateway.example/base/"))
+        let request = try GatewayREST.managedReadRequest(
+            baseURL: base, credential: .sessionToken("session-secret"),
+            path: "/srv/hermes-managed/renders/output.png")
+        XCTAssertEqual(request.httpMethod, "GET")
+        XCTAssertEqual(request.url?.path, "/base/api/files/read")
+        XCTAssertEqual(URLComponents(url: try XCTUnwrap(request.url),
+                                     resolvingAgainstBaseURL: false)?.queryItems,
+                       [URLQueryItem(name: "path", value: "/srv/hermes-managed/renders/output.png")])
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Hermes-Session-Token"),
+                       "session-secret")
+        XCTAssertFalse(try XCTUnwrap(request.url?.absoluteString).contains("/read/managed"))
     }
 
     func testGatewayOperationsRequireCanApplyAndExactAcceptedReceipt() throws {
@@ -155,10 +181,10 @@ final class ArtifactOperationsRemediationTests: XCTestCase {
     func testConfigMutationUsesPersistentCrossSurfaceMaintenanceAdmission() {
         let maintenance = GatewayMaintenanceRuntime.shared
         let workspace = WorkspaceRuntime.shared
-        maintenance.acknowledge()
+        clearMaintenanceFenceForTest(maintenance)
         _ = workspace.begin(gatewayID: "gateway-a")
         defer {
-            maintenance.acknowledge()
+            clearMaintenanceFenceForTest(maintenance)
             _ = workspace.begin(gatewayID: nil)
         }
         let source = GatewayMaintenanceSource(gatewayID: "gateway-a", profile: "worker")
@@ -176,8 +202,8 @@ final class ArtifactOperationsRemediationTests: XCTestCase {
     @MainActor
     func testMaintenanceFenceSurvivesScopeChangesAndBlocksAcceptedOrAmbiguousReplay() {
         let runtime = GatewayMaintenanceRuntime.shared
-        runtime.acknowledge()
-        defer { runtime.acknowledge() }
+        clearMaintenanceFenceForTest(runtime)
+        defer { clearMaintenanceFenceForTest(runtime) }
         let source = GatewayMaintenanceSource(gatewayID: "gateway-a", profile: "worker")
 
         XCTAssertTrue(runtime.begin(source: source, action: "hermes-update"))
@@ -190,13 +216,44 @@ final class ArtifactOperationsRemediationTests: XCTestCase {
         XCTAssertFalse(runtime.begin(source: source, action: "gateway-restart"),
                        "an accepted update must block an overlapping restart")
 
-        runtime.acknowledge()
+        XCTAssertTrue(runtime.acknowledge(source: source, action: "hermes-update"))
         XCTAssertTrue(runtime.begin(source: source, action: "gateway-restart"))
         runtime.markUncertain(source: source, action: "gateway-restart")
         XCTAssertFalse(runtime.fence?.source.matches(gatewayID: "gateway-b", profile: nil) == true)
         XCTAssertTrue(runtime.fence?.source.matches(gatewayID: "gateway-a", profile: "worker") == true,
                       "the ambiguous fence must survive navigating away and back")
         XCTAssertFalse(runtime.begin(source: source, action: "hermes-update"))
+    }
+
+    @MainActor
+    func testMaintenanceAcknowledgeRequiresExactSourceProfileAndAction() {
+        let runtime = GatewayMaintenanceRuntime.shared
+        clearMaintenanceFenceForTest(runtime)
+        defer { clearMaintenanceFenceForTest(runtime) }
+
+        let source = GatewayMaintenanceSource(gatewayID: "gateway-a", profile: "worker")
+        XCTAssertTrue(runtime.begin(source: source, action: "gateway-restart"))
+        XCTAssertFalse(runtime.canAcknowledge(source: source, action: "gateway-restart"),
+                       "a pending receipt is not an acknowledgement")
+        XCTAssertFalse(runtime.acknowledge(source: source, action: "gateway-restart"))
+        XCTAssertNotNil(runtime.fence)
+
+        runtime.accept(source: source, action: "gateway-restart", pid: 42)
+        let mismatches = [
+            (GatewayMaintenanceSource(gatewayID: "gateway-b", profile: "worker"), "gateway-restart"),
+            (GatewayMaintenanceSource(gatewayID: "gateway-a", profile: nil), "gateway-restart"),
+            (GatewayMaintenanceSource(gatewayID: "gateway-a", profile: "other"), "gateway-restart"),
+            (source, "hermes-update"),
+        ]
+        for (mismatchedSource, action) in mismatches {
+            XCTAssertFalse(runtime.canAcknowledge(source: mismatchedSource, action: action))
+            XCTAssertFalse(runtime.acknowledge(source: mismatchedSource, action: action),
+                           "a stale or differently scoped button must not clear the fence")
+            XCTAssertNotNil(runtime.fence)
+        }
+
+        XCTAssertTrue(runtime.acknowledge(source: source, action: "gateway-restart"))
+        XCTAssertNil(runtime.fence)
     }
 
     func testDelayedMaintenanceClientResolutionRejectsScopeFlipBeforePost() {

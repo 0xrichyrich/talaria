@@ -292,6 +292,13 @@ final class GatewayMaintenanceRuntime {
         fence?.outcome = .uncertain
     }
 
+    func canAcknowledge(source: GatewayMaintenanceSource, action: String) -> Bool {
+        guard let fence else { return false }
+        return fence.outcome != .pending
+            && fence.source == source
+            && fence.action == action
+    }
+
     /// Safe only when the POST was never sent or Hermes definitively refused.
     func releaseDefinite(source: GatewayMaintenanceSource, action: String) {
         guard fence?.source == source, fence?.action == action else { return }
@@ -299,8 +306,15 @@ final class GatewayMaintenanceRuntime {
     }
 
     /// Explicit user reconciliation is the only way accepted/uncertain state
-    /// leaves the ledger.
-    func acknowledge() { clear() }
+    /// leaves the ledger. The caller must identify the exact source and
+    /// action still fenced; a button from a different gateway/profile must
+    /// never clear another source's no-replay ledger.
+    @discardableResult
+    func acknowledge(source: GatewayMaintenanceSource, action: String) -> Bool {
+        guard canAcknowledge(source: source, action: action) else { return false }
+        clear()
+        return true
+    }
 
     func preservesWorkspaceMutation(owner: UUID?) -> Bool {
         fence != nil && owner != nil && owner == sharedOwner
@@ -770,6 +784,14 @@ public struct OperatorSettingsSection: View {
         return selectedProfile.flatMap { available.contains($0) ? $0 : nil }
     }
 
+    /// The source currently shown by Operator. A maintenance receipt may be
+    /// acknowledged only while this exact gateway/profile is selected.
+    private var targetMaintenanceSource: GatewayMaintenanceSource? {
+        targetGatewayID.map {
+            GatewayMaintenanceSource(gatewayID: $0, profile: targetProfile)
+        }
+    }
+
     private var scopeKey: String {
         let clientIdentity = model.client.map { String(describing: ObjectIdentifier($0)) } ?? "none"
         return "\(targetGatewayID ?? "demo")\u{1f}\(targetProfile ?? "__gateway__")"
@@ -869,9 +891,12 @@ public struct OperatorSettingsSection: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(maintenanceFenceMessage(fence))
                         .font(theme.mono(10)).foregroundStyle(theme.warn)
-                    if fence.outcome != .pending {
+                    if let source = targetMaintenanceSource,
+                       maintenanceRuntime.canAcknowledge(source: source, action: fence.action) {
                         Button("I reconciled this exact gateway action; allow another") {
-                            maintenanceRuntime.acknowledge()
+                            guard let currentSource = targetMaintenanceSource,
+                                  maintenanceRuntime.acknowledge(
+                                      source: currentSource, action: fence.action) else { return }
                             action = .empty
                             actionName = nil
                             Task { await loadUpdateCheck(scopeKey: scopeKey) }

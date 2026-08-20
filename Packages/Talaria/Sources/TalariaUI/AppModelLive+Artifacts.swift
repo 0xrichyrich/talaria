@@ -22,8 +22,8 @@ import AppKit
 // is an authenticated REST fetch. A transcript mention is only session
 // provenance; before any host-file request runs, the response itself must also
 // carry Hermes' locked managed-files containment proof. The artifact reader
-// uses the locked `/api/files/read/managed` route when available and validates
-// the older `/api/files/read` response shape before accepting its bytes. The
+// uses Hermes' pinned `/api/files/read` route and validates its locked
+// returned-path response shape before accepting its bytes. The
 // `/api/fs/*` routes are deliberately not artifact doors: their lexical path
 // checks cannot distinguish a managed-root symlink from a credential path.
 //
@@ -1229,16 +1229,42 @@ public extension GatewayREST {
         return (url, mime(ofDataURL: url), try validatedDeclaredByteSize(payload))
     }
 
-    /// `GET /api/files/read/managed?path=` → `{name, path, size, mime_type,
+    /// Build Hermes' pinned `GET /api/files/read?path=` request. Keeping this
+    /// as a small, testable fixture prevents an invented route from quietly
+    /// becoming the artifact data door again.
+    static func managedReadRequest(baseURL: URL, credential: GatewayCredential,
+                                   path: String) throws -> URLRequest {
+        var components = URLComponents(
+            url: baseURL.appending(path: "api/files/read"),
+            resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let url = components?.url else {
+            throw GatewayError(code: -9, message: "bad managed file URL")
+        }
+        var request = URLRequest(url: url, timeoutInterval: 45)
+        GatewayAuthClient(baseURL: baseURL).apply(credential: credential, to: &request)
+        return request
+    }
+
+    /// `GET /api/files/read?path=` → `{name, path, size, mime_type,
     /// locked_root, data_url}`. The response carries the locked canonical path
     /// proof; the caller's lexical managed-root admission is only an early
     /// fail-closed filter and never the fetch authority.
     static func managedDataURL(_ baseURL: URL, _ credential: GatewayCredential,
                                _ path: String) async throws -> (String, String, Int?) {
-        let query = [URLQueryItem(name: "path", value: path)]
-        let payload = try await restJSON(baseURL: baseURL, credential: credential,
-                                         path: "api/files/read/managed", query: query,
-                                         timeout: 45, what: "managed file")
+        let request = try managedReadRequest(baseURL: baseURL, credential: credential, path: path)
+        let data = try await withTrafficLease(baseURL: baseURL) {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(code) else {
+                let payload = try? JSONDecoder().decode(JSONValue.self, from: data)
+                let detail = payload?["detail"]?.stringValue ?? payload?["error"]?.stringValue
+                throw GatewayError(code: code,
+                                   message: detail ?? "managed file failed (HTTP \(code))")
+            }
+            return data
+        }
+        let payload = (try? JSONDecoder().decode(JSONValue.self, from: data)) ?? .null
         let proof = try authoritativeManagedRead(payload, requestedPath: path)
         return (proof.url, proof.mime, try validatedDeclaredByteSize(payload))
     }
