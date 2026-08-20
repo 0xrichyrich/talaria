@@ -280,31 +280,41 @@ private struct AttachmentSourceChooser: ViewModifier {
     let botID: String
     let isPresented: Bool
 
+    @State private var pendingAction: AttachmentSourceAction?
+
     func body(content: Content) -> some View {
-        let id = model.theme.themeID
-        let copy = model.theme.copy
-        return content.confirmationDialog(
-            copy.attachSourceTitle(id),
+        content.sheet(
             isPresented: Binding(
                 get: { isPresented },
-                set: { if !$0 { AttachmentRuntime.shared.chooserBotID = nil } }),
-            titleVisibility: .visible
+                set: { if !$0 { AttachmentRuntime.shared.chooserBotID = nil } }
+            ),
+            onDismiss: performPendingAction
         ) {
-            Button(copy.attachPhotos(id)) {
-                AttachmentRuntime.shared.chooserBotID = nil
-                AttachmentRuntime.shared.photoBotID = botID
-            }
-            Button(copy.attachFiles(id)) {
-                AttachmentRuntime.shared.chooserBotID = nil
-                AttachmentRuntime.shared.fileBotID = botID
-            }
-            Button(copy.attachPaste(id)) {
-                AttachmentRuntime.shared.chooserBotID = nil
-                Task { await model.pasteAttachment(botID: botID) }
-            }
-            Button(copy.cancel, role: .cancel) {
-                AttachmentRuntime.shared.chooserBotID = nil
-            }
+            AttachmentSourceSheet(
+                theme: model.theme.pack,
+                allowsPaste: true,
+                select: { action in
+                    pendingAction = action
+                    AttachmentRuntime.shared.chooserBotID = nil
+                },
+                close: {
+                    pendingAction = nil
+                    AttachmentRuntime.shared.chooserBotID = nil
+                }
+            )
+        }
+    }
+
+    private func performPendingAction() {
+        guard let action = pendingAction else { return }
+        pendingAction = nil
+        switch action {
+        case .photos:
+            AttachmentRuntime.shared.photoBotID = botID
+        case .files:
+            AttachmentRuntime.shared.fileBotID = botID
+        case .pasteImage:
+            Task { await model.pasteAttachment(botID: botID) }
         }
     }
 }

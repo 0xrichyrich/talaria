@@ -138,7 +138,8 @@ public struct ChatView: View {
                     jumpToLatestButton
                         .padding(.trailing, 16)
                         .padding(.bottom, 10)
-                        .transition(.scale.combined(with: .opacity))
+                        .transition(reducedMotion ? .opacity
+                            : .scale(scale: 0.9).combined(with: .opacity))
                 }
             }
             if transcriptPolicy.detail == .advanced { modelStrip }
@@ -1041,7 +1042,8 @@ public struct ChatView: View {
         .padding(.bottom, 10)
         // The strip appears and disappears per keystroke; without a transition
         // the field jumps under the thumb mid-word.
-        .animation(ChatComposerLayoutPolicy.animation(reducedMotion: reducedMotion, duration: 0.18),
+        .animation(TalariaMotionTokens.spatialAnimation(.fast,
+                                                        reducedMotion: reducedMotion),
                    value: mentionSuggestions.map(\.botID))
         // "/" as the first character opens the command palette; Cancel just
         // dismisses it and leaves the draft (and the keyboard) where they were.
@@ -1233,18 +1235,23 @@ public struct ChatView: View {
                 send()
             }
         } label: {
-            Group {
+            ZStack {
                 if showsStop {
                     RoundedRectangle(cornerRadius: theme.id == .soft ? 3
                                         : theme.id == .control ? 1 : 2)
                         .fill(stopGlyphColor)
                         .frame(width: 12, height: 12)
+                        .transition(TalariaMotionTokens.iconSwapTransition(
+                            reducedMotion: reducedMotion))
                 } else {
                     Text(verbatim: "↑")
                         .font(.system(size: 18, weight: .heavy))
                         .foregroundStyle(theme.accentFg)
+                        .transition(TalariaMotionTokens.iconSwapTransition(
+                            reducedMotion: reducedMotion))
                 }
             }
+            .frame(width: 20, height: 20)
             .frame(width: ChatComposerLayoutPolicy.controlHitTarget,
                    height: ChatComposerLayoutPolicy.controlHitTarget)
             .background(sendBackground, in: sendShape)
@@ -1258,11 +1265,11 @@ public struct ChatView: View {
         .buttonStyle(.plain)
         .shadow(color: showsStop && theme.glowRadius > 0 ? theme.danger.opacity(0.45) : .clear,
                 radius: 8)
-        .animation(ChatComposerLayoutPolicy.animation(reducedMotion: reducedMotion, duration: 0.2),
+        .animation(TalariaMotionTokens.opacityAnimation(.fast, reducedMotion: reducedMotion),
                    value: canSend)
-        .animation(ChatComposerLayoutPolicy.animation(reducedMotion: reducedMotion, duration: 0.2),
+        .animation(TalariaMotionTokens.opacityAnimation(.fast, reducedMotion: reducedMotion),
                    value: turnRunning)
-        .animation(ChatComposerLayoutPolicy.animation(reducedMotion: reducedMotion, duration: 0.2),
+        .animation(TalariaMotionTokens.opacityAnimation(.fast, reducedMotion: reducedMotion),
                    value: showsStop)
         .accessibilityLabel(showsStop ? copy.stopLabel(theme.id) : copy.sendLabel(theme.id))
     }
@@ -1483,11 +1490,13 @@ private struct ChatEntrance: ViewModifier {
     func body(content: Content) -> some View {
         content
             .opacity(shown ? 1 : 0)
-            .offset(y: shown ? 0 : 12)
+            .offset(y: reducedMotion ? 0 : (shown ? 0 : 12))
             .onAppear {
-                withAnimation(ChatComposerLayoutPolicy.animation(
-                    reducedMotion: reducedMotion, duration: 0.35
-                )) { shown = true }
+                withAnimation(reducedMotion
+                    ? TalariaMotionTokens.opacityAnimation(.fast, reducedMotion: true)
+                    : TalariaMotionTokens.spatialAnimation(.deliberate, reducedMotion: false)) {
+                    shown = true
+                }
             }
     }
 }
@@ -1508,7 +1517,9 @@ struct ThoughtBlock: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(reducedMotion ? nil : .easeOut(duration: 0.18)) { expanded.toggle() }
+                withAnimation(TalariaMotionTokens.spatialAnimation(
+                    .quick, reducedMotion: reducedMotion
+                )) { expanded.toggle() }
             } label: {
                 HStack(spacing: 5) {
                     Text(isLive ? "thinking" : "Thought")
