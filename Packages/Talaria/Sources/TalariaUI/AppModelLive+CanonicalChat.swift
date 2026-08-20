@@ -256,6 +256,7 @@ extension AppModel {
     /// minted on the laptop when the pin never reached it — and why it can
     /// never mint a second one alongside it.
     static var canonicalChatTitle: String { "Bot Chat" }
+    static var canonicalKickoffPrompt: String { BotModeStrings.canonicalKickoffPrompt }
 
     // MARK: The primary tap
 
@@ -413,15 +414,11 @@ extension AppModel {
         }
 
         // (d) Birth. A brand-new bot: mint the chat under the canonical title
-        //     and pin it immediately (plugin.js:2751-2766).
-        //
-        //     Desktop also submits a kickoff prompt here ("Hey, tell me about
-        //     yourself!", plugin.js:2790) so the chat is born with the bot
-        //     introducing itself. Deliberately NOT ported: tapping a bot on a
-        //     phone would spend a model turn nobody asked for, and the pin does
-        //     not need it — the gateway persists no row until the first prompt
-        //     (methods_session.py:114-120), so an untyped chat is simply pruned
-        //     and the next open re-mints and re-pins. Left as a product call.
+        //     and pin it immediately (plugin.js:2751-2766), then submit the
+        //     same kickoff desktop uses (plugin.js:2343-2390). The gateway
+        //     prunes zero-message sessions, so the forever-chat is born with
+        //     the bot introducing itself — a local roster-preview bubble is
+        //     not a first turn.
         //
         //     Born hidden, like every Bot Mode session (plugin.js:2758-2763,
         //     BOT-MODE-PARITY §canonical-chat): hidden means *owned*, not
@@ -440,7 +437,29 @@ extension AppModel {
               sourceGatewayID: route.gatewayID)
         if !stored.isEmpty { await pinCanonicalChat(stored, botID: botID) }
         try Task.checkCancellation()
+        do {
+            try await submitCanonicalKickoff(sessionID: live.sessionID, botID: botID,
+                                             client: client)
+        } catch let kickoffError {
+            // Desktop clears the pin if kickoff never persisted the row
+            // (plugin.js:2394-2396). The helper below refuses an empty id.
+            CanonicalChatRuntime.shared.pins[botID] = nil
+            throw kickoffError
+        }
         return live.sessionID
+    }
+
+    /// Desktop's first turn for a brand-new forever-chat. Bind first, then
+    /// submit, so the intro reply is visible without reopening.
+    private func submitCanonicalKickoff(sessionID: String, botID: String,
+                                        client: GatewayClient) async throws {
+        let chat = chat(for: botID)
+        let text = Self.canonicalKickoffPrompt
+        if chat.messages.isEmpty {
+            chat.messages.append(ChatMessage(author: .user, time: AppModel.clock(), text: text))
+        }
+        chat.isRunning = true
+        _ = try await client.submitPrompt(sessionID: sessionID, text: text)
     }
 
     /// Resume `target` — a durable key or the canonical title — and bind the

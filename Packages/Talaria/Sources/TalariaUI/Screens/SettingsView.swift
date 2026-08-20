@@ -691,19 +691,19 @@ extension CopyPack {
         switch t {
         case .soft:
             return [("Environment variables", "hermes config env — on the machine running the gateway"),
-                    ("config.yaml", "Provider keys, toolsets and defaults, edited in place"),
-                    ("Storage paths", "Where profiles, sessions and skills live on disk"),
-                    ("Update channel", "Gateway updates are applied where the gateway runs")]
+                    ("Raw config.yaml", "Provider keys and host paths stay on the gateway host"),
+                    ("Interactive terminal / PTY", "A phone is not a shell. Files & Git in Settings is the portable equivalent."),
+                    ("Electron windows and overlays", "Desktop chrome such as window placement has no mobile analogue")]
         case .control:
             return [("ENV VARS", "HERMES CONFIG ENV — GATEWAY HOST ONLY"),
-                    ("CONFIG.YAML", "PROVIDER KEYS / TOOLSETS / DEFAULTS"),
-                    ("STORAGE PATHS", "PROFILE, SESSION AND SKILL DIRECTORIES"),
-                    ("UPDATE CHANNEL", "APPLIED ON THE GATEWAY HOST")]
+                    ("RAW CONFIG.YAML", "HOST KEYS AND PATHS STAY ON THE GATEWAY"),
+                    ("PTY / TERMINAL", "NOT ON DEVICE. FILES & GIT IN SETTINGS IS THE PORTABLE SURFACE."),
+                    ("ELECTRON WINDOWS", "NO MOBILE ANALOGUE")]
         case .ink:
             return [("the environment", "set where the gateway itself runs"),
-                    ("the config", "keys, gifts and defaults, written in place"),
-                    ("the storage", "where natures, audiences and gifts are kept"),
-                    ("the updates", "applied at the gateway, not here")]
+                    ("the raw config", "keys and paths remain with the house"),
+                    ("the terminal", "a pocket is no shell; Files & Git is the ledger instead"),
+                    ("the windows", "desktop chrome has no counterpart here")]
         }
     }
 

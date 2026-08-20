@@ -298,6 +298,7 @@ public enum BotModeStrings {
     /// The one entry in this table that is not only copy: `/new` and `/reset`
     /// are rewritten to `/compact` when the session they would fork IS the
     /// bot's canonical chat, and this is what says so.
+    public static let canonicalKickoffPrompt = "Hey, tell me about yourself!"
     public static let neverResetsTitle = "This chat never resets"
     public static let neverResetsBody =
         "Bot chats are one continuous conversation — compacting instead. "
