@@ -250,19 +250,12 @@ public struct ChatView: View {
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 11) {
-                    ForEach(messages) { message in
-                        messageRow(message)
+                Group {
+                    if ChatTranscriptLayoutPolicy.usesLazyStack(messageCount: messages.count) {
+                        LazyVStack(alignment: .leading, spacing: 11) { transcriptRows }
+                    } else {
+                        VStack(alignment: .leading, spacing: 11) { transcriptRows }
                     }
-                    if transcriptPolicy.showsWorkingAvatar(
-                        isTurnRunning: turnRunning,
-                        hasLiveDetail: hasLiveTranscriptDetail
-                    ) {
-                        TranscriptWorkingAvatar(model: model, bot: bot, theme: theme,
-                                                label: copy.workingLabel(theme.id))
-                            .modifier(ChatEntrance())
-                    }
-                    Color.clear.frame(height: 1).id("chat-bottom")
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
@@ -284,16 +277,7 @@ public struct ChatView: View {
             .defaultScrollAnchor(.bottom)
             .task(id: initialTranscriptAnchorKey) {
                 guard transcriptAnchoredBotID != botID, !messages.isEmpty else { return }
-                // A long LazyVStack does not have its final bottom geometry on
-                // the first paint. Anchor once after the initial layout, then
-                // again after the first lazy measurement pass. Subsequent
-                // transcript updates keep the normal animated behavior below
-                // and never fight a person's manual scroll position.
-                await Task.yield()
-                proxy.scrollTo("chat-bottom", anchor: .bottom)
-                try? await Task.sleep(for: .milliseconds(60))
-                guard !Task.isCancelled else { return }
-                proxy.scrollTo("chat-bottom", anchor: .bottom)
+                await anchorTranscript(proxy)
                 transcriptAnchoredBotID = botID
             }
             .onChange(of: messages.count) {
@@ -301,14 +285,14 @@ public struct ChatView: View {
                 withAnimation(ChatComposerLayoutPolicy.animation(
                     reducedMotion: reducedMotion, duration: 0.25
                 )) {
-                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                    proxy.scrollTo(transcriptAnchorID, anchor: .bottom)
                 }
             }
             .onChange(of: chat?.isTyping ?? false) {
                 withAnimation(ChatComposerLayoutPolicy.animation(
                     reducedMotion: reducedMotion, duration: 0.25
                 )) {
-                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                    proxy.scrollTo(transcriptAnchorID, anchor: .bottom)
                 }
             }
         }
@@ -316,6 +300,45 @@ public struct ChatView: View {
 
     private var initialTranscriptAnchorKey: String {
         "\(botID)\u{1f}\(messages.count)\u{1f}\(String(describing: messages.last?.id))"
+    }
+
+    private var showingWorkingAvatar: Bool {
+        transcriptPolicy.showsWorkingAvatar(
+            isTurnRunning: turnRunning,
+            hasLiveDetail: hasLiveTranscriptDetail
+        )
+    }
+
+    private var transcriptAnchorID: String {
+        ChatTranscriptLayoutPolicy.anchorID(
+            lastMessageID: messages.last?.id,
+            showingWorkingAvatar: showingWorkingAvatar
+        )
+    }
+
+    @ViewBuilder private var transcriptRows: some View {
+        ForEach(messages) { message in
+            messageRow(message)
+                .id(message.id.uuidString)
+        }
+        if showingWorkingAvatar {
+            TranscriptWorkingAvatar(model: model, bot: bot, theme: theme,
+                                    label: copy.workingLabel(theme.id))
+                .modifier(ChatEntrance())
+        }
+        Color.clear.frame(height: 1).id("chat-bottom")
+    }
+
+    private func anchorTranscript(_ proxy: ScrollViewProxy) async {
+        for delay in ChatTranscriptLayoutPolicy.layoutPassesMs {
+            guard !Task.isCancelled else { return }
+            if delay > 0 {
+                try? await Task.sleep(for: .milliseconds(delay))
+            } else {
+                await Task.yield()
+            }
+            proxy.scrollTo(transcriptAnchorID, anchor: .bottom)
+        }
     }
 
     @ViewBuilder private func messageRow(_ message: ChatMessage) -> some View {

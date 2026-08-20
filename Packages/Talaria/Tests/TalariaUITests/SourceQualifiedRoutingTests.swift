@@ -1256,5 +1256,23 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         Routine(id: id, botID: botID, name: "Backup", schedule: "every 1h",
                 next: "in 1h", last: "", isOn: true)
     }
+
+    func testPrimaryForeverChatPersistsModelGloballyAndMoAStaysSession() {
+        let model = AppModel()
+        XCTAssertTrue(model.shouldPersistModelAsDefault(botID: "default", provider: "anthropic"))
+        XCTAssertTrue(model.shouldPersistModelAsDefault(botID: "seek", provider: "anthropic"))
+        XCTAssertTrue(model.shouldPersistModelAsDefault(botID: "homelab::default", provider: "anthropic"))
+        XCTAssertFalse(model.shouldPersistModelAsDefault(botID: "default", provider: "moa"))
+        XCTAssertEqual(
+            GatewayClient.modelSwitchValue(model: "claude-sonnet-4.6", provider: "anthropic",
+                                           persistAsDefault: true),
+            "claude-sonnet-4.6 --provider anthropic --global"
+        )
+        XCTAssertEqual(
+            GatewayClient.modelSwitchValue(model: "ensemble", provider: "moa",
+                                           persistAsDefault: false),
+            "ensemble --provider moa --session"
+        )
+    }
 }
 #endif

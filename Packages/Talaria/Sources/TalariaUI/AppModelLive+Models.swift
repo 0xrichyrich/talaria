@@ -480,6 +480,7 @@ extension AppModel {
             // ends up being looked for on a subscription endpoint.
             let outcome = try await context.client.applySessionModel(
                 sessionID: sessionID, model: model, provider: provider,
+                persistAsDefault: shouldPersistModelAsDefault(botID: botID, provider: provider),
                 confirmExpensive: confirmExpensive)
             guard modelStateIsCurrent(state, botID: botID, route: context.route) else {
                 return .failed("the bot changed gateways while the model picker was open")
@@ -654,6 +655,14 @@ extension AppModel {
         state.catalog.provider = provider
         // A `…-fast` variant IS fast mode, expressed as a separate model id.
         if ModelLabels.baseID(model).lowercased().hasSuffix("-fast") { state.fastMode = true }
+    }
+
+    /// Bot Mode has one forever-chat per profile, so a picker change is the
+    /// profile default. Desktop's primary-session picker writes `--global`
+    /// for that reason; MoA presets stay session-only so they cannot rewrite
+    /// config.yaml.
+    func shouldPersistModelAsDefault(botID _: String, provider: String) -> Bool {
+        provider.lowercased() != "moa"
     }
 
     /// The demo world's catalog: one honest provider row so the picker's

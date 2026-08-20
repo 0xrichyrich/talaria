@@ -301,6 +301,7 @@ public struct TalariaRootView: View {
                              onRoutines: { withAnimation(pushAnimation) { routinesBotID = botID } },
                              onVoice: { withAnimation(sheetAnimation) { showVoice = true } })
                 }
+                .modifier(ChatSwipeBack(onBack: closeOpenChat))
                 .transition(pushTransition)
             }
 
@@ -510,6 +511,10 @@ public struct TalariaRootView: View {
         .move(edge: .trailing).combined(with: .opacity)
     }
 
+    private func closeOpenChat() {
+        withAnimation(pushAnimation) { model.openBotID = nil }
+    }
+
     private var pushAnimation: Animation { .easeOut(duration: 0.32) }
     private var sheetAnimation: Animation { .easeOut(duration: 0.36) }
 
@@ -663,5 +668,47 @@ private struct ScanlineOverlay: View {
         }
         .ignoresSafeArea()
         .allowsHitTesting(false)
+    }
+}
+
+
+/// Left-edge interactive pop for the custom chat overlay. The drag lives on
+/// a leading hit target so the transcript can still scroll; committing it
+/// uses the same `openBotID = nil` path as the header back button.
+private struct ChatSwipeBack: ViewModifier {
+    var onBack: () -> Void
+    @State private var offset: CGFloat = 0
+
+    func body(content: Content) -> some View {
+        GeometryReader { geo in
+            content
+                .frame(width: geo.size.width, height: geo.size.height)
+                .offset(x: offset)
+                .overlay(alignment: .leading) {
+                    Color.clear
+                        .frame(width: ChatSwipeBackPolicy.edgeWidth)
+                        .contentShape(Rectangle())
+                        .highPriorityGesture(
+                            DragGesture(minimumDistance: ChatSwipeBackPolicy.minimumDistance)
+                                .onChanged { value in
+                                    guard ChatSwipeBackPolicy.shouldBegin(startX: value.startLocation.x) else { return }
+                                    offset = max(0, value.translation.width)
+                                }
+                                .onEnded { value in
+                                    let commit = ChatSwipeBackPolicy.shouldBegin(startX: value.startLocation.x)
+                                        && ChatSwipeBackPolicy.shouldCommit(
+                                            translationX: value.translation.width,
+                                            predictedX: value.predictedEndTranslation.width,
+                                            containerWidth: geo.size.width)
+                                    if commit {
+                                        onBack()
+                                        offset = 0
+                                    } else {
+                                        withAnimation(.easeOut(duration: 0.22)) { offset = 0 }
+                                    }
+                                }
+                        )
+                }
+        }
     }
 }

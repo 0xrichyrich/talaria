@@ -86,6 +86,36 @@ final class TranscriptComposerPolicyTests: XCTestCase {
         XCTAssertEqual(action("", attachments: 1, running: true), .stop)
     }
 
+    func testLongTranscriptUsesLazyStackAndRealMessageAnchor() {
+        XCTAssertFalse(ChatTranscriptLayoutPolicy.usesLazyStack(messageCount: 8))
+        XCTAssertFalse(ChatTranscriptLayoutPolicy.usesLazyStack(messageCount: 64))
+        XCTAssertTrue(ChatTranscriptLayoutPolicy.usesLazyStack(messageCount: 65))
+
+        let last = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
+        XCTAssertEqual(
+            ChatTranscriptLayoutPolicy.anchorID(lastMessageID: last, showingWorkingAvatar: false),
+            last.uuidString
+        )
+        XCTAssertEqual(
+            ChatTranscriptLayoutPolicy.anchorID(lastMessageID: last, showingWorkingAvatar: true),
+            "chat-bottom"
+        )
+        XCTAssertEqual(
+            ChatTranscriptLayoutPolicy.anchorID(lastMessageID: nil, showingWorkingAvatar: false),
+            "chat-bottom"
+        )
+        XCTAssertEqual(ChatTranscriptLayoutPolicy.layoutPassesMs, [16, 120, 360])
+    }
+
+    func testChatSwipeBackOnlyCommitsFromTheLeadingEdge() {
+        XCTAssertTrue(ChatSwipeBackPolicy.shouldBegin(startX: 8))
+        XCTAssertTrue(ChatSwipeBackPolicy.shouldBegin(startX: 28))
+        XCTAssertFalse(ChatSwipeBackPolicy.shouldBegin(startX: 40))
+        XCTAssertTrue(ChatSwipeBackPolicy.shouldCommit(translationX: 120, predictedX: 0, containerWidth: 390))
+        XCTAssertTrue(ChatSwipeBackPolicy.shouldCommit(translationX: 20, predictedX: 800, containerWidth: 390))
+        XCTAssertFalse(ChatSwipeBackPolicy.shouldCommit(translationX: 40, predictedX: 80, containerWidth: 390))
+    }
+
     private func action(_ draft: String, attachments: Int,
                         running: Bool) -> ChatComposerAction {
         ChatComposerActionPolicy.action(draft: draft, attachmentCount: attachments,

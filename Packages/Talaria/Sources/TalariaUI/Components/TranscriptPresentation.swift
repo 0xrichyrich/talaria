@@ -88,6 +88,47 @@ public enum ChatComposerActionPolicy {
     }
 }
 
+/// Chat transcript scrolling facts. A long LazyVStack only measures the
+/// rows near the current estimated offset, so anchoring to a trailing spacer
+/// can land on a blank region until the user drags. Eager stacks stay fully
+/// measured; lazy stacks scroll to the last real message (or the working
+/// avatar) across a few layout passes.
+public enum ChatTranscriptLayoutPolicy {
+    public static let eagerStackLimit = 64
+    public static let layoutPassesMs: [UInt64] = [16, 120, 360]
+
+    public static func usesLazyStack(messageCount: Int) -> Bool {
+        messageCount > eagerStackLimit
+    }
+
+    public static func anchorID(lastMessageID: UUID?, showingWorkingAvatar: Bool) -> String {
+        if showingWorkingAvatar { return "chat-bottom" }
+        if let lastMessageID { return lastMessageID.uuidString }
+        return "chat-bottom"
+    }
+}
+
+/// Interactive pop for the custom chat overlay. Talaria does not use a
+/// NavigationStack for bot chats, so iOS never installs its system edge
+/// gesture. These thresholds match that gesture closely enough to feel native
+/// without stealing horizontal scrolls from the transcript.
+public enum ChatSwipeBackPolicy {
+    public static let edgeWidth: CGFloat = 28
+    public static let minimumDistance: CGFloat = 16
+    public static let commitFraction: CGFloat = 0.28
+    public static let commitVelocity: CGFloat = 720
+
+    public static func shouldBegin(startX: CGFloat) -> Bool {
+        startX <= edgeWidth
+    }
+
+    public static func shouldCommit(translationX: CGFloat, predictedX: CGFloat,
+                                    containerWidth: CGFloat) -> Bool {
+        let width = max(containerWidth, 1)
+        return translationX >= width * commitFraction || predictedX >= commitVelocity
+    }
+}
+
 /// The compact Grok-style activity affordance. A generated portrait stays
 /// still, while the canonical geometric face receives `isWorking` and owns
 /// its normal animation/reduced-motion behavior.

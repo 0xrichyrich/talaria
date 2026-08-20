@@ -554,14 +554,28 @@ extension GatewayClient {
     /// within the *current* aggregator first (model_switch.py:713-716), so
     /// switching to a self-hosted model while a subscription provider is
     /// active otherwise resolves against the wrong endpoint.
+    ///
+    /// Persist flags follow desktop `use-model-controls.ts`: a Bot Mode
+    /// forever-chat writes `--global` so the profile default sticks across
+    /// roster polls; MoA presets stay `--session`.
     func applySessionModel(sessionID: String?, model: String, provider: String? = nil,
+                           persistAsDefault: Bool = false,
                            confirmExpensive: Bool = false) async throws -> ModelSwitchOutcome {
         let slug = (provider ?? "").trimmingCharacters(in: .whitespaces)
-        let value = slug.isEmpty ? model : "\(model) --provider \(slug)"
+        let value = Self.modelSwitchValue(model: model, provider: slug,
+                                          persistAsDefault: persistAsDefault)
         var params: [String: JSONValue] = ["key": "model", "value": .string(value)]
         if let sessionID, !sessionID.isEmpty { params["session_id"] = .string(sessionID) }
         if confirmExpensive { params["confirm_expensive_model"] = .bool(true) }
         return ModelSwitchOutcome(try await rpc("config.set", .object(params), timeout: 180))
+    }
+
+    static func modelSwitchValue(model: String, provider: String,
+                                 persistAsDefault: Bool) -> String {
+        var parts = [model]
+        if !provider.isEmpty { parts.append("--provider \(provider)") }
+        parts.append(persistAsDefault ? "--global" : "--session")
+        return parts.joined(separator: " ")
     }
 
     /// `config.set key:"reasoning"`. Returns the level the gateway settled on.
