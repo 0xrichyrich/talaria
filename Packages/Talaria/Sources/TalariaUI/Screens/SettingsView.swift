@@ -119,11 +119,10 @@ public struct SettingsView: View {
             .searchable(text: $search, prompt: "Search settings")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    HeaderIconButton(theme: theme, size: 32, action: close) {
-                        Text(verbatim: "‹")
-                            .font(.system(size: 16, weight: .bold))
+                    HeaderIconButton(theme: theme, size: 32, showsChrome: false, action: close) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 17, weight: .semibold))
                             .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
-                            .padding(.bottom, 2)
                     }
                     .accessibilityLabel(Text(copy.settingsBack(theme.id)))
                 }

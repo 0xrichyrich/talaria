@@ -97,13 +97,20 @@ public struct ScreenHeader<Trailing: View>: View {
 public struct HeaderIconButton<Glyph: View>: View {
     public var theme: ThemePack
     public var size: CGFloat
+    public var showsChrome: Bool
     public var action: () -> Void
     @ViewBuilder public var glyph: () -> Glyph
 
     public init(theme: ThemePack, size: CGFloat = 32, action: @escaping () -> Void,
                 @ViewBuilder glyph: @escaping () -> Glyph) {
+        self.init(theme: theme, size: size, showsChrome: true, action: action, glyph: glyph)
+    }
+
+    public init(theme: ThemePack, size: CGFloat = 32, showsChrome: Bool,
+                action: @escaping () -> Void, @ViewBuilder glyph: @escaping () -> Glyph) {
         self.theme = theme
         self.size = size
+        self.showsChrome = showsChrome
         self.action = action
         self.glyph = glyph
     }
@@ -112,9 +119,13 @@ public struct HeaderIconButton<Glyph: View>: View {
         Button(action: action) {
             glyph()
                 .frame(width: size, height: size)
-                .background(theme.id == .ink ? Color.clear : theme.panel)
+                .background(showsChrome && theme.id != .ink ? theme.panel : Color.clear)
                 .clipShape(shape)
-                .overlay(shape.strokeBorder(borderColor, lineWidth: 1))
+                .overlay {
+                    if showsChrome {
+                        shape.strokeBorder(borderColor, lineWidth: 1)
+                    }
+                }
                 .contentShape(shape)
         }
         .buttonStyle(.plain)
