@@ -24,3 +24,60 @@ public extension EnvironmentValues {
         set { self[TalariaReducedMotionKey.self] = newValue }
     }
 }
+
+/// Talaria's small, shared motion vocabulary. Keeping these four beats in one
+/// place stops navigation, controls and transient UI from each inventing a
+/// slightly different tempo.
+public enum TalariaMotionTokens {
+    public enum Pace: Double, CaseIterable, Sendable {
+        case fast = 0.15
+        case quick = 0.25
+        case standard = 0.30
+        case deliberate = 0.35
+    }
+
+    public static func duration(_ pace: Pace) -> Double { pace.rawValue }
+
+    /// Spatial changes snap when motion is reduced. This is the animation for
+    /// offsets, scale, resizing and matched-geometry movement.
+    public static func spatialAnimation(_ pace: Pace,
+                                        reducedMotion: Bool) -> Animation? {
+        reducedMotion ? nil : .easeOut(duration: pace.rawValue)
+    }
+
+    /// A short cross-fade remains available in reduced-motion mode; opacity
+    /// communicates state without moving the interface under the user.
+    public static func opacityAnimation(_ pace: Pace,
+                                        reducedMotion: Bool) -> Animation? {
+        reducedMotion ? .linear(duration: Pace.fast.rawValue)
+                      : .easeOut(duration: pace.rawValue)
+    }
+
+    public static func pushOffset(reducedMotion: Bool) -> CGFloat {
+        reducedMotion ? 0 : 10
+    }
+
+    public static func pushTransition(reducedMotion: Bool) -> AnyTransition {
+        guard !reducedMotion else { return .opacity }
+        return .asymmetric(
+            insertion: .offset(x: pushOffset(reducedMotion: false)).combined(with: .opacity),
+            removal: .offset(x: -8).combined(with: .opacity)
+        )
+    }
+
+    public static func verticalOverlayTransition(edge: Edge,
+                                                 reducedMotion: Bool) -> AnyTransition {
+        guard !reducedMotion else { return .opacity }
+        let y: CGFloat = edge == .top ? -10 : 10
+        return .offset(y: y).combined(with: .opacity)
+    }
+
+    /// Both symbols occupy the same fixed slot; only the glyph changes.
+    public static func iconSwapTransition(reducedMotion: Bool) -> AnyTransition {
+        reducedMotion ? .opacity
+            : .asymmetric(
+                insertion: .offset(y: 4).combined(with: .opacity),
+                removal: .offset(y: -4).combined(with: .opacity)
+            )
+    }
+}

@@ -18,6 +18,8 @@ public struct TalariaTabBar: View {
     /// Count per tab; absent or non-positive entries render no badge.
     public var badges: [CopyPack.Tab: Int]
     public var onSelect: (CopyPack.Tab) -> Void
+    @Environment(\.talariaReducedMotion) private var reducedMotion
+    @Namespace private var softSelection
 
     public init(theme: ThemePack, copy: CopyPack, selected: CopyPack.Tab,
                 badges: [CopyPack.Tab: Int], onSelect: @escaping (CopyPack.Tab) -> Void) {
@@ -71,11 +73,24 @@ public struct TalariaTabBar: View {
                 .foregroundStyle(on ? theme.panel : theme.ink.opacity(0.55))
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
-                .background(on ? theme.ink : Color.clear, in: Capsule())
+                .background { softActivePill(isSelected: on) }
                 .overlay(alignment: .topTrailing) { badge(for: tab).offset(x: 4, y: -5) }
                 .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+    }
+
+    @ViewBuilder private func softActivePill(isSelected: Bool) -> some View {
+        if isSelected {
+            if reducedMotion {
+                Capsule().fill(theme.ink)
+            } else {
+                Capsule()
+                    .fill(theme.ink)
+                    .matchedGeometryEffect(id: "talaria.soft.active-tab",
+                                           in: softSelection)
+            }
+        }
     }
 
     // MARK: - Control · terminal bar

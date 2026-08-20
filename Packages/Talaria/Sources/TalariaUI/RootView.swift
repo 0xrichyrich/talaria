@@ -37,6 +37,8 @@ public struct TalariaRootView: View {
     private let model: AppModel
 
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+    @Environment(\.talariaReducedMotion) private var environmentReducedMotion
 
     // Presentation state the model doesn't own (the model keeps routing state
     // other screens drive: selectedTab, openBotID, showOnboarding).
@@ -127,7 +129,9 @@ public struct TalariaRootView: View {
         ZStack {
             theme.bg
                 .ignoresSafeArea()
-                .animation(.easeInOut(duration: 0.45), value: theme.id)
+                .animation(TalariaMotionTokens.opacityAnimation(.standard,
+                                                          reducedMotion: reducedMotion),
+                           value: theme.id)
 
             // The re-auth / offline banner is zero-height while the link is
             // healthy, so stacking it above the graph costs nothing and means
@@ -156,7 +160,7 @@ public struct TalariaRootView: View {
                     .talariaSoloExplainer(model: model)
             }
             .opacity(themeSwapDim ? 0.3 : 1)
-            .scaleEffect(themeSwapDim ? 0.982 : 1)
+            .scaleEffect(reducedMotion ? 1 : (themeSwapDim ? 0.982 : 1))
 
             // The toast stack (Components/ToastBus.swift). Deliberately OUTSIDE
             // the VStack above: Settings, the approval-policy screen and Solo
@@ -374,7 +378,9 @@ public struct TalariaRootView: View {
                     TalariaTabBar(theme: theme, copy: copy,
                                   selected: model.selectedTab,
                                   badges: tabBadges) { tab in
-                        withAnimation(.easeOut(duration: 0.3)) {
+                        withAnimation(TalariaMotionTokens.opacityAnimation(
+                            .standard, reducedMotion: reducedMotion
+                        )) {
                             model.selectedTab = tab
                         }
                     }
@@ -394,7 +400,8 @@ public struct TalariaRootView: View {
             // Voice overlay (z20 — above chat, below banner).
             if showVoice, let botID = model.openBotID {
                 VoiceView(model: model, botID: botID, isPresented: $showVoice)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .transition(TalariaMotionTokens.verticalOverlayTransition(
+                        edge: .bottom, reducedMotion: reducedMotion))
                     .zIndex(20)
             }
 
@@ -414,7 +421,8 @@ public struct TalariaRootView: View {
                         )
                     Spacer()
                 }
-                .transition(.move(edge: .top).combined(with: .opacity))
+                .transition(TalariaMotionTokens.verticalOverlayTransition(
+                    edge: .top, reducedMotion: reducedMotion))
                 .zIndex(40)
             }
 
@@ -425,8 +433,10 @@ public struct TalariaRootView: View {
                     .zIndex(50)
             }
         }
-        .animation(.easeOut(duration: 0.32), value: model.openBotID)
-        .animation(.easeOut(duration: 0.4), value: model.showOnboarding)
+        .animation(pushAnimation, value: model.openBotID)
+        .animation(TalariaMotionTokens.opacityAnimation(.deliberate,
+                                                  reducedMotion: reducedMotion),
+                   value: model.showOnboarding)
     }
 
     @ViewBuilder private var tabContent: some View {
@@ -526,15 +536,27 @@ public struct TalariaRootView: View {
     // MARK: - Transitions
 
     private var pushTransition: AnyTransition {
-        .move(edge: .trailing).combined(with: .opacity)
+        TalariaMotionTokens.pushTransition(reducedMotion: reducedMotion)
     }
 
     private func closeOpenChat() {
         withAnimation(pushAnimation) { model.openBotID = nil }
     }
 
-    private var pushAnimation: Animation { .easeOut(duration: 0.32) }
-    private var sheetAnimation: Animation { .easeOut(duration: 0.36) }
+    private var pushAnimation: Animation? {
+        TalariaMotionTokens.opacityAnimation(.standard, reducedMotion: reducedMotion)
+    }
+    private var sheetAnimation: Animation? {
+        TalariaMotionTokens.opacityAnimation(.deliberate, reducedMotion: reducedMotion)
+    }
+
+    /// Root publishes the merged value to descendants, but also computes it
+    /// directly so transitions owned by the publisher itself obey the same
+    /// setting during the render in which it changes.
+    private var reducedMotion: Bool {
+        environmentReducedMotion
+            || model.settings.prefersReducedMotion(system: systemReduceMotion)
+    }
 
     // MARK: - Theme swap (tSwapX / tSwapY)
 
@@ -542,7 +564,10 @@ public struct TalariaRootView: View {
         var snap = Transaction()
         snap.disablesAnimations = true
         withTransaction(snap) { themeSwapDim = true }
-        withAnimation(.easeOut(duration: 0.5)) { themeSwapDim = false }
+        withAnimation(TalariaMotionTokens.opacityAnimation(.standard,
+                                                      reducedMotion: reducedMotion)) {
+            themeSwapDim = false
+        }
     }
 
     // MARK: - Wiring
@@ -601,14 +626,18 @@ public struct TalariaRootView: View {
 
     private func presentDemoBanner(_ push: BannerPush) {
         guard bannersAllowed else { return }
-        withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) {
+        withAnimation(TalariaMotionTokens.opacityAnimation(.deliberate,
+                                                      reducedMotion: reducedMotion)) {
             activeBanner = push
         }
         let shownID = push.id
         Task {
             try? await Task.sleep(for: .seconds(4.8))
             if activeBanner?.id == shownID {
-                withAnimation(.easeIn(duration: 0.25)) { activeBanner = nil }
+                withAnimation(TalariaMotionTokens.opacityAnimation(.quick,
+                                                              reducedMotion: reducedMotion)) {
+                    activeBanner = nil
+                }
             }
         }
     }
@@ -626,17 +655,26 @@ public struct TalariaRootView: View {
                 if let approval = pendingApproval {
                     ApprovalOutcomes.shared.resolve(approval, approve: true, in: model)
                 }
-                withAnimation(.easeIn(duration: 0.25)) { activeBanner = nil }
+                withAnimation(TalariaMotionTokens.opacityAnimation(.quick,
+                                                              reducedMotion: reducedMotion)) {
+                    activeBanner = nil
+                }
             },
             onLater: {
-                withAnimation(.easeIn(duration: 0.25)) { activeBanner = nil }
+                withAnimation(TalariaMotionTokens.opacityAnimation(.quick,
+                                                              reducedMotion: reducedMotion)) {
+                    activeBanner = nil
+                }
             })
     }
 
     /// bannerGo — approval → Approvals, gateway → Connections, else that
     /// bot's chat.
     private func routeBanner(_ banner: BannerPush) {
-        withAnimation(.easeIn(duration: 0.2)) { activeBanner = nil }
+        withAnimation(TalariaMotionTokens.opacityAnimation(.fast,
+                                                      reducedMotion: reducedMotion)) {
+            activeBanner = nil
+        }
         switch banner.kind {
         case .approval:
             withAnimation(pushAnimation) {
@@ -696,6 +734,7 @@ private struct ScanlineOverlay: View {
 private struct ChatSwipeBack: ViewModifier {
     var onBack: () -> Void
     @State private var offset: CGFloat = 0
+    @Environment(\.talariaReducedMotion) private var reducedMotion
 
     func body(content: Content) -> some View {
         GeometryReader { geo in
@@ -710,7 +749,7 @@ private struct ChatSwipeBack: ViewModifier {
                             DragGesture(minimumDistance: ChatSwipeBackPolicy.minimumDistance)
                                 .onChanged { value in
                                     guard ChatSwipeBackPolicy.shouldBegin(startX: value.startLocation.x) else { return }
-                                    offset = max(0, value.translation.width)
+                                    offset = reducedMotion ? 0 : max(0, value.translation.width)
                                 }
                                 .onEnded { value in
                                     let commit = ChatSwipeBackPolicy.shouldBegin(startX: value.startLocation.x)
@@ -722,7 +761,9 @@ private struct ChatSwipeBack: ViewModifier {
                                         onBack()
                                         offset = 0
                                     } else {
-                                        withAnimation(.easeOut(duration: 0.22)) { offset = 0 }
+                                        withAnimation(TalariaMotionTokens.spatialAnimation(
+                                            .quick, reducedMotion: reducedMotion
+                                        )) { offset = 0 }
                                     }
                                 }
                         )

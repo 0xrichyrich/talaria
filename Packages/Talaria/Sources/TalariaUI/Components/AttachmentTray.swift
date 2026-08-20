@@ -3,7 +3,7 @@ import TalariaKit
 import TalariaTheme
 import UniformTypeIdentifiers
 
-#if os(iOS)
+#if os(iOS) && canImport(PhotosUI)
 import PhotosUI
 #endif
 
@@ -280,31 +280,56 @@ private struct AttachmentSourceChooser: ViewModifier {
     let botID: String
     let isPresented: Bool
 
+    @State private var pendingAction: AttachmentSourceAction?
+
     func body(content: Content) -> some View {
-        let id = model.theme.themeID
-        let copy = model.theme.copy
-        return content.confirmationDialog(
-            copy.attachSourceTitle(id),
+        content.sheet(
             isPresented: Binding(
                 get: { isPresented },
-                set: { if !$0 { AttachmentRuntime.shared.chooserBotID = nil } }),
-            titleVisibility: .visible
+                set: { if !$0 { AttachmentRuntime.shared.chooserBotID = nil } }
+            ),
+            onDismiss: performPendingAction
         ) {
-            Button(copy.attachPhotos(id)) {
-                AttachmentRuntime.shared.chooserBotID = nil
-                AttachmentRuntime.shared.photoBotID = botID
+            AttachmentSourceSheet(
+                theme: model.theme.pack,
+                supportsPhotoLibrary: Self.supportsPhotoLibrary,
+                allowsPaste: true,
+                select: { action in
+                    pendingAction = action
+                    AttachmentRuntime.shared.chooserBotID = nil
+                },
+                close: {
+                    pendingAction = nil
+                    AttachmentRuntime.shared.chooserBotID = nil
+                }
+            )
+        }
+    }
+
+    /// AttachmentPhotoPicker is iOS-only, even where PhotosUI is otherwise
+    /// importable. Keep the chooser capability in lockstep with that picker.
+    private static var supportsPhotoLibrary: Bool {
+        #if os(iOS) && canImport(PhotosUI)
+        true
+        #else
+        false
+        #endif
+    }
+
+    private func performPendingAction() {
+        guard let action = pendingAction else { return }
+        pendingAction = nil
+        switch action {
+        case .photos:
+            guard Self.supportsPhotoLibrary else {
+                assertionFailure("Photo Library was selected without a picker")
+                return
             }
-            Button(copy.attachFiles(id)) {
-                AttachmentRuntime.shared.chooserBotID = nil
-                AttachmentRuntime.shared.fileBotID = botID
-            }
-            Button(copy.attachPaste(id)) {
-                AttachmentRuntime.shared.chooserBotID = nil
-                Task { await model.pasteAttachment(botID: botID) }
-            }
-            Button(copy.cancel, role: .cancel) {
-                AttachmentRuntime.shared.chooserBotID = nil
-            }
+            AttachmentRuntime.shared.photoBotID = botID
+        case .files:
+            AttachmentRuntime.shared.fileBotID = botID
+        case .pasteImage:
+            Task { await model.pasteAttachment(botID: botID) }
         }
     }
 }
@@ -336,7 +361,7 @@ private struct AttachmentFileImporter: ViewModifier {
     }
 }
 
-#if os(iOS)
+#if os(iOS) && canImport(PhotosUI)
 /// PhotosPicker over the photo library. Items arrive as raw camera-roll bytes
 /// (HEIC on any modern iPhone); `attachImageData` transcodes them.
 private struct AttachmentPhotoPicker: ViewModifier {

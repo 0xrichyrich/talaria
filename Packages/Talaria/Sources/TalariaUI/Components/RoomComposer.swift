@@ -23,10 +23,13 @@ public struct RoomComposer: View {
     @State private var attachments: [RoomOutboundAttachment] = []
     @State private var sending = false
     @State private var error: String?
+    @State private var showAttachmentSources = false
+    @State private var pendingAttachmentSource: AttachmentSourceAction?
     @State private var showFiles = false
+    @State private var showPhotos = false
     @FocusState private var focused: Bool
     #if canImport(PhotosUI)
-    @State private var photoItem: PhotosPickerItem?
+    @State private var photoItems: [PhotosPickerItem] = []
     #endif
 
     public init(theme: ThemePack, members: [RoomMember], placeholder: String,
@@ -50,17 +53,11 @@ public struct RoomComposer: View {
                 .disabled(sending)
                 .accessibilityLabel(placeholder)
             HStack(spacing: 10) {
-                #if canImport(PhotosUI)
-                PhotosPicker(selection: $photoItem, matching: .images) {
-                    Image(systemName: "photo").frame(width: 44, height: 44)
-                }
-                .buttonStyle(.plain).foregroundStyle(theme.ink.opacity(0.7)).disabled(sending)
-                .onChange(of: photoItem) { _, item in loadPhoto(item) }
-                #endif
-                Button { showFiles = true } label: {
+                Button { showAttachmentSources = true } label: {
                     Image(systemName: "paperclip").frame(width: 44, height: 44)
                 }
                 .buttonStyle(.plain).foregroundStyle(theme.ink.opacity(0.7)).disabled(sending)
+                .accessibilityLabel("Add attachment")
                 Spacer()
                 if !mentionHint.isEmpty {
                     Text(mentionHint).font(theme.mono(9)).foregroundStyle(theme.faint).lineLimit(1)
@@ -79,6 +76,26 @@ public struct RoomComposer: View {
                 .buttonStyle(.plain).disabled(!canSend || sending)
             }
         }
+        .sheet(isPresented: $showAttachmentSources, onDismiss: performPendingAttachmentSource) {
+            AttachmentSourceSheet(
+                theme: theme,
+                supportsPhotoLibrary: Self.supportsPhotoLibrary,
+                allowsPaste: false,
+                select: { action in
+                    pendingAttachmentSource = action
+                    showAttachmentSources = false
+                },
+                close: {
+                    pendingAttachmentSource = nil
+                    showAttachmentSources = false
+                }
+            )
+        }
+        #if canImport(PhotosUI)
+        .photosPicker(isPresented: $showPhotos, selection: $photoItems,
+                      maxSelectionCount: 6, matching: .images)
+        .onChange(of: photoItems) { _, items in loadPhotos(items) }
+        #endif
         #if canImport(UniformTypeIdentifiers)
         .fileImporter(isPresented: $showFiles, allowedContentTypes: [.data, .pdf, .image],
                       allowsMultipleSelection: true) { result in
@@ -86,6 +103,33 @@ public struct RoomComposer: View {
             Task { @MainActor in await loadFiles(urls) }
         }
         #endif
+    }
+
+    /// This must match the compile-time gate on the PhotosPicker modifier.
+    /// The source sheet fails closed when PhotosUI is unavailable.
+    private static var supportsPhotoLibrary: Bool {
+        #if canImport(PhotosUI)
+        true
+        #else
+        false
+        #endif
+    }
+
+    private func performPendingAttachmentSource() {
+        guard let action = pendingAttachmentSource else { return }
+        pendingAttachmentSource = nil
+        switch action {
+        case .photos:
+            #if canImport(PhotosUI)
+            showPhotos = true
+            #else
+            assertionFailure("Photo Library was selected without PhotosUI support")
+            #endif
+        case .files:
+            showFiles = true
+        case .pasteImage:
+            break // Room composers intentionally offer photo and file sources only.
+        }
     }
 
     private var canSend: Bool {
@@ -167,15 +211,19 @@ public struct RoomComposer: View {
     }
 
     #if canImport(PhotosUI)
-    private func loadPhoto(_ item: PhotosPickerItem?) {
-        guard let item else { return }
+    private func loadPhotos(_ items: [PhotosPickerItem]) {
+        guard !items.isEmpty else { return }
+        photoItems = []
         Task { @MainActor in
-            guard let data = try? await item.loadTransferable(type: Data.self),
-                  let shaped = AttachmentEncoder.gatewayImage(from: data, filename: "photo.heic") else { return }
-            attachments.append(RoomOutboundAttachment(kind: .image,
-                                                       name: "photo-\(attachments.count + 1).jpg",
-                                                       data: shaped.data))
-            photoItem = nil
+            for item in items {
+                guard let data = try? await item.loadTransferable(type: Data.self),
+                      let shaped = AttachmentEncoder.gatewayImage(from: data, filename: "photo.heic") else {
+                    continue
+                }
+                attachments.append(RoomOutboundAttachment(kind: .image,
+                                                           name: "photo-\(attachments.count + 1).jpg",
+                                                           data: shaped.data))
+            }
         }
     }
     #endif
