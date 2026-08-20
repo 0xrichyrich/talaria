@@ -561,10 +561,15 @@ public actor GatewayClient {
 
     /// Submit a prompt; returns once accepted ({"status":"streaming"}).
     /// Tokens/tool events then stream to event handlers.
-    public func submitPrompt(sessionID: String, text: String, queued: Bool = false) async throws {
+    @discardableResult
+    public func submitPrompt(sessionID: String, text: String, queued: Bool = false,
+                             truncate: TranscriptActing.TruncateAddress = .init()) async throws -> JSONValue {
         var params: [String: JSONValue] = ["session_id": .string(sessionID), "text": .string(text)]
         if queued { params["queued"] = .bool(true) }
-        try await rpc("prompt.submit", .object(params), timeout: 1800)
+        for (key, value) in TranscriptActing.truncateParams(truncate) {
+            params[key] = value
+        }
+        return try await rpc("prompt.submit", .object(params), timeout: 1800)
     }
 
     public func steer(sessionID: String, text: String) async throws {

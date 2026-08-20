@@ -60,5 +60,53 @@ final class CommandCenterContractTests: XCTestCase {
         XCTAssertEqual(status.activeSessions, 5)
         XCTAssertEqual(status.version, "v0.20.3")
     }
+
+    func testMaintenanceParsesCuratorMemoryAndDebugShareContracts() {
+        let curator = GatewayCuratorStatus(.object([
+            "enabled": .bool(true),
+            "paused": .bool(true),
+            "last_run_at": .string("2026-08-19T20:00:00Z"),
+        ]))
+        XCTAssertTrue(curator.enabled)
+        XCTAssertTrue(curator.paused)
+        XCTAssertFalse(curator.isActive)
+        XCTAssertEqual(curator.lastRunAt, "2026-08-19T20:00:00Z")
+
+        let memory = GatewayMemoryStoreStatus(.object([
+            "active": .string("built-in"),
+            "builtin_files": .object([
+                "memory": .number(2048),
+                "user": .number(0),
+            ]),
+        ]))
+        XCTAssertEqual(memory.active, "built-in")
+        XCTAssertEqual(memory.memoryBytes, 2048)
+        XCTAssertEqual(memory.userBytes, 0)
+
+        let share = GatewayDebugShare(.object([
+            "ok": .bool(true),
+            "redacted": .bool(true),
+            "auto_delete_seconds": .number(21600),
+            "urls": .object([
+                "summary": .string("https://paste.example/a"),
+                "logs": .string("https://paste.example/b"),
+                "empty": .string(""),
+            ]),
+            "failures": .object([
+                "nous": .string("offline"),
+            ]),
+        ]))
+        XCTAssertTrue(share.ok)
+        XCTAssertEqual(share.urls.map { $0.key }, ["logs", "summary"])
+        XCTAssertEqual(share.failures.map { $0.key }, ["nous"])
+        XCTAssertEqual(share.autoDeleteSeconds, 21600)
+
+        let reset = GatewayMemoryResetResult(.object([
+            "ok": .bool(true),
+            "deleted": .array([.string("MEMORY.md"), .string("USER.md")]),
+        ]))
+        XCTAssertTrue(reset.ok)
+        XCTAssertEqual(reset.deleted, ["MEMORY.md", "USER.md"])
+    }
 }
 #endif

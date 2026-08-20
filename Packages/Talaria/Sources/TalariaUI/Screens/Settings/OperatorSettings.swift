@@ -143,6 +143,91 @@ struct GatewayLogSnapshot: Equatable, Sendable {
     }
 }
 
+public struct GatewayCuratorStatus: Equatable, Sendable {
+    var enabled: Bool
+    var paused: Bool
+    var lastRunAt: String?
+
+    static let empty = GatewayCuratorStatus(enabled: false, paused: false, lastRunAt: nil)
+
+    init(enabled: Bool, paused: Bool, lastRunAt: String?) {
+        self.enabled = enabled; self.paused = paused; self.lastRunAt = lastRunAt
+    }
+
+    init(_ value: JSONValue) {
+        enabled = value["enabled"]?.boolValue ?? false
+        paused = value["paused"]?.boolValue ?? false
+        lastRunAt = value["last_run_at"]?.stringValue
+    }
+
+    var isActive: Bool { enabled && !paused }
+}
+
+public struct GatewayMemoryStoreStatus: Equatable, Sendable {
+    var active: String
+    var memoryBytes: Int
+    var userBytes: Int
+
+    static let empty = GatewayMemoryStoreStatus(active: "", memoryBytes: 0, userBytes: 0)
+
+    init(active: String, memoryBytes: Int, userBytes: Int) {
+        self.active = active; self.memoryBytes = memoryBytes; self.userBytes = userBytes
+    }
+
+    init(_ value: JSONValue) {
+        active = value["active"]?.stringValue ?? ""
+        let files = value["builtin_files"]
+        memoryBytes = files?["memory"]?.intValue ?? 0
+        userBytes = files?["user"]?.intValue ?? 0
+    }
+}
+
+public struct GatewayNamedLink: Equatable, Sendable {
+    public var key: String
+    public var value: String
+}
+
+public struct GatewayDebugShare: Equatable, Sendable {
+    public var ok: Bool
+    public var urls: [GatewayNamedLink]
+    public var failures: [GatewayNamedLink]
+    public var redacted: Bool
+    public var autoDeleteSeconds: Int?
+
+    static let empty = GatewayDebugShare(ok: false, urls: [], failures: [],
+                                         redacted: true, autoDeleteSeconds: nil)
+
+    init(ok: Bool, urls: [GatewayNamedLink], failures: [GatewayNamedLink],
+         redacted: Bool, autoDeleteSeconds: Int?) {
+        self.ok = ok; self.urls = urls; self.failures = failures
+        self.redacted = redacted; self.autoDeleteSeconds = autoDeleteSeconds
+    }
+
+    init(_ value: JSONValue) {
+        ok = value["ok"]?.boolValue ?? false
+        urls = (value["urls"]?.objectValue ?? [:]).compactMap { key, item in
+            guard let url = item.stringValue, !url.isEmpty else { return nil }
+            return GatewayNamedLink(key: key, value: url)
+        }.sorted { $0.key < $1.key }
+        failures = (value["failures"]?.objectValue ?? [:]).compactMap { key, item in
+            guard let message = item.stringValue, !message.isEmpty else { return nil }
+            return GatewayNamedLink(key: key, value: message)
+        }.sorted { $0.key < $1.key }
+        redacted = value["redacted"]?.boolValue ?? true
+        autoDeleteSeconds = value["auto_delete_seconds"]?.intValue
+    }
+}
+
+public struct GatewayMemoryResetResult: Equatable, Sendable {
+    var ok: Bool
+    var deleted: [String]
+
+    init(_ value: JSONValue) {
+        ok = value["ok"]?.boolValue ?? false
+        deleted = value["deleted"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+}
+
 extension GatewayClient {
     func operatorConfig(profile: String?) async throws -> GatewayOperatorConfig {
         var query: [URLQueryItem] = []
@@ -207,6 +292,103 @@ extension GatewayClient {
             try await restJSON(path: "api/analytics/usage", query: query, timeout: 30),
             days: clamped)
     }
+
+    func startDoctor() async throws -> GatewayCommandAction {
+        GatewayCommandAction(
+            try await restJSON(path: "api/ops/doctor", method: "POST", body: .object([:]), timeout: 30),
+            fallbackName: "doctor")
+    }
+
+    func startSecurityAudit() async throws -> GatewayCommandAction {
+        GatewayCommandAction(
+            try await restJSON(path: "api/ops/security-audit", method: "POST", body: .object([:]), timeout: 30),
+            fallbackName: "security-audit")
+    }
+
+    func startBackup() async throws -> GatewayCommandAction {
+        GatewayCommandAction(
+            try await restJSON(path: "api/ops/backup", method: "POST", body: .object([:]), timeout: 30),
+            fallbackName: "backup")
+    }
+
+    func curatorStatus(profile: String?) async throws -> GatewayCuratorStatus {
+        GatewayCuratorStatus(try await restJSON(path: "api/curator",
+                                                query: profileQuery(profile), timeout: 30))
+    }
+
+    func setCuratorPaused(_ paused: Bool, profile: String?) async throws {
+        _ = try await restJSON(path: "api/curator/paused", method: "PUT",
+                               query: profileQuery(profile),
+                               body: .object(["paused": .bool(paused)]), timeout: 30)
+    }
+
+    func startCuratorRun(profile: String?) async throws -> GatewayCommandAction {
+        GatewayCommandAction(
+            try await restJSON(path: "api/curator/run", method: "POST",
+                               query: profileQuery(profile), body: .object([:]), timeout: 30),
+            fallbackName: "curator-run")
+    }
+
+    func memoryStoreStatus(profile: String?) async throws -> GatewayMemoryStoreStatus {
+        GatewayMemoryStoreStatus(try await restJSON(path: "api/memory",
+                                                    query: profileQuery(profile), timeout: 30))
+    }
+
+    func resetMemoryStore(target: String, profile: String?) async throws -> GatewayMemoryResetResult {
+        GatewayMemoryResetResult(try await restJSON(
+            path: "api/memory/reset", method: "POST",
+            query: profileQuery(profile),
+            body: .object(["target": .string(target)]), timeout: 30))
+    }
+
+    func shareDebugReport() async throws -> GatewayDebugShare {
+        GatewayDebugShare(try await restJSON(
+            path: "api/ops/debug-share", method: "POST",
+            body: .object(["redact": .bool(true), "lines": .number(200)]),
+            timeout: 120))
+    }
+
+    private func profileQuery(_ profile: String?) -> [URLQueryItem] {
+        guard let profile, !profile.isEmpty else { return [] }
+        return [URLQueryItem(name: "profile", value: profile)]
+    }
+}
+
+private enum MaintenancePrompt: Equatable {
+    case backup
+    case debugShare
+    case resetMemory(String)
+
+    var role: ButtonRole? {
+        switch self {
+        case .backup, .debugShare: nil
+        case .resetMemory: .destructive
+        }
+    }
+
+    func title(_ copy: CopyPack, _ theme: ThemeID) -> String {
+        switch self {
+        case .backup: copy.settingsBackupConfirmTitle(theme)
+        case .debugShare: copy.settingsDebugShareConfirmTitle(theme)
+        case .resetMemory: copy.settingsResetMemoryConfirmTitle(theme)
+        }
+    }
+
+    func message(_ copy: CopyPack, _ theme: ThemeID) -> String {
+        switch self {
+        case .backup: copy.settingsBackupConfirmMessage(theme)
+        case .debugShare: copy.settingsDebugShareConfirmMessage(theme)
+        case .resetMemory(let target): copy.settingsResetMemoryConfirmMessage(theme, target: target)
+        }
+    }
+
+    func confirmTitle(_ copy: CopyPack, _ theme: ThemeID) -> String {
+        switch self {
+        case .backup: copy.settingsBackup(theme)
+        case .debugShare: copy.settingsDebugShare(theme)
+        case .resetMemory: copy.settingsResetMemoryConfirm(theme)
+        }
+    }
 }
 
 public struct OperatorSettingsSection: View {
@@ -244,6 +426,15 @@ public struct OperatorSettingsSection: View {
     @State private var updateCheck = GatewayCommandAction.empty
     @State private var action = GatewayCommandAction.empty
     @State private var actionName: String?
+    @State private var curator = GatewayCuratorStatus.empty
+    @State private var curatorError: String?
+    @State private var isLoadingCurator = false
+    @State private var memoryStore = GatewayMemoryStoreStatus.empty
+    @State private var memoryStoreError: String?
+    @State private var isLoadingMemoryStore = false
+    @State private var debugShare = GatewayDebugShare.empty
+    @State private var isSharingDebug = false
+    @State private var pendingMaintenance: MaintenancePrompt?
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -251,6 +442,9 @@ public struct OperatorSettingsSection: View {
             if !profileChoices.isEmpty { profilePickerSection }
             systemSection
             usageSection
+            maintenanceSection
+            curatorSection
+            memoryStoreSection
             runtimeSection
             memorySection
             imageSection
@@ -272,6 +466,26 @@ public struct OperatorSettingsSection: View {
             await loadLogs(scopeKey: key)
             await loadUsage(scopeKey: key)
             await loadUpdateCheck(scopeKey: key)
+            await loadCurator(scopeKey: key)
+            await loadMemoryStore(scopeKey: key)
+        }
+        .confirmationDialog(pendingMaintenance?.title(copy, theme.id) ?? "",
+                            isPresented: Binding(
+                                get: { pendingMaintenance != nil },
+                                set: { if !$0 { pendingMaintenance = nil } }),
+                            titleVisibility: .visible) {
+            if let pendingMaintenance {
+                Button(pendingMaintenance.confirmTitle(copy, theme.id), role: pendingMaintenance.role) {
+                    Task { await confirmMaintenance(pendingMaintenance) }
+                }
+            }
+            Button(copy.settingsMaintenanceCancel(theme.id), role: .cancel) {
+                pendingMaintenance = nil
+            }
+        } message: {
+            if let pendingMaintenance {
+                Text(pendingMaintenance.message(copy, theme.id))
+            }
         }
     }
 
@@ -408,6 +622,120 @@ public struct OperatorSettingsSection: View {
             }
         }
         .onChange(of: usageDays) { _, _ in Task { await loadUsage(scopeKey: scopeKey) } }
+    }
+
+    private var maintenanceSection: some View {
+        SettingsSection(theme: theme, title: copy.settingsMaintenanceSection(theme.id),
+                        footnote: copy.settingsMaintenanceNote(theme.id)) {
+            SettingsGroup(theme: theme) {
+                SettingsActionRow(theme: theme, title: copy.settingsDoctor(theme.id),
+                                  subtitle: copy.settingsDoctorNote(theme.id),
+                                  isBusy: actionName == "doctor" && action.running,
+                                  isLast: false) {
+                    Task { await runAction("doctor") }
+                }
+                SettingsActionRow(theme: theme, title: copy.settingsSecurityAudit(theme.id),
+                                  subtitle: copy.settingsSecurityAuditNote(theme.id),
+                                  isBusy: actionName == "security-audit" && action.running,
+                                  isLast: false) {
+                    Task { await runAction("security-audit") }
+                }
+                SettingsActionRow(theme: theme, title: copy.settingsBackup(theme.id),
+                                  subtitle: copy.settingsBackupNote(theme.id),
+                                  isBusy: actionName == "backup" && action.running,
+                                  isLast: false) {
+                    pendingMaintenance = .backup
+                }
+                SettingsActionRow(theme: theme, title: copy.settingsDebugShare(theme.id),
+                                  subtitle: copy.settingsDebugShareNote(theme.id),
+                                  isBusy: isSharingDebug, isLast: true) {
+                    pendingMaintenance = .debugShare
+                }
+            }
+            if let archive = action.message.isEmpty ? nil : action.message, actionName == "backup" {
+                Text(archive).font(theme.mono(10)).foregroundStyle(theme.sub)
+                    .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 2)
+            }
+            if !debugShare.urls.isEmpty || !debugShare.failures.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(debugShare.urls, id: \.key) { row in
+                        Text("\(row.key): \(row.value)")
+                            .font(theme.mono(10)).foregroundStyle(theme.sub)
+                            .textSelection(.enabled)
+                    }
+                    ForEach(debugShare.failures, id: \.key) { row in
+                        Text("\(row.key): \(row.value)")
+                            .font(theme.mono(10)).foregroundStyle(theme.warn)
+                    }
+                    if let seconds = debugShare.autoDeleteSeconds {
+                        Text(copy.settingsDebugShareExpiry(theme.id, seconds: seconds))
+                            .font(theme.mono(10)).foregroundStyle(theme.faint)
+                    }
+                }
+                .padding(.horizontal, 2)
+            }
+        }
+    }
+
+    private var curatorSection: some View {
+        SettingsSection(theme: theme, title: copy.settingsCuratorSection(theme.id),
+                        footnote: copy.settingsCuratorNote(theme.id)) {
+            SettingsGroup(theme: theme) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(copy.settingsCuratorState(theme.id, curator: curator))
+                        .font(SettingsType.rowTitle(theme))
+                    Text(copy.settingsCuratorLastRun(theme.id, curator: curator))
+                        .font(SettingsType.rowSubtitle(theme)).foregroundStyle(theme.sub)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .modifier(SettingsRowChrome(theme: theme, isLast: false))
+                if curator.enabled {
+                    SettingsActionRow(theme: theme,
+                                      title: curator.paused ? copy.settingsCuratorResume(theme.id)
+                                                            : copy.settingsCuratorPause(theme.id),
+                                      isBusy: busyField == "curator.paused", isLast: false) {
+                        Task { await toggleCuratorPaused() }
+                    }
+                }
+                SettingsActionRow(theme: theme, title: copy.settingsCuratorRun(theme.id),
+                                  isBusy: actionName == "curator-run" && action.running,
+                                  isLast: true) {
+                    Task { await runAction("curator-run") }
+                }
+            }
+            if let curatorError {
+                Text(curatorError).font(theme.mono(10)).foregroundStyle(theme.warn)
+                    .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 2)
+            }
+        }
+    }
+
+    private var memoryStoreSection: some View {
+        SettingsSection(theme: theme, title: copy.settingsMemoryStoreSection(theme.id),
+                        footnote: copy.settingsMemoryStoreNote(theme.id, memory: memoryStore)) {
+            SettingsGroup(theme: theme) {
+                SettingsActionRow(theme: theme, title: copy.settingsResetMemoryFile(theme.id),
+                                  subtitle: copy.settingsMemoryFileSize(theme.id, bytes: memoryStore.memoryBytes),
+                                  isDestructive: true,
+                                  isBusy: busyField == "memory.reset.memory",
+                                  isLast: false) {
+                    pendingMaintenance = .resetMemory("memory")
+                }
+                .disabled(memoryStore.memoryBytes <= 0)
+                SettingsActionRow(theme: theme, title: copy.settingsResetUserFile(theme.id),
+                                  subtitle: copy.settingsMemoryFileSize(theme.id, bytes: memoryStore.userBytes),
+                                  isDestructive: true,
+                                  isBusy: busyField == "memory.reset.user",
+                                  isLast: true) {
+                    pendingMaintenance = .resetMemory("user")
+                }
+                .disabled(memoryStore.userBytes <= 0)
+            }
+            if let memoryStoreError {
+                Text(memoryStoreError).font(theme.mono(10)).foregroundStyle(theme.warn)
+                    .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 2)
+            }
+        }
     }
 
     private var runtimeSection: some View {
@@ -561,6 +889,15 @@ public struct OperatorSettingsSection: View {
         updateCheck = GatewayCommandAction.empty
         action = GatewayCommandAction.empty
         actionName = nil
+        curator = GatewayCuratorStatus.empty
+        curatorError = nil
+        isLoadingCurator = false
+        memoryStore = GatewayMemoryStoreStatus.empty
+        memoryStoreError = nil
+        isLoadingMemoryStore = false
+        debugShare = GatewayDebugShare.empty
+        isSharingDebug = false
+        pendingMaintenance = nil
     }
 
     private func isCurrent(_ key: String, generation captured: Int) -> Bool {
@@ -670,6 +1007,109 @@ public struct OperatorSettingsSection: View {
         }
     }
 
+    private func loadCurator(scopeKey key: String) async {
+        guard stateScopeKey == key else { return }
+        let captured = generation
+        isLoadingCurator = true
+        defer { if isCurrent(key, generation: captured) { isLoadingCurator = false } }
+        guard model.mode == .live else { return }
+        do {
+            let client = try await targetClient(gatewayID: targetGatewayID)
+            let loaded = try await client.curatorStatus(profile: targetProfile)
+            guard isCurrent(key, generation: captured) else { return }
+            curator = loaded
+            curatorError = nil
+        } catch {
+            guard isCurrent(key, generation: captured) else { return }
+            curatorError = error.localizedDescription
+        }
+    }
+
+    private func loadMemoryStore(scopeKey key: String) async {
+        guard stateScopeKey == key else { return }
+        let captured = generation
+        isLoadingMemoryStore = true
+        defer { if isCurrent(key, generation: captured) { isLoadingMemoryStore = false } }
+        guard model.mode == .live else { return }
+        do {
+            let client = try await targetClient(gatewayID: targetGatewayID)
+            let loaded = try await client.memoryStoreStatus(profile: targetProfile)
+            guard isCurrent(key, generation: captured) else { return }
+            memoryStore = loaded
+            memoryStoreError = nil
+        } catch {
+            guard isCurrent(key, generation: captured) else { return }
+            memoryStoreError = error.localizedDescription
+        }
+    }
+
+    private func toggleCuratorPaused() async {
+        guard busyField == nil else { return }
+        let key = scopeKey
+        let captured = generation
+        let next = !curator.paused
+        busyField = "curator.paused"
+        defer { if isCurrent(key, generation: captured) { busyField = nil } }
+        do {
+            let client = try await targetClient(gatewayID: targetGatewayID)
+            try await client.setCuratorPaused(next, profile: targetProfile)
+            guard isCurrent(key, generation: captured) else { return }
+            curator.paused = next
+            curatorError = nil
+        } catch {
+            guard isCurrent(key, generation: captured) else { return }
+            curatorError = error.localizedDescription
+        }
+    }
+
+    private func confirmMaintenance(_ prompt: MaintenancePrompt) async {
+        pendingMaintenance = nil
+        switch prompt {
+        case .backup:
+            await runAction("backup")
+        case .debugShare:
+            await shareDebug()
+        case .resetMemory(let target):
+            await resetMemoryStore(target: target)
+        }
+    }
+
+    private func shareDebug() async {
+        guard !isSharingDebug else { return }
+        let key = scopeKey
+        let captured = generation
+        isSharingDebug = true
+        defer { if isCurrent(key, generation: captured) { isSharingDebug = false } }
+        do {
+            let client = try await targetClient(gatewayID: targetGatewayID)
+            let result = try await client.shareDebugReport()
+            guard isCurrent(key, generation: captured) else { return }
+            debugShare = result
+            setNotice(copy.settingsDebugShareDone(theme.id, share: result), warning: !result.ok)
+        } catch {
+            guard isCurrent(key, generation: captured) else { return }
+            setNotice(error.localizedDescription, warning: true)
+        }
+    }
+
+    private func resetMemoryStore(target: String) async {
+        guard busyField == nil else { return }
+        let key = scopeKey
+        let captured = generation
+        busyField = "memory.reset.\(target)"
+        defer { if isCurrent(key, generation: captured) { busyField = nil } }
+        do {
+            let client = try await targetClient(gatewayID: targetGatewayID)
+            let result = try await client.resetMemoryStore(target: target, profile: targetProfile)
+            guard isCurrent(key, generation: captured) else { return }
+            setNotice(copy.settingsResetMemoryDone(theme.id, result: result), warning: !result.ok)
+            await loadMemoryStore(scopeKey: key)
+        } catch {
+            guard isCurrent(key, generation: captured) else { return }
+            setNotice(error.localizedDescription, warning: true)
+        }
+    }
+
     private func runAction(_ name: String) async {
         guard busyField == nil else { return }
         let key = scopeKey
@@ -679,9 +1119,18 @@ public struct OperatorSettingsSection: View {
         do {
             let client = try await targetClient(gatewayID: targetGatewayID)
             let started: GatewayCommandAction
-            if name == "gateway-restart" {
+            switch name {
+            case "gateway-restart":
                 started = try await client.restartGateway(profile: targetProfile)
-            } else {
+            case "doctor":
+                started = try await client.startDoctor()
+            case "security-audit":
+                started = try await client.startSecurityAudit()
+            case "backup":
+                started = try await client.startBackup()
+            case "curator-run":
+                started = try await client.startCuratorRun(profile: targetProfile)
+            default:
                 started = try await client.startHermesUpdate()
             }
             guard isCurrent(key, generation: captured) else { return }
@@ -848,4 +1297,65 @@ public extension CopyPack {
             ? "\(usage.sessions) SESSIONS · \(usage.apiCalls) CALLS · \(usage.inputTokens)+\(usage.outputTokens) TOKENS · $\(cost)"
             : "\(usage.sessions) sessions · \(usage.apiCalls) API calls · \(usage.inputTokens) in / \(usage.outputTokens) out · $\(cost)"
     }
+    func settingsMaintenanceSection(_ t: ThemeID) -> String { t == .control ? "MAINTENANCE" : "Maintenance" }
+    func settingsMaintenanceNote(_ t: ThemeID) -> String { t == .control ? "POST /api/ops/doctor|security-audit|backup|debug-share." : "Run Hermes doctor, a security audit, a gateway backup, or a redacted debug share." }
+    func settingsDoctor(_ t: ThemeID) -> String { t == .control ? "RUN DOCTOR" : "Run doctor" }
+    func settingsDoctorNote(_ t: ThemeID) -> String { t == .control ? "hermes doctor — HEALTH CHECK." : "Checks gateway health and writes a tailed log." }
+    func settingsSecurityAudit(_ t: ThemeID) -> String { t == .control ? "SECURITY AUDIT" : "Security audit" }
+    func settingsSecurityAuditNote(_ t: ThemeID) -> String { t == .control ? "hermes security audit." : "Scans the gateway for common security issues." }
+    func settingsBackup(_ t: ThemeID) -> String { t == .control ? "BACKUP" : "Backup" }
+    func settingsBackupNote(_ t: ThemeID) -> String { t == .control ? "ZIP ON THE GATEWAY HOST." : "Writes a zip on the gateway host, not this phone." }
+    func settingsDebugShare(_ t: ThemeID) -> String { t == .control ? "DEBUG SHARE" : "Share debug report" }
+    func settingsDebugShareNote(_ t: ThemeID) -> String { t == .control ? "REDACTED UPLOAD · AUTO-DELETES." : "Uploads a redacted report and returns paste links." }
+    func settingsDebugShareExpiry(_ t: ThemeID, seconds: Int) -> String {
+        t == .control ? "AUTO-DELETE \(seconds)S" : "Links auto-delete after \(seconds) seconds."
+    }
+    func settingsCuratorSection(_ t: ThemeID) -> String { t == .control ? "CURATOR" : "Skill curator" }
+    func settingsCuratorNote(_ t: ThemeID) -> String { t == .control ? "GET /api/curator · PUT paused · POST run." : "Background skill maintenance for this profile." }
+    func settingsCuratorState(_ t: ThemeID, curator: GatewayCuratorStatus) -> String {
+        if !curator.enabled { return t == .control ? "DISABLED" : "Disabled" }
+        if curator.paused { return t == .control ? "PAUSED" : "Paused" }
+        return t == .control ? "ACTIVE" : "Active"
+    }
+    func settingsCuratorLastRun(_ t: ThemeID, curator: GatewayCuratorStatus) -> String {
+        if let last = curator.lastRunAt, !last.isEmpty {
+            return t == .control ? "LAST RUN \(last)" : "Last run \(last)"
+        }
+        return t == .control ? "NEVER RAN" : "Never ran"
+    }
+    func settingsCuratorPause(_ t: ThemeID) -> String { t == .control ? "PAUSE" : "Pause" }
+    func settingsCuratorResume(_ t: ThemeID) -> String { t == .control ? "RESUME" : "Resume" }
+    func settingsCuratorRun(_ t: ThemeID) -> String { t == .control ? "RUN NOW" : "Run now" }
+    func settingsMemoryStoreSection(_ t: ThemeID) -> String { t == .control ? "MEMORY FILES" : "Memory files" }
+    func settingsMemoryStoreNote(_ t: ThemeID, memory: GatewayMemoryStoreStatus) -> String {
+        let provider = memory.active.isEmpty ? "built-in" : memory.active
+        return t == .control ? "PROVIDER \(provider.uppercased()) · RESET ERASES GATEWAY FILES." : "Active provider: \(provider). Reset deletes MEMORY.md or USER.md on the gateway."
+    }
+    func settingsResetMemoryFile(_ t: ThemeID) -> String { t == .control ? "RESET MEMORY.md" : "Reset MEMORY.md" }
+    func settingsResetUserFile(_ t: ThemeID) -> String { t == .control ? "RESET USER.md" : "Reset USER.md" }
+    func settingsMemoryFileSize(_ t: ThemeID, bytes: Int) -> String {
+        if bytes <= 0 { return t == .control ? "EMPTY" : "Empty" }
+        if bytes >= 1_048_576 { return String(format: "%.1f MB", Double(bytes) / 1_048_576) }
+        if bytes >= 1024 { return String(format: "%.1f KB", Double(bytes) / 1024) }
+        return "\(bytes) B"
+    }
+    func settingsMaintenanceCancel(_ t: ThemeID) -> String { t == .control ? "CANCEL" : "Cancel" }
+    func settingsBackupConfirmTitle(_ t: ThemeID) -> String { t == .control ? "BACKUP THIS GATEWAY?" : "Back up this gateway?" }
+    func settingsBackupConfirmMessage(_ t: ThemeID) -> String { t == .control ? "WRITES A ZIP ON THE HOST. THE PHONE DOES NOT DOWNLOAD IT." : "This writes a zip on the gateway host. The phone does not download it." }
+    func settingsDebugShareConfirmTitle(_ t: ThemeID) -> String { t == .control ? "UPLOAD REDACTED DEBUG REPORT?" : "Upload a redacted debug report?" }
+    func settingsDebugShareConfirmMessage(_ t: ThemeID) -> String { t == .control ? "PASTES AUTO-DELETE. SECRETS ARE SCRUBBED." : "Creates shareable paste links. Secrets are scrubbed and the pastes auto-delete." }
+    func settingsResetMemoryConfirmTitle(_ t: ThemeID) -> String { t == .control ? "DELETE MEMORY FILE?" : "Delete this memory file?" }
+    func settingsResetMemoryConfirmMessage(_ t: ThemeID, target: String) -> String {
+        t == .control ? "ERASES \(target.uppercased()).MD ON THE GATEWAY." : "This permanently deletes \(target.uppercased()).md on the selected gateway."
+    }
+    func settingsResetMemoryConfirm(_ t: ThemeID) -> String { t == .control ? "DELETE" : "Delete" }
+    func settingsDebugShareDone(_ t: ThemeID, share: GatewayDebugShare) -> String {
+        if share.urls.isEmpty { return t == .control ? "DEBUG SHARE RETURNED NO LINKS" : "Debug share returned no links." }
+        return t == .control ? "DEBUG SHARE READY" : "Debug share ready."
+    }
+    func settingsResetMemoryDone(_ t: ThemeID, result: GatewayMemoryResetResult) -> String {
+        let names = result.deleted.isEmpty ? "nothing" : result.deleted.joined(separator: ", ")
+        return t == .control ? "DELETED \(names.uppercased())" : "Deleted \(names)."
+    }
 }
+

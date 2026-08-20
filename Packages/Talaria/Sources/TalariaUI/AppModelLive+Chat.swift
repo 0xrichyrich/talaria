@@ -351,7 +351,7 @@ extension AppModel {
             // text behind it rather than interrupting what is running.
             let redirected = (try? await client.redirectTurn(sessionID: sessionID, text: text)) ?? ""
             if redirected == "redirected" || redirected == "queued" { return }
-            try? await client.submitPrompt(sessionID: sessionID, text: text, queued: true)
+            _ = try? await client.submitPrompt(sessionID: sessionID, text: text, queued: true)
         }
     }
 
@@ -487,6 +487,74 @@ extension AppModel {
     private func clearWatchdog(_ botID: String) {
         ChatRuntime.shared.submitWatchdogs[botID]?.cancel()
         ChatRuntime.shared.submitWatchdogs[botID] = nil
+    }
+
+
+    // MARK: - Transcript acting (edit / rewind / regenerate)
+
+    /// Desktop's restore checkpoint: drop this user turn and everything after
+    /// it, then run the same text again.
+    public func rewind(to message: ChatMessage, in botID: String) {
+        applyTranscriptPlan(TranscriptActing.planRestore(chat(for: botID).messages, from: message.id),
+                            botID: botID)
+    }
+
+    /// Desktop's regenerate: resubmit the nearest previous user prompt.
+    public func regenerate(from message: ChatMessage, in botID: String) {
+        applyTranscriptPlan(TranscriptActing.planReload(chat(for: botID).messages, from: message.id),
+                            botID: botID)
+    }
+
+    /// Desktop's edit: drop the original user turn and resubmit the new text.
+    public func editMessage(_ message: ChatMessage, in botID: String, to text: String) {
+        applyTranscriptPlan(TranscriptActing.planEdit(chat(for: botID).messages, from: message.id, text: text),
+                            botID: botID)
+    }
+
+    public func canActOnTranscript(_ message: ChatMessage, in botID: String) -> Bool {
+        guard mode == .live else { return false }
+        guard chat(for: botID).sessionID != nil else { return false }
+        if message.author == .user {
+            return TranscriptActing.planRestore(chat(for: botID).messages, from: message.id) != nil
+        }
+        if message.author == .bot, !message.isStreaming {
+            return TranscriptActing.planReload(chat(for: botID).messages, from: message.id) != nil
+        }
+        return false
+    }
+
+    private func applyTranscriptPlan(_ plan: TranscriptActing.Plan?, botID: String) {
+        guard let plan else { return }
+        let chat = chat(for: botID)
+        let original = chat.messages
+        chat.messages = TranscriptActing.applyOptimistic(original, plan: plan)
+        chat.messages.append(ChatMessage(author: .user, time: AppModel.clock(), text: plan.text))
+        chat.isRunning = true
+        Task { @MainActor in
+            do {
+                let sid = try await ensureSession(botID: botID, hydrate: false)
+                guard let route = gatewayRoute(for: botID) else { throw GatewayRouteError.noRoute }
+                let client = try await routedClient(for: route)
+                if chat.isRunning, plan.truncate.rowID != nil {
+                    try? await client.interruptSession(sid)
+                }
+                let result = try await client.submitPrompt(sessionID: sid, text: plan.text,
+                                                           truncate: plan.truncate)
+                let survivors = TranscriptActing.survivorRowIDs(from: result)
+                if !survivors.isEmpty {
+                    chat.messages = TranscriptActing.rebindSurvivorRowIDs(chat.messages,
+                                                                          survivorRowIDs: survivors)
+                }
+            } catch {
+                chat.messages = original
+                chat.isRunning = false
+                let detail = (error as? GatewayError)?.message ?? error.localizedDescription
+                toast(kind: .failure,
+                      title: theme.copy.toastTranscriptActFailed(theme.themeID),
+                      message: detail,
+                      botID: botID)
+            }
+        }
     }
 
     // MARK: - Stop (session.interrupt)

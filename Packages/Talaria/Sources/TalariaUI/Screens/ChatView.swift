@@ -68,6 +68,8 @@ public struct ChatView: View {
     private let onVoice: () -> Void
 
     @State private var draft = ""
+    @State private var editingMessage: ChatMessage?
+    @State private var pendingRestore: ChatMessage?
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.talariaReducedMotion) private var reducedMotion
     @ScaledMetric(relativeTo: .body) private var softComposerSize = 14.5
@@ -153,6 +155,23 @@ public struct ChatView: View {
             // background bots keep their chips; this is the safety net for a
             // chat opened before that ran.
             model.attachChatEventRouter()
+        }
+        .confirmationDialog(copy.rewindConfirmTitle(theme.id),
+                            isPresented: Binding(
+                                get: { pendingRestore != nil },
+                                set: { if !$0 { pendingRestore = nil } }),
+                            titleVisibility: .visible) {
+            Button(copy.rewindMessage(theme.id), role: .destructive) {
+                if let pendingRestore {
+                    model.rewind(to: pendingRestore, in: botID)
+                }
+                pendingRestore = nil
+            }
+            Button(copy.rewindCancel(theme.id), role: .cancel) {
+                pendingRestore = nil
+            }
+        } message: {
+            Text(copy.rewindConfirmMessage(theme.id))
         }
     }
 
@@ -591,6 +610,27 @@ public struct ChatView: View {
             copyToPasteboard(message.text)
         } label: {
             Label(copy.copyMessage(theme.id), systemImage: "doc.on.doc")
+        }
+        if message.author == .user, model.canActOnTranscript(message, in: botID) {
+            Button {
+                editingMessage = message
+                draft = message.text
+                composerFocused = true
+            } label: {
+                Label(copy.editMessage(theme.id), systemImage: "pencil")
+            }
+            Button(role: .destructive) {
+                pendingRestore = message
+            } label: {
+                Label(copy.rewindMessage(theme.id), systemImage: "arrow.uturn.backward")
+            }
+        }
+        if message.author == .bot, model.canActOnTranscript(message, in: botID) {
+            Button {
+                model.regenerate(from: message, in: botID)
+            } label: {
+                Label(copy.regenerateMessage(theme.id), systemImage: "arrow.clockwise")
+            }
         }
         if model.canReact(to: message, in: botID) {
             Menu {
@@ -1200,6 +1240,11 @@ public struct ChatView: View {
             Task { await model.runSlash(text, botID: botID) }
             return
         }
+        if let editing = editingMessage {
+            editingMessage = nil
+            model.editMessage(editing, in: botID, to: text)
+            return
+        }
         model.sendOrSteer(text: text, to: botID)
     }
 }
@@ -1280,6 +1325,54 @@ extension CopyPack {
         case .soft: "React"
         case .control: "MARK"
         case .ink: "leave a mark"
+        }
+    }
+
+    func editMessage(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Edit"
+        case .control: "REVISE"
+        case .ink: "amend the words"
+        }
+    }
+
+    func rewindMessage(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Rewind from here"
+        case .control: "RESTORE CHECKPOINT"
+        case .ink: "return to this hour"
+        }
+    }
+
+    func regenerateMessage(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Regenerate"
+        case .control: "RERUN"
+        case .ink: "ask again"
+        }
+    }
+
+    func rewindCancel(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Cancel"
+        case .control: "CANCEL"
+        case .ink: "leave it"
+        }
+    }
+
+    func rewindConfirmTitle(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Rewind this chat?"
+        case .control: "RESTORE THIS CHECKPOINT?"
+        case .ink: "unwind the later hours?"
+        }
+    }
+
+    func rewindConfirmMessage(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Everything after this message will be dropped, then the same prompt runs again."
+        case .control: "DROPS THIS TURN AND EVERYTHING AFTER IT, THEN RESUBMITS."
+        case .ink: "What followed this word is struck out, and the word is spoken once more."
         }
     }
 
