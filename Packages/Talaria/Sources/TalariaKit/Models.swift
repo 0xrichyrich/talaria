@@ -526,7 +526,7 @@ public struct GatewayConnection: Identifiable, Codable, Sendable, Equatable {
 // MARK: - Notifications
 
 public enum PushKind: String, Codable, CaseIterable, Sendable {
-    case approval, routine, mention, task, gateway
+    case approval, response, routine, mention, task, gateway
 }
 
 public struct NotificationPref: Identifiable, Codable, Sendable, Equatable {

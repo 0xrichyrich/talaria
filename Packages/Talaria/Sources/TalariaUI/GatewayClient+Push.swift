@@ -36,7 +36,7 @@ enum PushRelayContract {
 }
 
 // Device-registry calls against the gateway-side talaria-push relay plugin
-// (app/relay). Routes are mounted at /api/plugins/talaria-push/ and use the
+// (relay/). Routes are mounted at /api/plugins/talaria-push/ and use the
 // same session auth as every other /api/* route — the plugin deliberately
 // adds no second secret.
 

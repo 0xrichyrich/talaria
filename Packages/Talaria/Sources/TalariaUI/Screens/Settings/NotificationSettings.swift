@@ -16,7 +16,7 @@ import TalariaTheme
 //
 //   PER BOT — yes. `profile_filter` on the device registration is an allow-list
 //   of hermes profiles; the fan-out consults it in `DeviceStore.for_bot`
-//   (app/relay/talaria-push/talaria_push_relay/devices.py:160), and an empty
+//   (relay/talaria-push/talaria_push_relay/devices.py:160), and an empty
 //   list means every bot. Registration is an idempotent upsert, so re-POSTing
 //   is how the filter is changed. That is a real, device-scoped preference and
 //   it gets real switches.
@@ -25,12 +25,14 @@ import TalariaTheme
 //   gateway process's environment (config.py:134-154) and applies to every
 //   device at once; nothing in the payload or the registry carries a per-device
 //   kind filter. Sending one would be silently dropped by the Pydantic model.
-//   The five kinds are therefore rendered as read-only state with the reason
+//   The six kinds are therefore rendered as read-only state with the reason
 //   each one is on or off — plus the honest caveat from the relay's own gap
-//   table (app/relay/README.md) about what actually fires today:
+//   table (relay/README.md) about what actually fires today:
 //
 //     approval   hook mode fires at the instant the agent blocks, but carries
 //                no request_id, so the app resolves it via `approval.pending`.
+//     response   fires when an agent reply is ready; it opens the exact
+//                source-qualified stored session and has no action authority.
 //     long_task  exact in hook mode; approximated from poll transitions in
 //                sidecar mode.
 //     mention    hook mode only — messaging-gateway traffic never crosses
@@ -170,15 +172,16 @@ public struct NotificationSettingsSection: View {
         }
     }
 
-    /// The relay's wire kinds (`ALL_EVENT_KINDS`,
+    /// The relay's six wire kinds (`ALL_EVENT_KINDS`,
     /// talaria_push_relay/config.py:19), ordered by phone-side urgency rather
     /// than declaration order. These are the strings `enabled_events` speaks —
     /// note `long_task`, which the app models as `PushKind.task`.
-    private static let kinds = ["approval", "mention", "routine", "long_task", "gateway"]
+    private static let kinds = ["approval", "response", "mention", "routine", "long_task", "gateway"]
 
     private func kindTitle(_ wire: String) -> String {
         switch wire {
         case "approval": copy.settingsKindApproval(theme.id)
+        case "response": copy.settingsKindResponse(theme.id)
         case "mention": copy.settingsKindMention(theme.id)
         case "routine": copy.settingsKindRoutine(theme.id)
         case "long_task": copy.settingsKindLongTask(theme.id)
@@ -193,6 +196,7 @@ public struct NotificationSettingsSection: View {
     private func kindCaveat(_ wire: String) -> String {
         switch wire {
         case "approval": return copy.settingsKindApprovalSub(theme.id)
+        case "response": return copy.settingsKindResponseSub(theme.id)
         case "mention": return copy.settingsKindMentionSub(theme.id)
         case "routine": return copy.settingsKindRoutineSub(theme.id)
         case "long_task":
@@ -484,6 +488,22 @@ public extension CopyPack {
         }
     }
 
+    func settingsKindResponse(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "An agent reply is ready"
+        case .control: "AGENT REPLY READY"
+        case .ink: "an agent has answered"
+        }
+    }
+
+    func settingsKindResponseSub(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Opens the exact source-qualified bot and stored session. Informational only — it cannot approve work."
+        case .control: "RESPONSE EVENT — SOURCE + STORED SESSION ROUTE. NO APPROVAL AUTHORITY."
+        case .ink: "Carries you to the very bot and stored session that holds the answer; it grants no seal."
+        }
+    }
+
     func settingsKindMention(_ t: ThemeID) -> String {
         switch t {
         case .soft: "A bot mentions you"
@@ -576,7 +596,7 @@ public extension CopyPack {
     func settingsRelayDisabled(_ t: ThemeID) -> String {
         switch t {
         case .soft: "Push is switched off on the gateway, so none of these will arrive."
-        case .control: "TALARIA_PUSH_DISABLED IS SET — FAN-OUT SUPPRESSED."
+        case .control: "TALARIA_PUSH_DISABLE IS SET — FAN-OUT SUPPRESSED."
         case .ink: "The gateway has been told to hold its tongue."
         }
     }

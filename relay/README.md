@@ -6,7 +6,7 @@ optional standalone sidecar watcher, and is written to be upstreamable into
 hermes-agent — MIT licensed, no Talaria-app dependencies, pure Python.
 
 ```
-app/relay/
+relay/
 ├── pyproject.toml            pip package "talaria-push-relay" (sidecar installs)
 ├── .env.example              every knob, systemd EnvironmentFile-friendly
 ├── LICENSE                   MIT
@@ -17,7 +17,7 @@ app/relay/
     ├── dashboard/
     │   ├── manifest.json     hidden tab + api: plugin_api.py
     │   ├── plugin_api.py     REST routes → /api/plugins/talaria-push/*
-    │   └── dist/index.js     no-op (REST-only plugin)
+    │   └── dist/index.js     inert classic script (REST-only plugin)
     └── talaria_push_relay/   importable package (shared by all three load paths)
         ├── config.py         TALARIA_* env parsing
         ├── devices.py        devices.json registry (0600, flock, atomic writes)
@@ -33,11 +33,23 @@ app/relay/
 |---|---|---|
 | Runs | inside every hermes process that loads plugins (`hermes serve`, `hermes gateway`, CLI, cron) | separate process; connects to `ws://host:9119/api/ws` + REST like the served SPA (auth-flows.md §2) |
 | Sees | plugin lifecycle hooks (`VALID_HOOKS`) | `session.active_list` / `approval.pending` RPC polling, global WS broadcasts, `/api/cron/jobs`, `/api/health` |
-| Best at | approvals at the instant they block, @mentions, per-turn timing | approval **request ids**, routine **names**, gateway offline/recovered |
+| Best at | approvals at the instant they block, final responses, @mentions, per-turn timing | approval **request ids**, routine **names**, gateway offline/recovered |
 
 Run either alone, or both together with `TALARIA_PUSH_EVENTS` split so no
 event kind is enabled in both processes (otherwise the phone buzzes twice).
 `.env.example` shows the recommended split.
+
+`TALARIA_PUSH_EVENTS` is a **process-wide allow-list**. If it is omitted (or
+left commented in `.env.example`), all six kinds are enabled in that process:
+`approval`, `long_task`, `response`, `mention`, `routine`, and `gateway`. The
+setting is checked before an event enters the APNs queue; it is not a per-device
+or per-profile preference. A normal hook-mode turn emits `response`; when
+`response` is enabled, the legacy duration-only `long_task` notification is
+suppressed so one turn cannot buzz twice. A sidecar has no `post_llm_call`
+producer, so a sidecar-only deployment must explicitly omit `response` if it
+needs the polling-based `long_task` event. Use `TALARIA_PUSH_DISABLE=1` as the
+process kill switch. In a hook+sidecar deployment, configure each process
+explicitly so a kind is owned by exactly one producer.
 
 ## What fires today vs. needs upstream hooks (honest table)
 
@@ -47,7 +59,8 @@ Sources verified against the upstream checkout (paths relative to
 | Event (HANDOFF spec) | Hook mode today | Sidecar mode today | Gap / upstream ask |
 |---|---|---|---|
 | **Approval request** | ✅ `pre_approval_request` hook (`tools/approval.py`) fires in the process running the blocked agent, before the notify callback. **But the hook kwargs carry no `request_id`** — pushes send `approval_request_id: ""`; the iOS client fetches the concrete id via the `approval.pending` RPC, or answers FIFO (`approval.respond` without `request_id` resolves the oldest, ws-protocol.md §8). | ✅ Polls `approval.pending` per active session (~2 s) — full fidelity incl. `request_id`, at polling latency. | Upstream ask: add `request_id` to the `pre_approval_request` kwargs (one-line change at the fire sites; `approval_data` already holds it). Then hook mode is exact and the sidecar's approval poller can be retired. |
-| **Long task done (>10 min)** | ✅ `pre_llm_call` (turn start) + `on_session_end` (turn end, `completed/failed/interrupted`) — exact per-turn duration. | ⚠️ Approximated from idle↔streaming transitions in `session.active_list` (resolution = 2 s poll; can't tell success from in-turn error). | None needed for hook mode. There is no per-turn `message.complete` hook; the `pre_llm_call`→`on_session_end` bracket is equivalent for wall-clock duration. |
+| **Final response** | ✅ `post_llm_call` fires once when a non-interrupted turn has any non-empty final response (including fallback/error summaries); emits a source-qualified `response` push. Cron turns are excluded so they remain `routine` notifications. | ❌ A fresh sidecar WS connection does not receive session-bound `message.complete` / response events. | The hook payload is the pinned Hermes contract (`session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform`). |
+| **Long task done (>10 min)** | ✅ `pre_llm_call` + `on_session_end` remain the fallback when `response` is disabled. With the default response event enabled, the duration-only push is suppressed. | ⚠️ Approximated from idle↔streaming transitions in `session.active_list`; set `TALARIA_PUSH_EVENTS` without `response` if this is the sidecar's completion signal (resolution = 2 s poll; can't tell success from in-turn error). | The response event supersedes the legacy duration-only notification for normal hook turns. |
 | **Routine (cron) finished** | ✅ `on_session_end` with `platform == "cron"` (cron jobs run their agent with `platform="cron"`, `cron/scheduler.py`). **The hook cannot see the job name** — push says "routine finished" generically. | ✅ Diffs `GET /api/cron/jobs?profile=all` on `cron.changed` broadcasts (+5 min backstop) — has the job name, parses the Talaria `[bot:<name>] <routine>` namespace. | Upstream ask: a `cron_job_completed` hook (mirroring the existing `kanban_task_*` observer family) carrying `job_id`, `job_name`, `status`. |
 | **@mention in A2A / gateway messages** | ✅ `pre_gateway_dispatch` observer sees every user-originated inbound `MessageEvent` in the messaging gateway — all platforms including `a2a` — and scans for `@<handle>` (`TALARIA_PUSH_MENTION_HANDLES`, default = profile name). Always returns `None` (never alters dispatch). | ❌ Messaging-gateway inbound traffic never crosses the `/api/ws` surface. | None — hook mode covers it. Caveat: fires per *gateway process*, so mentions of bot B are seen by B's gateway; install/enable the plugin for each bot profile that should push. |
 | **Gateway offline / recovered** | ❌ Structurally impossible — a dead process can't self-report, and there is no shipped shutdown hook that survives SIGKILL/power loss. | ✅ `/api/health` heartbeat; N consecutive failures ⇒ "offline", first success after ⇒ "recovered". **Only meaningful if the sidecar outlives the gateway** — run it under systemd/launchd, ideally on a different machine over Tailscale. A sidecar on the same host that dies with the host detects nothing; that residual gap needs an off-host watchdog and is out of scope here. | Inherent; no hook can fix this. |
@@ -58,13 +71,48 @@ vars present in each hermes process. `hermes serve` (WS/iOS sessions),
 enable covers them — but a bare `hermes chat` in an env without
 `TALARIA_APNS_*` simply won't push (it logs one warning and stays silent).
 
+### Hook details and the expected log line
+
+The pinned Hermes revision (`b5455fdd`) does expose a real
+`post_llm_call` observer. It fires **once per turn when the tool loop has
+produced any non-empty final response and the turn is not interrupted**. The
+response may be a normal answer or a fallback/error summary; success is not a
+precondition. An interrupted turn does not fire it. An iteration-limit turn
+does fire it when Hermes has produced a non-empty fallback response.
+Its response payload includes `session_id`, `task_id`, `turn_id`,
+`user_message`, `assistant_response`, `conversation_history`, `model`, and
+`platform`. Its return value is ignored. This is the per-turn response hook;
+it is not the session-bound WebSocket `message.complete` event.
+
+The current `talaria-push` 0.1 plugin registers `post_llm_call` and emits a
+source-qualified `response` push from it. Cron turns are filtered out of this
+path and continue to emit `routine`; `post_approval_response` only clears
+approval dedupe state. This distinction matters when reading logs:
+`events.py` registers six hooks and should emit one line like this **per
+Hermes process that loads the plugin** after restart:
+
+```text
+talaria-push: registered 6 hooks (bot=ops-bot, events=approval,response,mention,routine)
+```
+
+The exact bot and enabled-event list vary. Six is the registration count, not
+the number of callbacks expected for one turn. With `TALARIA_PUSH_DISABLE=1`,
+the plugin deliberately registers zero hooks and logs that it is disabled.
+
+Environment is inherited by child processes, not shared magically between
+already-running services. Export the variables before launching each process,
+or put the same `EnvironmentFile` on every systemd/launchd unit that runs
+`hermes serve`, `hermes gateway`, or cron. A sidecar is another process and has
+its own copy of `TALARIA_PUSH_EVENTS` and `TALARIA_APNS_*`; changing a shell
+file does not change a daemon until it is restarted.
+
 ## Install (plugin / hook mode)
 
 1. Copy the plugin dir into the hermes root (not a profile dir — user
    plugins load from `~/.hermes/plugins/` for every profile):
 
    ```sh
-   cp -R app/relay/talaria-push ~/.hermes/plugins/talaria-push
+   cp -R relay/talaria-push ~/.hermes/plugins/talaria-push
    ```
 
    (Real copy, not a symlink — the web server resolves plugin paths and
@@ -86,7 +134,7 @@ enable covers them — but a bare `hermes chat` in an env without
 
 4. Configure APNs env vars (see `.env.example`) in the environment of the
    hermes processes — for a systemd-managed `hermes serve`:
-   `EnvironmentFile=~/.hermes/talaria-push/relay.env`.
+   `EnvironmentFile=%h/.hermes/talaria-push/relay.env`.
 
 5. Restart `hermes serve` / `hermes gateway`. Verify:
 
@@ -104,8 +152,8 @@ name.
 ## Install (sidecar mode)
 
 ```sh
-pip install ./app/relay          # installs talaria-push-relay + talaria-push-sidecar
-cp app/relay/.env.example ~/.hermes/talaria-push/relay.env  # then edit
+pip install ./relay              # installs talaria-push-relay + talaria-push-sidecar
+cp relay/.env.example ~/.hermes/talaria-push/relay.env  # then edit
 set -a; . ~/.hermes/talaria-push/relay.env; set +a
 talaria-push-sidecar --base-url http://127.0.0.1:9119
 ```
@@ -116,6 +164,24 @@ gateways only: it authenticates like the served SPA (`?token=` on the WS,
 when `TALARIA_GATEWAY_TOKEN` is unset. Gated (OAuth, non-loopback)
 deployments need the sidecar co-located on the gateway host pointing at
 `http://127.0.0.1:9119`.
+
+The sidecar is deliberately a **best-effort complement**, not a second gateway
+runtime. A fresh `/api/ws` connection receives global broadcasts, not the
+session-bound `message.complete` stream; approvals and long tasks are therefore
+read by polling `session.active_list` and `approval.pending`. Polling can be
+late, cannot distinguish every in-turn error from a vanished session, and never
+sees messaging-gateway inbound traffic, so `mention` remains hook-only. Routine
+names come from the cron REST backstop, not from a completion hook.
+
+The current sidecar also uses one `TALARIA_PUSH_BOT_NAME` (default `hermes`)
+for approval and long-task events while it watches the gateway. It is not a
+profile-aware replacement for one hook-loaded process per bot. For a gateway
+with several profiles, use hook mode in each profile process, or run separate
+sidecars with carefully split scopes and event kinds; otherwise attribution,
+`profile_filter`, or duplicate suppression can be misleading. Finally,
+offline/recovered alerts are only meaningful when the sidecar outlives the
+gateway. A sidecar on the same host cannot report a host power loss; use an
+off-host supervisor for that guarantee.
 
 ## Device registration API
 
@@ -141,9 +207,29 @@ POST   /api/plugins/talaria-push/test               {"device_token"?: "...", "ki
 (`prod`, TestFlight/App Store) per device. `gateway_id` is the phone's stable
 source identity for this gateway; the relay echoes it into every payload so
 colliding profile/session/approval ids cannot route to another saved machine.
-`profile_filter` limits which bots may push to that device (empty = all).
-Registrations are idempotent upserts — the iOS app re-POSTs its token on every
-launch.
+`profile_filter` limits which **bots/profiles** may push to that device (empty
+= all); it is not an event-kind filter. Registrations are idempotent upserts —
+the iOS app re-POSTs its token on every launch.
+
+The build and registration environments must agree:
+
+| Talaria build | Signed entitlement | Device registration | APNs host |
+|---|---|---|---|
+| Xcode Debug / development install | `aps-environment=development` | `environment: "dev"` | `api.sandbox.push.apple.com` |
+| TestFlight / App Store Release | `aps-environment=production` | `environment: "prod"` | `api.push.apple.com` |
+
+`TALARIA_APNS_ENV` is only the relay fallback for a registration that omitted
+its environment; the per-device value wins when present. A sandbox token is
+not valid on the production host (and vice versa), so register a fresh token
+when moving between Debug and TestFlight.
+
+There is one intentional test-route exception: `POST /test` sends the
+synthetic `talaria-test` event directly to every selected registered device.
+It does **not** apply `profile_filter` or `TALARIA_PUSH_EVENTS`; this makes the
+button useful for proving APNs credentials, token, and presentation. A real
+hook/sidecar event goes through the dispatcher and `DeviceStore.for_bot`, so
+its `profile_filter` is enforced. A successful test push therefore does not
+prove that a real profile is allowed to push.
 
 The test route defaults to the non-actionable `mention` shape because its
 synthetic bot/session are not authoritative Hermes identities. Passing
@@ -163,11 +249,13 @@ auto-prunes the record.
     "alert": {"title": "ops-bot needs approval", "body": "rm -rf build …"},
     "sound": "default",
     "thread-id": "ops-bot",
-    "category": "TALARIA_APPROVAL",        // TALARIA_TASK | TALARIA_MENTION |
-                                           // TALARIA_ROUTINE | TALARIA_GATEWAY
+    "category": "TALARIA_APPROVAL",        // TALARIA_RESPONSE | TALARIA_TASK |
+                                           // TALARIA_MENTION | TALARIA_ROUTINE |
+                                           // TALARIA_GATEWAY
     "interruption-level": "time-sensitive" // approval + gateway; others "active"
   },
-  "kind": "approval",                      // approval|long_task|mention|routine|gateway
+  "kind": "approval",                      // approval|long_task|response|mention|
+                                           // routine|gateway
   "gateway_id": "2F80…",                  // source-qualified app connection id
   "bot": "ops-bot",
   "session_id": "ab12cd34",
@@ -194,6 +282,50 @@ Sandbox and production hosts get separate pooled connections. Transient
 `429/5xx` get one bounded retry; everything else is logged and dropped —
 pushes are best-effort by design, approvals remain safe because the
 upstream approval flow times out and denies on its own (ws-protocol.md §8).
+
+## Live gateway/device certification
+
+Static inspection, a green build, and the `/test` endpoint are not production
+certification. Use a disposable Hermes profile and a real iPhone, and record
+the gateway revision, Talaria build, relay environment, device-registration
+record (with the token redacted), and the relevant gateway/relay log excerpts.
+The complete app procedure is in [TESTING.md](../TESTING.md#5-live-gateway-and-push-certification); the relay-specific order is:
+
+1. Check out the exact pinned Hermes revision and install/enable the copied
+   `talaria-push` plugin. Put the same APNs environment and credentials in
+   every process that can run the test (`hermes serve`, messaging gateway,
+   and cron), then restart them. Expect the `registered 6 hooks` line once per
+   process; a missing line means that process cannot produce hook pushes.
+2. Build and install a Debug Talaria app with the development entitlement.
+   Register its token as `environment: "dev"`, confirm `gateway_id` and the
+   intended `profile_filter` in `GET /devices`, and use `POST /test` only to
+   establish the APNs/token/presentation baseline. For TestFlight, repeat with
+   a fresh production token, the Release entitlement, `environment: "prod"`,
+   and `TALARIA_APNS_ENV=prod` as the fallback.
+3. With `TALARIA_PUSH_EVENTS` temporarily set to one kind per producer, drive
+   each real path: a gateway approval (including an actual Approve/Later
+   response), a final-response-ready turn (including a fallback/error summary),
+   an inbound @mention, and a cron routine. Confirm the source-qualified
+   deep link, body truncation, and that an interrupted turn emits no response
+   push while a non-interrupted fallback/error summary does. To test legacy
+   long-task polling instead, exclude `response` and lower
+   `TALARIA_PUSH_LONG_TASK_MIN_S` in the disposable unit; restore both values
+   afterwards.
+4. Register a second device/profile combination with a non-empty
+   `profile_filter`. Trigger an allowed and a disallowed bot and verify only
+   the allowed event arrives. Repeat the `/test` call and note that it is
+   intentionally delivered even when the synthetic `talaria-test` bot is not
+   in the filter; this is why `/test` cannot close the real-event check.
+5. If sidecar mode is in scope, run it under a supervisor separate from the
+   gateway, exercise approval/long-task polling and routine discovery, then
+   stop the gateway for three health intervals and bring it back. Record the
+   offline/recovered alerts and the known polling/profile limitations. Do not
+   mark mention fidelity or per-profile sidecar attribution as certified.
+
+Do not promote a push/parity row from partial to complete until a real device
+has observed the corresponding event over the intended APNs environment and
+the failure cases above have been recorded. A successful `/test` proves only
+that one synthetic APNs delivery path worked.
 
 ## Security notes
 

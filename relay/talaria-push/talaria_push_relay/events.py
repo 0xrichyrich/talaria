@@ -26,9 +26,16 @@ post_approval_response  clears the approval dedupe entry so a re-prompt
                         after deny/timeout can buzz again.
 pre_llm_call            records the turn start time per (session_id,
                         turn_id) — the "long task" stopwatch.
+post_llm_call           fires once when Hermes has a final assistant response
+                        ready (the pinned hook is non-interrupted and carries
+                        no completed/failed flags). Used for ``response``
+                        pushes; kwargs follow b545's shape: session_id,
+                        task_id, turn_id, user_message, assistant_response,
+                        conversation_history, model, platform.
 on_session_end          fires at the end of every turn with completed /
                         failed / interrupted / platform. Used for:
-                        * ``long_task`` pushes (elapsed >= threshold),
+                        * ``long_task`` pushes (elapsed >= threshold) when
+                          ``response`` pushes are disabled,
                         * ``routine`` pushes (platform == "cron" — hermes
                           cron jobs run their agent with platform="cron").
 pre_gateway_dispatch    ``mention`` pushes: observes every user-originated
@@ -66,6 +73,27 @@ _TURN_MAP_MAX = 512
 # human is already at the terminal; "smart" means an auxiliary LLM decides
 # without a human prompt (unless it escalates, which re-fires as "gateway").
 _DEFAULT_APPROVAL_SURFACES = {"gateway"}
+
+
+def _safe_text(value: Any) -> str:
+    """Coerce hook values without allowing malformed objects to escape."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value)
+    except Exception:
+        return ""
+
+
+def _strict_text(value: Any) -> Optional[str]:
+    """Read a pinned string field without inventing an identity."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return None
+    return value.strip()
 
 
 def _approval_surfaces() -> set:
@@ -139,8 +167,54 @@ def on_post_approval_response(**kwargs: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# long task / routine
+# final responses / long task / routine
 # ---------------------------------------------------------------------------
+
+
+@_never_raise
+def on_post_llm_call(**kwargs: Any) -> None:
+    """Push a final assistant response when Hermes makes it ready.
+
+    Hermes invokes this observer after the tool loop has produced a final
+    response and has not been interrupted. Keep explicit event filtering here
+    as well as in the dispatcher so alternate hosts with a lightweight
+    dispatcher preserve the same allow-list semantics.
+    """
+    settings = relay_settings()
+    if not settings.event_enabled("response"):
+        return None
+
+    response = kwargs.get("assistant_response")
+    # The pinned hook contract carries a string. Do not stringify arbitrary
+    # malformed objects into a notification, and do not emit an empty alert.
+    if not isinstance(response, str) or not response.strip():
+        return None
+
+    platform = _strict_text(kwargs.get("platform"))
+    if platform is None:
+        return None
+    platform = platform.lower()
+    if platform == "cron":
+        # Cron turns are routine notifications, not chat responses.
+        return None
+
+    bot = _strict_text(current_bot())
+    session_id = _strict_text(kwargs.get("session_id"))
+    turn_id = _strict_text(kwargs.get("turn_id"))
+    task_id = _strict_text(kwargs.get("task_id"))
+    if not bot or not session_id or turn_id is None or task_id is None:
+        # A response without its profile/session cannot be source-qualified
+        # on the receiving device, so fail closed.
+        return None
+
+    push_mod.get_dispatcher().notify(push_mod.response_event(
+        bot=bot,
+        session_id=session_id,
+        turn_id=turn_id,
+        task_id=task_id,
+        assistant_response=response,
+    ))
+    return None
 
 
 @_never_raise
@@ -163,9 +237,9 @@ def on_pre_llm_call(**kwargs: Any) -> None:
 
 @_never_raise
 def on_session_end(**kwargs: Any) -> None:
-    session_id = str(kwargs.get("session_id") or "")
-    turn_id = str(kwargs.get("turn_id") or "")
-    platform = str(kwargs.get("platform") or "")
+    session_id = _safe_text(kwargs.get("session_id"))
+    turn_id = _safe_text(kwargs.get("turn_id"))
+    platform = _safe_text(kwargs.get("platform"))
     completed = bool(kwargs.get("completed"))
     failed = bool(kwargs.get("failed"))
     interrupted = bool(kwargs.get("interrupted"))
@@ -177,26 +251,36 @@ def on_session_end(**kwargs: Any) -> None:
     bot = current_bot()
     dispatcher = push_mod.get_dispatcher()
 
-    if platform == "cron":
+    if platform.strip().lower() == "cron":
         # Hermes cron jobs (Talaria "routines") run their agent with
         # platform="cron" (cron/scheduler.py). The hook surface does not
         # carry the job name — see the README gap table; the sidecar's
         # cron watcher does have it.
-        dispatcher.notify(push_mod.routine_event(
-            bot=bot,
-            session_id=session_id,
-            ok=completed and not failed,
-            detail=(
-                "" if completed and not failed
-                else f"exit: {kwargs.get('turn_exit_reason') or 'failed'}"
-            ),
-        ))
+        if relay_settings().event_enabled("routine"):
+            dispatcher.notify(push_mod.routine_event(
+                bot=bot,
+                session_id=session_id,
+                ok=completed and not failed,
+                detail=(
+                    "" if completed and not failed
+                    else f"exit: {_safe_text(kwargs.get('turn_exit_reason')) or 'failed'}"
+                ),
+            ))
         return None
 
     if interrupted:
         return None  # the user stopped it themselves; no point buzzing them
-    threshold = relay_settings().long_task_min_s
-    if started is not None and duration >= threshold > 0:
+    settings = relay_settings()
+    # ``response`` replaces the old duration-only completion buzz for normal
+    # turns. The dispatcher repeats this guard for sidecar-originated events.
+    if settings.event_enabled("response"):
+        return None
+    threshold = settings.long_task_min_s
+    if (
+        settings.event_enabled("long_task")
+        and started is not None
+        and duration >= threshold > 0
+    ):
         dispatcher.notify(push_mod.long_task_event(
             bot=bot,
             session_id=session_id,
@@ -271,6 +355,7 @@ HOOKS = {
     "pre_approval_request": on_pre_approval_request,
     "post_approval_response": on_post_approval_response,
     "pre_llm_call": on_pre_llm_call,
+    "post_llm_call": on_post_llm_call,
     "on_session_end": on_session_end,
     "pre_gateway_dispatch": on_pre_gateway_dispatch,
 }

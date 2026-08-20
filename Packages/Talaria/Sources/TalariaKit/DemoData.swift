@@ -146,13 +146,15 @@ public enum DemoData {
     public static let notificationPrefs: [NotificationPref] = [
         NotificationPref(id: "p1", kind: .approval, name: "Bot needs approval",
                          subtitle: "Time-sensitive — bots block on you", isOn: true, isCritical: true),
-        NotificationPref(id: "p2", kind: .routine, name: "Routine finished",
+        NotificationPref(id: "p2", kind: .response, name: "Agent reply ready",
+                         subtitle: "A completed answer opens its stored session", isOn: true),
+        NotificationPref(id: "p3", kind: .routine, name: "Routine finished",
                          subtitle: "Digest, sweeps, scheduled runs", isOn: true),
-        NotificationPref(id: "p3", kind: .mention, name: "Bot mentioned you",
+        NotificationPref(id: "p4", kind: .mention, name: "Bot mentioned you",
                          subtitle: "@you in any bot’s chat", isOn: true),
-        NotificationPref(id: "p4", kind: .task, name: "Long task done",
+        NotificationPref(id: "p5", kind: .task, name: "Long task done",
                          subtitle: "Anything over 10 minutes", isOn: true),
-        NotificationPref(id: "p5", kind: .gateway, name: "Gateway offline",
+        NotificationPref(id: "p6", kind: .gateway, name: "Gateway offline",
                          subtitle: "A connection drops or recovers", isOn: true),
     ]
 

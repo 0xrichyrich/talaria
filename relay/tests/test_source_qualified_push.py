@@ -1,3 +1,5 @@
+import os
+import json
 import sys
 import tempfile
 import unittest
@@ -10,11 +12,14 @@ from talaria_push_relay.devices import DeviceStore, DeviceValidationError
 from talaria_push_relay.apns import APNsResult
 from talaria_push_relay.apns import APNsClient
 from talaria_push_relay import events
+from talaria_push_relay.config import ALL_EVENT_KINDS, RelaySettings, current_bot
 from talaria_push_relay.push import (
     DEFAULT_TEST_KIND,
+    APNS_PAYLOAD_SAFE_BYTES,
     PushDispatcher,
     PushEvent,
     payload_for_device,
+    response_event,
     synthetic_test_event,
 )
 
@@ -52,7 +57,232 @@ class _Dispatcher:
         self.events.append(event)
 
 
+class _ProfileStore:
+    def __init__(self, devices):
+        self.devices = devices
+        self.bots = []
+        self.results = []
+
+    def for_bot(self, bot):
+        self.bots.append(bot)
+        return [
+            device for device in self.devices
+            if not device.get("profile_filter")
+            or bot in device["profile_filter"]
+        ]
+
+    def remove(self, token):
+        pass
+
+    def mark_result(self, token, ok):
+        self.results.append((token, ok))
+
+
 class SourceQualifiedPushTests(unittest.TestCase):
+    def test_response_payload_byte_budget_handles_ascii_cjk_and_emoji(self):
+        for text in (
+            "ascii response " * 1_000,
+            "回答済みです。" * 1_000,
+            "✅🌍✨" * 1_000,
+        ):
+            event = response_event(
+                bot="researcher",
+                session_id="session-42",
+                turn_id="turn-7",
+                task_id="task-3",
+                response=text,
+            )
+            payload = payload_for_device(
+                event, {"gateway_id": "gateway-with-a-long-but-valid-id"}
+            )
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            self.assertLessEqual(len(encoded), APNS_PAYLOAD_SAFE_BYTES)
+            self.assertEqual(payload["body"], payload["aps"]["alert"]["body"])
+            self.assertEqual(payload["gateway_id"], "gateway-with-a-long-but-valid-id")
+            self.assertIn("session_id=session-42", payload["deeplink"])
+            self.assertIn("gateway_id=gateway-with-a-long-but-valid-id", payload["deeplink"])
+
+    def test_current_bot_honors_hermes_context_home_override(self):
+        try:
+            import hermes_constants
+        except ImportError:
+            self.skipTest("pinned Hermes runtime is not installed in this test environment")
+
+        token = hermes_constants.set_hermes_home_override(
+            "/tmp/hermes/profiles/secondary"
+        )
+        try:
+            with patch.dict(os.environ, {"TALARIA_PUSH_BOT_NAME": ""}):
+                self.assertEqual(current_bot(), "secondary")
+            with patch.dict(os.environ, {"TALARIA_PUSH_BOT_NAME": "explicit-bot"}):
+                self.assertEqual(current_bot(), "explicit-bot")
+        finally:
+            hermes_constants.reset_hermes_home_override(token)
+
+    def test_response_kind_is_default_enabled_and_has_payload_contract(self):
+        self.assertIn("response", ALL_EVENT_KINDS)
+        settings = RelaySettings()
+        self.assertTrue(settings.event_enabled("response"))
+
+        with patch("talaria_push_relay.push.time.time", return_value=1_000):
+            event = response_event(
+                bot="researcher",
+                session_id="session-42",
+                turn_id="turn-7",
+                task_id="task-3",
+                response="\x00  \ud800 " + "answer " * 200,
+            )
+        payload = event.apns_payload()
+
+        self.assertEqual(payload["kind"], "response")
+        self.assertEqual(payload["bot"], "researcher")
+        self.assertEqual(payload["session_id"], "session-42")
+        self.assertEqual(payload["task_id"], "task-3")
+        self.assertEqual(payload["turn_id"], "turn-7")
+        self.assertEqual(payload["aps"]["category"], "TALARIA_RESPONSE")
+        self.assertEqual(payload["aps"]["interruption-level"], "active")
+        self.assertEqual(payload["deeplink"], "talaria://bot/researcher?session_id=session-42")
+        self.assertLessEqual(len(payload["body"]), 900)
+        self.assertNotIn("\x00", payload["body"])
+        self.assertIn("\ufffd", payload["body"])
+        self.assertEqual(event.expiration, 4_600)
+
+    def test_response_dedupe_includes_bot_session_turn_task_and_body(self):
+        base = {
+            "bot": "worker",
+            "session_id": "session",
+            "turn_id": "turn",
+            "task_id": "task",
+            "response": "same answer",
+        }
+        events_by_identity = [
+            response_event(**base),
+            response_event(**{**base, "bot": "other-worker"}),
+            response_event(**{**base, "session_id": "other-session"}),
+            response_event(**{**base, "turn_id": "other-turn"}),
+            response_event(**{**base, "task_id": "other-task"}),
+            response_event(**{**base, "response": "other answer"}),
+        ]
+        self.assertEqual(len({event.dedupe_key for event in events_by_identity}), 6)
+
+    def test_response_hook_dispatches_exact_profile_and_session(self):
+        dispatcher = _Dispatcher()
+        settings = RelaySettings(enabled_events=list(ALL_EVENT_KINDS))
+        with patch.object(events, "current_bot", return_value="ops-bot"), \
+             patch.object(events, "relay_settings", return_value=settings), \
+             patch.object(events.push_mod, "get_dispatcher", return_value=dispatcher):
+            events.on_post_llm_call(
+                session_id="durable-session",
+                task_id="task-9",
+                turn_id="turn-4",
+                user_message="What changed?",
+                assistant_response="Done.",
+                conversation_history=[],
+                model="hermes-test",
+                platform="cli",
+            )
+
+        self.assertEqual(len(dispatcher.events), 1)
+        event = dispatcher.events[0]
+        self.assertEqual(event.kind, "response")
+        self.assertEqual(event.bot, "ops-bot")
+        self.assertEqual(event.session_id, "durable-session")
+        self.assertEqual(event.extra, {"task_id": "task-9", "turn_id": "turn-4"})
+
+    def test_response_hook_filters_cron_empty_and_malformed_payloads(self):
+        dispatcher = _Dispatcher()
+        settings = RelaySettings(enabled_events=["response"])
+
+        class _BadString:
+            def __str__(self):
+                raise RuntimeError("bad value")
+
+        with patch.object(events, "current_bot", return_value="ops-bot"), \
+             patch.object(events, "relay_settings", return_value=settings), \
+             patch.object(events.push_mod, "get_dispatcher", return_value=dispatcher):
+            events.on_post_llm_call(
+                session_id="cron-session",
+                assistant_response="scheduled answer",
+                platform="cron",
+            )
+            events.on_post_llm_call(session_id="session", assistant_response="  ")
+            events.on_post_llm_call(session_id="session", assistant_response=None)
+            events.on_post_llm_call(session_id="session", assistant_response={"text": "x"})
+            events.on_post_llm_call(session_id=_BadString(), assistant_response="answer")
+
+        self.assertEqual(dispatcher.events, [])
+
+    def test_response_filter_leaves_long_task_available_when_response_disabled(self):
+        dispatcher = _Dispatcher()
+        settings = RelaySettings(enabled_events=["long_task"], long_task_min_s=1)
+        key = ("session", "turn")
+        with events._turn_lock:
+            events._turn_starts[key] = events.time.monotonic() - 2
+        with patch.object(events, "current_bot", return_value="ops-bot"), \
+             patch.object(events, "relay_settings", return_value=settings), \
+             patch.object(events.push_mod, "get_dispatcher", return_value=dispatcher):
+            events.on_session_end(
+                session_id="session",
+                turn_id="turn",
+                completed=True,
+                failed=False,
+                interrupted=False,
+                platform="cli",
+            )
+
+        self.assertEqual([event.kind for event in dispatcher.events], ["long_task"])
+
+    def test_response_enabled_suppresses_long_task_duplicate(self):
+        dispatcher = _Dispatcher()
+        settings = RelaySettings(enabled_events=list(ALL_EVENT_KINDS), long_task_min_s=1)
+        key = ("session", "turn")
+        with events._turn_lock:
+            events._turn_starts[key] = events.time.monotonic() - 2
+        with patch.object(events, "current_bot", return_value="ops-bot"), \
+             patch.object(events, "relay_settings", return_value=settings), \
+             patch.object(events.push_mod, "get_dispatcher", return_value=dispatcher):
+            events.on_session_end(
+                session_id="session",
+                turn_id="turn",
+                completed=True,
+                failed=False,
+                interrupted=False,
+                platform="cli",
+            )
+
+        self.assertEqual(dispatcher.events, [])
+
+    def test_response_fanout_uses_profile_filter_and_payload_source(self):
+        token_ops = "ab" * 32
+        token_other = "cd" * 32
+        store = _ProfileStore([
+            {"device_token": token_ops, "environment": "dev", "gateway_id": "gw-ops",
+             "profile_filter": ["ops-bot"]},
+            {"device_token": token_other, "environment": "dev", "gateway_id": "gw-other",
+             "profile_filter": ["other-bot"]},
+        ])
+        client = _Client([APNsResult(True, 200, "", "ops-apns-id")])
+        dispatcher = PushDispatcher()
+        dispatcher._client = client
+        event = response_event(
+            bot="ops-bot", session_id="session", turn_id="turn", task_id="task",
+            response="Done.",
+        )
+
+        with patch("talaria_push_relay.push.get_store", return_value=store):
+            dispatcher._fan_out(event)
+
+        self.assertEqual(store.bots, ["ops-bot"])
+        self.assertEqual([call[0] for call in client.calls], [token_ops])
+        self.assertEqual(client.calls[0][1]["gateway_id"], "gw-ops")
+        self.assertEqual(client.calls[0][1]["bot"], "ops-bot")
+        self.assertEqual(client.calls[0][1]["session_id"], "session")
+
     def test_approval_hook_uses_durable_session_key_when_runtime_id_also_exists(self):
         dispatcher = _Dispatcher()
         with patch.object(events, "current_bot", return_value="worker"), \
@@ -126,6 +356,22 @@ class SourceQualifiedPushTests(unittest.TestCase):
         self.assertEqual(b["gateway_id"], "gateway-b")
         self.assertEqual(a["aps"]["mutable-content"], 1)
         self.assertNotEqual(a["gateway_id"], b["gateway_id"])
+
+    def test_response_device_deeplink_carries_source_and_stored_session(self):
+        event = response_event(
+            bot="researcher",
+            session_id="session-42",
+            turn_id="turn-7",
+            task_id="task-3",
+            response="Done.",
+        )
+
+        payload = payload_for_device(event, {"gateway_id": "homelab"})
+
+        self.assertEqual(
+            payload["deeplink"],
+            "talaria://bot/researcher?session_id=session-42&gateway_id=homelab",
+        )
 
     def test_every_event_has_a_bounded_expiration(self):
         with patch("talaria_push_relay.push.time.time", return_value=1_000):

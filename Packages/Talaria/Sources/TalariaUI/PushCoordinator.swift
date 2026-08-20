@@ -5,6 +5,7 @@ import TalariaTheme
 // Push pipeline glue for the app process:
 // - notification authorization + UNUserNotificationCenter delegate,
 // - the TALARIA_APPROVAL actionable category (approve from the lock screen),
+// - the TALARIA_RESPONSE display-only category (agent reply ready),
 // - APNs remote registration with the device token exposed async for the
 //   gateway push-relay handshake,
 // - action + deep-link routing into AppModel,
@@ -25,6 +26,7 @@ public enum PushPayloadKey {
     public static let approvalRequestID = "approval_request_id"
     public static let sessionID = "session_id"
     public static let gatewayID = "gateway_id"
+    public static let deeplink = "deeplink"
 }
 
 /// Resolve an untrusted relay payload into Talaria's collision-safe roster id.
@@ -35,6 +37,10 @@ struct PushRouteResolver {
     static func botID(raw: String?, sourceGatewayID: String?,
                       knownGatewayIDs: Set<String>, activeGatewayID: String?) -> String? {
         guard let raw, !raw.isEmpty, raw != "gateway" else { return nil }
+        // The source is a separate stamped field. A pre-qualified profile is
+        // rejected rather than accepted under a second, possibly conflicting,
+        // source identity.
+        guard GatewayBotRoute(qualifiedID: raw) == nil else { return nil }
         let source: String
         if let sourceGatewayID, knownGatewayIDs.contains(sourceGatewayID) {
             source = sourceGatewayID
@@ -49,6 +55,70 @@ struct PushRouteResolver {
         }
         return source == activeGatewayID
             ? raw : GatewayBotRoute(gatewayID: source, profile: raw).qualifiedID
+    }
+
+    /// The destination a non-gateway push may safely open. The bot id is
+    /// source-qualified whenever it belongs to a saved gateway other than the
+    /// active one; the stored id is retained separately so a reply push can
+    /// reopen the exact durable transcript rather than the canonical chat.
+    static func destination(for payload: PushNotificationPayload,
+                            knownGatewayIDs: Set<String>,
+                            activeGatewayID: String?, demo: Bool = false)
+        -> PushRouteDestination? {
+        let botID = demo
+            ? payload.bot
+            : botID(raw: payload.bot, sourceGatewayID: payload.gatewayID,
+                   knownGatewayIDs: knownGatewayIDs, activeGatewayID: activeGatewayID)
+        guard let botID, !botID.isEmpty, botID != "gateway" else { return nil }
+        if payload.kind == .response,
+           payload.sessionID?.isEmpty != false { return nil }
+        return PushRouteDestination(botID: botID, storedSessionID: payload.sessionID,
+                                    gatewayID: payload.gatewayID)
+    }
+}
+
+/// The decoded, untrusted envelope shared by notification routing and tests.
+/// Display strings are optional because APNs may provide them only in `aps`,
+/// while routing identity is carried by the relay's custom fields.
+struct PushNotificationPayload: Sendable, Equatable {
+    var wireKind: String
+    var kind: PushKind
+    var gatewayID: String?
+    var bot: String?
+    var title: String?
+    var body: String?
+    var approvalRequestID: String?
+    var sessionID: String?
+    var deeplink: URL?
+}
+
+/// Source-qualified destination for a notification tap.
+struct PushRouteDestination: Sendable, Equatable {
+    var botID: String
+    var storedSessionID: String?
+    var gatewayID: String?
+}
+
+enum PushPayloadDecoder {
+    static func decode(_ userInfo: [AnyHashable: Any]) -> PushNotificationPayload? {
+        guard let rawKind = string(userInfo[PushPayloadKey.kind]),
+              let kind = PushNotificationPolicy.kind(for: rawKind) else { return nil }
+        return PushNotificationPayload(
+            wireKind: rawKind,
+            kind: kind,
+            gatewayID: string(userInfo[PushPayloadKey.gatewayID]),
+            bot: string(userInfo[PushPayloadKey.bot]),
+            title: string(userInfo[PushPayloadKey.title]),
+            body: string(userInfo[PushPayloadKey.body]),
+            approvalRequestID: string(userInfo[PushPayloadKey.approvalRequestID]),
+            sessionID: string(userInfo[PushPayloadKey.sessionID]),
+            deeplink: string(userInfo[PushPayloadKey.deeplink]).flatMap(URL.init(string:)))
+    }
+
+    private static func string(_ value: Any?) -> String? {
+        guard let string = value as? String else { return nil }
+        let normalized = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
     }
 }
 
@@ -117,8 +187,8 @@ enum PushApprovalOrchestrator {
             throw GatewayError(code: -21, message: "Approval session is no longer available.")
         }
         guard resumed.profile == identity.profile,
-              resumed.storedSessionID.isEmpty
-                || resumed.storedSessionID == identity.storedSessionID else {
+              !resumed.storedSessionID.isEmpty,
+              resumed.storedSessionID == identity.storedSessionID else {
             throw GatewayError(code: -20, message: "Approval session identity did not match.")
         }
         let first = try await actions.pending(resumed.sessionID)
@@ -150,7 +220,8 @@ public struct PushRegistrationFailure: Sendable, Equatable {
 /// Notification category / action identifiers, shared by PushCoordinator,
 /// the service extension and the relay payloads.
 public enum PushIdentifiers {
-    public static let approvalCategory = "TALARIA_APPROVAL"
+    public static let approvalCategory = PushNotificationPolicy.approvalCategory
+    public static let responseCategory = PushNotificationPolicy.responseCategory
     public static let approveAction = "APPROVE_ACTION"
     public static let laterAction = "LATER_ACTION"
 }
@@ -246,7 +317,8 @@ public final class PushCoordinator: NSObject {
     }
 
     /// Approve/Later become RELEASE/LATER become grant-the-seal/later —
-    /// category titles follow the copy pack.
+    /// category titles follow the copy pack. Response-ready notifications
+    /// intentionally register a separate category with no actions.
     public func registerCategories(copy: CopyPack) {
         // foreground:false — approving must not launch the app, and
         // authenticationRequired keeps a locked phone from releasing work.
@@ -263,7 +335,14 @@ public final class PushCoordinator: NSObject {
             actions: [approve, later],
             intentIdentifiers: [],
             options: [])
-        UNUserNotificationCenter.current().setNotificationCategories([category])
+        let responseCategory = UNNotificationCategory(
+            identifier: PushIdentifiers.responseCategory,
+            actions: [],
+            intentIdentifiers: [],
+            options: [])
+        UNUserNotificationCenter.current().setNotificationCategories([
+            category, responseCategory,
+        ])
     }
 
     private func armCategoryObservation() {
@@ -474,13 +553,23 @@ public final class PushCoordinator: NSObject {
     private func handle(response: UNNotificationResponse) async {
         guard let model else { return }
         let info = response.notification.request.content.userInfo
-        // The relay's wire kind "long_task" is the app's PushKind.task.
-        let kind = (info[PushPayloadKey.kind] as? String)
-            .flatMap { PushKind(rawValue: $0 == "long_task" ? "task" : $0) }
-        let botID = routedBotID(from: info, model: model)
+        guard let payload = PushPayloadDecoder.decode(info) else { return }
+        let destination = PushRouteResolver.destination(
+            for: payload,
+            knownGatewayIDs: Set(ConnectionRegistry.shared.saved.map(\.id)),
+            activeGatewayID: model.activeGatewayID,
+            demo: model.mode == .demo)
+        let kind = payload.kind
+        let botID = destination?.botID
 
         switch response.actionIdentifier {
         case PushIdentifiers.approveAction:
+            // Category registration is not an authority boundary: a crafted
+            // response can carry any action identifier. Only an explicitly
+            // decoded approval push may enter the existing cold approval path.
+            guard PushNotificationPolicy.allowsApprovalAction(for: payload.wireKind) else {
+                return
+            }
             do {
                 try await approveFromPush(info, in: model)
             } catch {
@@ -496,6 +585,15 @@ public final class PushCoordinator: NSObject {
                 model.selectedTab = .home
                 model.openBotID = nil
                 NotificationCenter.default.post(name: .talariaOpenConnections, object: nil)
+            case .response:
+                // Response pushes carry the durable session key. Keep the
+                // source-qualified roster id and reopen that exact session;
+                // unlike a summary/mention push, a missing session must not
+                // silently land in the bot's canonical chat.
+                guard let destination, let sessionID = destination.storedSessionID else {
+                    return
+                }
+                model.openStoredSession(sessionID, botID: destination.botID)
             default:
                 if let botID, botID != "gateway" {
                     // Prefer the exact pushed session; older/summary payloads
@@ -516,11 +614,14 @@ public final class PushCoordinator: NSObject {
     }
 
     private func approveFromPush(_ info: [AnyHashable: Any], in model: AppModel) async throws {
+        guard let payload = PushPayloadDecoder.decode(info), payload.kind == .approval else {
+            throw GatewayError(code: -20, message: "Only approval pushes can answer work.")
+        }
         let identity = PushApprovalIdentity.resolve(
-            gatewayID: info[PushPayloadKey.gatewayID] as? String,
-            profile: info[PushPayloadKey.bot] as? String,
-            storedSessionID: info[PushPayloadKey.sessionID] as? String,
-            requestID: info[PushPayloadKey.approvalRequestID] as? String,
+            gatewayID: payload.gatewayID,
+            profile: payload.bot,
+            storedSessionID: payload.sessionID,
+            requestID: payload.approvalRequestID,
             knownGatewayIDs: Set(ConnectionRegistry.shared.saved.map(\.id)))
         guard let identity else {
             throw GatewayError(code: -20, message: "Approval source is missing or no longer trusted.")
@@ -569,12 +670,12 @@ public final class PushCoordinator: NSObject {
     }
 
     private func routedBotID(from info: [AnyHashable: Any], model: AppModel) -> String? {
-        if model.mode == .demo { return info[PushPayloadKey.bot] as? String }
-        return PushRouteResolver.botID(
-            raw: info[PushPayloadKey.bot] as? String,
-            sourceGatewayID: info[PushPayloadKey.gatewayID] as? String,
+        guard let payload = PushPayloadDecoder.decode(info) else { return nil }
+        return PushRouteResolver.destination(
+            for: payload,
             knownGatewayIDs: Set(ConnectionRegistry.shared.saved.map(\.id)),
-            activeGatewayID: model.activeGatewayID)
+            activeGatewayID: model.activeGatewayID,
+            demo: model.mode == .demo)?.botID
     }
 
     // MARK: - Demo previews
@@ -587,11 +688,14 @@ public final class PushCoordinator: NSObject {
         public var body: String
         public var kind: PushKind
         public var approvalRequestID: String?
+        public var sessionID: String?
 
         public init(botID: String, title: String, body: String,
-                    kind: PushKind, approvalRequestID: String? = nil) {
+                    kind: PushKind, approvalRequestID: String? = nil,
+                    sessionID: String? = nil) {
             self.botID = botID; self.title = title; self.body = body
             self.kind = kind; self.approvalRequestID = approvalRequestID
+            self.sessionID = sessionID
         }
     }
 
@@ -601,6 +705,9 @@ public final class PushCoordinator: NSObject {
         DemoPush(botID: "inbox", title: "inbox needs approval",
                  body: "Reply to Sarah Chen is ready to send.",
                  kind: .approval, approvalRequestID: "ap1"),
+        DemoPush(botID: "inbox", title: "Agent reply ready",
+                 body: "The draft reply to Sarah Chen is ready to review.",
+                 kind: .response, sessionID: "s-8815"),
         DemoPush(botID: "researcher", title: "Morning digest finished",
                  body: "6 papers · 2 flagged must-read.", kind: .routine),
         DemoPush(botID: "comms", title: "comms mentioned you",
@@ -627,11 +734,17 @@ public final class PushCoordinator: NSObject {
             PushPayloadKey.title: push.title,
             PushPayloadKey.body: push.body,
         ]
+        if let category = PushNotificationPolicy.category(for: push.kind.rawValue) {
+            content.categoryIdentifier = category
+            content.interruptionLevel = push.kind == .approval ? .timeSensitive : .active
+        }
         if push.kind == .approval {
-            content.categoryIdentifier = PushIdentifiers.approvalCategory
             if let requestID = push.approvalRequestID {
                 info[PushPayloadKey.approvalRequestID] = requestID
             }
+        }
+        if let sessionID = push.sessionID, !sessionID.isEmpty {
+            info[PushPayloadKey.sessionID] = sessionID
         }
         content.userInfo = info
 

@@ -1501,9 +1501,9 @@ public extension CopyPack {
 
     func activityEmptyBody(_ t: ThemeID) -> String {
         switch t {
-        case .soft: "Approvals, finished runs, routines and gateway blips land here as they happen."
-        case .control: "APPROVALS · RUNS · ROUTINES · LINK EVENTS — LOGGED AS THEY LAND."
-        case .ink: "Every deed — seals, rites, finished turns — shall be written here."
+        case .soft: "Approvals, agent replies, finished runs, routines and gateway blips land here as they happen."
+        case .control: "APPROVALS · AGENT REPLIES · RUNS · ROUTINES · LINK EVENTS — LOGGED AS THEY LAND."
+        case .ink: "Every deed — seals, answers, rites, finished turns — shall be written here."
         }
     }
 
