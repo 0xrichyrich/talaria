@@ -52,6 +52,8 @@ public enum ArtifactBody: Sendable {
     case text(String, language: String, truncated: Bool, bytes: Int)
     /// Bytes we can hand to the share sheet but cannot render inline.
     case binary(Data, mime: String)
+    /// Authenticated stream of audio/video from GET /api/files/stream.
+    case media(URL)
     case unavailable(ArtifactUnavailable)
 
     /// The bytes, when there are any — what export/share needs.
@@ -60,7 +62,7 @@ public enum ArtifactBody: Sendable {
         case .image(let data): return data
         case .binary(let data, _): return data
         case .text(let text, _, _, _): return text.data(using: .utf8)
-        case .unavailable: return nil
+        case .media, .unavailable: return nil
         }
     }
 
@@ -69,7 +71,7 @@ public enum ArtifactBody: Sendable {
         case .image(let data): return data.count
         case .binary(let data, _): return data.count
         case .text(let text, _, _, _): return text.utf8.count
-        case .unavailable: return 0
+        case .media, .unavailable: return 0
         }
     }
 }
@@ -326,6 +328,7 @@ public extension AppModel {
             switch body {
             case .text: name += ".txt"
             case .image: name += ".png"
+            case .media: name += ".mp4"
             case .binary, .unavailable: name += ".bin"
             }
         }
@@ -365,6 +368,10 @@ public extension AppModel {
         let ext = (ArtifactScan.ext(of: value) ?? "").lowercased()
         var last: ArtifactUnavailable = .missing
 
+        if kind == .media, let url = GatewayREST.managedStreamURL(baseURL: base, credential: credential, path: path) {
+            return .media(url)
+        }
+
         if kind == .image {
             do {
                 let dataURL = try await GatewayREST.mediaDataURL(baseURL: base,
@@ -378,7 +385,7 @@ public extension AppModel {
             }
         }
 
-        if kind != .image, Self.textExtensions.contains(ext) {
+        if kind != .image, kind != .media, Self.textExtensions.contains(ext) {
             do {
                 let read = try await GatewayREST.fsText(baseURL: base, credential: credential,
                                                         path: path)
@@ -403,6 +410,12 @@ public extension AppModel {
                     return .unavailable(.tooLarge)
                 }
                 if kind == .image || mime.hasPrefix("image/") { return .image(data) }
+                if kind == .media || mime.hasPrefix("audio/") || mime.hasPrefix("video/") {
+                    if let url = GatewayREST.managedStreamURL(baseURL: base, credential: credential, path: path) {
+                        return .media(url)
+                    }
+                    return .binary(data, mime: mime)
+                }
                 // A file with no known text extension can still be text (a
                 // LICENSE, a Dockerfile); decode before giving up on a preview.
                 if mime.hasPrefix("text/") || mime.contains("json") || mime.contains("xml"),
@@ -678,6 +691,22 @@ public extension GatewayREST {
         return (url,
                 payload["mime_type"]?.stringValue ?? mime(ofDataURL: url),
                 payload["size"]?.intValue ?? 0)
+    }
+
+    /// `GET /api/files/stream?path=` with the same query-token the gateway
+    /// already accepts for media subresources (web_server.py:2665). AVPlayer
+    /// cannot set X-Hermes-Session-Token, so the token rides the URL.
+    static func managedStreamURL(baseURL: URL, credential: GatewayCredential, path: String) -> URL? {
+        var comps = URLComponents(url: baseURL.appending(path: "api/files/stream"), resolvingAgainstBaseURL: false)
+        var items = [URLQueryItem(name: "path", value: path)]
+        switch credential {
+        case .sessionToken(let token):
+            items.append(URLQueryItem(name: "token", value: token))
+        case .oauth(let tokens):
+            items.append(URLQueryItem(name: "token", value: tokens.accessToken))
+        }
+        comps?.queryItems = items
+        return comps?.url
     }
 
     /// "data:image/png;base64,…" → "image/png".

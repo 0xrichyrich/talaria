@@ -1,4 +1,5 @@
 import SwiftUI
+import AVKit
 import TalariaKit
 import TalariaTheme
 
@@ -123,7 +124,7 @@ public struct ArtifactsView: View {
     @ViewBuilder private var filterRow: some View {
         if !model.artifacts.isEmpty {
             HStack(spacing: 7) {
-                ForEach(Array([nil, ArtifactKind.image, .file, .link].enumerated()), id: \.offset) { _, kind in
+                ForEach(Array([nil, ArtifactKind.image, .media, .file, .link].enumerated()), id: \.offset) { _, kind in
                     let count = kind.map { k in model.artifacts.filter { $0.kind == k }.count }
                         ?? model.artifacts.count
                     Button {
@@ -301,6 +302,14 @@ private struct ArtifactCard: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .overlay(Rectangle().strokeBorder(ownerColor, lineWidth: 1.5))
+        case .media:
+            Text(artifact.ext ?? "MEDIA")
+                .font(theme.mono(10, weight: .heavy))
+                .tracking(1)
+                .foregroundStyle(theme.accent)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .overlay(Rectangle().strokeBorder(theme.accent, lineWidth: 1.5))
         case .link:
             Text(artifact.title)
                 .font(theme.mono(10))
@@ -446,7 +455,7 @@ private struct ArtifactDetailSheet: View {
         .task(id: artifact.id) {
             // Links are never fetched — see AppModelLive+Artifacts.swift. An
             // image URL is, because opening the card IS the user asking for it.
-            fetched = await model.loadArtifact(artifact, allowRemote: artifact.kind == .image)
+            fetched = await model.loadArtifact(artifact, allowRemote: artifact.kind == .image || artifact.kind == .media)
         }
     }
 
@@ -476,6 +485,12 @@ private struct ArtifactDetailSheet: View {
             textCard(text, language: language, truncated: truncated, bytes: bytes)
         case .binary(_, let mime):
             noticeCard(copy.artifactBinaryBody(theme.id), tone: theme.sub, detail: mime)
+        case .media(let url):
+            VideoPlayer(player: AVPlayer(url: url))
+                .frame(height: 280)
+                .clipShape(RoundedRectangle(cornerRadius: theme.cardRadius, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: theme.cardRadius, style: .continuous)
+                    .strokeBorder(theme.line, lineWidth: 1))
         case .unavailable(let why):
             noticeCard(copy.artifactUnavailable(theme.id, why),
                        tone: why == .remoteLink ? theme.sub : theme.warn)
@@ -632,7 +647,7 @@ private struct ArtifactDetailSheet: View {
     /// and a failed fetch must not offer an export that cannot happen.
     private var canShare: Bool {
         switch fetched {
-        case .image, .text, .binary: return true
+        case .image, .text, .binary, .media: return true
         case .none, .unavailable: return false
         }
     }

@@ -167,5 +167,12 @@ final class CommandCenterContractTests: XCTestCase {
         XCTAssertEqual(list.projects[1].path, "/tmp/scratch")
         XCTAssertFalse(list.projects[1].isActive)
     }
+    func testArtifactScanClassifiesMedia() {
+        XCTAssertEqual(ArtifactScan.kind(of: "~/out/clip.mp4"), .media)
+        XCTAssertEqual(ArtifactScan.kind(of: "/tmp/voice.m4a"), .media)
+        XCTAssertEqual(ArtifactScan.kind(of: "https://example.com/a.png"), .image)
+        XCTAssertEqual(ArtifactScan.kind(of: "https://example.com/page"), .link)
+        XCTAssertEqual(ArtifactScan.kind(of: "~/out/notes.md"), .file)
+    }
 }
 #endif

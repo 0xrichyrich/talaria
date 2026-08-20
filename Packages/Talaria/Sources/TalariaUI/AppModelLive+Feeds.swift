@@ -1104,6 +1104,7 @@ public extension AppModel {
 
 enum ArtifactScan {
     private static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"]
+    private static let mediaExtensions: Set<String> = ["mp4", "mov", "m4a", "mp3", "wav", "aac", "flac", "ogg", "opus", "webm", "mkv", "avi"]
     private static let fileExtensions: Set<String> = [
         "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "pdf", "txt", "json", "md", "csv",
         "zip", "tar", "gz", "avi", "flac", "m4a", "mkv", "mp3", "ogg", "opus", "wav", "webm",
@@ -1211,7 +1212,10 @@ enum ArtifactScan {
 
     static func kind(of value: String) -> ArtifactKind {
         if value.hasPrefix("data:image/") { return .image }
-        if let ext = ext(of: value)?.lowercased(), imageExtensions.contains(ext) { return .image }
+        if let ext = ext(of: value)?.lowercased() {
+            if imageExtensions.contains(ext) { return .image }
+            if mediaExtensions.contains(ext) { return .media }
+        }
         if value.hasPrefix("http://") || value.hasPrefix("https://") { return .link }
         return .file
     }
@@ -1590,6 +1594,9 @@ public extension CopyPack {
         case (.link, .soft): return "Links"
         case (.link, .control): return "LINKS"
         case (.link, .ink): return "links"
+        case (.media, .soft): return "Media"
+        case (.media, .control): return "MEDIA"
+        case (.media, .ink): return "media"
         }
     }
 
