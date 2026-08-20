@@ -387,8 +387,9 @@ public struct ChatView: View {
             TranscriptWorkingAvatar(model: model, bot: bot, theme: theme,
                                     label: copy.workingLabel(theme.id))
                 .modifier(ChatEntrance())
+                .id(ChatTranscriptLayoutPolicy.workingAnchorID)
         }
-        Color.clear.frame(height: 1).id("chat-bottom")
+        Color.clear.frame(height: 1).id(ChatTranscriptLayoutPolicy.emptyAnchorID)
             .background(
                 GeometryReader { geo in
                     let frame = geo.frame(in: .named("talaria.chat.transcript"))

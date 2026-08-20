@@ -96,15 +96,21 @@ public enum ChatComposerActionPolicy {
 public enum ChatTranscriptLayoutPolicy {
     public static let eagerStackLimit = 64
     public static let layoutPassesMs: [UInt64] = [16, 120, 360]
+    public static let workingAnchorID = "chat-working"
+    public static let emptyAnchorID = "chat-bottom"
 
     public static func usesLazyStack(messageCount: Int) -> Bool {
         messageCount > eagerStackLimit
     }
 
     public static func anchorID(lastMessageID: UUID?, showingWorkingAvatar: Bool) -> String {
-        if showingWorkingAvatar { return "chat-bottom" }
+        // The working row is a real, measured LazyVStack child. Never target
+        // the trailing geometry probe for a live turn: on a long transcript
+        // SwiftUI can satisfy that estimated spacer offset before measuring
+        // the tail rows, leaving the entire viewport blank until a drag.
+        if showingWorkingAvatar { return workingAnchorID }
         if let lastMessageID { return lastMessageID.uuidString }
-        return "chat-bottom"
+        return emptyAnchorID
     }
 
     /// How far from the latest row still counts as "following" the live turn.

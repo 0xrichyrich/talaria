@@ -98,7 +98,7 @@ final class TranscriptComposerPolicyTests: XCTestCase {
         )
         XCTAssertEqual(
             ChatTranscriptLayoutPolicy.anchorID(lastMessageID: last, showingWorkingAvatar: true),
-            "chat-bottom"
+            "chat-working"
         )
         XCTAssertEqual(
             ChatTranscriptLayoutPolicy.anchorID(lastMessageID: nil, showingWorkingAvatar: false),
