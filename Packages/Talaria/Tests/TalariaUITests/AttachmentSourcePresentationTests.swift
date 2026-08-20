@@ -3,8 +3,11 @@ import XCTest
 @testable import TalariaUI
 
 final class AttachmentSourcePresentationTests: XCTestCase {
-    func testChatSourceSheetPresentsAllExplicitAttachmentChoices() {
-        let options = AttachmentSourcePresentation.options(allowsPaste: true)
+    func testSourceSheetPresentsEverySupportedAttachmentChoice() {
+        let options = AttachmentSourcePresentation.options(
+            supportsPhotoLibrary: true,
+            allowsPaste: true
+        )
 
         XCTAssertEqual(AttachmentSourcePresentation.title, "Add to message")
         XCTAssertEqual(options.map(\.action), [.photos, .files, .pasteImage])
@@ -13,10 +16,22 @@ final class AttachmentSourcePresentationTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(AttachmentSourcePresentation.minimumRowHeight, 44)
     }
 
-    func testRoomSourceSheetExcludesClipboardWithoutChangingOtherSources() {
-        let options = AttachmentSourcePresentation.options(allowsPaste: false)
+    func testSourceSheetHidesPhotoLibraryWhenThePresenterCannotOpenIt() {
+        let options = AttachmentSourcePresentation.options(allowsPaste: true)
 
-        XCTAssertEqual(options.map(\.action), [.photos, .files])
+        XCTAssertEqual(options.map(\.action), [.files, .pasteImage])
+        XCTAssertFalse(options.contains { $0.action == .photos })
+        XCTAssertEqual(options.map(\.title), ["Files", "Paste Image"])
+    }
+
+    func testSourceSheetLeavesFilesWhenNoOptionalSourceIsAvailable() {
+        let options = AttachmentSourcePresentation.options(
+            supportsPhotoLibrary: false,
+            allowsPaste: false
+        )
+
+        XCTAssertEqual(options.map(\.action), [.files])
+        XCTAssertFalse(options.contains { $0.action == .photos })
         XCTAssertFalse(options.contains { $0.action == .pasteImage })
         XCTAssertTrue(options.allSatisfy { !$0.title.isEmpty && !$0.detail.isEmpty })
     }

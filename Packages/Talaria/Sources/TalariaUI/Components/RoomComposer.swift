@@ -79,6 +79,7 @@ public struct RoomComposer: View {
         .sheet(isPresented: $showAttachmentSources, onDismiss: performPendingAttachmentSource) {
             AttachmentSourceSheet(
                 theme: theme,
+                supportsPhotoLibrary: Self.supportsPhotoLibrary,
                 allowsPaste: false,
                 select: { action in
                     pendingAttachmentSource = action
@@ -104,6 +105,16 @@ public struct RoomComposer: View {
         #endif
     }
 
+    /// This must match the compile-time gate on the PhotosPicker modifier.
+    /// The source sheet fails closed when PhotosUI is unavailable.
+    private static var supportsPhotoLibrary: Bool {
+        #if canImport(PhotosUI)
+        true
+        #else
+        false
+        #endif
+    }
+
     private func performPendingAttachmentSource() {
         guard let action = pendingAttachmentSource else { return }
         pendingAttachmentSource = nil
@@ -111,6 +122,8 @@ public struct RoomComposer: View {
         case .photos:
             #if canImport(PhotosUI)
             showPhotos = true
+            #else
+            assertionFailure("Photo Library was selected without PhotosUI support")
             #endif
         case .files:
             showFiles = true

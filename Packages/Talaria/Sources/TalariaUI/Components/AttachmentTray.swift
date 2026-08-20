@@ -3,7 +3,7 @@ import TalariaKit
 import TalariaTheme
 import UniformTypeIdentifiers
 
-#if os(iOS)
+#if os(iOS) && canImport(PhotosUI)
 import PhotosUI
 #endif
 
@@ -292,6 +292,7 @@ private struct AttachmentSourceChooser: ViewModifier {
         ) {
             AttachmentSourceSheet(
                 theme: model.theme.pack,
+                supportsPhotoLibrary: Self.supportsPhotoLibrary,
                 allowsPaste: true,
                 select: { action in
                     pendingAction = action
@@ -305,11 +306,25 @@ private struct AttachmentSourceChooser: ViewModifier {
         }
     }
 
+    /// AttachmentPhotoPicker is iOS-only, even where PhotosUI is otherwise
+    /// importable. Keep the chooser capability in lockstep with that picker.
+    private static var supportsPhotoLibrary: Bool {
+        #if os(iOS) && canImport(PhotosUI)
+        true
+        #else
+        false
+        #endif
+    }
+
     private func performPendingAction() {
         guard let action = pendingAction else { return }
         pendingAction = nil
         switch action {
         case .photos:
+            guard Self.supportsPhotoLibrary else {
+                assertionFailure("Photo Library was selected without a picker")
+                return
+            }
             AttachmentRuntime.shared.photoBotID = botID
         case .files:
             AttachmentRuntime.shared.fileBotID = botID
@@ -346,7 +361,7 @@ private struct AttachmentFileImporter: ViewModifier {
     }
 }
 
-#if os(iOS)
+#if os(iOS) && canImport(PhotosUI)
 /// PhotosPicker over the photo library. Items arrive as raw camera-roll bytes
 /// (HEIC on any modern iPhone); `attachImageData` transcodes them.
 private struct AttachmentPhotoPicker: ViewModifier {

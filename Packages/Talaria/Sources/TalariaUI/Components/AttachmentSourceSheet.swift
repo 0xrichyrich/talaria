@@ -26,21 +26,29 @@ public enum AttachmentSourcePresentation {
     public static let title = "Add to message"
     public static let minimumRowHeight: CGFloat = 56
 
-    public static func options(allowsPaste: Bool) -> [AttachmentSourceOption] {
-        var result = [
-            AttachmentSourceOption(
+    /// Only advertise sources the presenter can actually open. Keeping this
+    /// explicit avoids a dead Photo Library row on targets without PhotosUI.
+    public static func options(
+        supportsPhotoLibrary: Bool = false,
+        allowsPaste: Bool
+    ) -> [AttachmentSourceOption] {
+        var result: [AttachmentSourceOption] = []
+        if supportsPhotoLibrary {
+            result.append(AttachmentSourceOption(
                 action: .photos,
                 title: "Photo Library",
                 detail: "Choose up to 6 photos",
                 systemImage: "photo.on.rectangle.angled"
-            ),
+            ))
+        }
+        result.append(
             AttachmentSourceOption(
                 action: .files,
                 title: "Files",
                 detail: "Browse files and documents",
                 systemImage: "folder"
-            ),
-        ]
+            )
+        )
         if allowsPaste {
             result.append(AttachmentSourceOption(
                 action: .pasteImage,
@@ -57,6 +65,7 @@ public enum AttachmentSourcePresentation {
 /// Apple's system pickers; this sheet only replaces the cramped action menu.
 public struct AttachmentSourceSheet: View {
     public let theme: ThemePack
+    public let supportsPhotoLibrary: Bool
     public let allowsPaste: Bool
     public let select: (AttachmentSourceAction) -> Void
     public let close: () -> Void
@@ -71,11 +80,13 @@ public struct AttachmentSourceSheet: View {
 
     public init(
         theme: ThemePack,
+        supportsPhotoLibrary: Bool = false,
         allowsPaste: Bool = true,
         select: @escaping (AttachmentSourceAction) -> Void,
         close: @escaping () -> Void
     ) {
         self.theme = theme
+        self.supportsPhotoLibrary = supportsPhotoLibrary
         self.allowsPaste = allowsPaste
         self.select = select
         self.close = close
@@ -110,7 +121,10 @@ public struct AttachmentSourceSheet: View {
 
             ScrollView {
                 LazyVStack(spacing: 10) {
-                    ForEach(AttachmentSourcePresentation.options(allowsPaste: allowsPaste)) { option in
+                    ForEach(AttachmentSourcePresentation.options(
+                        supportsPhotoLibrary: supportsPhotoLibrary,
+                        allowsPaste: allowsPaste
+                    )) { option in
                         sourceRow(option)
                     }
                 }
@@ -166,7 +180,9 @@ public struct AttachmentSourceSheet: View {
             .contentShape(rowShape)
         }
         .buttonStyle(.plain)
-        .accessibilityElement(children: .combine)
+        // The button supplies its label and hint below. Ignoring the visual
+        // children prevents VoiceOver from announcing the title/detail twice.
+        .accessibilityElement(children: .ignore)
         .accessibilityLabel(option.title)
         .accessibilityHint(option.detail)
     }
