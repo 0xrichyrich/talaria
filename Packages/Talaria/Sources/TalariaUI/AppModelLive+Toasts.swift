@@ -683,7 +683,16 @@ public extension AppModel {
 public extension CopyPack {
 
     // Pin — plugin.js:4056-4066.
-    func toastPinned(_ name: String, _ t: ThemeID) -> String {
+    
+    func toastScratchFailed(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Couldn’t start a new chat"
+        case .control: "SCRATCH SESSION FAILED"
+        case .ink: "A throwaway conversation would not open"
+        }
+    }
+
+func toastPinned(_ name: String, _ t: ThemeID) -> String {
         switch t {
         case .soft: "\(name) pinned to top"
         case .control: "\(name.uppercased()) PINNED"

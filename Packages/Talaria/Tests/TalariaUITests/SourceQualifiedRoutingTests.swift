@@ -2,6 +2,7 @@
 import XCTest
 @testable import TalariaKit
 @testable import TalariaUI
+import TalariaTheme
 
 @MainActor
 final class SourceQualifiedRoutingTests: XCTestCase {
@@ -1273,6 +1274,14 @@ final class SourceQualifiedRoutingTests: XCTestCase {
                                            persistAsDefault: false),
             "ensemble --provider moa --session"
         )
+    }
+
+    func testRosterCompanionCopyMatchesBotModePlugin() {
+        XCTAssertEqual(CopyPack.rosterNewChat(.soft), "New chat with this agent")
+        XCTAssertEqual(CopyPack.rosterSessions(.soft), "Sessions")
+        XCTAssertEqual(CopyPack.rosterDelete(.soft), "Delete")
+        XCTAssertEqual(CopyPack.rosterPin(.soft), "Pin to top")
+        XCTAssertEqual(CopyPack.soft.toastScratchFailed(.soft), "Couldn’t start a new chat")
     }
 }
 #endif

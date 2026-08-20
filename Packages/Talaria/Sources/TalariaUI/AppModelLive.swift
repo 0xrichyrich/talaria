@@ -174,6 +174,7 @@ extension AppModel {
         try await refreshRoster()
         try? await refreshRoutines()
         connections = registry.rows
+        await hideOwnedBotSessions()
         await flushComposeQueue()
     }
 
@@ -1098,6 +1099,7 @@ extension AppModel {
         try? await refreshRoster()
         try? await refreshRoutines()
         connections = ConnectionRegistry.shared.rows
+        await hideOwnedBotSessions()
         await flushComposeQueue()
     }
 

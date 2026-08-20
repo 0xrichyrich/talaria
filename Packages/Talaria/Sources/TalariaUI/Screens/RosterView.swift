@@ -53,6 +53,7 @@ public struct RosterView: View {
     /// roster is where desktop puts Edit Profile too (plugin.js:4051-4111);
     /// before this the only way in was to open the bot first.
     @State private var editing: Bot?
+    @State private var deleting: Bot?
     /// The in-place roster filter (plugin.js:7831-7842). Deliberately NOT the
     /// palette's query: the palette is a cross-surface jump (bots, sessions,
     /// artifacts, actions) and replaces the screen, where this narrows the list
@@ -302,6 +303,33 @@ public struct RosterView: View {
         .talariaLiveBots(Set(model.bots.lazy.filter { model.isActiveNow($0.id) }.map(\.id)))
         .sheet(item: $editing) { bot in
             CreateBotView(model: model, editing: bot)
+        }
+        .confirmationDialog(CopyPack.rosterDeleteTitle(theme.id, name: deleting.map { TalariaVoice.displayName(for: $0, theme.id) } ?? ""),
+                            isPresented: Binding(
+                                get: { deleting != nil },
+                                set: { if !$0 { deleting = nil } }),
+                            titleVisibility: .visible) {
+            if let bot = deleting, let target = model.profileLifecycleTarget(rosterID: bot.id) {
+                Button(CopyPack.rosterDelete(theme.id), role: .destructive) {
+                    let doomed = bot
+                    deleting = nil
+                    Task {
+                        let outcome = await model.deleteProfile(target, confirmed: true)
+                        if case .deleted = outcome {
+                            model.toast(kind: .success,
+                                        title: CopyPack.rosterDeleted(theme.id, name: TalariaVoice.displayName(for: doomed, theme.id)),
+                                        botID: doomed.id)
+                        } else if case .refused(let reason) = outcome {
+                            model.toast(kind: .failure,
+                                        title: CopyPack.rosterDeleteFailed(theme.id),
+                                        message: reason, botID: doomed.id)
+                        }
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) { deleting = nil }
+        } message: {
+            Text(CopyPack.rosterDeleteBody(theme.id))
         }
         // Ranking, the 90 s liveness window and the unread watermark all come
         // off one `profiles.list` poll. Armed here because the roster is the
@@ -755,22 +783,22 @@ public struct RosterView: View {
         .contextMenu { rowMenu(for: bot) }
     }
 
-    /// Desktop's row context menu, trimmed to what a phone owns
-    /// (plugin.js:4051-4111). Sessions and Delete deliberately stay off the
-    /// roster: the canonical forever-chat is the mobile model, and session
-    /// verbs are a tucked-away power-user surface (ROADMAP decision #4).
+    /// Desktop's row context menu (plugin.js:3466-3515). Tap still opens the
+    /// forever-chat; long-press is how you reach Sessions, a scratch chat,
+    /// look editing, duplicate, and delete without turning the roster into a
+    /// session sidebar.
     @ViewBuilder private func rowMenu(for bot: Bot) -> some View {
         let pinned = model.isPinned(bot.id)
         Button {
-            // Pinning re-ranks the list under the thumb; the buzz is the
-            // acknowledgement that the tap took, before the write round-trips.
-            // `pinBotWithFeedback` owns that haptic and the two-beat toast
-            // (plugin.js:4056-4066) — without it a gateway that refuses the
-            // write just slides the row back with no explanation.
             Task { await model.pinBotWithFeedback(botID: bot.id, pinned: !pinned) }
         } label: {
             Label(pinned ? CopyPack.rosterUnpin(theme.id) : CopyPack.rosterPin(theme.id),
                   systemImage: pinned ? "pin.slash" : "pin")
+        }
+        Button {
+            NotificationCenter.default.post(name: .talariaOpenSessions, object: bot.id)
+        } label: {
+            Label(CopyPack.rosterSessions(theme.id), systemImage: "clock.arrow.circlepath")
         }
         Button {
             editing = bot
@@ -778,12 +806,21 @@ public struct RosterView: View {
             Label(copy.editLook, systemImage: "paintbrush")
         }
         Button {
-            // Narrated: "Duplicating <name>…" → "Created <new> — full copy of
-            // <name>", or the failure in its place (plugin.js:4079-4085). The
-            // roster has no other surface to report a clone from.
             Task { await model.duplicateBotWithFeedback(from: bot.id) }
         } label: {
             Label(CopyPack.rosterDuplicate(theme.id), systemImage: "plus.square.on.square")
+        }
+        Button {
+            Task { await model.openScratchChat(botID: bot.id) }
+        } label: {
+            Label(CopyPack.rosterNewChat(theme.id), systemImage: "plus.bubble")
+        }
+        if bot.id != "default", GatewayBotRoute(qualifiedID: bot.id)?.profile != "default" {
+            Button(role: .destructive) {
+                deleting = bot
+            } label: {
+                Label(CopyPack.rosterDelete(theme.id), systemImage: "trash")
+            }
         }
     }
 
@@ -1087,6 +1124,62 @@ extension CopyPack {
         case .soft: "Duplicate"
         case .control: "DUPLICATE"
         case .ink: "Copy the familiar"
+        }
+    }
+
+    static func rosterSessions(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Sessions"
+        case .control: "SESSIONS"
+        case .ink: "the other conversations"
+        }
+    }
+
+    static func rosterNewChat(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "New chat with this agent"
+        case .control: "NEW CHAT WITH THIS AGENT"
+        case .ink: "open a throwaway page"
+        }
+    }
+
+    static func rosterDelete(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Delete"
+        case .control: "DELETE"
+        case .ink: "unmake this familiar"
+        }
+    }
+
+    static func rosterDeleteTitle(_ t: ThemeID, name: String) -> String {
+        switch t {
+        case .soft: "Delete \(name)?"
+        case .control: "DELETE \(name.uppercased())?"
+        case .ink: "Unmake \(name)?"
+        }
+    }
+
+    static func rosterDeleteBody(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "This removes the profile, its forever-chat pin, and its look. The default Hermes profile cannot be deleted."
+        case .control: "DESTROYS THE PROFILE, PIN, AND LOOK. DEFAULT CANNOT BE DELETED."
+        case .ink: "The familiar, its pin, and its guise go together. Hermes itself cannot be unmade."
+        }
+    }
+
+    static func rosterDeleted(_ t: ThemeID, name: String) -> String {
+        switch t {
+        case .soft: "Deleted \(name)"
+        case .control: "DELETED \(name.uppercased())"
+        case .ink: "\(name) is unmade"
+        }
+    }
+
+    static func rosterDeleteFailed(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Couldn’t delete this bot"
+        case .control: "DELETE FAILED"
+        case .ink: "It would not be unmade"
         }
     }
 

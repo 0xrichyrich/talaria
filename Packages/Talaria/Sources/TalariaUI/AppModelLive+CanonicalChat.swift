@@ -534,3 +534,63 @@ extension GatewayClient {
         return try await restJSON(path: "api/sessions/\(storedID)/messages", query: query)
     }
 }
+
+
+extension AppModel {
+    /// Reconcile every Bot Mode-owned stored session onto `hidden:true`
+    /// (plugin.js:setHideBotChats). Canonical pins plus room member sessions
+    /// stay out of shared recents; the per-bot Sessions sheet still lists them
+    /// via `include_hidden`. Older gateways reject `session.set_hidden`; that
+    /// is unsupported, not a toast.
+    func hideOwnedBotSessions() async {
+        guard mode == .live else { return }
+        var grouped: [String: Set<String>] = [:]
+        func add(_ gatewayID: String?, _ sessionID: String) {
+            let sid = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let gatewayID, !gatewayID.isEmpty, !sid.isEmpty else { return }
+            grouped[gatewayID, default: []].insert(sid)
+        }
+        let fallback = LiveRuntime.shared.gatewayID
+        for (botID, pin) in CanonicalChatRuntime.shared.pins {
+            add(gatewayRoute(for: botID)?.gatewayID ?? fallback, pin)
+        }
+        for room in rooms {
+            for (memberID, sessionID) in room.memberSessions {
+                add(gatewayRoute(for: memberID)?.gatewayID ?? fallback, sessionID)
+            }
+        }
+        for (gatewayID, ids) in grouped {
+            do {
+                let client = try await routedClient(gatewayID: gatewayID)
+                for sid in ids {
+                    do { _ = try await client.setSessionHidden(sid, hidden: true) }
+                    catch { /* older gateway or vanished row */ }
+                }
+            } catch { /* unreachable gateway */ }
+        }
+    }
+
+    /// Desktop's "New chat with this agent": a scratch session on this
+    /// profile, explicitly NOT the forever-chat (plugin.js:3503). The
+    /// `/new` guard's copy points here.
+    public func openScratchChat(botID: String) async {
+        let botID = resolvedBotID(botID)
+        guard mode == .live else { return }
+        do {
+            guard let route = gatewayRoute(for: botID) else { throw GatewayRouteError.noRoute }
+            let client = try await routedClient(for: route)
+            let live = try await client.createSession(profile: route.profile, hidden: false)
+            let stored = live.storedSessionID.isEmpty ? live.sessionID : live.storedSessionID
+            guard !stored.isEmpty else {
+                throw GatewayError(code: -8, message: "session.create returned no id")
+            }
+            openStoredSession(stored, botID: botID)
+        } catch {
+            toast(kind: .failure,
+                  title: theme.copy.toastScratchFailed(theme.themeID),
+                  message: (error as? GatewayError)?.message ?? error.localizedDescription,
+                  botID: botID)
+        }
+    }
+
+}

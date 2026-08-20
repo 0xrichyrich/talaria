@@ -501,6 +501,19 @@ public actor GatewayClient {
     /// owns it. Bot Mode's canonical chats are always born this way
     /// (plugin.js:2758-2763). Applied as `pending_hidden` until the row exists
     /// (methods_session.py:100, server.py:3014-3021); older gateways ignore it.
+    /// Flip the generic hidden flag on a stored session and its compression
+    /// lineage (methods_session.py:1183). Bot Mode uses this to keep forever
+    /// chats and room member sessions out of shared recents while remaining
+    /// resumable from the per-bot browser. Older gateways reject the RPC;
+    /// callers must treat that as unsupported, not as a user-visible failure.
+    @discardableResult
+    public func setSessionHidden(_ sessionID: String, hidden: Bool) async throws -> Bool {
+        let result = try await rpc("session.set_hidden",
+                                   ["session_id": .string(sessionID),
+                                    "hidden": .bool(hidden)])
+        return result["hidden"]?.boolValue ?? hidden
+    }
+
     public func createSession(profile: String? = nil, title: String? = nil,
                               model: String? = nil, hidden: Bool = false) async throws -> LiveSession {
         var params: [String: JSONValue] = ["source": "talaria", "cols": 100]
