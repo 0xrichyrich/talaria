@@ -143,5 +143,29 @@ final class CommandCenterContractTests: XCTestCase {
         XCTAssertEqual(git.changed, 4)
         XCTAssertEqual(git.files, ["Packages/Talaria/Package.swift"])
     }
+
+    func testWorkspaceParsesProjectsContract() {
+        let list = GatewayProjectList(.object([
+            "active_id": .string("p1"),
+            "projects": .array([
+                .object([
+                    "id": .string("p1"),
+                    "name": .string("Talaria"),
+                    "primary_path": .string("/Users/joshua/talaria"),
+                    "archived": .bool(false),
+                ]),
+                .object([
+                    "id": .string("p2"),
+                    "name": .string("Scratch"),
+                    "folders": .array([.object(["path": .string("/tmp/scratch")])]),
+                ]),
+            ]),
+        ]))
+        XCTAssertEqual(list.activeID, "p1")
+        XCTAssertEqual(list.projects.map { $0.name }, ["Talaria", "Scratch"])
+        XCTAssertTrue(list.projects[0].isActive)
+        XCTAssertEqual(list.projects[1].path, "/tmp/scratch")
+        XCTAssertFalse(list.projects[1].isActive)
+    }
 }
 #endif

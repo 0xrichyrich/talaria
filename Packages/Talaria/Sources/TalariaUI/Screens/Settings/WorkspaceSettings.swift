@@ -79,6 +79,43 @@ public struct GatewayGitStatus: Equatable, Sendable {
     }
 }
 
+public struct GatewayProject: Equatable, Identifiable, Sendable {
+    public var id: String
+    public var name: String
+    public var path: String
+    public var archived: Bool
+    public var isActive: Bool
+
+    init(_ value: JSONValue, activeID: String?) {
+        id = value["id"]?.stringValue ?? ""
+        name = value["name"]?.stringValue ?? id
+        path = value["primary_path"]?.stringValue
+            ?? value["folders"]?.arrayValue?.first?["path"]?.stringValue
+            ?? ""
+        archived = value["archived"]?.boolValue ?? false
+        isActive = !id.isEmpty && id == activeID
+    }
+}
+
+public struct GatewayProjectList: Equatable, Sendable {
+    public var projects: [GatewayProject]
+    public var activeID: String?
+
+    static let empty = GatewayProjectList(projects: [], activeID: nil)
+
+    init(projects: [GatewayProject], activeID: String?) {
+        self.projects = projects; self.activeID = activeID
+    }
+
+    init(_ value: JSONValue) {
+        let active = value["active_id"]?.stringValue
+        activeID = active
+        projects = (value["projects"]?.arrayValue ?? []).map {
+            GatewayProject($0, activeID: active)
+        }
+    }
+}
+
 extension GatewayClient {
     func listManagedFiles(path: String?) async throws -> GatewayFileListing {
         var query: [URLQueryItem] = []
@@ -94,6 +131,10 @@ extension GatewayClient {
             query: [URLQueryItem(name: "path", value: path)],
             timeout: 30))
     }
+
+    func listProjects() async throws -> GatewayProjectList {
+        GatewayProjectList(try await rpc("projects.list", timeout: 30))
+    }
 }
 
 public struct WorkspaceSettingsSection: View {
@@ -105,6 +146,7 @@ public struct WorkspaceSettingsSection: View {
 
     @State private var listing = GatewayFileListing.empty
     @State private var git = GatewayGitStatus.empty
+    @State private var projects = GatewayProjectList.empty
     @State private var path: String?
     @State private var error: String?
     @State private var isLoading = false
@@ -113,6 +155,7 @@ public struct WorkspaceSettingsSection: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 22) {
+            projectsSection
             filesSection
             gitSection
             if let error {
@@ -121,6 +164,45 @@ public struct WorkspaceSettingsSection: View {
             }
         }
         .task { await load(path: path) }
+    }
+
+    private var projectsSection: some View {
+        SettingsSection(theme: theme, title: copy.settingsWorkspaceProjects(theme.id),
+                        footnote: copy.settingsWorkspaceProjectsNote(theme.id)) {
+            SettingsGroup(theme: theme) {
+                if projects.projects.isEmpty {
+                    Text(copy.settingsWorkspaceProjectsEmpty(theme.id))
+                        .font(SettingsType.rowSubtitle(theme))
+                        .foregroundStyle(theme.sub)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .modifier(SettingsRowChrome(theme: theme, isLast: true))
+                } else {
+                    ForEach(Array(projects.projects.prefix(20).enumerated()), id: \.element.id) { index, project in
+                        Button {
+                            if !project.path.isEmpty {
+                                Task { await load(path: project.path) }
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(project.isActive ? "\(project.name) · active" : project.name)
+                                    .font(SettingsType.rowTitle(theme))
+                                    .foregroundStyle(theme.ink)
+                                if !project.path.isEmpty {
+                                    Text(project.path)
+                                        .font(theme.mono(9))
+                                        .foregroundStyle(theme.faint)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
+                        .modifier(SettingsRowChrome(theme: theme,
+                                                    isLast: index == min(19, projects.projects.count - 1)))
+                    }
+                }
+            }
+        }
     }
 
     private var filesSection: some View {
@@ -209,6 +291,7 @@ public struct WorkspaceSettingsSection: View {
             if !listed.path.isEmpty {
                 git = (try? await client.gitStatus(path: listed.path)) ?? .empty
             }
+            projects = (try? await client.listProjects()) ?? projects
         } catch {
             self.error = error.localizedDescription
         }
@@ -241,6 +324,13 @@ public struct WorkspaceSettingsSection: View {
 }
 
 public extension CopyPack {
+    func settingsWorkspaceProjects(_ t: ThemeID) -> String { t == .control ? "PROJECTS" : "Projects" }
+    func settingsWorkspaceProjectsNote(_ t: ThemeID) -> String {
+        t == .control ? "projects.list — TAP OPENS THE PRIMARY PATH IN FILES." : "Gateway projects. Tap one to browse its primary folder. Creating projects stays on desktop."
+    }
+    func settingsWorkspaceProjectsEmpty(_ t: ThemeID) -> String {
+        t == .control ? "NO PROJECTS" : "No projects on this gateway."
+    }
     func settingsWorkspaceFiles(_ t: ThemeID) -> String { t == .control ? "GATEWAY FILES" : "Gateway files" }
     func settingsWorkspaceFilesNote(_ t: ThemeID) -> String {
         t == .control ? "GET /api/files · READ-ONLY ON THE PHONE." : "Browse the gateway's managed files. Nothing is uploaded from this phone."
