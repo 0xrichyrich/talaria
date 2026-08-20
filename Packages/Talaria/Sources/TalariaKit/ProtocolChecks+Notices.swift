@@ -195,6 +195,8 @@ extension ProtocolChecks {
                    "plugin.js:5651")
 
         // The forever-chat notice — plugin.js:8233-8237.
+        try expect(BotModeStrings.canonicalKickoffPrompt == "Hey, tell me about yourself!",
+                   "plugin.js:2388")
         try expect(BotModeStrings.neverResetsTitle == "This chat never resets", "plugin.js:8234")
         try expect(BotModeStrings.neverResetsBody
                     == "Bot chats are one continuous conversation — compacting instead. "

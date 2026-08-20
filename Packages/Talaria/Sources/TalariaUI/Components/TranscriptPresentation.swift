@@ -175,6 +175,10 @@ struct TranscriptWorkingAvatar: View {
         Group {
             if let model, let bot {
                 BotPortraitView(model: model, bot: bot, size: 28, theme: theme, isWorking: true)
+                    .overlay(alignment: .bottomTrailing) {
+                        PetCompanionView(model: model, bot: bot)
+                            .offset(x: 2, y: 1)
+                    }
             } else {
                 AvatarView(shape: .squircle, hue: fallbackHue, size: 28,
                            isWorking: true, theme: theme, identity: "talaria-solo")

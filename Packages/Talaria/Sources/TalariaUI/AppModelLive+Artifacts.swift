@@ -19,21 +19,13 @@ import AppKit
 // What this file adds is the half desktop has and Talaria did not: the bytes.
 //
 // Every produced file lives on the GATEWAY host, not the phone, so reading one
-// is an authenticated REST fetch. Three doors, tried narrowest-first, all under
-// the same `/api/*` auth gate:
-//
-//  · `GET /api/media?path=`          (web_server.py:2227-2258) — image
-//    extensions only, ≤25 MB, and only under the gateway's own media roots
-//    (`~/.hermes/{images,screenshots,cache}`). This is where the agent's image
-//    tools write, and it is the door most likely to survive a locked-down
-//    gateway, so images try it first.
-//  · `GET /api/fs/read-text?path=`   (web_server.py:2872-2894) — UTF-8 preview
-//    with a language hint and a `truncated` flag (512 KB preview window).
-//  · `GET /api/fs/read-data-url?path=` (web_server.py:2943-2955) — anything
-//    else, ≤16 MB, as a base64 data URL.
-//    `GET /api/files/read?path=` (2586-2617) is the last fallback: same shape,
-//    but subject to the managed-files root policy, so it can refuse paths the
-//    fs door allows (and vice-versa on a hosted gateway).
+// is an authenticated REST fetch. A transcript mention is only session
+// provenance; before any host-file request runs, the response itself must also
+// carry Hermes' locked managed-files containment proof. The artifact reader
+// uses Hermes' pinned `/api/files/read` route and validates its locked
+// returned-path response shape before accepting its bytes. The
+// `/api/fs/*` routes are deliberately not artifact doors: their lexical path
+// checks cannot distinguish a managed-root symlink from a credential path.
 //
 // Deliberate non-fetch: an http(s) artifact is NEVER fetched while the grid
 // scrolls. A link the agent found is a third-party host, and a phone should not
@@ -52,6 +44,8 @@ public enum ArtifactBody: Sendable {
     case text(String, language: String, truncated: Bool, bytes: Int)
     /// Bytes we can hand to the share sheet but cannot render inline.
     case binary(Data, mime: String)
+    /// A protected local copy downloaded with source-qualified header auth.
+    case media(URL)
     case unavailable(ArtifactUnavailable)
 
     /// The bytes, when there are any — what export/share needs.
@@ -60,7 +54,7 @@ public enum ArtifactBody: Sendable {
         case .image(let data): return data
         case .binary(let data, _): return data
         case .text(let text, _, _, _): return text.data(using: .utf8)
-        case .unavailable: return nil
+        case .media, .unavailable: return nil
         }
     }
 
@@ -69,8 +63,49 @@ public enum ArtifactBody: Sendable {
         case .image(let data): return data.count
         case .binary(let data, _): return data.count
         case .text(let text, _, _, _): return text.utf8.count
+        case .media(let url):
+            return (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         case .unavailable: return 0
         }
+    }
+}
+
+/// Immutable authority for one artifact fetch. The same path can exist on two
+/// gateways and in two sessions on one gateway; all four fields therefore
+/// participate in caching and completion fencing.
+struct ArtifactProvenance: Hashable, Sendable {
+    var gatewayID: String
+    var profile: String
+    var sessionID: String
+    var value: String
+
+    var cacheKey: String {
+        [gatewayID, profile, sessionID, value].joined(separator: "\u{1f}")
+    }
+}
+
+/// Admission proof for a gateway-hosted artifact path.
+///
+/// A transcript is provenance for *which session mentioned a value*, not proof
+/// that the value is safe for a filesystem read.  Only a path under a
+/// gateway-advertised, locked managed-files root is allowed to reach a host
+/// file endpoint.  Inline data and public URLs do not need that proof because
+/// they do not address the gateway filesystem.
+enum ArtifactPathAdmission: Equatable, Sendable {
+    case notRequired
+    case managed(path: String, root: String)
+    case unproven
+
+    var isAllowed: Bool {
+        switch self {
+        case .notRequired, .managed: return true
+        case .unproven: return false
+        }
+    }
+
+    var path: String? {
+        guard case .managed(let path, _) = self else { return nil }
+        return path
     }
 }
 
@@ -90,6 +125,9 @@ public enum ArtifactUnavailable: Error, Sendable, Equatable {
     case missing
     /// 403/415 — outside the gateway's serve roots, or a type it won't serve.
     case refused
+    /// The transcript supplied a host path, but the gateway has not provided
+    /// an authoritative managed-files containment proof for it.
+    case unproven
     /// Anything else, carrying the gateway's own words.
     case unreadable(String)
 }
@@ -114,7 +152,24 @@ public final class ArtifactStore {
     @ObservationIgnored private var order: [String] = []
     @ObservationIgnored private var cost: [String: Int] = [:]
     @ObservationIgnored private var bytes = 0
-    @ObservationIgnored private var tasks: [String: Task<ArtifactBody, Never>] = [:]
+    /// Media folders produced by an in-flight fetch but not yet published in
+    /// `bodies`. The orphan sweeper must keep these alive just as it keeps a
+    /// cached body alive; a sibling waiter may still be about to publish them.
+    @ObservationIgnored private var inflightMediaFolders: [String: [UUID: Set<String>]] = [:]
+    struct FetchLease: Sendable {
+        var sourceKey: String
+        var fetchID: UUID
+        var waiterID: UUID
+        var task: Task<ArtifactBody, Never>
+    }
+
+    private struct Inflight {
+        var id: UUID
+        var task: Task<ArtifactBody, Never>
+        var waiters: Set<UUID>
+    }
+
+    @ObservationIgnored private var tasks: [String: Inflight] = [:]
 
     /// Resident ceiling. Generous enough to keep a screenful of renders warm,
     /// small enough that a gallery sweep cannot push the app into a jetsam.
@@ -124,28 +179,84 @@ public final class ArtifactStore {
     /// Longest edge of a grid thumbnail, in points × 3 (Retina headroom).
     static let thumbEdge: CGFloat = 260
 
-    private func key(_ value: String) -> String {
-        (LiveRuntime.shared.baseURL?.absoluteString ?? "demo") + "|" + value
-    }
-
-    public func body(for value: String) -> ArtifactBody? {
-        let id = key(value)
+    func body(for source: ArtifactProvenance) -> ArtifactBody? {
+        let id = source.cacheKey
         guard let body = bodies[id] else { return nil }
         touch(id)
         return body
     }
 
-    func thumbnail(for value: String) -> Image? { thumbs[key(value)] }
+    func thumbnail(for source: ArtifactProvenance) -> Image? { thumbs[source.cacheKey] }
 
-    func inflight(for value: String) -> Task<ArtifactBody, Never>? { tasks[key(value)] }
-
-    func begin(_ task: Task<ArtifactBody, Never>, for value: String) {
-        tasks[key(value)] = task
+    func acquire(for source: ArtifactProvenance,
+                 make: () -> Task<ArtifactBody, Never>) -> FetchLease {
+        let key = source.cacheKey
+        let waiter = UUID()
+        if var inflight = tasks[key] {
+            inflight.waiters.insert(waiter)
+            tasks[key] = inflight
+            return FetchLease(sourceKey: key, fetchID: inflight.id,
+                              waiterID: waiter, task: inflight.task)
+        }
+        let task = make()
+        let fetchID = UUID()
+        tasks[key] = Inflight(id: fetchID, task: task, waiters: [waiter])
+        return FetchLease(sourceKey: key, fetchID: fetchID, waiterID: waiter, task: task)
     }
 
-    func finish(_ body: ArtifactBody, for value: String) {
-        let id = key(value)
+    func inflightWaiterCount(for source: ArtifactProvenance) -> Int {
+        tasks[source.cacheKey]?.waiters.count ?? 0
+    }
+
+    /// Record a media result while the exact fetch lease is still live. This
+    /// closes the small window between `materializeMedia` returning a file and
+    /// `finish` publishing it into the cache.
+    func retainInflightMedia(_ body: ArtifactBody, lease: FetchLease) {
+        guard let folder = Self.mediaFolder(for: body),
+              let inflight = tasks[lease.sourceKey], inflight.id == lease.fetchID else { return }
+        var byFetch = inflightMediaFolders[lease.sourceKey] ?? [:]
+        byFetch[lease.fetchID, default: []].insert(folder)
+        inflightMediaFolders[lease.sourceKey] = byFetch
+    }
+
+    /// Run the media TTL sweep with this store's cached and in-flight folders
+    /// excluded. Cleanup is intentionally an owner operation, never part of
+    /// media materialization itself.
+    func sweepOrphanMediaDownloads() {
+        GatewayREST.sweepArtifactMediaDownloads(protectedFolders: ownedMediaFolders)
+    }
+
+    func release(_ lease: FetchLease, cancelIfLast: Bool) {
+        guard var inflight = tasks[lease.sourceKey], inflight.id == lease.fetchID,
+              inflight.waiters.remove(lease.waiterID) != nil else { return }
+        if inflight.waiters.isEmpty, cancelIfLast {
+            tasks[lease.sourceKey] = nil
+            clearInflightMedia(for: lease)
+            inflight.task.cancel()
+        } else {
+            tasks[lease.sourceKey] = inflight
+        }
+    }
+
+    @discardableResult
+    func finish(_ body: ArtifactBody, lease: FetchLease,
+                for source: ArtifactProvenance) -> Bool {
+        let id = source.cacheKey
+        guard let inflight = tasks[id], inflight.id == lease.fetchID else {
+            // A stale completion may race a replacement fetch. The old task
+            // owns its result, but must not remove a file while a newer
+            // inflight owner is still resolving the same cache key.
+            if tasks[id] == nil, !Self.sameOwnedFile(body, bodies[id]) {
+                Self.removeOwnedFile(body)
+            }
+            return false
+        }
         tasks[id] = nil
+        clearInflightMedia(for: lease)
+        if let prior = bodies[id] {
+            if !Self.sameOwnedFile(prior, body) { Self.removeOwnedFile(prior) }
+            bytes -= cost[id] ?? 0
+        }
         bodies[id] = body
         cost[id] = body.byteCost
         bytes += body.byteCost
@@ -154,14 +265,41 @@ public final class ArtifactStore {
             thumbs[id] = ArtifactImaging.thumbnail(data, maxDimension: Self.thumbEdge)
         }
         evict()
+        return true
+    }
+
+    /// Drop a completed body that lost its authority before publication. This
+    /// is deliberately separate from `finish`: a downloaded media file is
+    /// owned by the store only after its source/generation fence succeeds.
+    func discard(_ body: ArtifactBody) {
+        guard !bodies.values.contains(where: { Self.sameOwnedFile(body, $0) }),
+              !ownedMediaFolders.contains(where: { Self.mediaFolder(for: body) == $0 }) else { return }
+        Self.removeOwnedFile(body)
+    }
+
+    /// Release a body produced by this exact fetch lease. A cancelled waiter
+    /// must not delete a shared media file while another waiter still owns the
+    /// inflight fetch, or after a sibling has published that file into cache.
+    func discard(_ body: ArtifactBody, lease: FetchLease) {
+        if let cached = bodies[lease.sourceKey], Self.sameOwnedFile(body, cached) {
+            return
+        }
+        if let inflight = tasks[lease.sourceKey], inflight.id == lease.fetchID,
+           !inflight.waiters.isEmpty {
+            return
+        }
+        removeInflightMedia(body, for: lease)
+        discard(body)
     }
 
     /// Drop everything for the current gateway (sign-out, gateway swap). Keys
     /// are gateway-scoped so this is belt-and-braces, but a stale render of
     /// another machine's file is exactly the kind of thing that must not linger.
     public func flush() {
-        for task in tasks.values { task.cancel() }
+        for inflight in tasks.values { inflight.task.cancel() }
+        for body in bodies.values { Self.removeOwnedFile(body) }
         tasks.removeAll()
+        inflightMediaFolders.removeAll()
         bodies.removeAll(); thumbs.removeAll(); cost.removeAll(); order.removeAll()
         bytes = 0
     }
@@ -175,8 +313,61 @@ public final class ArtifactStore {
         while bytes > Self.budget, let oldest = order.first {
             order.removeFirst()
             bytes -= cost.removeValue(forKey: oldest) ?? 0
+            if let body = bodies[oldest] { Self.removeOwnedFile(body) }
             bodies[oldest] = nil
             thumbs[oldest] = nil
+        }
+    }
+
+    private static func removeOwnedFile(_ body: ArtifactBody) {
+        guard case .media(let url) = body,
+              url.path.contains("/talaria-media-") else { return }
+        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+    }
+
+    private static func sameOwnedFile(_ lhs: ArtifactBody, _ rhs: ArtifactBody?) -> Bool {
+        guard case .media(let left) = lhs, case .media(let right) = rhs else { return false }
+        return left == right
+    }
+
+    private static func mediaFolder(for body: ArtifactBody) -> String? {
+        guard case .media(let url) = body,
+              url.path.contains("/talaria-media-") else { return nil }
+        return url.deletingLastPathComponent().standardizedFileURL.path
+    }
+
+    private var ownedMediaFolders: Set<String> {
+        var folders = Set(bodies.values.compactMap(Self.mediaFolder(for:)))
+        for byFetch in inflightMediaFolders.values {
+            for paths in byFetch.values { folders.formUnion(paths) }
+        }
+        return folders
+    }
+
+    private func clearInflightMedia(for lease: FetchLease) {
+        guard var byFetch = inflightMediaFolders[lease.sourceKey] else { return }
+        byFetch[lease.fetchID] = nil
+        if byFetch.isEmpty {
+            inflightMediaFolders[lease.sourceKey] = nil
+        } else {
+            inflightMediaFolders[lease.sourceKey] = byFetch
+        }
+    }
+
+    private func removeInflightMedia(_ body: ArtifactBody, for lease: FetchLease) {
+        guard let folder = Self.mediaFolder(for: body),
+              var byFetch = inflightMediaFolders[lease.sourceKey],
+              var folders = byFetch[lease.fetchID] else { return }
+        folders.remove(folder)
+        if folders.isEmpty {
+            byFetch[lease.fetchID] = nil
+        } else {
+            byFetch[lease.fetchID] = folders
+        }
+        if byFetch.isEmpty {
+            inflightMediaFolders[lease.sourceKey] = nil
+        } else {
+            inflightMediaFolders[lease.sourceKey] = byFetch
         }
     }
 }
@@ -222,15 +413,96 @@ public extension AppModel {
         Self.artifactValue(artifact.id)
     }
 
+    /// Pure path admission used by the artifact fetch gate and by the focused
+    /// safety tests. `managedRoots` must come from the validated
+    /// `WorkspaceRuntime.fileRootSources` table; accepting a caller-provided
+    /// arbitrary root here would recreate the very boundary this contract is
+    /// meant to protect.
+    internal static func artifactPathAdmission(_ value: String, gatewayID: String,
+                                               workspaceGatewayID: String?,
+                                               managedRoots: [String]) -> ArtifactPathAdmission {
+        let path = gatewayPath(value)
+        if !ArtifactScan.isGatewayPath(path) {
+            return .notRequired
+        }
+
+        guard !gatewayID.isEmpty, workspaceGatewayID == gatewayID,
+              !path.contains("%"),
+              let normalized = WorkspaceRemotePath.normalized(path),
+              WorkspaceRemotePath.isAbsolute(normalized),
+              !WorkspaceRemotePath.isFilesystemRoot(normalized),
+              WorkspaceSensitivePath.allows(normalized) else {
+            return .unproven
+        }
+
+        // WorkspacePathFence.safeRoots drops filesystem roots and collapses
+        // duplicate/nested roots.  The remaining roots are the only roots the
+        // Command Center is willing to publish to a remote client.
+        let roots = WorkspacePathFence.safeRoots(managedRoots)
+        guard let root = roots.first(where: { WorkspacePathFence.contains(normalized, in: [$0]) }) else {
+            return .unproven
+        }
+        return .managed(path: normalized, root: root)
+    }
+
+    /// Current-runtime admission. WorkspaceRuntime only publishes a root after
+    /// `ManagedFileListing(validatingManaged:)` has verified Hermes' locked,
+    /// canonical root and every returned entry. Project roots are intentionally
+    /// excluded: their API has no symlink/realpath proof yet.
+    internal func artifactPathAdmission(_ source: ArtifactProvenance) -> ArtifactPathAdmission {
+        if mode == .demo, source.gatewayID == "demo" { return .notRequired }
+        let runtime = WorkspaceRuntime.shared
+        let managedRoots = runtime.fileRoots.filter {
+            runtime.fileRootSources[$0] == .managed
+        }
+        return Self.artifactPathAdmission(source.value,
+                                          gatewayID: source.gatewayID,
+                                          workspaceGatewayID: runtime.gatewayID,
+                                          managedRoots: managedRoots)
+    }
+
+    private static func artifactNeedsGatewayAdmission(_ value: String) -> Bool {
+        ArtifactScan.isGatewayPath(gatewayPath(value))
+    }
+
+    internal func artifactProvenance(_ artifact: Artifact) -> ArtifactProvenance? {
+        let value = artifactLocation(artifact)
+        if let ref = FeedsRuntime.shared.artifactSessions[artifact.id] {
+            let profile = GatewayBotRoute(qualifiedID: ref.botID)?.profile ?? ref.botID
+            guard !ref.gatewayID.isEmpty, !profile.isEmpty, !ref.storedID.isEmpty else {
+                return nil
+            }
+            return ArtifactProvenance(gatewayID: ref.gatewayID, profile: profile,
+                                      sessionID: ref.storedID, value: value)
+        }
+        // Public URLs and inline data do not consume gateway authority. Keep
+        // their cache identity tied to the producing bot/session anyway.
+        if value.hasPrefix("http://") || value.hasPrefix("https://")
+            || value.hasPrefix("data:") || mode == .demo {
+            let parts = artifact.id.split(separator: "|", maxSplits: 2,
+                                          omittingEmptySubsequences: false)
+            let session = parts.count > 1 ? String(parts[1]) : artifact.id
+            return ArtifactProvenance(gatewayID: mode == .demo ? "demo" : "public",
+                                      profile: artifact.botID, sessionID: session, value: value)
+        }
+        // A gateway-hosted path without its recorded SessionRef must never
+        // silently fall back to whichever gateway happens to be primary.
+        return nil
+    }
+
     /// Cached body, if one has landed. Views read this in `body` so a fetch
     /// completing repaints them.
     func artifactBody(_ artifact: Artifact) -> ArtifactBody? {
-        ArtifactStore.shared.body(for: artifactLocation(artifact))
+        guard let source = artifactProvenance(artifact) else { return nil }
+        guard artifactPathAdmission(source).isAllowed else { return nil }
+        return ArtifactStore.shared.body(for: source)
     }
 
     /// The grid thumbnail for an image artifact, once fetched.
     func artifactThumbnail(_ artifact: Artifact) -> Image? {
-        ArtifactStore.shared.thumbnail(for: artifactLocation(artifact))
+        guard let source = artifactProvenance(artifact) else { return nil }
+        guard artifactPathAdmission(source).isAllowed else { return nil }
+        return ArtifactStore.shared.thumbnail(for: source)
     }
 
     /// Fetch (or return) an artifact's bytes.
@@ -243,20 +515,53 @@ public extension AppModel {
     /// its own, so a card and its detail sheet cost one request.
     @discardableResult
     func loadArtifact(_ artifact: Artifact, allowRemote: Bool = false) async -> ArtifactBody {
-        let value = artifactLocation(artifact)
-        let store = ArtifactStore.shared
-        if let cached = store.body(for: value) { return cached }
-        if let running = store.inflight(for: value) { return await running.value }
-
-        let kind = artifact.kind
-        let task = Task { @MainActor [weak self] in
-            guard let self else { return ArtifactBody.unavailable(.notLive) }
-            return await self.fetchArtifactBody(value: value, kind: kind, allowRemote: allowRemote)
+        guard let source = artifactProvenance(artifact) else {
+            return .unavailable(Self.artifactNeedsGatewayAdmission(artifactLocation(artifact))
+                                ? .unproven : .noREST)
         }
-        store.begin(task, for: value)
-        let body = await task.value
-        store.finish(body, for: value)
-        return body
+        guard artifactPathAdmission(source).isAllowed else {
+            return .unavailable(.unproven)
+        }
+        let store = ArtifactStore.shared
+        // Cleanup is owned by the cache, so cached and in-flight media folders
+        // are excluded from the TTL sweep before a new fetch starts. The
+        // materializer itself never sweeps shared cache storage.
+        store.sweepOrphanMediaDownloads()
+        if let cached = store.body(for: source) { return cached }
+        let kind = artifact.kind
+        let sourceGeneration = LiveRuntime.shared.generation
+        let lease = store.acquire(for: source) {
+            Task { @MainActor [weak self] in
+                guard let self else { return ArtifactBody.unavailable(.notLive) }
+                return await self.fetchArtifactBody(source: source, kind: kind,
+                                                    allowRemote: allowRemote)
+            }
+        }
+        let body = await withTaskCancellationHandler {
+            await lease.task.value
+        } onCancel: {
+            Task { @MainActor in store.release(lease, cancelIfLast: true) }
+        }
+        store.retainInflightMedia(body, lease: lease)
+        if Task.isCancelled {
+            store.release(lease, cancelIfLast: true)
+            store.discard(body, lease: lease)
+            return .unavailable(.notLive)
+        }
+        guard artifactPathAdmission(source).isAllowed else {
+            store.release(lease, cancelIfLast: true)
+            store.discard(body, lease: lease)
+            return .unavailable(.unproven)
+        }
+        guard artifactProvenance(artifact) == source,
+              (source.gatewayID == "public" || source.gatewayID == "demo"
+               || LiveRuntime.shared.generation == sourceGeneration) else {
+            store.release(lease, cancelIfLast: true)
+            store.discard(body, lease: lease)
+            return .unavailable(.notLive)
+        }
+        let published = store.finish(body, lease: lease, for: source)
+        return published ? body : (store.body(for: source) ?? .unavailable(.notLive))
     }
 
     /// Grid-side prefetch: gateway-hosted images only, and only when there is a
@@ -264,10 +569,12 @@ public extension AppModel {
     /// for, which is what keeps the tab from becoming a network storm.
     func prefetchArtifactThumbnail(_ artifact: Artifact) {
         guard mode == .live, !isOffline, artifact.kind == .image else { return }
-        let value = artifactLocation(artifact)
+        guard let source = artifactProvenance(artifact) else { return }
+        guard artifactPathAdmission(source).isAllowed else { return }
+        let value = source.value
         guard !value.hasPrefix("http://"), !value.hasPrefix("https://") else { return }
         let store = ArtifactStore.shared
-        guard store.body(for: value) == nil, store.inflight(for: value) == nil else { return }
+        guard store.body(for: source) == nil else { return }
         Task { @MainActor in await self.loadArtifact(artifact) }
     }
 
@@ -294,11 +601,23 @@ public extension AppModel {
         }
         guard let body else { return .failure(.unreadable("")) }
         if case .unavailable(let why) = body { return .failure(why) }
+        if case .media(let url) = body {
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return .failure(.missing)
+            }
+            return .success(url)
+        }
         guard let data = body.data else { return .failure(.unreadable("")) }
         let name = Self.shareFilename(for: artifact, location: artifactLocation(artifact),
                                       body: body)
         do {
-            return .success(try TalariaExportBox.write(data, named: name))
+            try Task.checkCancellation()
+            let url = try TalariaExportBox.write(data, named: name)
+            if Task.isCancelled {
+                TalariaExportBox.removeOwned(url)
+                return .failure(.unreadable("Cancelled"))
+            }
+            return .success(url)
         } catch {
             return .failure(.unreadable(error.localizedDescription))
         }
@@ -326,6 +645,7 @@ public extension AppModel {
             switch body {
             case .text: name += ".txt"
             case .image: name += ".png"
+            case .media: name += ".mp4"
             case .binary, .unavailable: name += ".bin"
             }
         }
@@ -340,15 +660,13 @@ public extension AppModel {
 
     // MARK: - Fetch
 
-    private func fetchArtifactBody(value: String, kind: ArtifactKind,
+    private func fetchArtifactBody(source: ArtifactProvenance, kind: ArtifactKind,
                                    allowRemote: Bool) async -> ArtifactBody {
+        let value = source.value
         // Inline data: URLs are already the bytes — an image.generate result
         // pasted into the transcript never needs a round trip.
         if value.hasPrefix("data:") {
-            guard let data = ProfileAssetStore.decode(dataURL: value) else {
-                return .unavailable(.unreadable(""))
-            }
-            return .image(data)
+            return Self.boundedArtifactDataURL(value)
         }
 
         if value.hasPrefix("http://") || value.hasPrefix("https://") {
@@ -358,62 +676,52 @@ public extension AppModel {
             return await Self.fetchRemoteImage(url)
         }
 
-        guard mode == .live, !isOffline else { return .unavailable(.notLive) }
-        guard let (base, credential) = gatewayRESTContext() else { return .unavailable(.noREST) }
+        guard mode == .live else { return .unavailable(.notLive) }
+        guard let path = artifactPathAdmission(source).path else {
+            return .unavailable(.unproven)
+        }
+        guard let (base, credential) = gatewayRESTContext(gatewayID: source.gatewayID) else {
+            return .unavailable(.noREST)
+        }
 
-        let path = Self.gatewayPath(value)
         let ext = (ArtifactScan.ext(of: value) ?? "").lowercased()
         var last: ArtifactUnavailable = .missing
 
-        if kind == .image {
-            do {
-                let dataURL = try await GatewayREST.mediaDataURL(baseURL: base,
-                                                                 credential: credential, path: path)
-                if let data = ProfileAssetStore.decode(dataURL: dataURL) { return .image(data) }
-            } catch {
-                last = Self.artifactFailure(error)
-                // 403 here only means "outside the media roots" — an agent that
-                // wrote into a project directory is the normal case, so the
-                // general file doors below still get their turn.
+        do {
+            // The locked managed route is the only host-file data door. Its
+            // response is validated again in GatewayREST.managedDataURL, so a
+            // lexical path under a root cannot authorize a symlink escape.
+            let (dataURL, mime, size) = try await GatewayREST.managedDataURL(
+                base, credential, path)
+            let bounded = Self.boundedArtifactDataURL(dataURL, declaredSize: size)
+            let data: Data
+            switch bounded {
+            case .image(let decoded):
+                data = decoded
+            case .unavailable(let why):
+                return .unavailable(why)
+            default:
+                return .unavailable(.unreadable(""))
             }
-        }
-
-        if kind != .image, Self.textExtensions.contains(ext) {
-            do {
-                let read = try await GatewayREST.fsText(baseURL: base, credential: credential,
-                                                        path: path)
-                if !read.binary {
-                    return .text(read.text, language: read.language,
-                                 truncated: read.truncated, bytes: read.bytes)
+            if kind == .image || mime.hasPrefix("image/") { return .image(data) }
+            if kind == .media || mime.hasPrefix("audio/") || mime.hasPrefix("video/") {
+                do {
+                    return .media(try GatewayREST.materializeMedia(
+                        data: data, suggestedName: ArtifactScan.label(of: value)))
+                } catch {
+                    return .unavailable(.unreadable(error.localizedDescription))
                 }
-            } catch {
-                last = Self.artifactFailure(error)
             }
-        }
-
-        for door in [GatewayREST.fsDataURL, GatewayREST.managedDataURL] {
-            do {
-                let (dataURL, mime, size) = try await door(base, credential, path)
-                guard size <= ArtifactStore.maxFetchBytes else { return .unavailable(.tooLarge) }
-                guard let data = ProfileAssetStore.decode(dataURL: dataURL) else {
-                    last = .unreadable("")
-                    continue
-                }
-                guard data.count <= ArtifactStore.maxFetchBytes else {
-                    return .unavailable(.tooLarge)
-                }
-                if kind == .image || mime.hasPrefix("image/") { return .image(data) }
-                // A file with no known text extension can still be text (a
-                // LICENSE, a Dockerfile); decode before giving up on a preview.
-                if mime.hasPrefix("text/") || mime.contains("json") || mime.contains("xml"),
-                   let text = String(data: data, encoding: .utf8) {
-                    return .text(text, language: Self.language(for: ext), truncated: false,
-                                 bytes: data.count)
-                }
-                return .binary(data, mime: mime)
-            } catch {
-                last = Self.artifactFailure(error)
+            // A file with no known text extension can still be text (a
+            // LICENSE, a Dockerfile); decode before giving up on a preview.
+            if mime.hasPrefix("text/") || mime.contains("json") || mime.contains("xml"),
+               let text = String(data: data, encoding: .utf8) {
+                return .text(text, language: Self.language(for: ext), truncated: false,
+                             bytes: data.count)
             }
+            return .binary(data, mime: mime)
+        } catch {
+            last = Self.artifactFailure(error)
         }
         return .unavailable(last)
     }
@@ -424,18 +732,98 @@ public extension AppModel {
     private static func fetchRemoteImage(_ url: URL) async -> ArtifactBody {
         var request = URLRequest(url: url)
         request.timeoutInterval = 25
+        let limiter = ArtifactDownloadLimiter(limit: Int64(ArtifactStore.maxFetchBytes))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 25
+        configuration.timeoutIntervalForResource = 25
+        let session = URLSession(configuration: configuration, delegate: limiter,
+                                 delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (temporary, response) = try await session.download(for: request)
+            defer { try? FileManager.default.removeItem(at: temporary) }
             let code = (response as? HTTPURLResponse)?.statusCode ?? 200
             guard (200..<300).contains(code) else { return .unavailable(.missing) }
+            if limiter.didExceedLimit { return .unavailable(.tooLarge) }
+            let size = (try? temporary.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            guard size <= ArtifactStore.maxFetchBytes else { return .unavailable(.tooLarge) }
+            let data = try Data(contentsOf: temporary, options: [.mappedIfSafe])
             guard data.count <= ArtifactStore.maxFetchBytes else { return .unavailable(.tooLarge) }
             guard ProfileAssetStore.image(from: data) != nil else {
                 return .unavailable(.remoteLink)
             }
             return .image(data)
         } catch {
+            if limiter.didExceedLimit { return .unavailable(.tooLarge) }
             return .unavailable(.unreadable(""))
         }
+    }
+
+    /// Conservative decoded-byte upper bound for a base64 data URL. This is a
+    /// preflight only: the actual decoded length is checked again after
+    /// `Data(base64Encoded:)` returns. Returning nil also covers malformed data
+    /// URLs and encoded payloads that are already over the mobile ceiling.
+    static func dataURLDecodedUpperBound(_ value: String) -> Int? {
+        guard value.hasPrefix("data:"), let comma = value.firstIndex(of: ",") else {
+            return nil
+        }
+        let metadata = value[value.startIndex..<comma].lowercased()
+        guard metadata.contains(";base64") else { return nil }
+        let encoded = value[value.index(after: comma)...]
+        let encodedCount = encoded.utf8.count
+        let maxEncoded = ((ArtifactStore.maxFetchBytes + 2) / 3) * 4
+        guard encodedCount <= maxEncoded else { return nil }
+
+        // Base64 expands four characters to three bytes. Round up here so an
+        // unpadded/malformed final quantum is conservative; the decoder below
+        // remains the source of truth for validity.
+        let padding = encoded.suffix(2).reduce(0) { $1 == "=" ? $0 + 1 : $0 }
+        guard padding <= 2 else { return nil }
+        let quantumCount = (encodedCount + 3) / 4
+        let upperBound = quantumCount * 3 - padding
+        return upperBound >= 0 ? upperBound : nil
+    }
+
+    static func dataURLFitsArtifactLimit(_ value: String) -> Bool {
+        guard let upperBound = dataURLDecodedUpperBound(value) else { return false }
+        return upperBound <= ArtifactStore.maxFetchBytes
+    }
+
+    /// Applies the local 12 MB ceiling before allocating decoded `/api/media`
+    /// base64 and verifies the decoded result as a second, exact fence. When a
+    /// managed endpoint declares a size, it is checked both before and after
+    /// decode; a missing declaration is safe because the encoded preflight and
+    /// exact decoded fence still apply.
+    static func boundedArtifactDataURL(_ value: String, declaredSize: Int? = nil) -> ArtifactBody {
+        guard let upperBound = dataURLDecodedUpperBound(value),
+              upperBound <= ArtifactStore.maxFetchBytes else {
+            return .unavailable(.tooLarge)
+        }
+        if let declaredSize {
+            guard declaredSize >= 0 else {
+                return .unavailable(.unreadable("Gateway returned an invalid file size."))
+            }
+            guard declaredSize <= ArtifactStore.maxFetchBytes else {
+                return .unavailable(.tooLarge)
+            }
+            // A declared size larger than the encoded upper bound cannot be a
+            // truthful response. Reject it before allocating decoded bytes.
+            guard declaredSize <= upperBound else {
+                return .unavailable(.unreadable(
+                    "Gateway-declared file size does not match its data."))
+            }
+        }
+        guard let data = ProfileAssetStore.decode(dataURL: value) else {
+            return .unavailable(.unreadable(""))
+        }
+        guard data.count <= ArtifactStore.maxFetchBytes else {
+            return .unavailable(.tooLarge)
+        }
+        if let declaredSize, declaredSize != data.count {
+            return .unavailable(.unreadable(
+                "Gateway-declared file size does not match its data."))
+        }
+        return .image(data)
     }
 
     /// `file://` URLs are how some tools report a path; the gateway's own
@@ -497,12 +885,27 @@ enum TalariaExportBox {
     static let maxAge: TimeInterval = 3_600
 
     static func write(_ data: Data, named name: String) throws -> URL {
-        let dir = FileManager.default.temporaryDirectory.appending(path: folder)
+        let root = FileManager.default.temporaryDirectory.appending(path: folder)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        sweep(root)
+        let dir = root.appending(path: "share-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        sweep(dir)
         let url = dir.appending(path: name)
         try data.write(to: url, options: .atomic)
+        #if os(iOS)
+        try FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: url.path)
+        #endif
         return url
+    }
+
+    static func removeOwned(_ url: URL) {
+        let root = FileManager.default.temporaryDirectory.appending(path: folder)
+            .standardizedFileURL
+        let candidate = url.standardizedFileURL
+        guard candidate.path.hasPrefix(root.path + "/") else { return }
+        try? FileManager.default.removeItem(at: candidate.deletingLastPathComponent())
     }
 
     private static func sweep(_ dir: URL) {
@@ -545,11 +948,156 @@ struct TalariaShareSheet: UIViewControllerRepresentable {
 struct ExportedFile: Identifiable, Equatable {
     let url: URL
     var id: String { url.path }
+
+    func removeOwnedShareCopy() { TalariaExportBox.removeOwned(url) }
+}
+
+private final class ArtifactDownloadLimiter: NSObject, URLSessionDownloadDelegate,
+                                               @unchecked Sendable {
+    private let lock = NSLock()
+    private var exceeded = false
+    private let limit: Int64
+
+    init(limit: Int64) { self.limit = limit }
+
+    var didExceedLimit: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return exceeded
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        guard totalBytesExpectedToWrite > limit || totalBytesWritten > limit else { return }
+        lock.lock(); exceeded = true; lock.unlock()
+        downloadTask.cancel()
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {}
 }
 
 // MARK: - REST plumbing shared by this area
 
 public extension GatewayREST {
+
+    static let maximumMediaDownloadBytes: Int64 = 40 * 1_024 * 1_024
+
+    static func authenticatedMediaRequest(baseURL: URL, credential: GatewayCredential,
+                                          path: String) throws -> URLRequest {
+        var components = URLComponents(
+            url: baseURL.appending(path: "api/files/stream"),
+            resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let url = components?.url else {
+            throw GatewayError(code: -9, message: "bad media URL")
+        }
+        var request = URLRequest(url: url, timeoutInterval: 180)
+        GatewayAuthClient(baseURL: baseURL).apply(credential: credential, to: &request)
+        return request
+    }
+
+    static func downloadMedia(baseURL: URL, credential: GatewayCredential, path: String,
+                              suggestedName: String) async throws -> URL {
+        let request = try authenticatedMediaRequest(baseURL: baseURL, credential: credential,
+                                                    path: path)
+        let limiter = ArtifactDownloadLimiter(limit: maximumMediaDownloadBytes)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 180
+        configuration.timeoutIntervalForResource = 180
+        let session = URLSession(configuration: configuration, delegate: limiter,
+                                 delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        let temporary: URL
+        let response: URLResponse
+        do {
+            (temporary, response) = try await withTrafficLease(baseURL: baseURL) {
+                try await session.download(for: request)
+            }
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            if limiter.didExceedLimit {
+                throw GatewayError(code: 413, message: "Media exceeds the 40 MB mobile preview limit.")
+            }
+            throw error
+        }
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else {
+            throw GatewayError(code: status, message: "Media download failed (HTTP \(status)).")
+        }
+        let expected = response.expectedContentLength
+        let actual = Int64((try temporary.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        guard expected <= maximumMediaDownloadBytes,
+              actual <= maximumMediaDownloadBytes else {
+            throw GatewayError(code: 413, message: "Media exceeds the 40 MB mobile preview limit.")
+        }
+        try Task.checkCancellation()
+
+        let safe = suggestedName.map { character in
+            character.isLetter || character.isNumber || "._- ".contains(character)
+                ? character : "-"
+        }
+        let name = String(safe).trimmingCharacters(in: .whitespacesAndNewlines)
+        let folder = FileManager.default.temporaryDirectory
+            .appending(path: "talaria-media-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var completed = false
+        defer { if !completed { try? FileManager.default.removeItem(at: folder) } }
+        let destination = folder.appending(path: name.isEmpty ? "media.bin" : String(name.prefix(100)))
+        try FileManager.default.moveItem(at: temporary, to: destination)
+        #if os(iOS)
+        try FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: destination.path)
+        #endif
+        try Task.checkCancellation()
+        completed = true
+        return destination
+    }
+
+    /// Materialize bytes already returned by the locked managed read route.
+    /// Keeping this separate from `downloadMedia` lets media previews use the
+    /// same authoritative path proof as images/files without re-opening a
+    /// lexical host path through a second endpoint.
+    static func materializeMedia(data: Data, suggestedName: String) throws -> URL {
+        let safe = suggestedName.map { character in
+            character.isLetter || character.isNumber || "._- ".contains(character)
+                ? character : "-"
+        }
+        let name = String(safe).trimmingCharacters(in: .whitespacesAndNewlines)
+        let folder = FileManager.default.temporaryDirectory
+            .appending(path: "talaria-media-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var completed = false
+        defer { if !completed { try? FileManager.default.removeItem(at: folder) } }
+        let destination = folder.appending(path: name.isEmpty ? "media.bin" : String(name.prefix(100)))
+        try data.write(to: destination, options: .atomic)
+        #if os(iOS)
+        try FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: destination.path)
+        #endif
+        try Task.checkCancellation()
+        completed = true
+        return destination
+    }
+
+    internal static func sweepArtifactMediaDownloads(protectedFolders: Set<String>) {
+        let manager = FileManager.default
+        let root = manager.temporaryDirectory
+        guard let entries = try? manager.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        let cutoff = Date().addingTimeInterval(-3_600)
+        for entry in entries where entry.lastPathComponent.hasPrefix("talaria-media-") {
+            let folder = entry.standardizedFileURL.path
+            guard !protectedFolders.contains(folder) else { continue }
+            let modified = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            if let modified, modified > cutoff { continue }
+            try? manager.removeItem(at: entry)
+        }
+    }
 
     /// Acquire the same source-qualified ordinary-traffic lease used by
     /// `GatewayClient.rpc/restData`, and retain it across the complete HTTP
@@ -650,34 +1198,109 @@ public extension GatewayREST {
 
     /// `GET /api/fs/read-data-url?path=` (web_server.py:2943-2955) → `{dataUrl}`,
     /// ≤16 MB, any regular file. The mime rides inside the data URL.
+    internal static func validatedDeclaredByteSize(_ payload: JSONValue) throws -> Int? {
+        guard let object = payload.objectValue else { return nil }
+        for key in ["size", "byteSize", "byte_size"] {
+            guard let value = object[key] else { continue }
+            guard case .number(let raw) = value,
+                  raw.isFinite,
+                  raw >= 0,
+                  raw.rounded(.towardZero) == raw,
+                  raw < Double(Int.max) else {
+                throw GatewayError(code: 502,
+                                   message: "Gateway returned an invalid file size.")
+            }
+            return Int(raw)
+        }
+        return nil
+    }
+
     static func fsDataURL(_ baseURL: URL, _ credential: GatewayCredential,
-                          _ path: String) async throws -> (String, String, Int) {
+                          _ path: String) async throws -> (String, String, Int?) {
         let payload = try await restJSON(baseURL: baseURL, credential: credential,
                                          path: "api/fs/read-data-url",
                                          query: [URLQueryItem(name: "path", value: path)],
                                          timeout: 45, what: "file")
-        guard let url = payload["dataUrl"]?.stringValue, !url.isEmpty else {
+        guard let url = payload["dataUrl"]?.stringValue
+                ?? payload["data_url"]?.stringValue,
+              !url.isEmpty else {
             throw GatewayError(code: 404, message: "no file")
         }
-        return (url, mime(ofDataURL: url), 0)
+        return (url, mime(ofDataURL: url), try validatedDeclaredByteSize(payload))
     }
 
-    /// `GET /api/files/read?path=` (web_server.py:2586-2617) →
-    /// `{name, path, size, mime_type, data_url}`. Same job as the fs door but
-    /// under the managed-files root policy, which a hosted gateway locks to one
-    /// directory — so it can serve paths the fs door refuses, and vice-versa.
+    /// Build Hermes' pinned `GET /api/files/read?path=` request. Keeping this
+    /// as a small, testable fixture prevents an invented route from quietly
+    /// becoming the artifact data door again.
+    static func managedReadRequest(baseURL: URL, credential: GatewayCredential,
+                                   path: String) throws -> URLRequest {
+        var components = URLComponents(
+            url: baseURL.appending(path: "api/files/read"),
+            resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let url = components?.url else {
+            throw GatewayError(code: -9, message: "bad managed file URL")
+        }
+        var request = URLRequest(url: url, timeoutInterval: 45)
+        GatewayAuthClient(baseURL: baseURL).apply(credential: credential, to: &request)
+        return request
+    }
+
+    /// `GET /api/files/read?path=` → `{name, path, size, mime_type,
+    /// locked_root, data_url}`. The response carries the locked canonical path
+    /// proof; the caller's lexical managed-root admission is only an early
+    /// fail-closed filter and never the fetch authority.
     static func managedDataURL(_ baseURL: URL, _ credential: GatewayCredential,
-                               _ path: String) async throws -> (String, String, Int) {
-        let payload = try await restJSON(baseURL: baseURL, credential: credential,
-                                         path: "api/files/read",
-                                         query: [URLQueryItem(name: "path", value: path)],
-                                         timeout: 45, what: "file")
-        guard let url = payload["data_url"]?.stringValue, !url.isEmpty else {
-            throw GatewayError(code: 404, message: "no file")
+                               _ path: String) async throws -> (String, String, Int?) {
+        let request = try managedReadRequest(baseURL: baseURL, credential: credential, path: path)
+        let data = try await withTrafficLease(baseURL: baseURL) {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(code) else {
+                let payload = try? JSONDecoder().decode(JSONValue.self, from: data)
+                let detail = payload?["detail"]?.stringValue ?? payload?["error"]?.stringValue
+                throw GatewayError(code: code,
+                                   message: detail ?? "managed file failed (HTTP \(code))")
+            }
+            return data
+        }
+        let payload = (try? JSONDecoder().decode(JSONValue.self, from: data)) ?? .null
+        let proof = try authoritativeManagedRead(payload, requestedPath: path)
+        return (proof.url, proof.mime, try validatedDeclaredByteSize(payload))
+    }
+
+    internal static func authoritativeManagedRead(
+        _ payload: JSONValue, requestedPath: String
+    ) throws -> (url: String, mime: String) {
+        guard let locked = payload["locked_root"]?.stringValue
+                .flatMap(WorkspaceRemotePath.normalized),
+              WorkspaceRemotePath.isAbsolute(locked),
+              !WorkspaceRemotePath.isFilesystemRoot(locked),
+              let returned = payload["path"]?.stringValue
+                .flatMap(WorkspaceRemotePath.normalized),
+              let requested = WorkspaceRemotePath.normalized(requestedPath),
+              WorkspaceRemotePath.contains(returned, in: locked),
+              WorkspaceRemotePath.contains(requested, in: returned),
+              WorkspaceRemotePath.contains(returned, in: requested),
+              WorkspaceSensitivePath.allows(returned),
+              let url = payload["data_url"]?.stringValue
+                ?? payload["dataUrl"]?.stringValue,
+              !url.isEmpty else {
+            throw GatewayError(
+                code: 501,
+                message: "Hermes did not provide an authoritative managed-file containment proof.")
+        }
+        if let root = payload["root"]?.stringValue,
+           let normalizedRoot = WorkspaceRemotePath.normalized(root),
+           normalizedRoot != locked {
+            throw GatewayError(
+                code: 501,
+                message: "Hermes returned conflicting managed-file roots.")
         }
         return (url,
-                payload["mime_type"]?.stringValue ?? mime(ofDataURL: url),
-                payload["size"]?.intValue ?? 0)
+                payload["mime_type"]?.stringValue
+                    ?? payload["mimeType"]?.stringValue
+                    ?? mime(ofDataURL: url))
     }
 
     /// "data:image/png;base64,…" → "image/png".
@@ -730,6 +1353,12 @@ public extension CopyPack {
             case .control: return "HOST REFUSED — OUTSIDE SERVE ROOTS."
             case .ink: return "The house will not release this one."
             }
+        case .unproven:
+            switch t {
+            case .soft: return "This host path is not proven to be inside the gateway's managed Files root."
+            case .control: return "UNPROVEN HOST PATH — MANAGED ROOT PROOF REQUIRED."
+            case .ink: return "Its place within the house could not be proved safe."
+            }
         case .unreadable(let detail):
             if !detail.isEmpty { return detail }
             switch t {
@@ -747,11 +1376,11 @@ public extension CopyPack {
     func artifactsFetchNote(_ t: ThemeID) -> String {
         switch t {
         case .soft:
-            return "Previews are fetched from the gateway host on demand over its authenticated file routes, and cached on this device only. Links are never fetched — open them yourself."
+            return "Previews are fetched from the gateway host on demand only after its managed Files root proves the path, and cached on this device only. Links are never fetched — open them yourself."
         case .control:
-            return "PREVIEWS PULLED ON DEMAND VIA AUTHED /API/MEDIA · /API/FS · CACHED LOCALLY. LINKS NEVER AUTO-FETCHED."
+            return "PREVIEWS PULLED ON DEMAND VIA LOCKED MANAGED-FILE READS · CACHED LOCALLY. LINKS NEVER AUTO-FETCHED."
         case .ink:
-            return "Each relic is fetched from the house only when you ask, and kept here alone. What lies abroad is never fetched unbidden."
+            return "Each relic is fetched from the house only after its place within the managed root is proved, and kept here alone. What lies abroad is never fetched unbidden."
         }
     }
 

@@ -26,5 +26,6 @@ final class ProtocolXCTests: XCTestCase {
     func testUnreadWatermarks() throws { try ProtocolChecks.unreadWatermarks() }
     func testToastPairing() throws { try ProtocolChecks.toastPairing() }
     func testBotModeNotices() throws { try ProtocolChecks.botModeNotices() }
+    func testTranscriptActing() throws { try ProtocolChecks.transcriptActing() }
 }
 #endif

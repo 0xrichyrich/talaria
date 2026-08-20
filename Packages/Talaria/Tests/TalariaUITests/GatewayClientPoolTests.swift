@@ -77,5 +77,23 @@ final class GatewayClientPoolTests: XCTestCase {
         XCTAssertEqual(connected, ["one", "two"])
         await pool.disconnectAll()
     }
+
+    func testCapturedDisconnectCannotRetireReplacementClient() async throws {
+        let pool = GatewayClientPool { baseURL, credential in
+            GatewayClient(baseURL: baseURL, credential: credential)
+        }
+        let old = GatewayClient(baseURL: url, credential: .sessionToken("old"))
+        let replacement = GatewayClient(baseURL: url, credential: .sessionToken("new"))
+        await pool.adopt(old, for: "one")
+        let captured = try await pool.connectWithGeneration(
+            gatewayID: "one", baseURL: url, credential: .sessionToken("old"))
+        await pool.adopt(replacement, for: "one")
+
+        let disconnected = await pool.disconnectIfCurrent(captured, for: "one")
+        let current = await pool.client(for: "one")
+        XCTAssertFalse(disconnected)
+        XCTAssertEqual(ObjectIdentifier(current!), ObjectIdentifier(replacement))
+        await pool.disconnect(gatewayID: "one")
+    }
 }
 #endif

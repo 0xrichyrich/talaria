@@ -2,12 +2,13 @@ import SwiftUI
 import TalariaKit
 import TalariaTheme
 
-private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
+enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
     case connections
     case appearance
     case intelligence
     case agents
     case operations
+    case workspace
     case localData
     case about
 
@@ -20,6 +21,7 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .intelligence: "Models, Voice & Memory"
         case .agents: "Agents & Profiles"
         case .operations: "Gateway Operations"
+        case .workspace: "Command Center"
         case .localData: "On-device & Privacy"
         case .about: "About & Diagnostics"
         }
@@ -31,7 +33,8 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .appearance: "Theme, text, motion and transcript detail"
         case .intelligence: "Inference providers, OAuth, voice and memory"
         case .agents: "Rename, delete and manage Hermes profiles"
-        case .operations: "Typed configuration and gateway logs"
+        case .operations: "Restart, update, usage, runtime and logs"
+        case .workspace: "Projects, files, review, commands and system"
         case .localData: "Solo mode, storage, exports and deletion"
         case .about: "Versions, health, links and desktop-only boundaries"
         }
@@ -44,6 +47,7 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .intelligence: "cpu.fill"
         case .agents: "person.2.fill"
         case .operations: "slider.horizontal.3"
+        case .workspace: "square.grid.2x2"
         case .localData: "lock.iphone"
         case .about: "info.circle.fill"
         }
@@ -56,10 +60,13 @@ private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
         case .intelligence: "model provider oauth endpoint api key voice speech memory stt tts"
         case .agents: "bot profile rename delete lifecycle"
         case .operations: "operator config logs debug level"
+        case .workspace: "command center projects files git review commands system workspace directory preview pty terminal"
         case .localData: "solo offline storage cache privacy export delete reset"
         case .about: "version gateway health diagnostics source docs desktop"
         }
     }
+
+    var presentsCommandCenter: Bool { self == .workspace }
 }
 
 // Settings — roadmap Phase 2.
@@ -102,13 +109,38 @@ public struct SettingsView: View {
             List {
                 Section {
                     ForEach(filteredDestinations) { destination in
-                        NavigationLink(value: destination) {
-                            SettingsIndexRow(destination: destination, theme: theme)
+                        if destination.presentsCommandCenter {
+                            Button {
+                                model.requestCommandCenter()
+                            } label: {
+                                HStack(spacing: 10) {
+                                    SettingsIndexRow(destination: destination, theme: theme)
+                                    Spacer(minLength: 0)
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(theme.faint)
+                                        .accessibilityHidden(true)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(!WorkspaceCommandCenterRequest.allows(mode: model.mode))
+                            .accessibilityHint(Text(
+                                WorkspaceCommandCenterRequest.allows(mode: model.mode)
+                                    ? "Opens the source-qualified workspace controls"
+                                    : "Connect a live gateway to enable Command Center"
+                            ))
+                            .listRowBackground(theme.panel)
+                        } else {
+                            NavigationLink(value: destination) {
+                                SettingsIndexRow(destination: destination, theme: theme)
+                            }
+                            .listRowBackground(theme.panel)
                         }
-                        .listRowBackground(theme.panel)
                     }
                 } footer: {
-                    Text("Settings are grouped by task. Nothing was removed; each row opens a focused page.")
+                    Text("Settings are grouped by task. Nothing was removed; each row opens a focused surface.")
                         .foregroundStyle(theme.sub)
                 }
             }
@@ -119,11 +151,10 @@ public struct SettingsView: View {
             .searchable(text: $search, prompt: "Search settings")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    HeaderIconButton(theme: theme, size: 32, action: close) {
-                        Text(verbatim: "‹")
-                            .font(.system(size: 16, weight: .bold))
+                    HeaderIconButton(theme: theme, size: 32, showsChrome: false, action: close) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 17, weight: .semibold))
                             .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
-                            .padding(.bottom, 2)
                     }
                     .accessibilityLabel(Text(copy.settingsBack(theme.id)))
                 }
@@ -226,6 +257,11 @@ private struct SettingsDetailPage: View {
                     ProfileLifecycleSettingsSection(model: model)
                 case .operations:
                     OperatorSettingsSection(model: model)
+                case .workspace:
+                    // The index renders this destination as a modal action, not
+                    // a NavigationLink. Keep the switch exhaustive without
+                    // mounting the legacy Files/Git page as a second entry.
+                    EmptyView()
                 case .localData:
                     SoloSettingsSection(model: model)
                     PrivacySettingsSection(model: model)
@@ -685,19 +721,19 @@ extension CopyPack {
         switch t {
         case .soft:
             return [("Environment variables", "hermes config env — on the machine running the gateway"),
-                    ("config.yaml", "Provider keys, toolsets and defaults, edited in place"),
-                    ("Storage paths", "Where profiles, sessions and skills live on disk"),
-                    ("Update channel", "Gateway updates are applied where the gateway runs")]
+                    ("Raw config.yaml", "Provider keys and host paths stay on the gateway host"),
+                    ("Interactive terminal / PTY", "A phone is not a shell. Command Center provides bounded, noninteractive workspace controls."),
+                    ("Electron windows and overlays", "Desktop chrome such as window placement has no mobile analogue")]
         case .control:
             return [("ENV VARS", "HERMES CONFIG ENV — GATEWAY HOST ONLY"),
-                    ("CONFIG.YAML", "PROVIDER KEYS / TOOLSETS / DEFAULTS"),
-                    ("STORAGE PATHS", "PROFILE, SESSION AND SKILL DIRECTORIES"),
-                    ("UPDATE CHANNEL", "APPLIED ON THE GATEWAY HOST")]
+                    ("RAW CONFIG.YAML", "HOST KEYS AND PATHS STAY ON THE GATEWAY"),
+                    ("PTY / TERMINAL", "NOT ON DEVICE. COMMAND CENTER PROVIDES BOUNDED, NONINTERACTIVE CONTROLS."),
+                    ("ELECTRON WINDOWS", "NO MOBILE ANALOGUE")]
         case .ink:
             return [("the environment", "set where the gateway itself runs"),
-                    ("the config", "keys, gifts and defaults, written in place"),
-                    ("the storage", "where natures, audiences and gifts are kept"),
-                    ("the updates", "applied at the gateway, not here")]
+                    ("the raw config", "keys and paths remain with the house"),
+                    ("the terminal", "a pocket is no shell; Command Center keeps bounded workspace controls instead"),
+                    ("the windows", "desktop chrome has no counterpart here")]
         }
     }
 

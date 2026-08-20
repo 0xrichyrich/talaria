@@ -120,11 +120,17 @@ extension AppModel {
             }
             return
         }
+        let generation = LiveRuntime.shared.generation
+        let chatID = ObjectIdentifier(chat(for: botID))
         guard profileLifecycleAccepts(lifecycle) else { return }
         do {
             let rows = try await client.listSessions(limit: 200, profile: route.profile,
                                                      includeHidden: true)
-            guard profileLifecycleAccepts(lifecycle) else { return }
+            guard profileLifecycleAccepts(lifecycle),
+                  LiveRuntime.shared.generation == generation,
+                  gatewayRoute(for: botID) == route,
+                  self.client.map(ObjectIdentifier.init) == ObjectIdentifier(client),
+                  chats[botID].map({ ObjectIdentifier($0) == chatID }) == true else { return }
             var summaries: [SessionSummary] = []
             summaries.reserveCapacity(rows.count)
             for row in rows where !row.id.isEmpty {
@@ -185,8 +191,15 @@ extension AppModel {
             return
         }
         guard profileLifecycleAccepts(lifecycle) else { return }
+        let generation = LiveRuntime.shared.generation
+        let chatID = ObjectIdentifier(chat(for: botID))
         guard let segments = try? await client.contextBreakdown(sid) else { return }
-        guard profileLifecycleAccepts(lifecycle) else { return }
+        guard profileLifecycleAccepts(lifecycle),
+              LiveRuntime.shared.generation == generation,
+              gatewayRoute(for: botID) == route,
+              self.client.map(ObjectIdentifier.init) == ObjectIdentifier(client),
+              chats[botID].map({ ObjectIdentifier($0) == chatID }) == true,
+              chats[botID]?.sessionID == sid else { return }
         chat(for: botID).contextSegments = segments
         // The bot sheet's meter reads the global `contextMeter`; it only ever
         // shows the bot whose sheet is open, so mirroring is correct.
@@ -216,6 +229,47 @@ extension AppModel {
         let sessionsRuntime = SessionsRuntime.shared
         let openGeneration = sessionsRuntime.beginOpen(botID: botID)
         let connectionGeneration = runtime.generation
+
+        // An explicit session selection replaces the binding at this tap,
+        // except when it is reopening the exact durable row that owns a
+        // deferred stop. Keep that intent through the temporary nil sid; the
+        // subsequent resume/bind proves the same ChatState and durable route.
+        // A different durable row (or known route) retires the old intent so
+        // it cannot drain into a reused profile id.
+        let reopenRoute = stateRoute(for: botID) ?? gatewayRoute(for: botID)
+        let preservesPendingStop = ChatRuntime.shared.pendingStopMatchesReopen(
+            botID: botID, storedID: id, chatID: ObjectIdentifier(chat), route: reopenRoute)
+        if !preservesPendingStop {
+            ChatRuntime.shared.clearPendingStop(botID: botID)
+        }
+
+        let oldStoredID = chat.storedSessionID
+        if oldStoredID == id, let oldSessionID = chat.sessionID, !oldSessionID.isEmpty {
+            // Keep the exact old runtime sid while the same durable session is
+            // explicitly reopened; adopt/bind consumes it to migrate queued
+            // mirrors and accepted mutation state to the replacement sid.
+            runtime.reconnectParkedSessionIDs[botID] = oldSessionID
+        } else if oldStoredID != id {
+            // A different explicit durable row is a replacement binding. Do
+            // not let an edit/rewind fence for A survive the stored-id swap.
+            ChatRuntime.shared.transcriptActions[botID] = nil
+            ChatRuntime.shared.transcriptActionGenerations[botID] = nil
+            ChatRuntime.shared.transcriptLeases[botID] = nil
+            ChatRuntime.shared.transcriptFences[botID] = nil
+            if let oldStoredID, !oldStoredID.isEmpty, let reopenRoute {
+                _ = ChatRuntime.shared.retireQueuedState(
+                    botID: botID, route: reopenRoute, storedID: oldStoredID)
+                retireComposeQueue(botID: botID, storedID: oldStoredID,
+                                   chatID: ObjectIdentifier(chat))
+                ChatRuntime.shared.offlineComposeFences =
+                    ChatRuntime.shared.offlineComposeFences.filter { _, fence in
+                        !(fence.botID == botID && fence.route == reopenRoute
+                          && fence.storedID == oldStoredID
+                          && fence.chatID == ObjectIdentifier(chat))
+                    }
+            }
+            runtime.reconnectParkedSessionIDs[botID] = nil
+        }
 
         // Unbind first: a send racing this must not land in the session we
         // are leaving, and an in-flight attach for the old session is stale.
@@ -386,6 +440,7 @@ extension AppModel {
               let client = try? await routedClient(for: route) else {
             return theme.copy.sessUnreachable(theme.themeID)
         }
+        let generation = LiveRuntime.shared.generation
         do {
             try await client.deleteSession(id, profile: route.profile)
         } catch let error as GatewayError where error.code == 4023 {
@@ -393,11 +448,15 @@ extension AppModel {
         } catch let error as GatewayError where error.code == 4007 {
             // Already gone — the desktop treats an absent row as success and
             // so must we, or the row resurrects on the next refresh.
+            guard LiveRuntime.shared.generation == generation,
+                  gatewayRoute(for: botID) == route else { return nil }
             dropSessionRow(id, botID: botID)
             return nil
         } catch {
             return Self.sessionFailure(error, theme: theme)
         }
+        guard LiveRuntime.shared.generation == generation,
+              gatewayRoute(for: botID) == route else { return nil }
         dropSessionRow(id, botID: botID)
         return nil
     }
@@ -418,6 +477,7 @@ extension AppModel {
             return theme.copy.sessUnreachable(theme.themeID)
         }
         let chat = chats[botID]
+        let generation = LiveRuntime.shared.generation
         do {
             if let sid = chat?.sessionID, chat?.storedSessionID == id {
                 try await client.setSessionTitle(sessionID: sid, title: clean)
@@ -427,6 +487,8 @@ extension AppModel {
         } catch {
             return Self.sessionFailure(error, theme: theme)
         }
+        guard LiveRuntime.shared.generation == generation,
+              gatewayRoute(for: botID) == route else { return nil }
         applyTitle(clean, to: id, botID: botID)
         return nil
     }
@@ -441,8 +503,12 @@ extension AppModel {
         guard let sid = await liveSessionID(botID: botID) else { return needsLiveSession }
         guard let route = gatewayRoute(for: botID),
               let client = try? await routedClient(for: route) else { return needsLiveSession }
+        let generation = LiveRuntime.shared.generation
         do {
             let branch = try await client.branchSession(sid)
+            guard LiveRuntime.shared.generation == generation,
+                  gatewayRoute(for: botID) == route,
+                  chats[botID]?.sessionID == sid else { return needsLiveSession }
             await refreshSessions(botID: botID)
             return SessionActionOutcome(
                 ok: true,
@@ -460,8 +526,12 @@ extension AppModel {
         guard let sid = await liveSessionID(botID: botID) else { return needsLiveSession }
         guard let route = gatewayRoute(for: botID),
               let client = try? await routedClient(for: route) else { return needsLiveSession }
+        let generation = LiveRuntime.shared.generation
         do {
             let result = try await client.compressSession(sid)
+            guard LiveRuntime.shared.generation == generation,
+                  gatewayRoute(for: botID) == route,
+                  chats[botID]?.sessionID == sid else { return needsLiveSession }
             if !result.messages.isEmpty {
                 let rebuilt = Self.chatMessages(fromTranscript: .array(result.messages))
                 if !rebuilt.isEmpty { chat(for: botID).messages = rebuilt }
@@ -486,8 +556,12 @@ extension AppModel {
         guard let sid = await liveSessionID(botID: botID) else { return needsLiveSession }
         guard let route = gatewayRoute(for: botID),
               let client = try? await routedClient(for: route) else { return needsLiveSession }
+        let generation = LiveRuntime.shared.generation
         do {
             let path = try await client.saveSession(sid)
+            guard LiveRuntime.shared.generation == generation,
+                  gatewayRoute(for: botID) == route,
+                  chats[botID]?.sessionID == sid else { return needsLiveSession }
             return SessionActionOutcome(ok: true,
                                         headline: theme.copy.sessExported(theme.themeID),
                                         detail: path.isEmpty ? nil : path)
@@ -684,6 +758,13 @@ extension AppModel {
     private func dropSessionRow(_ id: String, botID: String) {
         let runtime = SessionsRuntime.shared
         let key = SessionsRuntime.key(botID: botID, sessionID: id)
+        // A deleted durable row can never receive the deferred interrupt that
+        // was captured for it. Clear before mutating ChatState so a later
+        // replacement session cannot inherit the intent.
+        ChatRuntime.shared.clearPendingStopIfStored(id, botID: botID)
+        if chats[botID]?.storedSessionID == id {
+            ChatRuntime.shared.clearPendingStop(botID: botID)
+        }
         runtime.titles[key] = nil
         runtime.previews[key] = nil
         if let chat = chats[botID] {

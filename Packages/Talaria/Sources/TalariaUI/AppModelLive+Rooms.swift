@@ -18,6 +18,7 @@ final class RoomRuntime {
     var loadError: String?
     var metadataPendingCount = 0
     var metadataLastError: String?
+    var profileLifecycleError: String?
     var isLoaded = false
 
     @ObservationIgnored var store = RoomStore.shared
@@ -30,6 +31,13 @@ final class RoomRuntime {
     @ObservationIgnored var loadOperation: (() async throws -> [RoomRecord])?
     @ObservationIgnored var submitOperation:
         (@MainActor (RoomAttempt, RoomMemberSessionSnapshot, [RoomOutboundAttachment]) async -> RoomPromptSubmission)?
+    @ObservationIgnored var metadataMutationOperation:
+        (@MainActor (RoomMetadataMutation) async throws -> Void)?
+    /// Source-qualified lifecycle generations fence metadata flushes and room
+    /// drive completions that outlive a profile rename/delete await.
+    @ObservationIgnored var profileRouteGenerations: [GatewayBotRoute: UInt64] = [:]
+    @ObservationIgnored var retiredProfileRoutes: Set<GatewayBotRoute> = []
+    @ObservationIgnored var deferredProfileRearmRooms: Set<RoomID> = []
 
     func replace(_ room: RoomRecord) {
         if let index = rooms.firstIndex(where: { $0.id == room.id }) { rooms[index] = room }
@@ -44,6 +52,31 @@ final class RoomRuntime {
         rooms.removeAll { $0.id == id }
         if openRoomID == id { openRoomID = nil }
     }
+
+    func profileRouteGeneration(_ route: GatewayBotRoute) -> UInt64 {
+        profileRouteGenerations[route, default: 0]
+    }
+
+    func bumpProfileRouteGeneration(_ route: GatewayBotRoute) -> UInt64 {
+        let next = profileRouteGenerations[route, default: 0] &+ 1
+        profileRouteGenerations[route] = next
+        return next
+    }
+
+    func acceptsProfileRoute(_ route: GatewayBotRoute,
+                             generation: UInt64) -> Bool {
+        !retiredProfileRoutes.contains(route)
+            && profileRouteGenerations[route, default: 0] == generation
+    }
+}
+
+/// MainActor-side token captured before a profile lifecycle REST await. The
+/// durable RoomStore mutation is performed only after the server postcondition
+/// commits, while this token prevents the old source completion from writing
+/// into a reused destination in the meantime.
+struct RoomProfileLifecycleToken: Equatable, Sendable {
+    var source: GatewayBotRoute
+    var generation: UInt64
 }
 
 @MainActor
@@ -241,6 +274,7 @@ public extension AppModel {
     var rooms: [RoomRecord] { RoomRuntime.shared.rooms }
     var roomMetadataPendingCount: Int { RoomRuntime.shared.metadataPendingCount }
     var roomMetadataLastError: String? { RoomRuntime.shared.metadataLastError }
+    var roomProfileLifecycleError: String? { RoomRuntime.shared.profileLifecycleError }
     var openRoomID: RoomID? {
         get { RoomRuntime.shared.openRoomID }
         set { RoomRuntime.shared.openRoomID = newValue }
@@ -261,14 +295,22 @@ public extension AppModel {
     /// the durable attempt after checking the owning Hermes session.
     func abandonRoomAttempt(roomID: RoomID, attemptID: RoomAttemptID) async {
         let updated = try? await RoomMutationGate.shared.withLock(roomID.description) {
-            if let room = try await RoomRuntime.shared.store.room(id: roomID),
+            let runtime = RoomRuntime.shared
+            if let room = try await runtime.store.room(id: roomID),
                let attempt = room.attempts.first(where: { $0.id == attemptID }),
                !attempt.stagedImagePaths.isEmpty,
+               runtime.acceptsProfileRoute(attempt.member,
+                                           generation: runtime.profileRouteGeneration(attempt.member)),
                let client = try? await routedClient(for: attempt.member) {
-                await client.detachRoomStagedImages(attempt.stagedImagePaths,
+               await client.detachRoomStagedImages(attempt.stagedImagePaths,
                                                     sessionID: attempt.runtimeSessionID)
             }
-            return try await RoomRuntime.shared.store.mutate(roomID: roomID) { room in
+            guard let current = try await runtime.store.room(id: roomID),
+                  let attempt = current.attempts.first(where: { $0.id == attemptID }),
+                  runtime.acceptsProfileRoute(attempt.member,
+                                              generation: runtime.profileRouteGeneration(attempt.member))
+            else { throw CancellationError() }
+            return try await runtime.store.mutate(roomID: roomID) { room in
                 guard let index = room.attempts.firstIndex(where: { $0.id == attemptID }),
                       room.attempts[index].finishedAt == nil else { throw CancellationError() }
                 let attempt = room.attempts[index]
@@ -286,6 +328,157 @@ public extension AppModel {
 
     func roomStorageUsage() async -> RoomStorageUsage? {
         try? await RoomStore.shared.storageUsage()
+    }
+
+    @discardableResult
+    internal func prepareRoomProfileLifecycle(
+        source route: GatewayBotRoute, deleting: Bool = false
+    ) -> RoomProfileLifecycleToken {
+        let runtime = RoomRuntime.shared
+        let generation = runtime.bumpProfileRouteGeneration(route)
+        if deleting { runtime.retiredProfileRoutes.insert(route) }
+        let affected = runtime.rooms.filter { room in
+            room.members.contains(where: { $0.route == route })
+                || room.formerMembers.contains(where: { $0.route == route })
+                || room.attempts.contains(where: { $0.member == route })
+                || room.memberSessions[route.qualifiedID] != nil
+        }.map(\.id)
+        for id in affected {
+            runtime.driveTasks[id]?.cancel()
+            runtime.driveTokens[id] = UUID()
+        }
+        return RoomProfileLifecycleToken(source: route, generation: generation)
+    }
+
+    internal func commitRoomProfileRename(
+        _ token: RoomProfileLifecycleToken, destination: GatewayBotRoute
+    ) async throws {
+        let runtime = RoomRuntime.shared
+        guard runtime.profileRouteGeneration(token.source) == token.generation
+        else { throw CancellationError() }
+        try await RoomMutationGate.shared.withLock("profile-route:\(token.source.qualifiedID)") {
+            let result = try await runtime.store.migrateProfileRoute(
+                from: token.source, to: destination)
+            try await runtime.store.clearProfileRouteLifecycleIntent(token.source)
+            guard runtime.profileRouteGeneration(token.source) == token.generation
+            else { throw CancellationError() }
+            runtime.retiredProfileRoutes.remove(token.source)
+            runtime.retiredProfileRoutes.remove(destination)
+            _ = runtime.bumpProfileRouteGeneration(destination)
+            runtime.rooms = result.rooms.sorted { $0.lastActivityAt > $1.lastActivityAt }
+            runtime.metadataPendingCount = (try? await runtime.store.metadataOutbox().count) ?? 0
+            for room in result.rooms {
+                runtime.deferredProfileRearmRooms.insert(room.id)
+            }
+        }
+    }
+
+    /// Durable preflight fence. This is awaited before the profile REST call,
+    /// so a crash during the remote mutation restarts with the source route
+    /// retired rather than replaying its outbox into a reused profile.
+    internal func persistRoomProfileLifecycleFence(
+        source route: GatewayBotRoute, deleting: Bool = false
+    ) async throws -> RoomProfileLifecycleToken {
+        let token = prepareRoomProfileLifecycle(source: route, deleting: deleting)
+        let runtime = RoomRuntime.shared
+        try await RoomMutationGate.shared.withLock("profile-route:\(route.qualifiedID)") {
+            try await runtime.store.beginProfileRouteLifecycleIntent(route)
+            runtime.retiredProfileRoutes.insert(route)
+        }
+        return token
+    }
+
+    internal func commitRoomProfileRemoval(
+        _ token: RoomProfileLifecycleToken
+    ) async throws {
+        let runtime = RoomRuntime.shared
+        guard runtime.profileRouteGeneration(token.source) == token.generation else {
+            throw CancellationError()
+        }
+        try await RoomMutationGate.shared.withLock("profile-route:\(token.source.qualifiedID)") {
+            let result = try await runtime.store.retireProfileRoute(token.source)
+            try await runtime.store.clearProfileRouteLifecycleIntent(token.source)
+            guard runtime.profileRouteGeneration(token.source) == token.generation else {
+                throw CancellationError()
+            }
+            runtime.retiredProfileRoutes.insert(token.source)
+            runtime.rooms = result.rooms.sorted { $0.lastActivityAt > $1.lastActivityAt }
+            runtime.metadataPendingCount = (try? await runtime.store.metadataOutbox().count) ?? 0
+        }
+    }
+
+    /// Fail closed after Hermes has committed but local reconciliation could
+    /// not finish. The actor write is retried here so a restart observes the
+    /// durable tombstone rather than replaying the source outbox.
+    internal func failClosedRoomProfileRoute(_ route: GatewayBotRoute) async {
+        do {
+            try await RoomMutationGate.shared.withLock("profile-route:\(route.qualifiedID)") {
+                let result = try await RoomRuntime.shared.store.retireProfileRoute(route)
+                RoomRuntime.shared.rooms = result.rooms.sorted { $0.lastActivityAt > $1.lastActivityAt }
+            }
+        } catch {
+            RoomRuntime.shared.profileLifecycleError =
+                "Room state for \(route.qualifiedID) is fenced; retry reconciliation before reuse."
+        }
+        RoomRuntime.shared.retiredProfileRoutes.insert(route)
+    }
+
+    internal func abortRoomProfileLifecycle(_ token: RoomProfileLifecycleToken) async {
+        do {
+            try await RoomMutationGate.shared.withLock("profile-route:\(token.source.qualifiedID)") {
+                try await RoomRuntime.shared.store.clearProfileRouteLifecycleIntent(token.source)
+            }
+        } catch {
+            RoomRuntime.shared.profileLifecycleError =
+                "Profile route remains fenced because its durable lifecycle intent could not be cleared."
+            return
+        }
+        abortRoomProfileLifecycleMemory(token)
+    }
+
+    private func abortRoomProfileLifecycleMemory(_ token: RoomProfileLifecycleToken) {
+        let runtime = RoomRuntime.shared
+        guard runtime.profileRouteGeneration(token.source) == token.generation else { return }
+        _ = runtime.bumpProfileRouteGeneration(token.source)
+        runtime.retiredProfileRoutes.remove(token.source)
+        let affected = runtime.rooms.filter { room in
+            room.members.contains { $0.route == token.source }
+                || room.formerMembers.contains { $0.route == token.source }
+                || room.attempts.contains { $0.member == token.source && $0.finishedAt == nil }
+        }
+        for room in affected {
+            runtime.deferredProfileRearmRooms.insert(room.id)
+        }
+    }
+
+    /// Called after the profile lifecycle traffic lease is released. Keeping
+    /// this separate from commit/abort prevents a drive from opening a new
+    /// provider request while Hermes is still fenced for the old route.
+    internal func rearmDeferredRoomProfileWork() {
+        let runtime = RoomRuntime.shared
+        let pending = runtime.deferredProfileRearmRooms
+        runtime.deferredProfileRearmRooms.removeAll()
+        for id in pending {
+            guard let room = runtime.rooms.first(where: { $0.id == id }) else { continue }
+            if !room.drives.isEmpty { scheduleRoomDrive(roomID: id) }
+            else if room.attempts.contains(where: { $0.finishedAt == nil }) {
+                scheduleRoomReconciliation(roomID: id)
+            }
+        }
+    }
+
+    internal func activateRoomProfileRoute(_ route: GatewayBotRoute) async throws {
+        let runtime = RoomRuntime.shared
+        let generation = runtime.profileRouteGeneration(route)
+        try await RoomMutationGate.shared.withLock("profile-route:\(route.qualifiedID)") {
+            try await runtime.store.activateProfileRoute(route)
+            guard runtime.profileRouteGeneration(route) == generation else {
+                throw CancellationError()
+            }
+            runtime.retiredProfileRoutes.remove(route)
+            _ = runtime.bumpProfileRouteGeneration(route)
+        }
+        runtime.profileLifecycleError = nil
     }
 
     /// Settings → Delete local data. New room mutations are held outside the
@@ -344,7 +537,11 @@ public extension AppModel {
             runtime.loadError = nil
             runtime.metadataPendingCount = 0
             runtime.metadataLastError = nil
+            runtime.profileLifecycleError = nil
             runtime.isLoaded = false
+            runtime.profileRouteGenerations.removeAll()
+            runtime.retiredProfileRoutes.removeAll()
+            runtime.deferredProfileRearmRooms.removeAll()
     }
 
     /// Root integration hook: call once when the roster shell appears. It is
@@ -364,6 +561,7 @@ public extension AppModel {
             if let operation = runtime.loadOperation { loaded = try await operation() }
             else { loaded = try await runtime.store.loadAll() }
             runtime.rooms = loaded.sorted { $0.lastActivityAt > $1.lastActivityAt }
+            runtime.retiredProfileRoutes = (try? await runtime.store.retiredMetadataRoutes()) ?? []
             for room in loaded {
                 if let avatar = room.avatar,
                    let data = try? await runtime.store.readBlob(roomID: room.id, attachment: avatar) {
@@ -398,6 +596,9 @@ public extension AppModel {
         let unique = proposedMembers.reduce(into: [RoomMember]()) { members, member in
             if !members.contains(where: { $0.route == member.route }) { members.append(member) }
         }
+        if let retired = unique.first(where: { RoomRuntime.shared.retiredProfileRoutes.contains($0.route) }) {
+            throw RoomStoreError.retiredRoute(retired.route)
+        }
         var record = RoomRecord(name: trimmed, members: unique)
         try RoomEngine.validate(record)
         record.updatedAt = Date()
@@ -431,6 +632,9 @@ public extension AppModel {
 
             let members = proposedMembers.reduce(into: [RoomMember]()) { result, member in
                 if !result.contains(where: { $0.route == member.route }) { result.append(member) }
+            }
+            if let retired = members.first(where: { RoomRuntime.shared.retiredProfileRoutes.contains($0.route) }) {
+                throw RoomStoreError.retiredRoute(retired.route)
             }
             guard (RoomEngine.minimumMembers...RoomEngine.maximumMembers).contains(members.count) else {
                 throw RoomValidationError.memberCount(members.count)
@@ -584,9 +788,12 @@ public extension AppModel {
                                          threadID: RoomThreadID?,
                                          attachments: [RoomOutboundAttachment]) async throws -> RoomThreadID {
         let runtime = RoomRuntime.shared
-        guard try await runtime.store.room(id: roomID) != nil else {
+        guard let existing = try await runtime.store.room(id: roomID) else {
             throw RoomStoreError.roomNotFound(roomID)
         }
+        guard !existing.members.contains(where: {
+            runtime.retiredProfileRoutes.contains($0.route)
+        }) else { throw CancellationError() }
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty || !attachments.isEmpty else {
             throw GatewayError(code: -8, message: "A room message cannot be empty.")
@@ -665,9 +872,27 @@ extension AppModel {
             var blockedRoutes = Set<GatewayBotRoute>()
             for mutation in mutations {
                 guard !blockedRoutes.contains(mutation.route) else { continue }
+                let generation = runtime.profileRouteGeneration(mutation.route)
+                guard runtime.acceptsProfileRoute(mutation.route, generation: generation) else {
+                    blockedRoutes.insert(mutation.route)
+                    continue
+                }
                 do {
-                    try await applyRoomMetadataMutation(mutation)
-                    try await runtime.store.removeMetadataMutation(id: mutation.id)
+                    if let operation = runtime.metadataMutationOperation {
+                        try await operation(mutation)
+                    } else {
+                        try await applyRoomMetadataMutation(mutation)
+                    }
+                    // A committed profile rename may have rewritten this same
+                    // id while the network request was suspended. Do not let
+                    // the old completion remove the destination mutation.
+                    guard runtime.acceptsProfileRoute(mutation.route,
+                                                      generation: generation) else {
+                        blockedRoutes.insert(mutation.route)
+                        continue
+                    }
+                    try await runtime.store.removeMetadataMutation(
+                        id: mutation.id, matching: mutation)
                     runtime.metadataPendingCount = max(0, runtime.metadataPendingCount - 1)
                     runtime.metadataLastError = nil
                 } catch {
@@ -764,22 +989,49 @@ extension AppModel {
         runtime.driveTasks[roomID] = next
     }
 
+    private func roomRouteGenerationSnapshot(_ room: RoomRecord)
+        -> [GatewayBotRoute: UInt64] {
+        var routes = Set(room.members.map(\.route))
+        routes.formUnion(room.formerMembers.map(\.route))
+        routes.formUnion(room.attempts.map(\.member))
+        routes.formUnion(room.drives.flatMap(\.roundMembers))
+        routes.formUnion(room.activity.compactMap(\.member))
+        routes.formUnion(room.memberSessions.keys.compactMap(GatewayBotRoute.init(qualifiedID:)))
+        return Dictionary(uniqueKeysWithValues: routes.map {
+            ($0, RoomRuntime.shared.profileRouteGeneration($0))
+        })
+    }
+
+    private func acceptsRoomRouteGenerations(
+        _ generations: [GatewayBotRoute: UInt64]
+    ) -> Bool {
+        generations.allSatisfy {
+            RoomRuntime.shared.acceptsProfileRoute($0.key, generation: $0.value)
+        }
+    }
+
     func runRoomDrive(roomID: RoomID) async {
         let runtime = RoomRuntime.shared
+        guard let initial = try? await runtime.store.room(id: roomID) else { return }
+        let routeGenerations = roomRouteGenerationSnapshot(initial)
         while !Task.isCancelled {
+            guard acceptsRoomRouteGenerations(routeGenerations) else { return }
             guard var room = try? await runtime.store.room(id: roomID),
                   let driveIndex = room.drives.firstIndex(where: { $0.epoch == room.epoch })
             else { return }
             var drive = room.drives[driveIndex]
             guard drive.round < RoomEngine.maximumRounds,
                   drive.posted < RoomEngine.maximumPosts else {
+                guard acceptsRoomRouteGenerations(routeGenerations) else { return }
                 await settleRoomDrive(roomID: roomID, epoch: drive.epoch,
-                                      threadID: drive.threadID)
+                                      threadID: drive.threadID,
+                                      routeGenerations: routeGenerations)
                 return
             }
 
             // Late-result reconciliation precedes any new selection.
             await harvestRoomAttempts(roomID: roomID, epoch: drive.epoch)
+            guard acceptsRoomRouteGenerations(routeGenerations) else { return }
             guard let refreshed = try? await runtime.store.room(id: roomID),
                   refreshed.epoch == drive.epoch,
                   let refreshedDrive = refreshed.drives.first(where: { $0.epoch == drive.epoch })
@@ -795,6 +1047,7 @@ extension AppModel {
                 drive.roundMembers = responders.map(\.route)
                 let driveToPersist = drive
                 let expectedEpoch = drive.epoch
+                guard acceptsRoomRouteGenerations(routeGenerations) else { return }
                 guard let updated = try? await runtime.store.mutate(roomID: roomID, { current in
                     guard current.epoch == expectedEpoch,
                           let index = current.drives.firstIndex(where: { $0.epoch == expectedEpoch })
@@ -812,8 +1065,10 @@ extension AppModel {
                 // Durable roundStartPosted keeps this correct after a crash in
                 // the middle of a round.
                 if drive.posted == drive.roundStartPosted {
+                    guard acceptsRoomRouteGenerations(routeGenerations) else { return }
                     await settleRoomDrive(roomID: roomID, epoch: drive.epoch,
-                                          threadID: drive.threadID)
+                                          threadID: drive.threadID,
+                                          routeGenerations: routeGenerations)
                     return
                 }
                 drive.round += 1
@@ -824,6 +1079,7 @@ extension AppModel {
                 drive.updatedAt = Date()
                 let driveToPersist = drive
                 let expectedEpoch = drive.epoch
+                guard acceptsRoomRouteGenerations(routeGenerations) else { return }
                 guard let updated = try? await runtime.store.mutate(roomID: roomID, { current in
                     guard current.epoch == expectedEpoch,
                           let index = current.drives.firstIndex(where: { $0.epoch == expectedEpoch })
@@ -835,8 +1091,11 @@ extension AppModel {
             }
 
             let member = responders[drive.nextMemberIndex]
+            guard runtime.acceptsProfileRoute(
+                member.route, generation: routeGenerations[member.route] ?? 0) else { return }
             await runRoomMemberBoundary(roomID: roomID, epoch: drive.epoch,
                                         threadID: drive.threadID, member: member)
+            guard acceptsRoomRouteGenerations(routeGenerations) else { return }
 
             let expectedEpoch = drive.epoch
             if let parked = try? await runtime.store.room(id: roomID),
@@ -848,7 +1107,8 @@ extension AppModel {
                 try? await Task.sleep(for: runtime.pollInterval)
                 continue
             }
-            guard let nextRoom = try? await runtime.store.mutate(roomID: roomID, { current in
+            guard acceptsRoomRouteGenerations(routeGenerations),
+                  let nextRoom = try? await runtime.store.mutate(roomID: roomID, { current in
                 guard current.epoch == expectedEpoch,
                       let index = current.drives.firstIndex(where: { $0.epoch == expectedEpoch })
                 else { throw CancellationError() }
@@ -856,6 +1116,7 @@ extension AppModel {
                 current.drives[index].status = .running
                 current.drives[index].updatedAt = Date()
             }) else { return }
+            guard acceptsRoomRouteGenerations(routeGenerations) else { return }
             runtime.replace(nextRoom)
         }
     }
@@ -864,6 +1125,8 @@ extension AppModel {
                                threadID: RoomThreadID, member: RoomMember) async {
         let runtime = RoomRuntime.shared
         guard var room = try? await runtime.store.room(id: roomID), room.epoch == epoch else { return }
+        let routeGeneration = runtime.profileRouteGeneration(member.route)
+        guard runtime.acceptsProfileRoute(member.route, generation: routeGeneration) else { return }
 
         // An accepted/uncertain/timed-out attempt is stranded work. Harvest it
         // at boundaries; never submit a replacement into that session.
@@ -885,9 +1148,11 @@ extension AppModel {
         do { client = try await routedClient(for: member.route) }
         catch {
             await persistRoomActivity(roomID: roomID, epoch: epoch, kind: .failed,
-                                      member: member.route, threadID: threadID)
+                                      member: member.route, threadID: threadID,
+                                      routeGeneration: routeGeneration)
             return
         }
+        guard runtime.acceptsProfileRoute(member.route, generation: routeGeneration) else { return }
 
         let session: RoomMemberSessionSnapshot
         do {
@@ -896,9 +1161,11 @@ extension AppModel {
                 storedID: room.memberSessions[member.route.qualifiedID])
         } catch {
             await persistRoomActivity(roomID: roomID, epoch: epoch, kind: .failed,
-                                      member: member.route, threadID: threadID)
+                                      member: member.route, threadID: threadID,
+                                      routeGeneration: routeGeneration)
             return
         }
+        guard runtime.acceptsProfileRoute(member.route, generation: routeGeneration) else { return }
 
         let prompt = roomTurnPrompt(room: room, viewer: member,
                                     delta: Array(delta.suffix(RoomEngine.historyLimit)))
@@ -916,6 +1183,7 @@ extension AppModel {
             // Durable wait proves no room prompt was submitted. Reconciliation
             // watches until idle, then settles this boundary without a blind
             // submission; a later round can consider fresh deltas normally.
+            guard runtime.acceptsProfileRoute(member.route, generation: routeGeneration) else { return }
             if let waiting = try? await runtime.store.mutate(roomID: roomID, { current in
                 guard current.epoch == epoch else { throw CancellationError() }
                 current.memberSessions[member.route.qualifiedID] = session.storedID
@@ -923,10 +1191,14 @@ extension AppModel {
                 RoomEngine.recordActivity(RoomActivity(epoch: epoch, kind: .queued,
                                                        member: member.route, threadID: threadID),
                                           in: &current)
-            }) { runtime.replace(waiting) }
+            }) {
+                guard runtime.acceptsProfileRoute(member.route, generation: routeGeneration) else { return }
+                runtime.replace(waiting)
+            }
             return
         }
 
+        guard runtime.acceptsProfileRoute(member.route, generation: routeGeneration) else { return }
         guard let persisted = try? await runtime.store.mutate(roomID: roomID, { current in
             guard current.epoch == epoch else { throw CancellationError() }
             current.memberSessions[member.route.qualifiedID] = session.storedID
@@ -934,6 +1206,7 @@ extension AppModel {
             RoomEngine.recordActivity(RoomActivity(epoch: epoch, kind: .working,
                                                    member: member.route, threadID: threadID), in: &current)
         }) else { return }
+        guard runtime.acceptsProfileRoute(member.route, generation: routeGeneration) else { return }
         room = persisted
         runtime.replace(persisted)
 
@@ -948,9 +1221,11 @@ extension AppModel {
                 profile: member.route.profile, attachments: outbound)
         }
 
+        guard runtime.acceptsProfileRoute(member.route, generation: routeGeneration) else { return }
         let saved = await persistRoomSubmission(roomID: roomID, attemptID: attempt.id,
                                                 member: member.route, epoch: epoch,
-                                                threadID: threadID, submitted: submitted)
+                                                threadID: threadID, submitted: submitted,
+                                                routeGeneration: routeGeneration)
         if saved, case .accepted = submitted.acceptance {
             await waitForRoomReply(roomID: roomID, attemptID: attempt.id)
         }
@@ -960,10 +1235,16 @@ extension AppModel {
     func persistRoomSubmission(roomID: RoomID, attemptID: RoomAttemptID,
                                member: GatewayBotRoute, epoch: UInt64,
                                threadID: RoomThreadID,
-                               submitted: RoomPromptSubmission) async -> Bool {
-        guard let room = try? await RoomRuntime.shared.store.mutate(roomID: roomID, { current in
+                               submitted: RoomPromptSubmission,
+                               routeGeneration: UInt64? = nil) async -> Bool {
+        let runtime = RoomRuntime.shared
+        if let routeGeneration,
+           !runtime.acceptsProfileRoute(member, generation: routeGeneration) { return false }
+        guard let room = try? await runtime.store.mutate(roomID: roomID, { current in
             guard let index = current.attempts.firstIndex(where: { $0.id == attemptID })
             else { throw CancellationError() }
+            guard current.attempts[index].member == member,
+                  current.attempts[index].epoch == epoch else { throw CancellationError() }
             current.attempts[index].baselineMessageCount = submitted.baseline
             current.attempts[index].storedSessionID = submitted.storedID
             current.attempts[index].runtimeSessionID = submitted.runtimeID
@@ -988,7 +1269,9 @@ extension AppModel {
                                                        member: member, threadID: threadID), in: &current)
             }
         }) else { return false }
-        RoomRuntime.shared.replace(room)
+        if let routeGeneration,
+           !runtime.acceptsProfileRoute(member, generation: routeGeneration) { return false }
+        runtime.replace(room)
         return true
     }
 
@@ -1006,13 +1289,17 @@ extension AppModel {
                   attempt.finishedAt == nil,
                   room.epoch == attempt.epoch,
                   let member = room.members.first(where: { $0.route == attempt.member }),
+                  let routeGeneration = Optional(runtime.profileRouteGeneration(attempt.member)),
                   let client = try? await routedClient(for: attempt.member),
                   let session = try? await client.readRoomSession(
                     storedID: attempt.storedSessionID, profile: attempt.member.profile)
             else { return }
+            guard runtime.acceptsProfileRoute(attempt.member,
+                                              generation: routeGeneration) else { return }
             if let reply = session.assistantReply(for: attempt), !session.running {
                 await finishRoomAttempt(roomID: roomID, attemptID: attemptID,
-                                        member: member, reply: reply, delivered: false)
+                                        member: member, reply: reply, delivered: false,
+                                        routeGeneration: routeGeneration)
                 return
             }
             if session.running {
@@ -1021,11 +1308,16 @@ extension AppModel {
             } else if session.containsAttempt(attempt) {
                 // Accepted with no assistant row (tool-only/no output): pass.
                 await finishRoomAttempt(roomID: roomID, attemptID: attemptID,
-                                        member: member, reply: nil, delivered: false)
+                                        member: member, reply: nil, delivered: false,
+                                        routeGeneration: routeGeneration)
                 return
             }
         }
-        guard let room = try? await runtime.store.mutate(roomID: roomID, { current in
+        guard let timeoutRoom = try? await runtime.store.room(id: roomID),
+              let timeoutAttempt = timeoutRoom.attempts.first(where: { $0.id == attemptID }),
+              runtime.acceptsProfileRoute(timeoutAttempt.member,
+                                          generation: runtime.profileRouteGeneration(timeoutAttempt.member)),
+              let room = try? await runtime.store.mutate(roomID: roomID, { current in
             guard let index = current.attempts.firstIndex(where: { $0.id == attemptID }),
                   current.attempts[index].finishedAt == nil,
                   current.epoch == current.attempts[index].epoch else { throw CancellationError() }
@@ -1035,6 +1327,8 @@ extension AppModel {
                                                    member: current.attempts[index].member,
                                                    threadID: current.attempts[index].threadID), in: &current)
         }) else { return }
+        guard runtime.acceptsProfileRoute(timeoutAttempt.member,
+                                          generation: runtime.profileRouteGeneration(timeoutAttempt.member)) else { return }
         runtime.replace(room)
     }
 
@@ -1051,6 +1345,10 @@ extension AppModel {
         for attempt in pending {
             guard !Task.isCancelled,
                   let current = try? await runtime.store.room(id: roomID) else { continue }
+            let routeGeneration = runtime.profileRouteGeneration(attempt.member)
+            guard runtime.acceptsProfileRoute(attempt.member, generation: routeGeneration) else {
+                continue
+            }
             if attempt.state == .waiting, current.epoch != attempt.epoch {
                 if let cancelled = try? await runtime.store.mutate(roomID: roomID, { value in
                     guard let index = value.attempts.firstIndex(where: { $0.id == attempt.id }),
@@ -1066,6 +1364,8 @@ extension AppModel {
                   let session = try? await client.readRoomSession(
                     storedID: attempt.storedSessionID, profile: attempt.member.profile)
             else { continue }
+            guard runtime.acceptsProfileRoute(attempt.member,
+                                              generation: routeGeneration) else { continue }
             if attempt.state == .waiting {
                 guard !session.running else { continue }
                 if session.containsAttempt(attempt) {
@@ -1073,7 +1373,11 @@ extension AppModel {
                         guard let index = value.attempts.firstIndex(where: { $0.id == attempt.id })
                         else { throw CancellationError() }
                         value.attempts[index].state = .accepted
-                    }) { runtime.replace(accepted) }
+                    }) {
+                        guard runtime.acceptsProfileRoute(attempt.member,
+                                                          generation: routeGeneration) else { continue }
+                        runtime.replace(accepted)
+                    }
                 } else {
                     await submitWaitingRoomAttempt(roomID: roomID, attempt: attempt,
                                                    session: session, client: client)
@@ -1097,15 +1401,21 @@ extension AppModel {
                                                                member: attempt.member,
                                                                threadID: attempt.threadID), in: &value)
                     }
-                }) { runtime.replace(unresolved) }
+                }) {
+                    guard runtime.acceptsProfileRoute(attempt.member,
+                                                      generation: routeGeneration) else { continue }
+                    runtime.replace(unresolved)
+                }
                 continue
             }
             if let reply = session.assistantReply(for: attempt), !session.running {
                 await finishRoomAttempt(roomID: roomID, attemptID: attempt.id,
-                                        member: seat, reply: reply, delivered: true)
+                                        member: seat, reply: reply, delivered: true,
+                                        routeGeneration: routeGeneration)
             } else if !session.running, session.containsAttempt(attempt) {
                 await finishRoomAttempt(roomID: roomID, attemptID: attempt.id,
-                                        member: seat, reply: nil, delivered: true)
+                                        member: seat, reply: nil, delivered: true,
+                                        routeGeneration: routeGeneration)
             }
         }
     }
@@ -1117,10 +1427,14 @@ extension AppModel {
                                   session: RoomMemberSessionSnapshot,
                                   client: GatewayClient) async {
         let runtime = RoomRuntime.shared
+        let routeGeneration = runtime.profileRouteGeneration(attempt.member)
         guard !session.running,
+              runtime.acceptsProfileRoute(attempt.member, generation: routeGeneration),
               let claimed = try? await runtime.store.mutate(roomID: roomID, { value in
                   guard let index = value.attempts.firstIndex(where: { $0.id == attempt.id }),
-                        value.attempts[index].state == .waiting else { throw CancellationError() }
+                        value.attempts[index].state == .waiting,
+                        value.attempts[index].member == attempt.member,
+                        value.attempts[index].epoch == attempt.epoch else { throw CancellationError() }
                   if value.epoch != attempt.epoch {
                       value.attempts[index].state = .cancelled
                       value.attempts[index].finishedAt = Date()
@@ -1135,6 +1449,7 @@ extension AppModel {
         else { return }
         runtime.replace(claimed)
         guard claimedAttempt.state == .working else { return }
+        guard runtime.acceptsProfileRoute(attempt.member, generation: routeGeneration) else { return }
         let payloads = await roomOutboundAttachments(
             roomID: roomID, descriptors: claimedAttempt.outboundAttachments)
         let submitted: RoomPromptSubmission
@@ -1145,21 +1460,27 @@ extension AppModel {
                 attempt: claimedAttempt, session: session,
                 profile: claimedAttempt.member.profile, attachments: payloads)
         }
+        guard runtime.acceptsProfileRoute(attempt.member, generation: routeGeneration) else { return }
         let saved = await persistRoomSubmission(
             roomID: roomID, attemptID: claimedAttempt.id,
             member: claimedAttempt.member, epoch: claimedAttempt.epoch,
-            threadID: claimedAttempt.threadID, submitted: submitted)
+            threadID: claimedAttempt.threadID, submitted: submitted,
+            routeGeneration: routeGeneration)
         if saved, case .accepted = submitted.acceptance {
             await waitForRoomReply(roomID: roomID, attemptID: claimedAttempt.id)
         }
     }
 
     func finishRoomAttempt(roomID: RoomID, attemptID: RoomAttemptID,
-                           member: RoomMember, reply: String?, delivered: Bool) async {
+                           member: RoomMember, reply: String?, delivered: Bool,
+                           routeGeneration: UInt64? = nil) async {
         let runtime = RoomRuntime.shared
+        if let routeGeneration,
+           !runtime.acceptsProfileRoute(member.route, generation: routeGeneration) { return }
         guard let room = try? await runtime.store.mutate(roomID: roomID, { current in
             guard let index = current.attempts.firstIndex(where: { $0.id == attemptID }),
-                  current.attempts[index].finishedAt == nil else { throw CancellationError() }
+                  current.attempts[index].finishedAt == nil,
+                  current.attempts[index].member == member.route else { throw CancellationError() }
             let attempt = current.attempts[index]
             let pass = RoomEngine.isPass(reply)
             current.attempts[index].state = pass ? .passed : (delivered ? .delivered : .replied)
@@ -1182,27 +1503,39 @@ extension AppModel {
                                                    kind: pass ? .passed : (delivered ? .delivered : .replied),
                                                    member: member.route, threadID: attempt.threadID), in: &current)
         }) else { return }
+        if let routeGeneration,
+           !runtime.acceptsProfileRoute(member.route, generation: routeGeneration) { return }
         runtime.replace(room)
     }
 
-    func settleRoomDrive(roomID: RoomID, epoch: UInt64, threadID: RoomThreadID) async {
+    func settleRoomDrive(roomID: RoomID, epoch: UInt64, threadID: RoomThreadID,
+                         routeGenerations: [GatewayBotRoute: UInt64]? = nil) async {
         let runtime = RoomRuntime.shared
+        if let routeGenerations,
+           !acceptsRoomRouteGenerations(routeGenerations) { return }
         guard let room = try? await runtime.store.mutate(roomID: roomID, { current in
             guard current.epoch == epoch else { throw CancellationError() }
             current.drives.removeAll { $0.epoch == epoch }
             RoomEngine.recordActivity(RoomActivity(epoch: epoch, kind: .settled,
                                                    threadID: threadID), in: &current)
         }) else { return }
+        if let routeGenerations,
+           !acceptsRoomRouteGenerations(routeGenerations) { return }
         runtime.replace(room)
     }
 
     func persistRoomActivity(roomID: RoomID, epoch: UInt64, kind: RoomActivityKind,
-                             member: GatewayBotRoute?, threadID: RoomThreadID?) async {
+                             member: GatewayBotRoute?, threadID: RoomThreadID?,
+                             routeGeneration: UInt64? = nil) async {
+        if let member, let routeGeneration = routeGeneration,
+           !RoomRuntime.shared.acceptsProfileRoute(member, generation: routeGeneration) { return }
         guard let room = try? await RoomRuntime.shared.store.mutate(roomID: roomID, { current in
             guard current.epoch == epoch else { throw CancellationError() }
             RoomEngine.recordActivity(RoomActivity(epoch: epoch, kind: kind,
                                                    member: member, threadID: threadID), in: &current)
         }) else { return }
+        if let member, let routeGeneration = routeGeneration,
+           !RoomRuntime.shared.acceptsProfileRoute(member, generation: routeGeneration) { return }
         RoomRuntime.shared.replace(room)
     }
 

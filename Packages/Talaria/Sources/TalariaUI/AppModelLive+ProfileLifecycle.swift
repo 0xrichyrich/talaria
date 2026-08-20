@@ -42,6 +42,16 @@ private final class ProfileLifecycleRuntime {
     var routeGenerations: [GatewayBotRoute: UInt64] = [:]
     var blockedRoutes: Set<GatewayBotRoute> = []
     var ordinaryTrafficCounts: [String: Int] = [:]
+    /// The active-primary profile is parked under a qualified key before its
+    /// gateway-wide retirement disconnect. Keep only that exact stop intent
+    /// outside ChatRuntime so disconnectGateway's source scrub cannot erase it
+    /// before a committed rename re-keys it (or a refusal restores it).
+    var pendingStopParking: [GatewayBotRoute: ProfileLifecyclePendingStopParking] = [:]
+    /// Canonical pins are portable profile metadata, but in-flight kickoff
+    /// bookkeeping is route-owned and must not cross a profile directory
+    /// mutation. Keep only the pin while the source is fenced so a committed
+    /// rename can re-key it; kickoffs are retired synchronously.
+    var pendingCanonicalPinParking: [GatewayBotRoute: ProfileLifecyclePendingCanonicalPinParking] = [:]
 
     func beginLifecycle(gatewayID: String) -> Bool {
         guard !heldGateways.contains(gatewayID),
@@ -208,6 +218,27 @@ private struct ProfileLifecyclePreservedState {
     var unread: Int
 }
 
+private struct ProfileLifecyclePendingStopParking: Equatable {
+    var originalBotID: String
+    var parkedBotID: String
+    var pending: PendingStopRequest
+}
+
+private struct ProfileLifecyclePendingCanonicalPinParking: Equatable {
+    var values: [String: String]
+    var dirty: Set<String>
+}
+
+/// Exact pre-accept projection captured before lifecycle teardown scrubs
+/// streaming/tool state. It is restored only for a request proven not to have
+/// crossed its wire acceptance boundary.
+private struct ProfileLifecycleMutationRollback {
+    var chatID: ObjectIdentifier
+    var messages: [ChatMessage]
+    var isRunning: Bool
+    var isTyping: Bool
+}
+
 extension AppModel {
     /// Capture one route generation before an async profile-owned operation.
     /// Lifecycle mutation blocks the route and bumps this generation before it
@@ -227,6 +258,22 @@ extension AppModel {
             && runtime.routeGenerations[token.route, default: 0] == token.generation
     }
 
+    /// A route token alone cannot reject a stale primary client after a
+    /// reconnect. Canonical attach/pin and roster cosmetics also retain the
+    /// client identity and primary generation across their awaits.
+    internal func profileLifecycleAcceptsGatewaySnapshot(
+        route: GatewayBotRoute, client: GatewayClient, generation: Int
+    ) -> Bool {
+        let tokenID = route.gatewayID == LiveRuntime.shared.gatewayID
+            ? route.profile : route.qualifiedID
+        guard let token = profileLifecycleGenerationToken(for: tokenID),
+              token.route == route,
+              profileLifecycleAccepts(token) else { return false }
+        guard route.gatewayID == LiveRuntime.shared.gatewayID else { return true }
+        return LiveRuntime.shared.generation == generation
+            && self.client.map(ObjectIdentifier.init) == ObjectIdentifier(client)
+    }
+
     /// Gateway-wide admission check for runtimes such as voice whose stream
     /// can outlive one profile route. Both an active mutation and an unresolved
     /// postcondition must stop new traffic until lifecycle authority returns.
@@ -236,9 +283,11 @@ extension AppModel {
 
     /// A successful explicit create/recreate makes a formerly deleted identity
     /// authoritative again. Never infer this from a possibly stale roster.
-    internal func activateProfileLifecycleRoute(gatewayID: String, profile: String) {
-        ProfileLifecycleRuntime.shared.activate(
-            GatewayBotRoute(gatewayID: gatewayID, profile: profile))
+    internal func activateProfileLifecycleRoute(gatewayID: String, profile: String) async throws {
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: profile)
+        try await activateRoomProfileRoute(route)
+        A2ARuntime.shared.activateProfileRoute(route)
+        ProfileLifecycleRuntime.shared.activate(route)
     }
 
     public func profileLifecycleTarget(rosterID: String) -> ProfileLifecycleTarget? {
@@ -278,20 +327,50 @@ extension AppModel {
         defer { exclusive.releaseIfHeld() }
 
         let changesDirectory = target.route.profile != "default"
+        // Room drive/metadata work must be fenced before the first suspend;
+        // otherwise a completion can make the destination writable while the
+        // profile REST mutation is still unresolved.
+        let roomLifecycleToken: RoomProfileLifecycleToken?
+        if changesDirectory {
+            do {
+                roomLifecycleToken = try await persistRoomProfileLifecycleFence(source: target.route)
+            } catch {
+                return .refused("Room state could not be durably fenced before the profile rename.")
+            }
+        } else { roomLifecycleToken = nil }
         let preserved = captureProfileLifecycleState(target)
         if changesDirectory {
+            parkProfileLifecycleCanonicalState(target)
             parkProfileLifecycleState(target)
-            abortProfileRuntime(target)
+            // Keep the exact deferred stop parked until a committed rename
+            // can re-key it; a refused rename restores the original route.
+            abortProfileRuntime(target, preservePendingStop: true,
+                                preserveQueuedState: true)
         } else {
             // A default rename changes presentation metadata only, but late
             // profile-owned completions still must not publish across an
             // uncertain mutation response.
             ProfileLifecycleRuntime.shared.block(target.route)
+            A2ARuntime.shared.retireProfileRoute(
+                target.route, sourceBotIDs: profileLifecycleSourceIDs(target),
+                preserveForRename: true)
+        }
+        if changesDirectory {
+            // disconnectGateway clears the departing primary's A2A scope;
+            // this route was already retired/paused above and must survive
+            // until the rename postcondition can migrate it.
+            A2ARuntime.shared.preserveRouteAcrossGatewayReset(target.route)
         }
         let retirement = changesDirectory
             ? await retireProfileLifecycleClient(target.route.gatewayID, baseURL: baseURL,
                                                   credential: credential)
             : ProfileLifecycleRetirement(wasActive: false, connectionGeneration: nil)
+        if changesDirectory {
+            // The active-primary retirement scrubbed all gateway stops. Put
+            // only this target back under its parked qualified key before the
+            // REST result is reconciled; siblings remain retired.
+            restoreProfileLifecyclePendingStop(target, parked: true)
+        }
 
         let result: ProfileRenameResult
         do {
@@ -308,7 +387,8 @@ extension AppModel {
             return await resolveAmbiguousRename(
                 target, requested: cleanName, originalError: error.message,
                 baseURL: baseURL, credential: credential, retirement: retirement,
-                preserved: preserved, exclusive: exclusive)
+                preserved: preserved, exclusive: exclusive,
+                roomLifecycleToken: roomLifecycleToken)
         } catch {
             guard changesDirectory else {
                 return await resolveAmbiguousDefaultDisplayRename(
@@ -318,11 +398,25 @@ extension AppModel {
             return await resolveAmbiguousRename(
                 target, requested: cleanName, originalError: error.localizedDescription,
                 baseURL: baseURL, credential: credential, retirement: retirement,
-                preserved: preserved, exclusive: exclusive)
+                preserved: preserved, exclusive: exclusive,
+                roomLifecycleToken: roomLifecycleToken)
         }
 
         let canonical = result.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !canonical.isEmpty else { return .refused("Hermes returned an empty profile name.") }
+        guard !canonical.isEmpty else {
+            if changesDirectory {
+                return await resolveAmbiguousRename(
+                    target, requested: cleanName,
+                    originalError: "Hermes returned an empty profile name.",
+                    baseURL: baseURL, credential: credential, retirement: retirement,
+                    preserved: preserved, exclusive: exclusive,
+                    roomLifecycleToken: roomLifecycleToken)
+            }
+            return await resolveAmbiguousDefaultDisplayRename(
+                target, requested: cleanName,
+                originalError: "Hermes returned an empty profile name.",
+                baseURL: baseURL, credential: credential, exclusive: exclusive)
+        }
         // `default` is presentation-only and must keep the same canonical route.
         if !changesDirectory {
             guard canonical == target.route.profile, result.displayName == cleanName else {
@@ -331,6 +425,8 @@ extension AppModel {
                     originalError: "Hermes returned an inconsistent default-profile rename result.",
                     baseURL: baseURL, credential: credential, exclusive: exclusive)
             }
+            A2ARuntime.shared.restoreProfileRoute(
+                target.route, sourceBotIDs: profileLifecycleSourceIDs(target))
             ProfileLifecycleRuntime.shared.restore(target.route)
             // Hermes and local route state now agree. End the exclusive
             // filesystem fence before the owner refresh acquires an ordinary
@@ -338,6 +434,7 @@ extension AppModel {
             let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await refreshProfileRoster(gatewayID: target.route.gatewayID)
             await recoveryLease.release()
+            rearmDeferredRoomProfileWork()
             return .renamed(canonicalName: canonical, displayName: result.displayName)
         }
         guard canonical != target.route.profile,
@@ -346,7 +443,15 @@ extension AppModel {
                 target, requested: cleanName,
                 originalError: "Hermes did not return a valid changed canonical profile name.",
                 baseURL: baseURL, credential: credential, retirement: retirement,
-                preserved: preserved, exclusive: exclusive)
+                preserved: preserved, exclusive: exclusive,
+                roomLifecycleToken: roomLifecycleToken)
+        }
+        let destinationRoute = GatewayBotRoute(
+            gatewayID: target.route.gatewayID, profile: canonical)
+        guard await commitRoomProfileLifecycleIfNeeded(
+            roomLifecycleToken, destination: destinationRoute, source: target.route) else {
+            holdIndeterminateLifecycle(target)
+            return .refused("The profile was renamed remotely, but its room state could not be migrated. The gateway remains fenced until it is verified.")
         }
         reconcileProfileRoute(target, canonicalNewName: canonical,
                               scope: baseURL, preserved: preserved,
@@ -360,6 +465,7 @@ extension AppModel {
             await refreshProfileRoster(gatewayID: target.route.gatewayID)
         }
         await recoveryLease.release()
+        rearmDeferredRoomProfileWork()
         return .renamed(canonicalName: canonical, displayName: result.displayName)
     }
 
@@ -389,8 +495,21 @@ extension AppModel {
         let exclusive = ProfileLifecycleExclusiveLease(gatewayID: target.route.gatewayID)
         defer { exclusive.releaseIfHeld() }
 
+        // Deletion is a tombstone in RoomRuntime. It is prepared before any
+        // disconnect/REST await and is only reopened on a definitive refusal.
+        let roomLifecycleToken: RoomProfileLifecycleToken
+        do {
+            roomLifecycleToken = try await persistRoomProfileLifecycleFence(
+                source: target.route, deleting: true)
+        } catch {
+            return .refused("Room state could not be durably fenced before profile deletion.")
+        }
         let preserved = captureProfileLifecycleState(target)
+        parkProfileLifecycleCanonicalState(target)
         parkProfileLifecycleState(target)
+        // Deletion has no destination. Retire source-qualified deferred stops
+        // before the backend is torn down so they cannot reach a replacement
+        // profile if the id is later reused.
         abortProfileRuntime(target)
         let retirement = await retireProfileLifecycleClient(target.route.gatewayID,
                                                              baseURL: baseURL,
@@ -403,18 +522,27 @@ extension AppModel {
             return await resolveAmbiguousDelete(
                 target, originalError: error.message, baseURL: baseURL,
                 credential: credential, retirement: retirement,
-                preserved: preserved, exclusive: exclusive)
+                preserved: preserved, exclusive: exclusive,
+                roomLifecycleToken: roomLifecycleToken)
         } catch {
             return await resolveAmbiguousDelete(
                 target, originalError: error.localizedDescription, baseURL: baseURL,
                 credential: credential, retirement: retirement,
-                preserved: preserved, exclusive: exclusive)
+                preserved: preserved, exclusive: exclusive,
+                roomLifecycleToken: roomLifecycleToken)
         }
 
         reconcileProfileRoute(target, canonicalNewName: nil,
                               scope: baseURL, preserved: preserved,
                               restorePrimaryIfUnclaimed:
                                   mayRestoreRetiredPrimary(retirement))
+        do {
+            try await commitRoomProfileRemoval(roomLifecycleToken)
+        } catch {
+            await failClosedRoomProfileRoute(target.route)
+            holdIndeterminateLifecycle(target)
+            return .refused("The profile was deleted remotely, but its room tombstone could not be committed. The gateway remains fenced until it is verified.")
+        }
         let recoveryLease = exclusive.finishAuthoritativeReconciliation()
         await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                             retirement: retirement, baseURL: baseURL,
@@ -423,7 +551,28 @@ extension AppModel {
             await refreshProfileRoster(gatewayID: target.route.gatewayID)
         }
         await recoveryLease.release()
+        rearmDeferredRoomProfileWork()
         return .deleted
+    }
+
+    /// RoomStore migration is part of the authoritative rename boundary. If
+    /// it cannot commit after Hermes has accepted the rename, tombstone the
+    /// source route instead of reopening it or publishing a partially moved
+    /// destination. The caller keeps the profile lifecycle fenced so a later
+    /// verification can reconcile both stores together.
+    private func commitRoomProfileLifecycleIfNeeded(
+        _ token: RoomProfileLifecycleToken?, destination: GatewayBotRoute,
+        source: GatewayBotRoute
+    ) async -> Bool {
+        guard let token else { return true }
+        do {
+            try await commitRoomProfileRename(token, destination: destination)
+            return true
+        } catch {
+            _ = prepareRoomProfileLifecycle(source: source, deleting: true)
+            await failClosedRoomProfileRoute(source)
+            return false
+        }
     }
 
     private func resolveAmbiguousRename(
@@ -431,7 +580,8 @@ extension AppModel {
         baseURL: URL, credential: GatewayCredential,
         retirement: ProfileLifecycleRetirement,
         preserved: ProfileLifecyclePreservedState,
-        exclusive: ProfileLifecycleExclusiveLease
+        exclusive: ProfileLifecycleExclusiveLease,
+        roomLifecycleToken: RoomProfileLifecycleToken?
     ) async -> ProfileLifecycleOutcome {
         let names = try? await GatewayREST.profileNames(baseURL: baseURL, credential: credential)
         let verdict = names.map {
@@ -440,6 +590,13 @@ extension AppModel {
         } ?? .indeterminate
         switch verdict {
         case .committed:
+            let destinationRoute = GatewayBotRoute(
+                gatewayID: target.route.gatewayID, profile: requested)
+            guard await commitRoomProfileLifecycleIfNeeded(
+                roomLifecycleToken, destination: destinationRoute, source: target.route) else {
+                holdIndeterminateLifecycle(target)
+                return .refused("The profile was renamed remotely, but its room state could not be migrated. The gateway remains fenced until it is verified.")
+            }
             reconcileProfileRoute(target, canonicalNewName: requested, scope: baseURL,
                                   preserved: preserved,
                                   restorePrimaryIfUnclaimed:
@@ -452,18 +609,28 @@ extension AppModel {
                 await refreshProfileRoster(gatewayID: target.route.gatewayID)
             }
             await recoveryLease.release()
+            rearmDeferredRoomProfileWork()
             return .renamed(canonicalName: requested, displayName: nil)
         case .notCommitted:
-            restoreParkedProfileLifecycleStateIfNeeded(
-                target, wasActive: mayRestoreRetiredPrimary(retirement))
+            if let roomLifecycleToken {
+                await abortRoomProfileLifecycle(roomLifecycleToken)
+            }
+            let restorePrimary = mayRestoreRetiredPrimary(retirement)
+            restoreParkedProfileLifecycleCanonicalStateIfNeeded(
+                target, preferPrimary: restorePrimary)
+            restoreParkedProfileLifecycleStateIfNeeded(target, wasActive: restorePrimary)
+            A2ARuntime.shared.restoreProfileRoute(
+                target.route, sourceBotIDs: profileLifecycleSourceIDs(target))
             ProfileLifecycleRuntime.shared.restore(target.route)
             let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                                 retirement: retirement, baseURL: baseURL,
                                                 credential: credential)
             await recoveryLease.release()
+            rearmDeferredRoomProfileWork()
             return .refused(originalError)
         case .indeterminate:
+            ProfileLifecycleRuntime.shared.pendingCanonicalPinParking[target.route] = nil
             holdIndeterminateLifecycle(target)
             return .refused("\(originalError) The profile result is uncertain, so this gateway remains fenced and queued work for that profile was quarantined.")
         }
@@ -482,15 +649,21 @@ extension AppModel {
         } ?? .indeterminate
         switch verdict {
         case .committed:
+            A2ARuntime.shared.restoreProfileRoute(
+                target.route, sourceBotIDs: profileLifecycleSourceIDs(target))
             ProfileLifecycleRuntime.shared.restore(target.route)
             let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await refreshProfileRoster(gatewayID: target.route.gatewayID)
             await recoveryLease.release()
+            rearmDeferredRoomProfileWork()
             return .renamed(canonicalName: target.route.profile, displayName: requested)
         case .notCommitted:
+            A2ARuntime.shared.restoreProfileRoute(
+                target.route, sourceBotIDs: profileLifecycleSourceIDs(target))
             ProfileLifecycleRuntime.shared.restore(target.route)
             let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await recoveryLease.release()
+            rearmDeferredRoomProfileWork()
             return .refused(originalError)
         case .indeterminate:
             ProfileLifecycleRuntime.shared.heldGateways.insert(target.route.gatewayID)
@@ -503,7 +676,8 @@ extension AppModel {
         baseURL: URL, credential: GatewayCredential,
         retirement: ProfileLifecycleRetirement,
         preserved: ProfileLifecyclePreservedState,
-        exclusive: ProfileLifecycleExclusiveLease
+        exclusive: ProfileLifecycleExclusiveLease,
+        roomLifecycleToken: RoomProfileLifecycleToken
     ) async -> ProfileLifecycleOutcome {
         let names = try? await GatewayREST.profileNames(baseURL: baseURL, credential: credential)
         let verdict = names.map {
@@ -511,6 +685,13 @@ extension AppModel {
         } ?? .indeterminate
         switch verdict {
         case .committed:
+            do {
+                try await commitRoomProfileRemoval(roomLifecycleToken)
+            } catch {
+                await failClosedRoomProfileRoute(target.route)
+                holdIndeterminateLifecycle(target)
+                return .refused("The profile was deleted remotely, but its room tombstone could not be committed. The gateway remains fenced until it is verified.")
+            }
             reconcileProfileRoute(target, canonicalNewName: nil, scope: baseURL,
                                   preserved: preserved,
                                   restorePrimaryIfUnclaimed:
@@ -523,18 +704,26 @@ extension AppModel {
                 await refreshProfileRoster(gatewayID: target.route.gatewayID)
             }
             await recoveryLease.release()
+            rearmDeferredRoomProfileWork()
             return .deleted
         case .notCommitted:
-            restoreParkedProfileLifecycleStateIfNeeded(
-                target, wasActive: mayRestoreRetiredPrimary(retirement))
+            await abortRoomProfileLifecycle(roomLifecycleToken)
+            let restorePrimary = mayRestoreRetiredPrimary(retirement)
+            restoreParkedProfileLifecycleCanonicalStateIfNeeded(
+                target, preferPrimary: restorePrimary)
+            restoreParkedProfileLifecycleStateIfNeeded(target, wasActive: restorePrimary)
+            A2ARuntime.shared.restoreProfileRoute(
+                target.route, sourceBotIDs: profileLifecycleSourceIDs(target))
             ProfileLifecycleRuntime.shared.restore(target.route)
             let recoveryLease = exclusive.finishAuthoritativeReconciliation()
             await releaseProfileLifecycleFence(gatewayID: target.route.gatewayID,
                                                 retirement: retirement, baseURL: baseURL,
                                                 credential: credential)
             await recoveryLease.release()
+            rearmDeferredRoomProfileWork()
             return .refused(originalError)
         case .indeterminate:
+            ProfileLifecycleRuntime.shared.pendingCanonicalPinParking[target.route] = nil
             holdIndeterminateLifecycle(target)
             return .refused("\(originalError) The profile result is uncertain, so this gateway remains fenced and queued work for that profile was quarantined.")
         }
@@ -544,6 +733,7 @@ extension AppModel {
         ProfileLifecycleRuntime.shared.heldGateways.insert(target.route.gatewayID)
         let sources: Set = [target.route.qualifiedID]
         ProfileLifecycleQueue.reconcile(&composeQueue, sources: sources, destination: nil)
+        reconcileComposeQueueIDs(sources: sources, destination: nil)
         if target.route.gatewayID == LiveRuntime.shared.gatewayID || client == nil {
             isOffline = true
         }
@@ -559,6 +749,90 @@ extension AppModel {
             unread: max(routed, visible))
     }
 
+    /// Canonical-chat metadata is keyed by the roster id rather than carrying
+    /// a route alongside the value. Resolve only the exact source ids that
+    /// belong to this lifecycle operation; in particular, a secondary
+    /// profile must never borrow the primary gateway's bare `profile` key.
+    private func profileLifecycleSourceIDs(_ target: ProfileLifecycleTarget) -> Set<String> {
+        var ids: Set<String> = [target.route.qualifiedID]
+        if target.rosterID == target.route.profile,
+           LiveRuntime.shared.gatewayID == target.route.gatewayID {
+            ids.insert(target.route.profile)
+        }
+        return ids
+    }
+
+    /// Remove canonical route bookkeeping before the profile directory is
+    /// touched. A pin is portable and is parked for a committed rename; an
+    /// in-flight kickoff is not portable because Hermes tears down its old
+    /// session/backend as part of the rename and must therefore be retired.
+    internal func parkProfileLifecycleCanonicalState(_ target: ProfileLifecycleTarget) {
+        let runtime = CanonicalChatRuntime.shared
+        let sourceIDs = profileLifecycleSourceIDs(target)
+        var pins: [String: String] = [:]
+        var dirty: Set<String> = []
+        for source in sourceIDs {
+            if let pin = runtime.pins.removeValue(forKey: source) { pins[source] = pin }
+            if runtime.dirtyPins.remove(source) != nil { dirty.insert(source) }
+            runtime.writing.remove(source)
+            runtime.writeCount.removeValue(forKey: source)
+            runtime.opens.removeValue(forKey: source)?.cancel()
+            let retired: Bool
+            if let lease = runtime.kickoffLeases[source]
+                ?? runtime.ambiguousKickoffs[source],
+               let chat = chats[source],
+               let storedID = chat.storedSessionID {
+                retired = runtime.retireKickoff(
+                    botID: source, route: target.route,
+                    storedID: storedID,
+                    chatID: ObjectIdentifier(chat), operationID: lease.id)
+            } else {
+                retired = false
+            }
+            guard retired else { continue }
+        }
+        ProfileLifecycleRuntime.shared.pendingCanonicalPinParking[target.route] =
+            ProfileLifecyclePendingCanonicalPinParking(values: pins, dirty: dirty)
+    }
+
+    /// Put a parked canonical pin back under the source key immediately
+    /// before the normal postcondition reconciliation re-keys it. This keeps
+    /// the destination unwritable until the REST mutation has committed.
+    private func restoreParkedProfileLifecycleCanonicalState(
+        _ target: ProfileLifecycleTarget, destinationID: String?
+    ) {
+        guard let parked = ProfileLifecycleRuntime.shared.pendingCanonicalPinParking
+            .removeValue(forKey: target.route) else { return }
+        let sourceID = destinationID.map {
+            GatewayBotRoute(qualifiedID: $0) == nil
+                ? target.route.profile : target.route.qualifiedID
+        }
+        guard let sourceID else { return }
+        let runtime = CanonicalChatRuntime.shared
+        // The parked dictionary is keyed by the exact source id. Falling
+        // back to an arbitrary value would let a sibling/qualified profile
+        // inherit this pin during a refused primary rename.
+        guard let pin = parked.values[sourceID] else { return }
+        runtime.pins[sourceID] = pin
+        if parked.dirty.contains(sourceID) { runtime.dirtyPins.insert(sourceID) }
+        runtime.writeCount[sourceID, default: 0] &+= 1
+    }
+
+    /// A refused or definitively failed mutation returns the parked pin only
+    /// when the captured source still owns the exact primary/qualified key.
+    internal func restoreParkedProfileLifecycleCanonicalStateIfNeeded(
+        _ target: ProfileLifecycleTarget, preferPrimary: Bool
+    ) {
+        guard let parked = ProfileLifecycleRuntime.shared.pendingCanonicalPinParking
+            .removeValue(forKey: target.route) else { return }
+        let runtime = CanonicalChatRuntime.shared
+        let sourceID = preferPrimary ? target.route.profile : target.route.qualifiedID
+        guard let pin = parked.values[sourceID] else { return }
+        runtime.pins[sourceID] = pin
+        if parked.dirty.contains(sourceID) { runtime.dirtyPins.insert(sourceID) }
+        runtime.writeCount[sourceID, default: 0] &+= 1
+    }
+
     /// Before the first suspension, move a primary profile's portable state
     /// off its collision-prone bare key. The user may switch gateways while
     /// disconnect or REST is awaiting; from this point onward the mutation
@@ -569,6 +843,26 @@ extension AppModel {
         let source = target.route.profile
         let destination = target.route.qualifiedID
         guard source != destination else { return }
+
+        let canonical = CanonicalChatRuntime.shared
+        if let pin = canonical.pins.removeValue(forKey: source) {
+            canonical.pins[destination] = pin
+        }
+        if canonical.dirtyPins.remove(source) != nil {
+            canonical.dirtyPins.insert(destination)
+        }
+        if let count = canonical.writeCount.removeValue(forKey: source) {
+            canonical.writeCount[destination] = count
+        }
+
+        // `disconnectGateway` intentionally clears every pending stop for the
+        // departing gateway. Capture only this exact primary ChatState before
+        // that scrub; sibling profile intents are never carried into the
+        // renamed destination.
+        if let chat = chats[source] {
+            parkProfileLifecyclePendingStop(target, source: source,
+                                             destination: destination, chat: chat)
+        }
 
         rekeyProfileLifecyclePortableState(target, from: source, to: destination)
     }
@@ -584,6 +878,65 @@ extension AppModel {
         guard current == target.route.gatewayID || (current == nil && wasActive) else { return }
         rekeyProfileLifecyclePortableState(target, from: target.route.qualifiedID,
                                            to: target.route.profile)
+        migrateRetainedProfileMutationFences(
+            fromBotIDs: [target.route.qualifiedID], fromRoute: target.route,
+            toBotID: target.route.profile, toRoute: target.route)
+    }
+
+    /// Restore the target stop after a primary retirement disconnect. The
+    /// caller chooses the parked qualified key for a still-unresolved/committed
+    /// route, or the original bare key when a refused mutation is returned to
+    /// the same primary owner.
+    internal func restoreProfileLifecyclePendingStop(
+        _ target: ProfileLifecycleTarget, parked: Bool
+    ) {
+        guard let parking = ProfileLifecycleRuntime.shared.pendingStopParking
+            .removeValue(forKey: target.route) else { return }
+        let botID = parked ? parking.parkedBotID : parking.originalBotID
+        var pending = parking.pending
+        pending.botID = botID
+        if let existing = ChatRuntime.shared.pendingStopRequests[botID],
+           existing != pending {
+            // A replacement owns this key already. Keep it untouched and
+            // retire the parked intent rather than cross-delivering a stop.
+            return
+        }
+        ChatRuntime.shared.pendingStopRequests[botID] = pending
+    }
+
+    private func parkProfileLifecyclePendingStop(
+        _ target: ProfileLifecycleTarget, source: String, destination: String,
+        chat: ChatState
+    ) {
+        let runtime = ProfileLifecycleRuntime.shared
+        guard runtime.pendingStopParking[target.route] == nil else { return }
+        let sourceIDs = Set([source, destination])
+        let chatID = ObjectIdentifier(chat)
+        let candidates = ChatRuntime.shared.pendingStopRequests.filter { key, pending in
+            sourceIDs.contains(key)
+                && pending.route == target.route
+                && pending.chatID == chatID
+                && ChatRuntime.sameDurable(pending.storedID, chat.storedSessionID)
+        }
+        if ChatRuntime.shared.pendingStopRequests[destination] != nil,
+           !candidates.contains(where: { $0.key == destination }) {
+            let stale = ChatRuntime.shared.pendingStopRequests.compactMap { key, pending in
+                sourceIDs.contains(key) && pending.route == target.route ? key : nil
+            }
+            for key in stale { ChatRuntime.shared.pendingStopRequests[key] = nil }
+            return
+        }
+        guard candidates.count == 1, let (originalBotID, pending) = candidates.first else {
+            // Any source-route entry that cannot prove this exact ChatState or
+            // durable row is stale; fail closed before the disconnect scrub.
+            let stale = ChatRuntime.shared.pendingStopRequests.compactMap { key, pending in
+                sourceIDs.contains(key) && pending.route == target.route ? key : nil
+            }
+            for key in stale { ChatRuntime.shared.pendingStopRequests[key] = nil }
+            return
+        }
+        runtime.pendingStopParking[target.route] = ProfileLifecyclePendingStopParking(
+            originalBotID: originalBotID, parkedBotID: destination, pending: pending)
     }
 
     private func rekeyProfileLifecyclePortableState(
@@ -591,11 +944,58 @@ extension AppModel {
     ) {
         guard source != destination else { return }
 
+        // Primary profile state is parked under its qualified route before
+        // the gateway disconnect. Move every durable queue mirror with that
+        // alias first; a later profile rename can then migrate the qualified
+        // owner to its committed destination. Unknown durable bindings are
+        // retired rather than allowed to follow a reused profile name.
+        let queueRuntime = ChatRuntime.shared
+        var queueCandidates: [(sessionID: String, storedID: String?)] = []
+        for binding in queueRuntime.queuedBindings.values where
+            binding.botID == source && binding.route == target.route {
+            queueCandidates.append((binding.sessionID, binding.storedID))
+        }
+        for session in queueRuntime.queuedLifecycles.keys where
+            session.botID == source && session.route == target.route {
+            queueCandidates.append((session.sessionID, session.storedID))
+        }
+        for session in queueRuntime.pendingQueuedSubmissions.keys where
+            session.botID == source && session.route == target.route {
+            queueCandidates.append((session.sessionID, session.storedID))
+        }
+        var migratedQueueKeys = Set<String>()
+        for candidate in queueCandidates {
+            let key = candidate.sessionID + "\u{0}" + (candidate.storedID ?? "")
+            guard migratedQueueKeys.insert(key).inserted else { continue }
+            guard let storedID = candidate.storedID, !storedID.isEmpty,
+                  !candidate.sessionID.isEmpty else {
+                // An absent durable key cannot prove ownership of a queue
+                // row across a profile directory mutation. Leave it parked
+                // under the old route for quarantine/recovery; deleting it
+                // here would turn missing identity into a false success.
+                continue
+            }
+            _ = migrateQueuedState(
+                fromBotID: source, toBotID: destination, route: target.route,
+                oldSessionID: candidate.sessionID, newSessionID: candidate.sessionID,
+                storedID: storedID)
+        }
+
+        if let chat = chats[source] {
+            _ = ChatRuntime.shared.rekeyStopMutation(
+                fromBotID: source, toBotID: destination, route: target.route,
+                chatID: ObjectIdentifier(chat), storedID: chat.storedSessionID)
+            _ = ChatRuntime.shared.movePendingStopBindingKey(
+                fromBotID: source, toBotID: destination, route: target.route,
+                chatID: ObjectIdentifier(chat), storedID: chat.storedSessionID)
+        }
+
         ProfileLifecycleCache.moveFirst(&chats, from: [source], to: destination)
         ProfileLifecycleCache.moveFirst(&memory, from: [source], to: destination)
         ProfileLifecycleCache.moveFirst(&sessions, from: [source], to: destination)
         ProfileLifecycleQueue.reconcile(&composeQueue, sources: [source],
                                         destination: destination)
+        reconcileComposeQueueIDs(sources: [source], destination: destination)
         if openBotID == source { openBotID = destination }
         for day in activity.indices {
             for item in activity[day].items.indices where activity[day].items[item].botID == source {
@@ -628,6 +1028,20 @@ extension AppModel {
         }
         ProfileLifecycleCache.moveFirst(&runtime.lastSessionByBot,
                                         from: [source], to: destination)
+        // Queue mirrors keep the old runtime SID until the destination bind
+        // supplies its replacement. The sid is not a valid wire destination
+        // after a profile rename; it is only a migration token that prevents
+        // the queued rows from becoming orphaned when ChatState is rebound.
+        if let parked = runtime.reconnectParkedSessionIDs.removeValue(forKey: source) {
+            if let existing = runtime.reconnectParkedSessionIDs[destination],
+               existing != parked {
+                // A destination owner already has a different parked SID.
+                // Leave the source queue quarantined rather than letting this
+                // rename inherit B's runtime address.
+            } else {
+                runtime.reconnectParkedSessionIDs[destination] = parked
+            }
+        }
         ProfileLifecycleCache.moveFirst(&runtime.attachTasks,
                                         from: [source], to: destination)
         reconcileCanonicalAndSessionCaches(sourceIDs: [source],
@@ -665,6 +1079,9 @@ extension AppModel {
         // routed lookup receives it and fails closed instead of opening a new
         // socket while the old profile directory is between names.
         let sentinel = GatewayClient(baseURL: baseURL, credential: credential)
+        // Replace only the transport subscription. A2A route-owned delivery
+        // and watcher state is preserved for the postcondition migration.
+        await removeRoutedEventSubscription(gatewayID: gatewayID)
         await ConnectionRegistry.shared.clientPool.adopt(sentinel, for: gatewayID)
         return ProfileLifecycleRetirement(
             wasActive: wasActive, connectionGeneration: retirementGeneration)
@@ -732,8 +1149,30 @@ extension AppModel {
     /// after the lifecycle fence is raised. The route generation is blocked
     /// before disconnect awaits, so a late socket or task completion cannot
     /// republish the parked state while the owning socket is being retired.
-    internal func abortProfileRuntime(_ target: ProfileLifecycleTarget) {
+    internal func abortProfileRuntime(_ target: ProfileLifecycleTarget,
+                                      preservePendingStop: Bool = false,
+                                      preserveQueuedState: Bool = false) {
         ProfileLifecycleRuntime.shared.block(target.route)
+        // The transcript worker owns the identity-bearing ChatRuntime lane.
+        // Retire the exact route synchronously, before any disconnect/REST
+        // await can make a replacement profile directory writable. The local
+        // helper below additionally clears presentation and legacy aliases.
+        let routeStateIDs = profileLifecycleSourceIDs(target)
+        // Capture each mutation before route teardown. A request that has not
+        // crossed the wire acceptance boundary is rolled back exactly; one
+        // that has crossed it becomes a no-replay fence and remains parked for
+        // the postcondition/reconnect path. Clearing the dictionaries first
+        // would permit a lifecycle rename/delete to replay an accepted edit
+        // or steer against a replacement profile.
+        let mutationRollbacks = preserveOrRollbackProfileLifecycleMutations(
+            sourceIDs: routeStateIDs)
+        retireProfileLifecycleMutationState(
+            target, preservePendingStop: preservePendingStop,
+            preserveQueuedState: preserveQueuedState)
+        if !preservePendingStop {
+            ChatRuntime.shared.clearPendingStops(forRoute: target.route)
+            ProfileLifecycleRuntime.shared.pendingStopParking[target.route] = nil
+        }
         var sourceIDs: Set = [target.route.qualifiedID]
         // This synchronous ownership check is safe: unlike the former caller
         // snapshot, it is never carried across an await. It also keeps this
@@ -760,6 +1199,17 @@ extension AppModel {
                 }
             }
         }
+        // The scrub above is correct for ordinary stale turns, but a
+        // pre-accept transcript/steer was restored to an exact snapshot and
+        // must remain byte-for-byte visible after lifecycle teardown.
+        for rollback in mutationRollbacks {
+            guard let chat = chats.values.first(where: {
+                ObjectIdentifier($0) == rollback.chatID
+            }) else { continue }
+            chat.messages = rollback.messages
+            chat.isRunning = rollback.isRunning
+            chat.isTyping = rollback.isTyping
+        }
 
         let attachments = AttachmentRuntime.shared
         for botID in sourceIDs {
@@ -785,6 +1235,27 @@ extension AppModel {
         affectedSessions.formUnion(live.routedSessionToBot.compactMap { route, botID in
             sourceIDs.contains(botID) ? route : nil
         })
+        // These live identity maps can outlive a secondary client sentinel;
+        // retire them before the profile REST call so a late event/attach
+        // cannot repopulate the source route while its directory is changing.
+        live.sessionToBot = live.sessionToBot.filter { !sourceIDs.contains($0.value) }
+        live.routedSessionToBot = live.routedSessionToBot.filter { !sourceIDs.contains($0.value) }
+        live.workingBotIDs.subtract(sourceIDs)
+        live.lastSessionByBot = live.lastSessionByBot.filter {
+            !sourceIDs.contains($0.key)
+        }
+        if !preserveQueuedState {
+            live.reconnectParkedSessionIDs = live.reconnectParkedSessionIDs.filter {
+                !sourceIDs.contains($0.key)
+            }
+        }
+        let attachTasks = live.attachTasks.filter { sourceIDs.contains($0.key) }
+        for task in attachTasks.values { task.cancel() }
+        for key in attachTasks.keys { live.attachTasks.removeValue(forKey: key) }
+        let staleTargets = live.approvalTargets.compactMap { key, value in
+            sourceIDs.contains(value.bot.qualifiedID) || value.bot == target.route ? key : nil
+        }
+        for key in staleTargets { live.approvalTargets.removeValue(forKey: key) }
         let approvalIDs = Set(approvals.compactMap { sourceIDs.contains($0.botID) ? $0.id : nil })
         let bridges = ApprovalBridges.shared
         bridges.prompts.removeAll { prompt in
@@ -812,20 +1283,181 @@ extension AppModel {
         bridges.sweepFailures = bridges.sweepFailures.filter { !affectedSessions.contains($0.key) }
         bridges.resetSweepScope(gatewayID: target.route.gatewayID)
 
-        // A2A reply watches retain the recipient but not the sender. A remote
-        // rename therefore fences only watches to that exact qualified row;
-        // renaming a captured primary row must fence all primary-sender watches
-        // because none can prove which local profile owns its return session.
-        let a2a = A2ARuntime.shared
-        let capturedPrimary = GatewayBotRoute(qualifiedID: target.rosterID) == nil
-        var doomedDeliveries = Set(a2a.deliveries.compactMap { key, delivery in
-            capturedPrimary || sourceIDs.contains(delivery.to) ? key : nil
-        })
-        if capturedPrimary { doomedDeliveries.formUnion(a2a.watchers.keys) }
-        for key in doomedDeliveries {
-            a2a.watchers.removeValue(forKey: key)?.cancel()
-            a2a.watcherGeneration.removeValue(forKey: key)
-            a2a.deliveries.removeValue(forKey: key)
+        // A2A owns both recipient and sender route identity. Preserve accepted
+        // handoffs while a rename is unresolved so the commit hook can migrate
+        // them; delete retires them. The runtime also bumps its exact route
+        // generation, fencing late canonical/watch completions independently
+        // of sibling profiles on this gateway.
+        A2ARuntime.shared.retireProfileRoute(
+            target.route, sourceBotIDs: profileLifecycleSourceIDs(target),
+            preserveForRename: preservePendingStop && preserveQueuedState)
+    }
+
+    /// Retire every ChatRuntime mutation whose authority is the captured
+    /// source route. These dictionaries are intentionally not cleared by a
+    /// gateway-wide disconnect: sibling profiles may share that transport.
+    /// Profile lifecycle is the narrow operation that knows the exact route,
+    /// and it performs this synchronous scrub before Hermes can make a
+    /// replacement directory writable.
+    private func preserveOrRollbackProfileLifecycleMutations(
+        sourceIDs: Set<String>
+    ) -> [ProfileLifecycleMutationRollback] {
+        let runtime = ChatRuntime.shared
+        var rollbacks: [ProfileLifecycleMutationRollback] = []
+
+        // Transcript leases carry the complete pre-optimistic projection.
+        // The UUID-only map remains for admission compatibility, but the
+        // lease is the only safe way to decide whether a request crossed its
+        // acceptance boundary.
+        let transcriptLeases = runtime.transcriptLeases.filter {
+            sourceIDs.contains($0.key)
+        }
+        for (botID, lease) in transcriptLeases {
+            guard runtime.transcriptActions[botID] == lease.id else {
+                runtime.transcriptLeases[botID] = nil
+                continue
+            }
+            if lease.submitStarted {
+                fenceTranscriptActionIfDurableTargetStillOwned(lease)
+            } else {
+                _ = restoreTranscriptActionOptimisticIfOwned(lease)
+                if let chat = chats.values.first(where: {
+                    ObjectIdentifier($0) == lease.chatID
+                }) {
+                    rollbacks.append(ProfileLifecycleMutationRollback(
+                        chatID: lease.chatID, messages: chat.messages,
+                        isRunning: chat.isRunning, isTyping: chat.isTyping))
+                }
+            }
+            runtime.transcriptActions[botID] = nil
+            runtime.transcriptActionGenerations[botID] = nil
+            runtime.transcriptLeases[botID] = nil
+        }
+
+        // A steer's `requestStarted` flips immediately before the first wire
+        // verb. Before that point removing its optimistic row is definitive;
+        // afterwards the old route must retain a fence even if lifecycle
+        // teardown cancels the worker.
+        let steerLeases = runtime.steerActions.filter {
+            sourceIDs.contains($0.key)
+        }
+        for (botID, lease) in steerLeases {
+            guard runtime.steerActions[botID]?.id == lease.id else { continue }
+            if lease.requestStarted {
+                fenceSteerMutationIfOwned(lease)
+            } else {
+                _ = restoreSteerMutationOptimisticIfOwned(lease)
+                if let chat = chats.values.first(where: {
+                    ObjectIdentifier($0) == lease.chatID
+                }) {
+                    rollbacks.append(ProfileLifecycleMutationRollback(
+                        chatID: lease.chatID, messages: chat.messages,
+                        isRunning: chat.isRunning, isTyping: chat.isTyping))
+                }
+            }
+            runtime.steerActions[botID] = nil
+        }
+
+        // Existing fences are already accepted-unknown operations. Keep them
+        // attached to the captured source key; reconcileProfileRoute rekeys
+        // them only after Hermes' rename postcondition commits.
+        return rollbacks
+    }
+
+    private func retireProfileLifecycleMutationState(
+        _ target: ProfileLifecycleTarget, preservePendingStop: Bool,
+        preserveQueuedState: Bool
+    ) {
+        let runtime = ChatRuntime.shared
+        let sourceIDs = profileLifecycleSourceIDs(target)
+        let route = target.route
+
+        runtime.transcriptActions = runtime.transcriptActions.filter {
+            !sourceIDs.contains($0.key)
+        }
+        runtime.transcriptActionGenerations = runtime.transcriptActionGenerations.filter {
+            !sourceIDs.contains($0.key)
+        }
+        runtime.transcriptLeases = runtime.transcriptLeases.filter {
+            !sourceIDs.contains($0.key)
+        }
+        // transcriptFences/steerFences are intentionally retained: they are
+        // accepted-unknown mutations captured above (or before this
+        // lifecycle) and must not be replayed into a replacement binding.
+
+        runtime.steerActions = runtime.steerActions.filter {
+            !sourceIDs.contains($0.key) && $0.value.route != route
+        }
+        if !(preservePendingStop && preserveQueuedState) {
+            runtime.stopActions = runtime.stopActions.filter {
+                !sourceIDs.contains($0.key) && $0.value.route != route
+            }
+            runtime.stopFences = runtime.stopFences.filter {
+                !sourceIDs.contains($0.key)
+                    && ($0.value.unaddressable || $0.value.route != route)
+            }
+        }
+
+        let tasks = runtime.reconciliationTasks.filter { sourceIDs.contains($0.key) }
+        for task in tasks.values { task.cancel() }
+        for key in tasks.keys {
+            runtime.reconciliationTasks.removeValue(forKey: key)
+            runtime.reconciliationTokens.removeValue(forKey: key)
+        }
+        // A canceled task can already have consumed its task entry while its
+        // token remains as the stale completion fence; retire that token by
+        // route as well rather than relying on the task dictionary's shape.
+        runtime.reconciliationTokens = runtime.reconciliationTokens.filter {
+            !sourceIDs.contains($0.key)
+        }
+        runtime.reconcilingBots.subtract(sourceIDs)
+        runtime.deferredReconciliationBots.subtract(sourceIDs)
+        if !preservePendingStop { runtime.clearPendingStops(forRoute: route) }
+
+        // Queue mirrors have an AppModel-owned presentation half. A rename
+        // parks them until its committed route migration; a delete (or an
+        // explicitly unpreservable binding) removes the exact visible rows
+        // and identity-bearing side tables together.
+        if !preserveQueuedState {
+            for source in sourceIDs {
+                var storedIDs = Set<String?>()
+                for binding in runtime.queuedBindings.values where
+                    binding.botID == source && binding.route == route {
+                    storedIDs.insert(binding.storedID)
+                }
+                for session in runtime.queuedLifecycles.keys where
+                    session.botID == source && session.route == route {
+                    storedIDs.insert(session.storedID)
+                }
+                for session in runtime.pendingQueuedSubmissions.keys where
+                    session.botID == source && session.route == route {
+                    storedIDs.insert(session.storedID)
+                }
+                for storedID in storedIDs where storedID?.isEmpty == false {
+                    _ = retireQueuedState(botID: source, route: route, storedID: storedID)
+                }
+            }
+        }
+
+        // Kickoff state has no valid destination after Hermes tears down the
+        // source directory. Pins are parked separately before this helper is
+        // reached; only the in-flight operation itself is retired here.
+        let canonical = CanonicalChatRuntime.shared
+        for source in sourceIDs {
+            canonical.opens.removeValue(forKey: source)?.cancel()
+            let retired: Bool
+            if let lease = canonical.kickoffLeases[source]
+                ?? canonical.ambiguousKickoffs[source],
+               let chat = chats[source],
+               let storedID = chat.storedSessionID {
+                retired = canonical.retireKickoff(
+                    botID: source, route: target.route,
+                    storedID: storedID,
+                    chatID: ObjectIdentifier(chat), operationID: lease.id)
+            } else {
+                retired = false
+            }
+            guard retired else { continue }
         }
     }
 
@@ -842,7 +1474,168 @@ extension AppModel {
                                              canonicalNewName: canonicalNewName,
                                              currentPrimaryGatewayID: currentPrimaryGatewayID,
                                              restorePrimaryIfUnclaimed: restorePrimaryIfUnclaimed)
+        let sourceIDs = Set(plan.sourceIDs)
+        // A primary ChatState is parked under its qualified key before the
+        // gateway retirement, but accepted-unknown fences may still have
+        // been captured under the original bare owner. Retain that exact
+        // source key for fence migration/scrubbing; a secondary route must
+        // never borrow another gateway's bare profile name.
+        var retainedSourceIDs = sourceIDs
+        if target.rosterID == target.route.profile {
+            retainedSourceIDs.insert(target.route.profile)
+        }
+        if let destinationID = plan.destinationID, let canonicalNewName {
+            let destinationRoute = GatewayBotRoute(
+                gatewayID: target.route.gatewayID, profile: canonicalNewName)
+            A2ARuntime.shared.migrateProfileRoute(
+                from: target.route, to: destinationRoute,
+                sourceBotIDs: sourceIDs, destinationBotID: destinationID)
+        } else {
+            A2ARuntime.shared.retireProfileRoute(
+                target.route, sourceBotIDs: sourceIDs)
+        }
+        let sourceChat = plan.sourceIDs.first.flatMap { chats[$0] }
+        if let destinationID = plan.destinationID,
+           let canonicalNewName,
+           let sourceChat,
+           let storedID = sourceChat.storedSessionID,
+           !storedID.isEmpty,
+           let oldSessionID = sourceChat.sessionID
+                ?? LiveRuntime.shared.reconnectParkedSessionIDs[plan.sourceIDs[0]],
+           !oldSessionID.isEmpty {
+            // This is deliberately before any cache can publish the new
+            // profile key. ChatRuntime migrates only an exact ChatState/
+            // durable-row owner; a collision retires the source state.
+            let destinationRoute = GatewayBotRoute(
+                gatewayID: target.route.gatewayID, profile: canonicalNewName)
+            // ChatRuntime owns the identity-bearing queue mirrors, while the
+            // visible prompt rows live on AppModel. Capture their exact ids
+            // before the route migration so the presentation half follows
+            // the same owner and cannot remain under the retired bot key.
+            var queuedStoredIDs = Set<String?>()
+            for binding in ChatRuntime.shared.queuedBindings.values where
+                binding.botID == plan.sourceIDs[0] && binding.route == target.route {
+                queuedStoredIDs.insert(binding.storedID)
+            }
+            for session in ChatRuntime.shared.queuedLifecycles.keys where
+                session.botID == plan.sourceIDs[0] && session.route == target.route {
+                queuedStoredIDs.insert(session.storedID)
+            }
+            for session in ChatRuntime.shared.pendingQueuedSubmissions.keys where
+                session.botID == plan.sourceIDs[0] && session.route == target.route {
+                queuedStoredIDs.insert(session.storedID)
+            }
+            for staleStoredID in queuedStoredIDs where staleStoredID != storedID {
+                _ = retireQueuedState(botID: plan.sourceIDs[0], route: target.route,
+                                      storedID: staleStoredID)
+            }
+            // A queued row from the same durable transcript but a different
+            // runtime SID cannot be proven to belong to the next bind. Keep
+            // only the exact old SID as the migration token; the rest is
+            // quarantined instead of being replayed into a renamed profile.
+            let staleSessionIDs = Set(ChatRuntime.shared.queuedBindings.values.compactMap {
+                binding -> String? in
+                binding.botID == plan.sourceIDs[0]
+                    && binding.route == target.route
+                    && binding.storedID == storedID
+                    && binding.sessionID != oldSessionID ? binding.sessionID : nil
+            })
+            if !staleSessionIDs.isEmpty {
+                _ = retireQueuedState(botID: plan.sourceIDs[0], route: target.route,
+                                      storedID: storedID)
+                // `retireQueuedState` above intentionally retires the full
+                // exact durable owner. There is no safe way to retain a
+                // subset when one destination FIFO is shared by stale SIDs.
+            }
+            let migratingPromptIDs = Set(ChatRuntime.shared.queuedBindings.compactMap {
+                id, binding in
+                binding.botID == plan.sourceIDs[0]
+                    && binding.route == target.route
+                    && binding.storedID == storedID ? id : nil
+            })
+            ChatRuntime.shared.migrateProfileRouteState(
+                from: target.route, to: destinationRoute,
+                sourceBotID: plan.sourceIDs[0], destinationBotID: destinationID,
+                storedID: storedID, chatID: ObjectIdentifier(sourceChat),
+                sessionID: oldSessionID)
+            migrateComposeQueueRoute(
+                from: plan.sourceIDs[0], to: destinationID,
+                fromRoute: target.route, toRoute: destinationRoute,
+                storedID: storedID, sessionID: oldSessionID,
+                chatID: ObjectIdentifier(sourceChat))
+            // Preserve this old SID as a local migration token. Hermes has
+            // already retired the runtime address, so it must never be sent;
+            // bindSession consumes it when the renamed durable session gets
+            // its next runtime SID.
+            if let existing = LiveRuntime.shared.reconnectParkedSessionIDs[destinationID],
+               existing != oldSessionID {
+                // A replacement already owns this destination's parked SID;
+                // keep the renamed queue rows quarantined until an explicit
+                // destination bind can disambiguate them.
+            } else {
+                LiveRuntime.shared.reconnectParkedSessionIDs[destinationID] = oldSessionID
+            }
+            for index in promptQueue.indices where migratingPromptIDs.contains(promptQueue[index].id) {
+                promptQueue[index].botID = destinationID
+            }
+        } else if plan.destinationID == nil {
+            // A delete has no destination; repeat the exact-route retirement
+            // at the authoritative reconciliation boundary to catch any
+            // state that was queued before the REST response returned.
+            ChatRuntime.shared.retireProfileRouteState(
+                route: target.route, botIDs: retainedSourceIDs)
+        }
+        // Re-introduce only the parked canonical pin under the source key that
+        // still belongs to this route. The destination remains untouched until
+        // this point, after Hermes has authoritatively committed the rename or
+        // deletion.
+        restoreParkedProfileLifecycleCanonicalState(
+            target, destinationID: plan.destinationID)
+        let destinationRoute = plan.destinationID.flatMap { destinationID in
+            canonicalNewName.map {
+                GatewayBotRoute(gatewayID: target.route.gatewayID, profile: $0)
+            }
+        }
+        if let destinationID = plan.destinationID, let destinationRoute {
+            rekeyComposeQueueRoute(from: plan.sourceIDs[0], to: destinationID,
+                                   fromRoute: target.route, toRoute: destinationRoute)
+            migrateRetainedProfileMutationFences(
+                fromBotIDs: retainedSourceIDs, fromRoute: target.route,
+                toBotID: destinationID, toRoute: destinationRoute,
+                chatID: sourceChat.map { ObjectIdentifier($0) },
+                storedID: sourceChat?.storedSessionID)
+        } else {
+            ChatRuntime.shared.transcriptFences = ChatRuntime.shared.transcriptFences
+                .filter { !retainedSourceIDs.contains($0.key) }
+            ChatRuntime.shared.steerFences = ChatRuntime.shared.steerFences
+                .filter { !retainedSourceIDs.contains($0.key) }
+            ChatRuntime.shared.offlineComposeFences =
+                ChatRuntime.shared.offlineComposeFences.filter { _, fence in
+                    !retainedSourceIDs.contains(fence.botID)
+                        && fence.route != target.route
+                }
+        }
         let sources = Set(plan.sourceIDs)
+        // A profile rename changes the source-qualified route but keeps the
+        // same durable session and ChatState when that ownership is provable.
+        // Re-key only that exact deferred interrupt; the old runtime sid is
+        // invalid after Hermes retires the old profile backend. Deletion has
+        // no destination and therefore retires only this source route (other
+        // profiles on the same secondary gateway keep their intents).
+        if let destination = plan.destinationID,
+           let sourceChat {
+            let sourceBotIDs = Set(plan.sourceIDs + [target.route.profile])
+            let destinationRoute = GatewayBotRoute(
+                gatewayID: target.route.gatewayID,
+                profile: canonicalNewName ?? target.route.profile)
+            _ = ChatRuntime.shared.rekeyPendingStop(
+                fromBotIDs: sourceBotIDs, fromRoute: target.route,
+                toBotID: destination, toRoute: destinationRoute,
+                chatID: ObjectIdentifier(sourceChat),
+                storedID: sourceChat.storedSessionID)
+        } else {
+            ChatRuntime.shared.clearPendingStops(forRoute: target.route)
+        }
         if let destination = plan.destinationID {
             ProfileLifecycleRuntime.shared.activate(
                 GatewayBotRoute(gatewayID: target.route.gatewayID,
@@ -867,6 +1660,7 @@ extension AppModel {
             ProfileLifecycleCache.moveFirst(&sessions, from: plan.sourceIDs, to: destination)
             ProfileLifecycleQueue.reconcile(&composeQueue, sources: sources,
                                             destination: destination)
+            reconcileComposeQueueIDs(sources: sources, destination: destination)
             if let openBotID, sources.contains(openBotID) { self.openBotID = destination }
             for day in activity.indices {
                 for item in activity[day].items.indices where sources.contains(activity[day].items[item].botID) {
@@ -891,6 +1685,7 @@ extension AppModel {
             }
             ProfileLifecycleQueue.reconcile(&composeQueue, sources: sources,
                                             destination: nil)
+            reconcileComposeQueueIDs(sources: sources, destination: nil)
             if let openBotID, sources.contains(openBotID) { self.openBotID = nil }
             for day in activity.indices {
                 activity[day].items.removeAll { sources.contains($0.botID) }
@@ -902,8 +1697,9 @@ extension AppModel {
             routines.removeAll { sources.contains($0.botID) }
         }
 
-        // Pending operations and runtime session ids cannot survive Hermes'
-        // backend teardown, even for rename.
+        // Other pending operations and runtime session ids cannot survive
+        // Hermes' backend teardown. The one exception is the exact deferred
+        // stop re-keyed above; its sid is parked until the new route binds.
         approvals.removeAll { sources.contains($0.botID) }
         let runtime = LiveRuntime.shared
         runtime.sessionToBot = runtime.sessionToBot.filter { !sources.contains($0.value) }
@@ -918,7 +1714,9 @@ extension AppModel {
         }
         for key in staleApprovals { runtime.approvalTargets.removeValue(forKey: key) }
 
-        reconcileCanonicalAndSessionCaches(sourceIDs: sources,
+        var canonicalSources = sources
+        if plan.destinationIsPrimary { canonicalSources.insert(target.route.profile) }
+        reconcileCanonicalAndSessionCaches(sourceIDs: canonicalSources,
                                            destinationID: plan.destinationID)
         reconcileFeedCaches(target: target.route, sourceIDs: sources,
                             destinationID: plan.destinationID,
@@ -927,6 +1725,80 @@ extension AppModel {
                                    scope: scope, preserved: preserved,
                                    destinationIsPrimary: plan.destinationIsPrimary)
         scrubProfileEditorCaches(route: target.route, newProfile: canonicalNewName)
+    }
+
+    /// Move accepted-unknown mutation fences only after a rename is
+    /// authoritative. Their durable key remains the same, while the old
+    /// runtime SID is parked and migrated by the destination's next bind.
+    /// A destination collision leaves the source fence quarantined rather than
+    /// attaching an accepted mutation to an unrelated ChatState.
+    private func migrateRetainedProfileMutationFences(
+        fromBotIDs: Set<String>, fromRoute: GatewayBotRoute,
+        toBotID: String, toRoute: GatewayBotRoute,
+        chatID: ObjectIdentifier? = nil, storedID: String? = nil
+    ) {
+        let runtime = ChatRuntime.shared
+        let hasExactProof = chatID != nil && storedID?.isEmpty == false
+        let proofMatches: (ObjectIdentifier?, String?) -> Bool = { candidateChatID, candidateStoredID in
+            guard hasExactProof, let chatID, let storedID else { return !hasExactProof }
+            return candidateChatID == chatID && ChatRuntime.sameDurable(storedID, candidateStoredID)
+        }
+        if runtime.transcriptFences[toBotID] == nil,
+           let source = runtime.transcriptFences.first(where: { key, fence in
+               fromBotIDs.contains(key)
+                   && fence.gatewayID == fromRoute.gatewayID
+                   && fence.profile == fromRoute.profile
+                   && proofMatches(fence.chatID, fence.storedID)
+           }) {
+            var moved = source.value
+            moved.gatewayID = toRoute.gatewayID
+            moved.profile = toRoute.profile
+            runtime.transcriptFences[toBotID] = moved
+            runtime.transcriptFences[source.key] = nil
+        }
+        if runtime.steerFences[toBotID] == nil,
+           let source = runtime.steerFences.first(where: { key, fence in
+               fromBotIDs.contains(key) && fence.route == fromRoute
+                   && proofMatches(fence.chatID, fence.storedID)
+           }) {
+            var moved = source.value
+            moved.botID = toBotID
+            moved.route = toRoute
+            runtime.steerFences[toBotID] = moved
+            runtime.steerFences[source.key] = nil
+        }
+        if runtime.stopActions[toBotID] == nil,
+           let source = runtime.stopActions.first(where: { key, action in
+               fromBotIDs.contains(key) && action.route == fromRoute
+                   && proofMatches(action.chatID, action.storedID)
+           }) {
+            var moved = source.value
+            moved.botID = toBotID
+            moved.route = toRoute
+            runtime.stopActions[toBotID] = moved
+            runtime.stopActions[source.key] = nil
+        }
+        if runtime.stopFences[toBotID] == nil,
+           let source = runtime.stopFences.first(where: { key, fence in
+               fromBotIDs.contains(key) && !fence.unaddressable
+                   && fence.route == fromRoute
+                   && proofMatches(fence.chatID, fence.storedID)
+           }) {
+            var moved = source.value
+            moved.botID = toBotID
+            moved.route = toRoute
+            runtime.stopFences[toBotID] = moved
+            runtime.stopFences[source.key] = nil
+        }
+        let retainedComposeFences = runtime.offlineComposeFences
+        for (itemID, fence) in retainedComposeFences {
+            guard fromBotIDs.contains(fence.botID), fence.route == fromRoute,
+                  proofMatches(fence.chatID, fence.storedID) else { continue }
+            var moved = fence
+            moved.botID = toBotID
+            moved.route = toRoute
+            runtime.offlineComposeFences[itemID] = moved
+        }
     }
 
     private func reconcileUnreadAndPortrait(target: GatewayBotRoute, newProfile: String?,
@@ -1038,7 +1910,10 @@ extension AppModel {
         publishActivity()
 
         func reconciled(_ ref: SessionRef) -> SessionRef? {
-            guard sourceIDs.contains(ref.botID) else { return ref }
+            // A bare `default` can belong to another gateway. SessionRef's
+            // captured source outranks the collision-prone roster spelling.
+            guard ref.gatewayID == target.gatewayID,
+                  sourceIDs.contains(ref.botID) else { return ref }
             guard let destinationID else { return nil }
             return SessionRef(gatewayID: target.gatewayID,
                               botID: destinationID, storedID: ref.storedID)

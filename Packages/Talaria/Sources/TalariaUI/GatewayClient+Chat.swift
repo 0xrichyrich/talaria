@@ -6,6 +6,28 @@ import TalariaKit
 // .research/ws-protocol.md §6.2 / §7.4 (tui_gateway/methods_session.py:1241,
 // 3406, 3443) — nothing here guesses a payload.
 
+/// Validate the application-level acknowledgement before exposing its status
+/// to chat mutation fallback logic. Some gateway revisions put a plausible
+/// status beside `ok: false`; returning that status would make the caller
+/// treat a refusal as an accepted steer/redirect and release its fence.
+enum SessionMutationReceipt {
+    static func requireStatus(_ value: JSONValue, operation: String,
+                              accepted: Set<String>) throws -> String {
+        if value["ok"]?.boolValue == false {
+            throw GatewayError(code: 409,
+                               message: "Hermes refused " + operation.lowercased() + ".")
+        }
+        guard let status = value["status"]?.stringValue,
+              accepted.contains(status) else {
+            throw AckValidationError(
+                operation: operation,
+                detail: "Hermes did not return an authoritative "
+                    + operation.lowercased() + " status.")
+        }
+        return status
+    }
+}
+
 extension GatewayClient {
 
     /// `message.react` — one emoji per author per message, iOS Tapback
@@ -34,7 +56,8 @@ extension GatewayClient {
     public func steerTurn(sessionID: String, text: String) async throws -> String {
         let result = try await rpc("session.steer", ["session_id": .string(sessionID),
                                                      "text": .string(text)])
-        return result["status"]?.stringValue ?? ""
+        return try SessionMutationReceipt.requireStatus(
+            result, operation: "session.steer", accepted: ["queued", "rejected"])
     }
 
     /// `session.redirect` — re-aim the active turn, preserving context.
@@ -42,6 +65,8 @@ extension GatewayClient {
     public func redirectTurn(sessionID: String, text: String) async throws -> String {
         let result = try await rpc("session.redirect", ["session_id": .string(sessionID),
                                                         "text": .string(text)])
-        return result["status"]?.stringValue ?? ""
+        return try SessionMutationReceipt.requireStatus(
+            result, operation: "session.redirect",
+            accepted: ["redirected", "queued", "rejected"])
     }
 }

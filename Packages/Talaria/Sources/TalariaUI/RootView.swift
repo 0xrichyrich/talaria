@@ -53,6 +53,7 @@ public struct TalariaRootView: View {
     // notifications rather than from a tab.
     @State private var capabilitiesRequest: CapabilitiesRequest?
     @State private var sessionsRequest: SessionsRequest?
+    @State private var commandCenterRequest: CommandCenterRequest?
 
     /// Capabilities opens on a profile, and `nil` means "the gateway's launch
     /// profile" — a real value — so presentation can't key off the profile
@@ -67,6 +68,15 @@ public struct TalariaRootView: View {
     private struct SessionsRequest: Identifiable, Equatable {
         var id: String { botID }
         let botID: String
+    }
+
+    /// A fresh identity allows Command Center to be presented again after a
+    /// dismissal even when the requested source is unchanged. The model
+    /// resolves ordinary Settings requests to an available source before it
+    /// posts; the optional keeps this receiver honest for direct notifications.
+    private struct CommandCenterRequest: Identifiable, Equatable {
+        let id = UUID()
+        let gatewayID: String?
     }
 
     // Demo push banner cycle.
@@ -226,6 +236,12 @@ public struct TalariaRootView: View {
                 revealChat()
             }
         }
+        .sheet(item: $commandCenterRequest) { request in
+            CommandCenterView(model: model, initialGatewayID: request.gatewayID)
+                .presentationBackground(theme.bg)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
         .onChange(of: model.theme.themeID) { runThemeSwapAnimation() }
         .onChange(of: model.openBotID) {
             if model.openBotID == nil {
@@ -276,6 +292,11 @@ public struct TalariaRootView: View {
                 capabilitiesRequest = CapabilitiesRequest(
                     profile: note.userInfo?["profile"] as? String)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .talariaOpenCommandCenter)) { note in
+            guard commandCenterRequest == nil else { return }
+            commandCenterRequest = CommandCenterRequest(
+                gatewayID: note.userInfo?["gatewayID"] as? String)
         }
         .onReceive(NotificationCenter.default.publisher(for: .talariaOpenSessions)) { note in
             // object carries the bot id; fall back to whatever chat is open.

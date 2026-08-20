@@ -340,7 +340,10 @@ extension GatewayClient {
         for key in path.dropLast().reversed() { patch = .object([key: patch]) }
         var body: [String: JSONValue] = ["config": patch]
         if let profile, !profile.isEmpty { body["profile"] = .string(profile) }
-        try await restJSON(path: "api/config", method: "PUT", body: .object(body), timeout: 30)
+        let receipt = try await restJSON(path: "api/config", method: "PUT",
+                                         body: .object(body), timeout: 30)
+        try GatewayOperationsPolicy.requireOKReceipt(
+            receipt, operation: "Update gateway configuration")
     }
 
     /// `voice.toggle on|off` — the gateway HOST's voice mode. Runtime-only

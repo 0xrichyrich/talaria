@@ -684,6 +684,14 @@ public extension CopyPack {
 
     // Pin — plugin.js:4056-4066.
     
+    func toastTranscriptActFailed(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Could not rewind that turn"
+        case .control: "TRANSCRIPT ACT FAILED"
+        case .ink: "the earlier hour would not return"
+        }
+    }
+
     func toastScratchFailed(_ t: ThemeID) -> String {
         switch t {
         case .soft: "Couldn’t start a new chat"

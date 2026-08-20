@@ -116,7 +116,10 @@ struct SessionRef: Sendable, Equatable {
     /// Exact source of both the profile and durable session id.
     var gatewayID: String
     var botID: String
-    /// Durable session key (session.resume / REST transcript id).
+    /// Durable session key (session.resume / REST transcript id). This is
+    /// transcript provenance only; it is not filesystem authority. Artifact
+    /// bytes still require a separately validated managed-root admission at
+    /// the fetch boundary.
     var storedID: String
 
     func rosterID(activeGatewayID: String?) -> String? {
@@ -814,13 +817,32 @@ public extension AppModel {
     /// artifacts RPC — desktop derives the same index client-side from
     /// transcripts, and so does this (artifact-utils.ts parity).
     func refreshArtifacts(force: Bool = false) async {
-        guard mode == .live, let client, !bots.isEmpty else { return }
+        guard mode == .live, !bots.isEmpty,
+              let sourceGatewayID = LiveRuntime.shared.gatewayID else { return }
+        let sourceGeneration = LiveRuntime.shared.generation
         let runtime = FeedsRuntime.shared
         if runtime.artifactsScanning { return }
         if !force, let last = runtime.lastArtifactScan, last.timeIntervalSinceNow > -120 { return }
-        guard let (base, credential) = gatewayRESTContext() else {
+        guard let (base, credential) = gatewayRESTContext(gatewayID: sourceGatewayID) else {
             runtime.artifactsNote = theme.copy.needsRESTNote(theme.themeID)
             return
+        }
+        let sourceClient: GatewayClient
+        do {
+            sourceClient = try await routedClient(gatewayID: sourceGatewayID)
+        } catch {
+            runtime.artifactsNote = error.localizedDescription
+            return
+        }
+        guard LiveRuntime.shared.gatewayID == sourceGatewayID,
+              LiveRuntime.shared.generation == sourceGeneration else { return }
+
+        // `bots` can momentarily contain retained/qualified rows while a
+        // gateway switch reconciles. Bind each sweep row to the captured source
+        // and pass Hermes only its raw profile name.
+        let sourceProfiles: [String] = bots.compactMap { bot in
+            Self.artifactSweepProfile(route: stateRoute(for: bot.id),
+                                      sourceGatewayID: sourceGatewayID)
         }
 
         runtime.artifactsScanning = true
@@ -833,12 +855,12 @@ public extension AppModel {
 
         // One transcript resident at a time: recent sessions run to thousands
         // of rows and the phone pays for every one of them.
-        for bot in bots.prefix(8) {
+        for profile in sourceProfiles.prefix(8) {
             // The forever chat is where a bot does most of its work, and it is
             // hidden — scanning without the flag indexes artifacts from every
             // session EXCEPT the one that matters (methods_session.py:180-186).
-            guard let sessions = try? await client.listSessions(limit: 6, profile: bot.id,
-                                                                includeHidden: true) else {
+            guard let sessions = try? await sourceClient.listSessions(
+                limit: 6, profile: profile, includeHidden: true) else {
                 failures += 1
                 continue
             }
@@ -847,18 +869,17 @@ public extension AppModel {
                 do {
                     let rows = try await GatewayREST.sessionMessages(
                         baseURL: base, credential: credential,
-                        storedID: session.id, profile: bot.id, limit: 150)
+                        storedID: session.id, profile: profile, limit: 150)
                     scanned += 1
                     let title = session.title.isEmpty ? (session.preview ?? "session") : session.title
-                    let harvest = Self.artifacts(in: rows, botID: bot.id,
+                    let harvest = Self.artifacts(in: rows, botID: profile,
                                                  sessionID: session.id, sessionTitle: title,
-                                                 sessionStart: session.startedAt)
+                                                 sessionStart: session.startedAt,
+                                                 sourceGatewayID: sourceGatewayID)
                     for artifact in harvest {
-                        if let gatewayID = LiveRuntime.shared.gatewayID {
-                            refs[artifact.id] = SessionRef(gatewayID: gatewayID,
-                                                           botID: bot.id,
-                                                           storedID: session.id)
-                        }
+                        refs[artifact.id] = SessionRef(gatewayID: sourceGatewayID,
+                                                       botID: profile,
+                                                       storedID: session.id)
                     }
                     found.append(contentsOf: harvest)
                 } catch {
@@ -871,18 +892,35 @@ public extension AppModel {
         // see (the transcript row is written after the event). Keep those, but
         // match on bot + value, not id: the same file ingested live and swept
         // from the transcript carries two different timestamps.
-        let swept = Set(found.map { "\($0.botID)|\(Self.artifactValue($0.id))" })
+        let swept = Set(found.map {
+            Self.artifactSourceKey(gatewayID: sourceGatewayID, botID: $0.botID,
+                                   value: Self.artifactValue($0.id))
+        })
+        let foreign = artifacts.filter {
+            runtime.artifactSessions[$0.id]?.gatewayID != sourceGatewayID
+        }
         let liveOnly = artifacts.filter {
-            runtime.artifactSessions[$0.id] != nil
-                && !swept.contains("\($0.botID)|\(Self.artifactValue($0.id))")
+            guard let ref = runtime.artifactSessions[$0.id], ref.gatewayID == sourceGatewayID else {
+                return false
+            }
+            return !swept.contains(Self.artifactSourceKey(
+                gatewayID: ref.gatewayID, botID: ref.botID,
+                value: Self.artifactValue($0.id)))
         }
         for artifact in liveOnly { refs[artifact.id] = runtime.artifactSessions[artifact.id] }
 
-        runtime.artifactSessions = refs
-        artifacts = (found + liveOnly)
+        guard !Task.isCancelled,
+              LiveRuntime.shared.gatewayID == sourceGatewayID,
+              LiveRuntime.shared.generation == sourceGeneration else { return }
+        var combinedRefs = runtime.artifactSessions.filter { $0.value.gatewayID != sourceGatewayID }
+        combinedRefs.merge(refs) { _, fresh in fresh }
+        let published = (found + liveOnly + foreign)
             .sorted { Self.sortKey($0) > Self.sortKey($1) }
             .prefix(150)
             .map { $0 }
+        let publishedIDs = Set(published.map(\.id))
+        runtime.artifactSessions = combinedRefs.filter { publishedIDs.contains($0.key) }
+        artifacts = published
         runtime.artifactsNote = theme.copy.artifactsDerivationNote(theme.themeID,
                                                                   sessions: scanned,
                                                                   failures: failures)
@@ -928,20 +966,29 @@ public extension AppModel {
         let producer = ArtifactScan.isProducer(tool.name.lowercased())
         guard producer || text.contains("MEDIA:") || text.contains("Screenshot path:") else { return }
 
+        let route = stateRoute(for: botID)
         let stored = chats[botID]?.storedSessionID
+        let artifactBotID = route?.profile ?? botID
         // Same file, same bot, twice in a turn is one artifact.
-        let known = Set(artifacts.filter { $0.botID == botID }
+        let known = Set(artifacts.filter {
+            guard $0.botID == artifactBotID else { return false }
+            guard let route else { return true }
+            return FeedsRuntime.shared.artifactSessions[$0.id]?.gatewayID == route.gatewayID
+        }
             .map { Self.artifactValue($0.id) })
         var added = false
         for value in ArtifactScan.values(inToolText: text, producer: producer).prefix(6)
         where !known.contains(value) {
-            let artifact = Self.artifact(from: value, botID: botID,
-                                         sessionID: stored ?? sessionID,
+            let identitySession = route.map {
+                "\($0.gatewayID)\u{1f}\(stored ?? sessionID)"
+            } ?? (stored ?? sessionID)
+            let artifact = Self.artifact(from: value, botID: artifactBotID,
+                                         sessionID: identitySession,
                                          sessionTitle: tool.name, at: Date())
-            if let stored, let gatewayID = stateRoute(for: botID)?.gatewayID {
+            if let stored, let route {
                 FeedsRuntime.shared.artifactSessions[artifact.id] =
-                    SessionRef(gatewayID: gatewayID,
-                               botID: botID, storedID: stored)
+                    SessionRef(gatewayID: route.gatewayID,
+                               botID: route.profile, storedID: stored)
             }
             artifacts.insert(artifact, at: 0)
             added = true
@@ -951,7 +998,8 @@ public extension AppModel {
 
     /// Extract every artifact value from one session's transcript rows.
     static func artifacts(in rows: [JSONValue], botID: String, sessionID: String,
-                          sessionTitle: String, sessionStart: Double?) -> [Artifact] {
+                          sessionTitle: String, sessionStart: Double?,
+                          sourceGatewayID: String? = nil) -> [Artifact] {
         var seen = Set<String>()
         var out: [Artifact] = []
         for row in rows {
@@ -971,7 +1019,9 @@ public extension AppModel {
                 values = ArtifactScan.values(inToolText: text, producer: producer)
             }
             for value in values where seen.insert(value).inserted {
-                out.append(artifact(from: value, botID: botID, sessionID: sessionID,
+                let identitySession = sourceGatewayID.map { "\($0)\u{1f}\(sessionID)" }
+                    ?? sessionID
+                out.append(artifact(from: value, botID: botID, sessionID: identitySession,
                                     sessionTitle: sessionTitle, at: when))
             }
         }
@@ -1003,6 +1053,18 @@ public extension AppModel {
         let parts = id.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
         return parts.count == 3 ? String(parts[2]) : id
     }
+
+    static func artifactSourceKey(gatewayID: String, botID: String, value: String) -> String {
+        [gatewayID, botID, value].joined(separator: "\u{1f}")
+    }
+
+    static func artifactSweepProfile(route: GatewayBotRoute?,
+                                     sourceGatewayID: String) -> String? {
+        guard let route, route.gatewayID == sourceGatewayID, !route.profile.isEmpty else {
+            return nil
+        }
+        return route.profile
+    }
 }
 
 // MARK: - Agent Inbox (bot ⇄ bot)
@@ -1026,23 +1088,39 @@ public extension AppModel {
     }
 
     /// Split one inbox transcript into attributed A2A rows.
-    static func inboxMessages(in rows: [JSONValue], owner: String) -> [(A2AMessage, Date)] {
+    static func inboxMessages(in rows: [JSONValue], owner: String,
+                              sourceGatewayID: String? = nil) -> [(A2AMessage, Date)] {
         var out: [(A2AMessage, Date)] = []
         var lastSender: String?
         var lastAttemptID: UUID?
-        for row in rows {
+        let orderedRows = rows.enumerated().sorted { left, right in
+            let lhs = HermesTime.date(left.element["timestamp"]) ?? .distantPast
+            let rhs = HermesTime.date(right.element["timestamp"]) ?? .distantPast
+            return lhs == rhs ? left.offset < right.offset : lhs < rhs
+        }.map(\.element)
+        for row in orderedRows {
             let role = row["role"]?.stringValue ?? ""
             guard role == "user" || role == "assistant" else { continue }
             let text = ArtifactScan.text(of: row).trimmingCharacters(in: .whitespacesAndNewlines)
+            if role == "user" {
+                // Even an empty ordinary user row terminates the prior
+                // attributed turn; never let a later assistant inherit it.
+                lastSender = nil
+                lastAttemptID = nil
+            }
             guard !text.isEmpty else { continue }
             let at = HermesTime.date(row["timestamp"]) ?? Date()
             let time = shortTime(at.timeIntervalSince1970)
             if role == "user" {
                 guard let sender = a2aSender(in: text) else { continue }
-                lastSender = sender
+                let immutableSenderRoute = A2AWire.senderRoute(in: text)
+                lastSender = immutableSenderRoute?.qualifiedID ?? sourceGatewayID.flatMap { gatewayID in
+                    guard gatewayID != LiveRuntime.shared.gatewayID else { return sender }
+                    return GatewayBotRoute(gatewayID: gatewayID, profile: sender).qualifiedID
+                } ?? sender
                 lastAttemptID = A2AWire.attemptID(in: text)
                 out.append((A2AMessage(id: lastAttemptID ?? UUID(),
-                                       fromBotID: sender, toBotID: owner, time: time,
+                                       fromBotID: lastSender ?? sender, toBotID: owner, time: time,
                                        text: strippedA2A(text)), at))
             } else if let sender = lastSender {
                 // The owner's reply goes back to whoever last wrote in.
@@ -1078,25 +1156,73 @@ public extension AppModel {
     /// Sender handle from "Message from 🤖 <name> (@<handle>): …" or the older
     /// "Message from agent '<name>'" form.
     static func a2aSender(in text: String) -> String? {
-        guard let range = text.range(of: #"^Message from (?:agent '[^']+'|🤖\s*[^\s(@:]+)"#,
-                                     options: [.regularExpression, .caseInsensitive]) else { return nil }
+        guard text.range(of: #"^Message from (?:agent '[^']+'|🤖)"#,
+                         options: [.regularExpression, .caseInsensitive]) != nil else {
+            return nil
+        }
+        // Restrict identity markers to the attributed prefix. This prevents a
+        // body mentioning another handle from changing sender ownership.
+        let attributionPrefix: String = {
+            guard let marker = text.range(
+                of: #"^Message from .*?\[Talaria handoff attempt [0-9a-fA-F-]{36}\]:"#,
+                options: .regularExpression) else { return text }
+            guard let markerStart = text[..<marker.upperBound].lastIndex(of: "[") else {
+                return text
+            }
+            return String(text[..<markerStart])
+        }()
+        if let handleRange = attributionPrefix.range(of: #"\(@[^)\s]+\)"#,
+                                        options: .regularExpression) {
+            let marker = attributionPrefix[handleRange]
+            return String(marker.dropFirst(2).dropLast()).lowercased()
+        }
+        if text.range(of: #"^Message from agent '"#,
+                      options: [.regularExpression, .caseInsensitive]) != nil {
+            return legacyA2ASender(in: text)
+        }
+        guard let emoji = attributionPrefix.range(of: "🤖") else { return nil }
+        var display = String(attributionPrefix[emoji.upperBound...]).trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        for delimiter in ["(@", "[Talaria handoff attempt", ":"] {
+            if let boundary = display.range(of: delimiter) {
+                display = String(display[..<boundary.lowerBound])
+                break
+            }
+        }
+        return display.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func legacyA2ASender(in text: String) -> String? {
+        guard let range = text.range(of: #"^Message from agent '[^']+'"#,
+                                     options: [.regularExpression, .caseInsensitive]) else {
+            return nil
+        }
         let head = String(text[range])
         if let quoted = head.range(of: #"'[^']+'"#, options: .regularExpression) {
             return String(head[quoted]).trimmingCharacters(in: CharacterSet(charactersIn: "'")).lowercased()
         }
-        let name = head.replacingOccurrences(of: "Message from", with: "", options: .caseInsensitive)
-            .replacingOccurrences(of: "🤖", with: "")
-            .trimmingCharacters(in: .whitespaces)
-        return name.isEmpty ? nil : name.lowercased()
+        return nil
     }
 
     /// The message with its attribution prefix removed.
     static func strippedA2A(_ text: String) -> String {
-        guard let range = text.range(of: #"^Message from (?:agent '[^']+'|🤖[^:]+):\s*"#,
-                                     options: [.regularExpression, .caseInsensitive]) else {
+        guard text.range(of: #"^Message from (?:agent '[^']+'|🤖)"#,
+                         options: [.regularExpression, .caseInsensitive]) != nil else {
             return previewLine(text)
         }
-        return String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if let marker = text.range(of: #"^Message from .*?\[Talaria handoff attempt [0-9a-fA-F-]{36}\]:\s*"#,
+                                   options: .regularExpression) {
+            return String(text[marker.upperBound...]).trimmingCharacters(
+                in: .whitespacesAndNewlines)
+        }
+        if let handle = text.range(of: #"\(@[^)\s]+\)\s*:\s*"#,
+                                   options: .regularExpression) {
+            return String(text[handle.upperBound...]).trimmingCharacters(
+                in: .whitespacesAndNewlines)
+        }
+        guard let colon = text.firstIndex(of: ":") else { return previewLine(text) }
+        return String(text[text.index(after: colon)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -1104,11 +1230,21 @@ public extension AppModel {
 
 enum ArtifactScan {
     private static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"]
+    private static let mediaExtensions: Set<String> = ["mp4", "mov", "m4a", "mp3", "wav", "aac", "flac", "ogg", "opus", "webm", "mkv", "avi"]
     private static let fileExtensions: Set<String> = [
         "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "pdf", "txt", "json", "md", "csv",
         "zip", "tar", "gz", "avi", "flac", "m4a", "mkv", "mp3", "ogg", "opus", "wav", "webm",
         "mp4", "mov", "html", "log", "py", "swift", "ts", "tsx", "js", "yaml", "yml", "toml",
     ]
+
+    /// Values that address the gateway host. A transcript may mention one of
+    /// these, but that mention is never itself an authorization to read it;
+    /// AppModel's artifact admission gate must prove managed-root containment
+    /// before any REST file route or prefetch can use the value.
+    static func isGatewayPath(_ value: String) -> Bool {
+        !value.hasPrefix("data:") && !value.hasPrefix("http://")
+            && !value.hasPrefix("https://")
+    }
 
     /// Tools that *produce* things. Reading a file is not an artifact; writing,
     /// generating, rendering, downloading or exporting one is.
@@ -1211,7 +1347,10 @@ enum ArtifactScan {
 
     static func kind(of value: String) -> ArtifactKind {
         if value.hasPrefix("data:image/") { return .image }
-        if let ext = ext(of: value)?.lowercased(), imageExtensions.contains(ext) { return .image }
+        if let ext = ext(of: value)?.lowercased() {
+            if imageExtensions.contains(ext) { return .image }
+            if mediaExtensions.contains(ext) { return .media }
+        }
         if value.hasPrefix("http://") || value.hasPrefix("https://") { return .link }
         return .file
     }
@@ -1590,6 +1729,9 @@ public extension CopyPack {
         case (.link, .soft): return "Links"
         case (.link, .control): return "LINKS"
         case (.link, .ink): return "links"
+        case (.media, .soft): return "Media"
+        case (.media, .control): return "MEDIA"
+        case (.media, .ink): return "media"
         }
     }
 

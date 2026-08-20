@@ -95,6 +95,21 @@ public struct A2ADelivery: Sendable, Equatable {
     /// Exact gateway/profile that accepted this attempt. Nil only for legacy
     /// in-memory entries constructed by older tests/callers.
     public var route: GatewayBotRoute?
+    /// The sender is part of the delivery's ownership too. A recipient route
+    /// alone cannot tell a profile rename whether this watch belongs to the
+    /// profile being renamed or to a sibling that merely shares its gateway.
+    public var senderRoute: GatewayBotRoute?
+    /// The roster spelling used by the sender at submit time. This is kept
+    /// separately from `senderRoute` because primary rows are bare while
+    /// retained secondary rows are source-qualified.
+    public var senderRosterID: String?
+    /// Submit-time fence metadata for an accepted prompt whose publication
+    /// raced lifecycle. It is portable evidence, not permission to rearm.
+    public var submitScopeGeneration: Int?
+    public var submitTargetGeneration: UInt64?
+    public var submitSenderGeneration: UInt64?
+    public var submitClientID: ObjectIdentifier?
+    public var requiresExplicitRearm: Bool
     /// One identity per submit attempt. Equal recipient/body pairs must not
     /// replace each other's watcher or delivery outcome.
     public var attemptID: UUID
@@ -107,10 +122,24 @@ public struct A2ADelivery: Sendable, Equatable {
     public var state: State
     public var at: Date
 
-    public init(to: String, route: GatewayBotRoute? = nil, attemptID: UUID = UUID(),
+    public init(to: String, route: GatewayBotRoute? = nil,
+                senderRoute: GatewayBotRoute? = nil, senderRosterID: String? = nil,
+                submitScopeGeneration: Int? = nil,
+                submitTargetGeneration: UInt64? = nil,
+                submitSenderGeneration: UInt64? = nil,
+                submitClientID: ObjectIdentifier? = nil,
+                requiresExplicitRearm: Bool = false,
+                attemptID: UUID = UUID(),
                 bodyHash: Int? = nil, queuedBehindRun: Bool,
                 state: State, at: Date) {
-        self.to = to; self.route = route; self.attemptID = attemptID
+        self.to = to; self.route = route
+        self.senderRoute = senderRoute; self.senderRosterID = senderRosterID
+        self.submitScopeGeneration = submitScopeGeneration
+        self.submitTargetGeneration = submitTargetGeneration
+        self.submitSenderGeneration = submitSenderGeneration
+        self.submitClientID = submitClientID
+        self.requiresExplicitRearm = requiresExplicitRearm
+        self.attemptID = attemptID
         self.bodyHash = bodyHash; self.queuedBehindRun = queuedBehindRun
         self.state = state; self.at = at
     }
@@ -161,21 +190,69 @@ enum A2APinAuthority {
 /// before its final colon, so `strippedA2A` removes it from every inbox/preview
 /// surface while the canonical transcript can distinguish repeated bodies.
 enum A2AWire {
+    /// The attempt marker is deliberately anchored to the attribution line.
+    /// A title/body can contain marker-looking text, but it cannot become the
+    /// wire identity unless it is the terminal marker before the body colon.
+    private static let attemptPrefixPattern =
+        #"^Message from .*?\[Talaria handoff attempt ([0-9a-fA-F-]{36})\]:"#
+
+    private static func escapeMarkerValue(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics
+            .union(CharacterSet(charactersIn: "-._~"))
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
+
+    private static func unescapeMarkerValue(_ value: String) -> String {
+        value.removingPercentEncoding ?? value
+    }
+
     static func attributed(displayTitle: String, handle: String, body: String,
-                           attemptID: UUID) -> String {
-        "Message from 🤖 \(displayTitle) (@\(handle)) "
+                           attemptID: UUID,
+                           senderRoute: GatewayBotRoute? = nil) -> String {
+        let source = senderRoute.map {
+            " [Talaria handoff source \(escapeMarkerValue($0.qualifiedID))]"
+        } ?? ""
+        return "Message from 🤖 \(displayTitle) (@\(handle)) "
+            + source
             + "[Talaria handoff attempt \(attemptID.uuidString.lowercased())]: \(body)"
+    }
+
+    static func senderRoute(in attributed: String) -> GatewayBotRoute? {
+        guard let attempt = attributed.range(
+            of: attemptPrefixPattern, options: .regularExpression) else { return nil }
+        guard let markerStart = attributed[..<attempt.upperBound].lastIndex(of: "[") else {
+            return nil
+        }
+        let prefixText = String(attributed[..<markerStart])
+        let sourcePattern = #"\[Talaria handoff source ([^\]]+)\]"#
+        var range: Range<String.Index>?
+        var searchStart = prefixText.startIndex
+        while let candidate = prefixText.range(of: sourcePattern,
+                                                options: .regularExpression,
+                                                range: searchStart..<prefixText.endIndex) {
+            range = candidate
+            searchStart = candidate.upperBound
+        }
+        guard let range else { return nil }
+        let marker = String(attributed[range])
+        let prefix = "[Talaria handoff source "
+        guard marker.hasPrefix(prefix), marker.hasSuffix("]") else { return nil }
+        let qualified = unescapeMarkerValue(
+            String(marker.dropFirst(prefix.count).dropLast()))
+        return GatewayBotRoute(qualifiedID: qualified)
     }
 
     static func attemptID(in attributed: String) -> UUID? {
         guard let range = attributed.range(
-            of: #"\[Talaria handoff attempt ([0-9a-fA-F-]{36})\]"#,
+            of: attemptPrefixPattern,
             options: .regularExpression) else { return nil }
         let marker = String(attributed[range])
-        guard let idRange = marker.range(
+        guard let markerStart = marker.lastIndex(of: "[") else { return nil }
+        let attemptMarker = String(marker[markerStart...])
+        guard let idRange = attemptMarker.range(
             of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"#,
             options: .regularExpression) else { return nil }
-        return UUID(uuidString: String(marker[idRange]))
+        return UUID(uuidString: String(attemptMarker[idRange]))
     }
 
     /// Deterministic companion id for the assistant row belonging to an
@@ -196,6 +273,27 @@ struct A2AAcceptedOutcome: Sendable, Equatable {
             ? Self(state: .waiting, retainWatcher: true)
             : Self(state: .quiet, retainWatcher: false)
     }
+}
+
+/// The two source-qualified identities a reply watch must retain. Keeping
+/// this in the runtime, rather than only in a task closure, lets a committed
+/// profile rename update the sender/recipient before the same watch relays its
+/// answer. A deleted route simply removes the registration.
+@MainActor
+struct A2AWatcherRegistration: Equatable {
+    var target: A2AEndpoint
+    var sender: A2AEndpoint
+    var targetGeneration: UInt64
+    var senderGeneration: UInt64
+    var paused = false
+}
+
+@MainActor
+struct A2AOptimisticOwner: Equatable {
+    var target: GatewayBotRoute
+    var targetRosterID: String
+    var sender: GatewayBotRoute
+    var senderRosterID: String
 }
 
 enum A2AInboxMerge {
@@ -287,14 +385,43 @@ final class A2ARuntime {
     @ObservationIgnored var watcherScopes: [String: String] = [:]
     /// Invalidates a task even when cancellation races an RPC already in flight.
     @ObservationIgnored var scopeGenerations: [String: Int] = [:]
+    /// Profile-route generations are narrower than `scopeGenerations`: a
+    /// secondary gateway can retain several profiles, and renaming/deleting
+    /// one must not invalidate a sibling's handoff. Every canonical-open,
+    /// watcher, and accepted-completion path captures this token before its
+    /// first await and checks it again before publishing.
+    @ObservationIgnored var routeGenerations: [GatewayBotRoute: UInt64] = [:]
     /// Coalesce concurrent handoffs to the same bot so pin/title misses cannot
     /// mint two hidden canonical chats in parallel.
     @ObservationIgnored var canonicalOpens: [GatewayBotRoute: Task<A2ACanonicalSession, Error>] = [:]
     @ObservationIgnored var canonicalOpenGenerations: [GatewayBotRoute: Int] = [:]
+    /// Reply-watch ownership is mutable across a committed rename. The task
+    /// reads this registration after each network await, so its captured
+    /// sender/recipient cannot relay into a retired bare or qualified id.
+    @ObservationIgnored var watcherRegistrations: [String: A2AWatcherRegistration] = [:]
     /// Optimistic rows that a sweep must retain until the exact anchored rows
     /// appear in the owning gateway's transcript.
     @ObservationIgnored var optimisticRows: [UUID: String] = [:]
+    @ObservationIgnored var optimisticOwners: [UUID: A2AOptimisticOwner] = [:]
+    @ObservationIgnored var pendingRearms: Set<String> = []
+    /// A rename fences a watch while Hermes moves the profile directory. The
+    /// task remains retained so the commit hook can migrate it in place; a
+    /// delete removes it instead. This set is intentionally route-qualified.
+    @ObservationIgnored var pausedRoutes: Set<GatewayBotRoute> = []
+    /// Profile lifecycle parks this exact route before a primary disconnect;
+    /// reset(gatewayID:) must not mistake that deliberate teardown for a
+    /// request to erase its portable handoff/watch state.
+    @ObservationIgnored var routesPreservedAcrossGatewayReset: Set<GatewayBotRoute> = []
+    /// Restore hooks can run while the lifecycle exclusive lease still fences
+    /// ordinary traffic. Keep the rearm pending instead of unpausing a route
+    /// that cannot yet reacquire its client.
+    @ObservationIgnored var deferredRestores: [GatewayBotRoute: Set<String>] = [:]
+    @ObservationIgnored var deferredRestoreTasks: [GatewayBotRoute: Task<Void, Never>] = [:]
     @ObservationIgnored var eventToken: UUID?
+    /// addEventHandler is asynchronous; a late token from a departing client
+    /// must not replace the subscription installed for its successor.
+    @ObservationIgnored var eventClient: ObjectIdentifier?
+    @ObservationIgnored var eventGeneration: UInt64 = 0
     /// Which gateway the state above belongs to; a swap owns none of it.
     @ObservationIgnored var routedClient: ObjectIdentifier?
     @ObservationIgnored var inboxGatewayID: String?
@@ -304,12 +431,317 @@ final class A2ARuntime {
     /// Screens currently showing the inbox. Events keep arriving when it is
     /// zero; sweeping for a screen nobody is looking at is just radio.
     @ObservationIgnored var viewers = 0
+    /// Invalidates an inbox sweep still awaiting a profile during reset.
+    @ObservationIgnored var inboxSweepGeneration: UInt64 = 0
+
+    func routeGeneration(for route: GatewayBotRoute) -> UInt64 {
+        routeGenerations[route, default: 0]
+    }
+
+    func accepts(route: GatewayBotRoute, generation: UInt64) -> Bool {
+        routeGenerations[route, default: 0] == generation
+            && !pausedRoutes.contains(route)
+    }
+
+    /// Acceptance is owned by both ends of a handoff. This seam keeps the
+    /// post-submit boundary testable without constructing a live client and
+    /// prevents a sender rename from being mistaken for a valid recipient
+    /// completion (or vice versa).
+    func acceptsCompletion(senderRoute: GatewayBotRoute,
+                           senderGeneration: UInt64,
+                           targetRoute: GatewayBotRoute,
+                           targetGeneration: UInt64) -> Bool {
+        accepts(route: senderRoute, generation: senderGeneration)
+            && accepts(route: targetRoute, generation: targetGeneration)
+    }
+
+    /// Invalidate one exact profile route without disturbing siblings on the
+    /// same gateway. The caller may preserve accepted delivery state for a
+    /// rename; it is then paused until `migrateProfileRoute` or
+    /// `restoreProfileRoute` supplies a new owner.
+    func retireProfileRoute(_ route: GatewayBotRoute,
+                            sourceBotIDs: Set<String>,
+                            preserveForRename: Bool = false) {
+        routeGenerations[route, default: 0] &+= 1
+        pausedRoutes.insert(route)
+        deferredRestoreTasks.removeValue(forKey: route)?.cancel()
+        deferredRestores.removeValue(forKey: route)
+
+        let canonicalRoutes = canonicalOpens.keys.filter { $0 == route }
+        for route in canonicalRoutes {
+            canonicalOpens.removeValue(forKey: route)?.cancel()
+        }
+
+        var keys = Set(deliveries.compactMap { key, delivery in
+            let ownsRecipient = delivery.route == route
+                || delivery.to == route.qualifiedID
+                || sourceBotIDs.contains(delivery.to)
+            let ownsSender = delivery.senderRoute == route
+                || delivery.senderRosterID.map(sourceBotIDs.contains) == true
+            return ownsRecipient || ownsSender ? key : nil
+        }).union(watcherRegistrations.compactMap { key, registration in
+            let ownsRecipient = registration.target.route == route
+                || sourceBotIDs.contains(registration.target.rosterID)
+            let ownsSender = registration.sender.route == route
+                || sourceBotIDs.contains(registration.sender.rosterID)
+            return ownsRecipient || ownsSender ? key : nil
+        })
+        // Older callers may have installed a primary watch before sender
+        // ownership was recorded. A bare primary cannot prove which profile
+        // owns such a closure, so retire those legacy watches rather than let
+        // them relay into a replacement profile. New watches always carry a
+        // registration and are migrated above.
+        let barePrimary = sourceBotIDs.contains(route.profile)
+        let legacyWatchers = barePrimary
+            ? Set(watchers.keys.filter { watcherRegistrations[$0] == nil }) : []
+        let legacyDeliveries = barePrimary
+            ? Set(deliveries.compactMap { key, delivery in
+                delivery.senderRoute == nil && delivery.route != route ? key : nil
+            }) : []
+        let retireLegacy: (String) -> Void = { key in
+            self.watchers.removeValue(forKey: key)?.cancel()
+            self.watcherGeneration.removeValue(forKey: key)
+            self.watcherScopes.removeValue(forKey: key)
+            self.watcherRegistrations.removeValue(forKey: key)
+            if let delivery = self.deliveries.removeValue(forKey: key) {
+                self.optimisticRows.removeValue(forKey: delivery.attemptID)
+                self.optimisticOwners.removeValue(forKey: delivery.attemptID)
+            }
+        }
+
+        if preserveForRename {
+            for key in keys {
+                watcherRegistrations[key]?.paused = true
+                if watcherRegistrations[key] == nil { retireLegacy(key) }
+            }
+            for key in legacyWatchers.union(legacyDeliveries) { retireLegacy(key) }
+            // Keep accepted delivery records and optimistic rows. They are
+            // portable state and are migrated after Hermes confirms the name.
+            return
+        }
+        keys.formUnion(legacyWatchers)
+        keys.formUnion(legacyDeliveries)
+
+        for key in keys {
+            watchers.removeValue(forKey: key)?.cancel()
+            watcherGeneration.removeValue(forKey: key)
+            watcherScopes.removeValue(forKey: key)
+            watcherRegistrations.removeValue(forKey: key)
+            if let delivery = deliveries.removeValue(forKey: key) {
+                optimisticRows.removeValue(forKey: delivery.attemptID)
+                optimisticOwners.removeValue(forKey: delivery.attemptID)
+            }
+        }
+        let optimistic = optimisticOwners.compactMap { id, owner in
+            let ownsRecipient = owner.target == route
+                || sourceBotIDs.contains(owner.targetRosterID)
+            let ownsSender = owner.sender == route
+                || sourceBotIDs.contains(owner.senderRosterID)
+            return ownsRecipient || ownsSender ? id : nil
+        }
+        for id in optimistic {
+            optimisticOwners.removeValue(forKey: id)
+            optimisticRows.removeValue(forKey: id)
+        }
+    }
+
+    /// A successful explicit profile create/recreate re-authorizes a route
+    /// that a prior delete permanently retired. Bump once more so no task
+    /// captured before the new directory existed can publish into it.
+    func activateProfileRoute(_ route: GatewayBotRoute) {
+        deferredRestoreTasks.removeValue(forKey: route)?.cancel()
+        deferredRestores.removeValue(forKey: route)
+        routeGenerations[route, default: 0] &+= 1
+        pausedRoutes.remove(route)
+    }
+
+    /// Restore a refused rename. Canonical opens were intentionally retired;
+    /// only accepted deliveries/watchers are unpaused and allowed to continue
+    /// against the original source route.
+    func restoreProfileRoute(_ route: GatewayBotRoute, sourceBotIDs: Set<String>) {
+        guard ProfileLifecycleTrafficAdmission.allows(route.gatewayID) else {
+            deferredRestores[route, default: []].formUnion(sourceBotIDs)
+            if deferredRestoreTasks[route] == nil {
+                deferredRestoreTasks[route] = Task { @MainActor [weak self] in
+                    while !Task.isCancelled,
+                          !ProfileLifecycleTrafficAdmission.allows(route.gatewayID) {
+                        try? await Task.sleep(for: .milliseconds(25))
+                    }
+                    guard let self, !Task.isCancelled,
+                          ProfileLifecycleTrafficAdmission.allows(route.gatewayID) else { return }
+                    let ids = self.deferredRestores.removeValue(forKey: route) ?? []
+                    self.deferredRestoreTasks[route] = nil
+                    self.restoreProfileRoute(route, sourceBotIDs: ids)
+                }
+            }
+            return
+        }
+        deferredRestores.removeValue(forKey: route)
+        deferredRestoreTasks.removeValue(forKey: route)
+        routeGenerations[route, default: 0] &+= 1
+        pausedRoutes.remove(route)
+        for key in watcherRegistrations.keys {
+            guard var registration = watcherRegistrations[key] else { continue }
+            let owns = registration.target.route == route
+                || registration.sender.route == route
+                || sourceBotIDs.contains(registration.target.rosterID)
+                || sourceBotIDs.contains(registration.sender.rosterID)
+            guard owns else { continue }
+            if registration.target.route == route {
+                registration.targetGeneration = routeGeneration(for: route)
+            }
+            if registration.sender.route == route {
+                registration.senderGeneration = routeGeneration(for: route)
+            }
+            registration.paused = false
+            watcherRegistrations[key] = registration
+            pendingRearms.remove(key)
+        }
+
+        for key in deliveries.keys {
+            guard var delivery = deliveries[key],
+                  delivery.route == route || delivery.senderRoute == route else { continue }
+            delivery.requiresExplicitRearm = false
+            deliveries[key] = delivery
+            pendingRearms.remove(key)
+        }
+    }
+
+    /// Re-key accepted delivery/watch state after a committed profile rename.
+    /// The old route remains fenced forever; all mutable watcher ownership is
+    /// moved to the destination before ordinary traffic is released.
+    func migrateProfileRoute(from source: GatewayBotRoute,
+                             to destination: GatewayBotRoute,
+                             sourceBotIDs: Set<String>,
+                             destinationBotID: String) {
+        guard source != destination else {
+            restoreProfileRoute(source, sourceBotIDs: sourceBotIDs)
+            return
+        }
+        // Never allow a canonical-open completion from the old directory to
+        // become a destination pin/create. The profile lifecycle parks the
+        // portable pin separately and will re-key it at reconciliation.
+        canonicalOpens.removeValue(forKey: source)?.cancel()
+        routeGenerations[source, default: 0] &+= 1
+        routeGenerations[destination, default: 0] &+= 1
+        // Keep the old route permanently fenced. Only the destination may
+        // accept a late completion after a committed rename.
+        pausedRoutes.insert(source)
+        pausedRoutes.remove(destination)
+
+        for key in deliveries.keys {
+            guard var delivery = deliveries[key] else { continue }
+            var changed = false
+            if delivery.route == source {
+                delivery.route = destination
+                delivery.to = destinationBotID
+                changed = true
+            }
+            if delivery.senderRoute == source {
+                delivery.senderRoute = destination
+                delivery.senderRosterID = destinationBotID
+                changed = true
+            }
+            if changed { deliveries[key] = delivery }
+            if changed {
+                delivery.requiresExplicitRearm = false
+                deliveries[key] = delivery
+                pendingRearms.remove(key)
+            }
+        }
+
+        for key in watcherRegistrations.keys {
+            guard var registration = watcherRegistrations[key] else { continue }
+            var changed = false
+            if registration.target.route == source {
+                registration.target.route = destination
+                registration.target.rosterID = destinationBotID
+                registration.targetGeneration = routeGeneration(for: destination)
+                changed = true
+            }
+            if registration.sender.route == source {
+                registration.sender.route = destination
+                registration.sender.rosterID = destinationBotID
+                registration.senderGeneration = routeGeneration(for: destination)
+                changed = true
+            }
+            if changed {
+                registration.paused = false
+                watcherRegistrations[key] = registration
+                pendingRearms.remove(key)
+            }
+        }
+
+        for id in optimisticOwners.keys {
+            guard var owner = optimisticOwners[id] else { continue }
+            if owner.target == source {
+                owner.target = destination
+                owner.targetRosterID = destinationBotID
+            }
+            if owner.sender == source {
+                owner.sender = destination
+                owner.senderRosterID = destinationBotID
+            }
+            optimisticOwners[id] = owner
+        }
+    }
+
+    func installWatcher(key: String, target: A2AEndpoint,
+                        sender: A2AEndpoint) -> Int {
+        let generation = (watcherGeneration[key] ?? 0) + 1
+        watcherGeneration[key] = generation
+        watcherScopes[key] = target.route.gatewayID
+        watcherRegistrations[key] = A2AWatcherRegistration(
+            target: target, sender: sender,
+            targetGeneration: routeGeneration(for: target.route),
+            senderGeneration: routeGeneration(for: sender.route))
+        if pendingRearms.contains(key) {
+            watcherRegistrations[key]?.paused = true
+        }
+        return generation
+    }
+
+    func watcherRegistration(key: String, generation: Int)
+        -> A2AWatcherRegistration? {
+        guard watcherGeneration[key] == generation,
+              let registration = watcherRegistrations[key], !registration.paused,
+              accepts(route: registration.target.route,
+                      generation: registration.targetGeneration),
+              accepts(route: registration.sender.route,
+                      generation: registration.senderGeneration) else { return nil }
+        return registration
+    }
+
+    func watcherIsPaused(key: String, generation: Int) -> Bool {
+        watcherGeneration[key] == generation
+            && watcherRegistrations[key]?.paused == true
+    }
+
+    func removeWatcher(key: String, generation: Int) {
+        guard watcherGeneration[key] == generation else { return }
+        watchers.removeValue(forKey: key)
+        watcherGeneration.removeValue(forKey: key)
+        watcherScopes.removeValue(forKey: key)
+        watcherRegistrations.removeValue(forKey: key)
+        pendingRearms.remove(key)
+    }
+
+    func preserveRouteAcrossGatewayReset(_ route: GatewayBotRoute) {
+        routesPreservedAcrossGatewayReset.insert(route)
+    }
 
     func reset() {
         let gateways = Set(watcherScopes.values)
             .union(deliveries.values.compactMap { $0.route?.gatewayID })
             .union(canonicalOpens.keys.map(\.gatewayID))
         for gatewayID in gateways { scopeGenerations[gatewayID, default: 0] += 1 }
+        let routes = Set(routeGenerations.keys)
+            .union(deliveries.values.compactMap { $0.route })
+            .union(deliveries.values.compactMap { $0.senderRoute })
+            .union(canonicalOpens.keys)
+            .union(watcherRegistrations.values.flatMap { [$0.target.route, $0.sender.route] })
+        for route in routes { routeGenerations[route, default: 0] &+= 1 }
+        inboxSweepGeneration &+= 1
         deliveries.removeAll()
         for task in watchers.values { task.cancel() }
         watchers.removeAll()
@@ -317,11 +749,20 @@ final class A2ARuntime {
         watcherScopes.removeAll()
         for task in canonicalOpens.values { task.cancel() }
         canonicalOpens.removeAll()
-        canonicalOpenGenerations.removeAll()
+        watcherRegistrations.removeAll()
+        pendingRearms.removeAll()
         optimisticRows.removeAll()
+        optimisticOwners.removeAll()
+        pausedRoutes.removeAll()
+        routesPreservedAcrossGatewayReset.removeAll()
+        for task in deferredRestoreTasks.values { task.cancel() }
+        deferredRestoreTasks.removeAll()
+        deferredRestores.removeAll()
         sweepDebounce?.cancel(); sweepDebounce = nil
         idlePoll?.cancel(); idlePoll = nil
         eventToken = nil
+        eventClient = nil
+        eventGeneration &+= 1
         inboxGatewayID = nil
     }
 
@@ -329,22 +770,79 @@ final class A2ARuntime {
     /// their captured client/session and continue independently.
     func reset(gatewayID: String) {
         scopeGenerations[gatewayID, default: 0] += 1
-        let keys = Set(deliveries.compactMap { key, delivery in
-            delivery.route?.gatewayID == gatewayID
+        for route in Array(deferredRestoreTasks.keys) where route.gatewayID == gatewayID {
+            deferredRestoreTasks.removeValue(forKey: route)?.cancel()
+            deferredRestores.removeValue(forKey: route)
+        }
+        if inboxGatewayID == gatewayID {
+            eventGeneration &+= 1
+            eventToken = nil
+            eventClient = nil
+        }
+        let preservedRoutes = routesPreservedAcrossGatewayReset.filter {
+            $0.gatewayID == gatewayID
+        }
+        let routes = Set(routeGenerations.keys.filter {
+            $0.gatewayID == gatewayID && !preservedRoutes.contains($0)
+        })
+            .union(deliveries.values.compactMap { $0.route }.filter { $0.gatewayID == gatewayID })
+            .union(deliveries.values.compactMap { $0.senderRoute }.filter { $0.gatewayID == gatewayID })
+            .union(canonicalOpens.keys.filter { $0.gatewayID == gatewayID })
+            .union(watcherRegistrations.values.flatMap { [$0.target.route, $0.sender.route] }
+                .filter { $0.gatewayID == gatewayID })
+        for route in routes { routeGenerations[route, default: 0] &+= 1 }
+        inboxSweepGeneration &+= 1
+        let keys: Set<String> = Set(deliveries.compactMap { key, delivery in
+            let preserved = delivery.route.map { preservedRoutes.contains($0) } == true
+                || delivery.senderRoute.map { preservedRoutes.contains($0) } == true
+            if preserved { return nil }
+            return delivery.route?.gatewayID == gatewayID
+                || delivery.senderRoute?.gatewayID == gatewayID
                 || GatewayBotRoute(qualifiedID: delivery.to)?.gatewayID == gatewayID ? key : nil
-        }).union(watcherScopes.compactMap { $0.value == gatewayID ? $0.key : nil })
+        }).union(watcherScopes.compactMap { key, value in
+            guard value == gatewayID else { return nil }
+            guard let registration = watcherRegistrations[key] else { return key }
+            return preservedRoutes.contains(registration.target.route)
+                || preservedRoutes.contains(registration.sender.route) ? nil : key
+        })
+            .union(watcherRegistrations.compactMap { key, registration in
+                if preservedRoutes.contains(registration.target.route)
+                    || preservedRoutes.contains(registration.sender.route) { return nil }
+                return registration.target.route.gatewayID == gatewayID
+                    || registration.sender.route.gatewayID == gatewayID ? key : nil
+            })
         for key in keys {
             watchers.removeValue(forKey: key)?.cancel()
             watcherGeneration.removeValue(forKey: key)
             watcherScopes.removeValue(forKey: key)
-            deliveries.removeValue(forKey: key)
+            watcherRegistrations.removeValue(forKey: key)
+            pendingRearms.remove(key)
+            if let delivery = deliveries.removeValue(forKey: key) {
+                optimisticRows.removeValue(forKey: delivery.attemptID)
+                optimisticOwners.removeValue(forKey: delivery.attemptID)
+            }
         }
-        let routes = canonicalOpens.keys.filter { $0.gatewayID == gatewayID }
-        for route in routes {
+        let canonicalRoutes = canonicalOpens.keys.filter { $0.gatewayID == gatewayID }
+        for route in canonicalRoutes {
             canonicalOpens.removeValue(forKey: route)?.cancel()
-            canonicalOpenGenerations.removeValue(forKey: route)
         }
-        optimisticRows = optimisticRows.filter { $0.value != gatewayID }
+        let preservedAttempts = Set(deliveries.values.compactMap { delivery in
+            delivery.route.map { preservedRoutes.contains($0) } == true
+                || delivery.senderRoute.map { preservedRoutes.contains($0) } == true
+                ? delivery.attemptID : nil
+        })
+        optimisticRows = optimisticRows.filter {
+            $0.value != gatewayID || preservedAttempts.contains($0.key)
+        }
+        optimisticOwners = optimisticOwners.filter {
+            ( $0.value.target.gatewayID != gatewayID
+                && $0.value.sender.gatewayID != gatewayID )
+                || preservedAttempts.contains($0.key)
+        }
+        pausedRoutes = Set(pausedRoutes.filter {
+            $0.gatewayID != gatewayID || preservedRoutes.contains($0)
+        })
+        routesPreservedAcrossGatewayReset.subtract(preservedRoutes)
     }
 
     /// Keep the note table bounded; oldest deliveries lose their note first.
@@ -353,10 +851,15 @@ final class A2ARuntime {
         let doomed = deliveries.sorted { $0.value.at < $1.value.at }
             .prefix(deliveries.count - A2APolicy.deliveryLimit)
         for (key, _) in doomed {
+            if let delivery = deliveries[key] {
+                optimisticRows.removeValue(forKey: delivery.attemptID)
+                optimisticOwners.removeValue(forKey: delivery.attemptID)
+            }
             deliveries.removeValue(forKey: key)
             watchers.removeValue(forKey: key)?.cancel()
             watcherGeneration.removeValue(forKey: key)
             watcherScopes.removeValue(forKey: key)
+            watcherRegistrations.removeValue(forKey: key)
         }
     }
 }
@@ -525,13 +1028,46 @@ public extension AppModel {
     /// other source. `detachRoutedEvents(gatewayID:)` calls this when a pooled
     /// secondary is retired; the primary detach path above uses the same hook.
     func dropA2AScope(gatewayID: String, wasPrimary: Bool = false) {
+        let a2a = A2ARuntime.shared
+        let inboxRefs = FeedsRuntime.shared.inboxSessions
+        // A primary profile rename marks its exact route portable before the
+        // disconnect path reaches this gateway-wide scrub. Keep those rows
+        // visible; reset(gatewayID:) will preserve the matching deliveries
+        // and watchers for postcondition migration.
+        let preservedRoutes = a2a.routesPreservedAcrossGatewayReset.filter {
+            $0.gatewayID == gatewayID
+        }
+        let preservedOptimisticIDs = Set(a2a.deliveries.values.compactMap { delivery in
+            delivery.route.map { preservedRoutes.contains($0) } == true
+                || delivery.senderRoute.map { preservedRoutes.contains($0) } == true
+                ? delivery.attemptID : nil
+        })
+        let ownedInboxIDs = Set(inboxRefs.compactMap {
+            id, ref in ref.gatewayID == gatewayID ? id : nil
+        }).subtracting(preservedOptimisticIDs)
+        // Optimistic rows can be visible before the next transcript sweep and
+        // therefore have no SessionRef yet. Use the exact delivery/source
+        // owner first, including replies from a remote target into a departing
+        // bare primary sender.
+        let ownedOptimisticIDs = Set(a2a.optimisticRows.compactMap {
+            id, sourceGateway in sourceGateway == gatewayID ? id : nil
+        }).union(a2a.optimisticOwners.compactMap { id, owner in
+            owner.sender.gatewayID == gatewayID || owner.target.gatewayID == gatewayID
+                ? id : nil
+        }).union(a2a.deliveries.values.compactMap { delivery in
+            delivery.senderRoute?.gatewayID == gatewayID || delivery.route?.gatewayID == gatewayID
+                ? delivery.attemptID : nil
+        }).subtracting(preservedOptimisticIDs)
         A2ARuntime.shared.reset(gatewayID: gatewayID)
         let prefix = gatewayID + GatewayBotRoute.separator
         agentInbox.removeAll { message in
-            message.fromBotID.hasPrefix(prefix) || message.toBotID.hasPrefix(prefix)
-                || (wasPrimary
-                    && GatewayBotRoute(qualifiedID: message.fromBotID) == nil
-                    && GatewayBotRoute(qualifiedID: message.toBotID) == nil)
+            !preservedOptimisticIDs.contains(message.id)
+                && (ownedInboxIDs.contains(message.id) || ownedOptimisticIDs.contains(message.id)
+                    || message.fromBotID.hasPrefix(prefix) || message.toBotID.hasPrefix(prefix)
+                    || (wasPrimary
+                        && GatewayBotRoute(qualifiedID: message.fromBotID) == nil
+                        && GatewayBotRoute(qualifiedID: message.toBotID) == nil
+                        && (inboxRefs[message.id].map { $0.gatewayID == gatewayID } ?? true)))
         }
         FeedsRuntime.shared.inboxSessions = FeedsRuntime.shared.inboxSessions.filter { _, ref in
             ref.gatewayID != gatewayID
@@ -595,6 +1131,9 @@ public extension AppModel {
         defer { runtime.inboxScanning = false; runtime.lastInboxScan = Date() }
 
         var collected: [(A2AMessage, Date, SessionRef)] = []
+        let a2aRuntime = A2ARuntime.shared
+        let sweepGeneration = a2aRuntime.inboxSweepGeneration
+        var routeGenerations: [GatewayBotRoute: UInt64] = [:]
         var scanned = 0
         var completedProfiles: [String: Int] = [:]
         var failedGateways: Set<String> = []
@@ -613,11 +1152,20 @@ public extension AppModel {
         for endpoint in selected {
             guard !Task.isCancelled else { return }
             let route = endpoint.route
+            let routeGeneration = A2ARuntime.shared.routeGeneration(for: route)
+            routeGenerations[route] = routeGeneration
+            guard a2aRuntime.inboxSweepGeneration == sweepGeneration,
+                  a2aRuntime.accepts(route: route, generation: routeGeneration) else { continue }
             guard let sourceClient = try? await routedClient(for: route),
                   let (base, credential) = gatewayRESTContext(gatewayID: route.gatewayID) else {
                 failedGateways.insert(route.gatewayID)
                 continue
             }
+            await attachRoutedEventsIfNeeded(client: sourceClient,
+                                             gatewayID: route.gatewayID,
+                                             preserveStateOnReplacement: true)
+            guard a2aRuntime.inboxSweepGeneration == sweepGeneration,
+                  a2aRuntime.accepts(route: route, generation: routeGeneration) else { continue }
             var targets: [String] = []
             if let pin = CanonicalChatRuntime.shared.pins[endpoint.rosterID], !pin.isEmpty {
                 targets.append(pin)
@@ -628,6 +1176,8 @@ public extension AppModel {
             do {
                 let live = try await sourceClient.resumeSession(
                     Self.canonicalChatTitle, profile: route.profile, deferHistory: true)
+                guard a2aRuntime.inboxSweepGeneration == sweepGeneration,
+                      a2aRuntime.accepts(route: route, generation: routeGeneration) else { continue }
                 let stored = live.storedSessionID
                 if !stored.isEmpty, !targets.contains(stored) { targets.append(stored) }
             } catch let error as GatewayError where error.code == GatewayError.storedSessionGone {
@@ -641,6 +1191,8 @@ public extension AppModel {
             do {
                 let sessions = try await sourceClient.listSessions(
                     limit: 200, profile: route.profile, includeHidden: true)
+                guard a2aRuntime.inboxSweepGeneration == sweepGeneration,
+                      a2aRuntime.accepts(route: route, generation: routeGeneration) else { continue }
                 for session in sessions where session.title.lowercased().contains("agent inbox") {
                     guard targets.count < A2APolicy.scanSessionsPerProfile else { break }
                     if !targets.contains(session.id) { targets.append(session.id) }
@@ -657,11 +1209,17 @@ public extension AppModel {
                     let rows = try await GatewayREST.sessionMessages(
                         baseURL: base, credential: credential, storedID: stored,
                         profile: route.profile, limit: A2APolicy.scanMessages)
+                    guard a2aRuntime.inboxSweepGeneration == sweepGeneration,
+                          a2aRuntime.accepts(route: route, generation: routeGeneration) else {
+                        profileComplete = false
+                        continue
+                    }
                     scanned += 1
                     let ref = SessionRef(gatewayID: route.gatewayID,
                                          botID: endpoint.rosterID, storedID: stored)
                     for (message, at) in AppModel.inboxMessages(
-                        in: rows, owner: endpoint.rosterID) {
+                        in: rows, owner: endpoint.rosterID,
+                        sourceGatewayID: route.gatewayID) {
                         collected.append((message, at, ref))
                     }
                 } catch {
@@ -670,6 +1228,14 @@ public extension AppModel {
                 }
             }
             if profileComplete { completedProfiles[route.gatewayID, default: 0] += 1 }
+        }
+
+        guard a2aRuntime.inboxSweepGeneration == sweepGeneration else { return }
+        collected = collected.filter { _, _, ref in
+            let profile = GatewayBotRoute(qualifiedID: ref.botID)?.profile ?? ref.botID
+            let route = GatewayBotRoute(gatewayID: ref.gatewayID, profile: profile)
+            guard let generation = routeGenerations[route] else { return false }
+            return a2aRuntime.accepts(route: route, generation: generation)
         }
 
         let successfulGateways = Set(totalProfiles.compactMap { gatewayID, count in
@@ -730,21 +1296,34 @@ private extension AppModel {
             }
             runtime.routedClient = identity
             runtime.inboxGatewayID = activeGatewayID
-            subscribeToA2AChanges(client)
+            runtime.eventGeneration &+= 1
+            runtime.eventClient = identity
+            runtime.eventToken = nil
+            subscribeToA2AChanges(client, generation: runtime.eventGeneration,
+                                   gatewayID: activeGatewayID)
         }
         sweepInbox(after: 0)
         startIdleInboxPoll()
     }
 
-    func subscribeToA2AChanges(_ client: GatewayClient) {
-        let sourceGatewayID = activeGatewayID
+    func subscribeToA2AChanges(_ client: GatewayClient, generation: UInt64,
+                                gatewayID sourceGatewayID: String?) {
+        let identity = ObjectIdentifier(client)
         Task { @MainActor in
             let token = await client.addEventHandler { event in
                 Task { @MainActor [weak self] in
                     self?.routeA2AChange(event, sourceGatewayID: sourceGatewayID)
                 }
             }
-            A2ARuntime.shared.eventToken = token
+            let runtime = A2ARuntime.shared
+            guard runtime.eventGeneration == generation,
+                  runtime.eventClient == identity,
+                  runtime.routedClient == identity,
+                  runtime.inboxGatewayID == sourceGatewayID else {
+                await client.removeEventHandler(token)
+                return
+            }
+            runtime.eventToken = token
         }
     }
 
@@ -938,19 +1517,32 @@ public extension AppModel {
         // the other direction.
         var accepted = 0
         var firstFailure: Error?
+        var routeWasFenced = false
         for target in targets {
+            var submissionClient: GatewayClient?
+            var submissionStored: String?
+            var submissionBaseline: Int?
             let attemptID = UUID()
             let attributed = A2AWire.attributed(displayTitle: sender.displayTitle,
                                                 handle: sender.attributionHandle,
-                                                body: body, attemptID: attemptID)
+                                                body: body, attemptID: attemptID,
+                                                senderRoute: sender.route)
             let scopeGeneration = A2ARuntime.shared.scopeGenerations[
                 target.route.gatewayID] ?? 0
+            let targetRouteGeneration = A2ARuntime.shared.routeGeneration(for: target.route)
+            let senderRouteGeneration = A2ARuntime.shared.routeGeneration(for: sender.route)
             func scopeIsCurrent() -> Bool {
                 (A2ARuntime.shared.scopeGenerations[target.route.gatewayID] ?? 0)
                     == scopeGeneration
+                    && A2ARuntime.shared.acceptsCompletion(
+                        senderRoute: sender.route,
+                        senderGeneration: senderRouteGeneration,
+                        targetRoute: target.route,
+                        targetGeneration: targetRouteGeneration)
             }
             do {
                 let client = try await routedClient(for: target.route)
+                submissionClient = client
                 guard scopeIsCurrent() else { throw CancellationError() }
                 let session = try await canonicalInboxSession(for: target, client: client)
                 guard scopeIsCurrent() else { throw CancellationError() }
@@ -963,6 +1555,8 @@ public extension AppModel {
                 let baseline = await storedMessageCount(of: session.stored,
                                                         route: target.route,
                                                         client: client) ?? 0
+                submissionStored = session.stored
+                submissionBaseline = baseline
                 guard scopeIsCurrent() else { throw CancellationError() }
                 let queued = try await client.submitHandoff(sessionID: session.runtime,
                                                             text: attributed)
@@ -972,10 +1566,27 @@ public extension AppModel {
                 let outcome = A2AAcceptedOutcome.afterSubmit(
                     scopeIsCurrent: scopeIsCurrent())
                 accepted += 1
-                let key = record(handoff: body, from: sender, to: target,
+                let current = scopeIsCurrent()
+                let key: String
+                if current {
+                    key = record(handoff: body, from: sender, to: target,
                                  attemptID: attemptID, queued: queued,
                                  state: outcome.state)
-                if outcome.retainWatcher {
+                } else {
+                    // The gateway accepted the durable prompt, but lifecycle
+                    // fencing won before publication. Retain only portable
+                    // delivery ownership; migration can re-key it and the
+                    // paused watcher can rearm without creating an old-route
+                    // optimistic row or failure notice.
+                    key = recordAcceptedUntracked(handoff: body, from: sender,
+                                                  to: target, attemptID: attemptID,
+                                                  queued: queued,
+                                                  scopeGeneration: scopeGeneration,
+                                                  targetGeneration: targetRouteGeneration,
+                                                  senderGeneration: senderRouteGeneration,
+                                                  clientID: ObjectIdentifier(client))
+                }
+                if outcome.retainWatcher || !current {
                     watchForReply(to: target, sender: sender, body: body,
                                   attemptID: attemptID, attributed: attributed,
                                   stored: session.stored, baseline: baseline, client: client)
@@ -983,12 +1594,44 @@ public extension AppModel {
                     reportQuietHandoff(to: target, key: key)
                 }
             } catch {
+                if PromptMutationFailure.isAmbiguous(error) {
+                    // The gateway may have accepted the prompt before the
+                    // transport/decode failure. Preserve accepted-unknown
+                    // ownership and fence replay; reconciliation/watch will
+                    // discover the durable row without submitting again.
+                    accepted += 1
+                    guard let client = submissionClient,
+                          let stored = submissionStored,
+                          let baseline = submissionBaseline else {
+                        if firstFailure == nil { firstFailure = error }
+                        continue
+                    }
+                    _ = recordAcceptedUntracked(
+                        handoff: body, from: sender, to: target,
+                        attemptID: attemptID, queued: false,
+                        scopeGeneration: scopeGeneration,
+                        targetGeneration: targetRouteGeneration,
+                        senderGeneration: senderRouteGeneration,
+                        clientID: ObjectIdentifier(client))
+                    watchForReply(to: target, sender: sender, body: body,
+                                  attemptID: attemptID, attributed: attributed,
+                                  stored: stored, baseline: baseline, client: client)
+                    continue
+                }
                 if firstFailure == nil { firstFailure = error }
                 if scopeIsCurrent() {
-                    recordFailure(error, to: target, body: body, attemptID: attemptID)
+                    recordFailure(error, from: sender, to: target, body: body,
+                                  attemptID: attemptID)
+                } else {
+                    routeWasFenced = true
                 }
             }
         }
+        // Lifecycle teardown is an expected supersession, not a transport
+        // failure to announce in the old sender chat. In particular, a
+        // canonical-open cancellation racing a rename must not become a late
+        // `a2aFailedNote` after the profile route was retired.
+        if accepted == 0, routeWasFenced { return 0 }
         if accepted == 0, let firstFailure { throw firstFailure }
         // The optimistic rows above are ours; the sweep replaces them with the
         // stored ones so every row in the feed came from a real transcript.
@@ -1006,8 +1649,18 @@ private extension AppModel {
     func canonicalInboxSession(for endpoint: A2AEndpoint,
                                client: GatewayClient) async throws -> (runtime: String, stored: String) {
         let runtime = A2ARuntime.shared
+        let routeGeneration = runtime.routeGeneration(for: endpoint.route)
+        guard runtime.accepts(route: endpoint.route, generation: routeGeneration) else {
+            throw CancellationError()
+        }
         if let existing = runtime.canonicalOpens[endpoint.route] {
+            guard runtime.accepts(route: endpoint.route, generation: routeGeneration) else {
+                throw CancellationError()
+            }
             let result = try await existing.value
+            guard runtime.accepts(route: endpoint.route, generation: routeGeneration) else {
+                throw CancellationError()
+            }
             return (result.runtime, result.stored)
         }
         let generation = (runtime.canonicalOpenGenerations[endpoint.route] ?? 0) + 1
@@ -1016,30 +1669,42 @@ private extension AppModel {
             guard let self else {
                 throw GatewayError(code: -3, message: "handoff route was released")
             }
-            return try await self.resolveCanonicalInboxSession(for: endpoint, client: client)
+            return try await self.resolveCanonicalInboxSession(
+                for: endpoint, client: client, routeGeneration: routeGeneration)
         }
         runtime.canonicalOpens[endpoint.route] = task
         defer {
             if runtime.canonicalOpenGenerations[endpoint.route] == generation {
                 runtime.canonicalOpens[endpoint.route] = nil
-                runtime.canonicalOpenGenerations[endpoint.route] = nil
             }
         }
         let result = try await task.value
+        guard runtime.accepts(route: endpoint.route, generation: routeGeneration) else {
+            throw CancellationError()
+        }
         return (result.runtime, result.stored)
     }
 
     private func resolveCanonicalInboxSession(for endpoint: A2AEndpoint,
-                                              client: GatewayClient) async throws
+                                              client: GatewayClient,
+                                              routeGeneration: UInt64) async throws
         -> A2ACanonicalSession {
         let botID = endpoint.rosterID
         let profile = endpoint.route.profile
         let canonical = CanonicalChatRuntime.shared
         let sampledWrite = canonical.writeCount[botID] ?? 0
         let cachedPin = canonical.pins[botID]
-        let pin: String?
+        var pin: String?
         do {
+            guard A2ARuntime.shared.accepts(route: endpoint.route,
+                                            generation: routeGeneration) else {
+                throw CancellationError()
+            }
             let profiles = try await client.listProfiles(includeSessions: false)
+            guard A2ARuntime.shared.accepts(route: endpoint.route,
+                                            generation: routeGeneration) else {
+                throw CancellationError()
+            }
             guard let row = profiles.first(where: { $0.name == profile }) else {
                 throw GatewayRouteError.noRoute
             }
@@ -1051,6 +1716,10 @@ private extension AppModel {
                 currentWrite: canonical.writeCount[botID] ?? 0,
                 serverReadSucceeded: true,
                 serverPin: BotModeMeta(uiMeta: row.uiMeta)?.pinnedChat)
+            guard A2ARuntime.shared.accepts(route: endpoint.route,
+                                            generation: routeGeneration) else {
+                throw CancellationError()
+            }
             canonical.pins[botID] = pin
         } catch let error as GatewayRouteError {
             throw error
@@ -1062,6 +1731,10 @@ private extension AppModel {
                 serverReadSucceeded: false, serverPin: nil)
         }
         try Task.checkCancellation()
+        guard A2ARuntime.shared.accepts(route: endpoint.route,
+                                        generation: routeGeneration) else {
+            throw CancellationError()
+        }
 
         // 1. Fresh server pin. 2. Gateway/database exact-title resolver. The
         // latter searches the profile store directly and cannot miss a Bot Chat
@@ -1072,12 +1745,18 @@ private extension AppModel {
                 let live = try await client.resumeSession(target, profile: profile,
                                                           deferHistory: true)
                 try Task.checkCancellation()
+                guard A2ARuntime.shared.accepts(route: endpoint.route,
+                                                generation: routeGeneration) else {
+                    throw CancellationError()
+                }
                 guard !live.sessionID.isEmpty else {
                     throw GatewayError(code: -8, message: "session.resume returned no id")
                 }
                 let stored = live.storedSessionID.isEmpty ? target : live.storedSessionID
                 if target == Self.canonicalChatTitle, !stored.isEmpty {
-                    await pinCanonicalChat(stored, botID: botID)
+                    await pinA2ACanonicalChat(stored, botID: botID,
+                                              route: endpoint.route,
+                                              generation: routeGeneration)
                 }
                 return A2ACanonicalSession(runtime: live.sessionID, stored: stored)
             } catch let error as GatewayError where error.code == GatewayError.storedSessionGone {
@@ -1087,6 +1766,10 @@ private extension AppModel {
             }
         }
         try Task.checkCancellation()
+        guard A2ARuntime.shared.accepts(route: endpoint.route,
+                                        generation: routeGeneration) else {
+            throw CancellationError()
+        }
 
         // 3. No exact canonical session exists: mint one hidden.
         // Born hidden, like every Bot Mode session (plugin.js:2540-2542): a
@@ -1094,17 +1777,40 @@ private extension AppModel {
         let created = try await client.createSession(profile: profile,
                                                      title: Self.canonicalChatTitle, hidden: true)
         try Task.checkCancellation()
+        guard A2ARuntime.shared.accepts(route: endpoint.route,
+                                        generation: routeGeneration) else {
+            throw CancellationError()
+        }
         guard !created.sessionID.isEmpty else {
             throw GatewayError(code: -8, message: "session.create returned no id")
         }
         if !created.storedSessionID.isEmpty {
             // Same block desktop pins into, so the phone's handoff and the
             // laptop's roster tap open the same conversation.
-            await pinCanonicalChat(created.storedSessionID, botID: botID)
+            await pinA2ACanonicalChat(created.storedSessionID, botID: botID,
+                                      route: endpoint.route,
+                                      generation: routeGeneration)
         }
         try Task.checkCancellation()
+        guard A2ARuntime.shared.accepts(route: endpoint.route,
+                                        generation: routeGeneration) else {
+            throw CancellationError()
+        }
         return A2ACanonicalSession(runtime: created.sessionID,
                                    stored: created.storedSessionID)
+    }
+
+    /// `pinCanonicalChat` is shared with the ordinary chat opener and has no
+    /// A2A route token of its own. Keep this narrow wrapper at every A2A
+    /// pin/create completion so a late old-profile result cannot write a pin
+    /// into a renamed/deleted profile.
+    private func pinA2ACanonicalChat(_ storedID: String, botID: String,
+                                     route: GatewayBotRoute,
+                                     generation: UInt64) async {
+        guard A2ARuntime.shared.accepts(route: route, generation: generation) else {
+            return
+        }
+        await pinCanonicalChat(storedID, botID: botID)
     }
 
     /// Stored row count for a session this app does not own — the cheap side
@@ -1127,7 +1833,10 @@ private extension AppModel {
         let runtime = A2ARuntime.shared
         let key = Self.deliveryKey(route: target.route, body: body, attemptID: attemptID)
         runtime.watchers.removeValue(forKey: key)?.cancel()
+        runtime.watcherRegistrations.removeValue(forKey: key)
         runtime.deliveries[key] = A2ADelivery(to: target.rosterID, route: target.route,
+                                              senderRoute: sender.route,
+                                              senderRosterID: sender.rosterID,
                                               attemptID: attemptID,
                                               bodyHash: Self.stableHash(body),
                                               queuedBehindRun: queued,
@@ -1139,6 +1848,9 @@ private extension AppModel {
                                      toBotID: target.rosterID,
                                      time: Self.clock(), text: body), at: 0)
         runtime.optimisticRows[attemptID] = target.route.gatewayID
+        runtime.optimisticOwners[attemptID] = A2AOptimisticOwner(
+            target: target.route, targetRosterID: target.rosterID,
+            sender: sender.route, senderRosterID: sender.rosterID)
         FeedsRuntime.shared.lastInboxScan = nil
         recordActivity(kind: .mention, botID: target.rosterID,
                        text: theme.copy.feedHandoffSent(theme.themeID)
@@ -1167,12 +1879,41 @@ private extension AppModel {
     /// left to say so — and it is the right place: the row survives the sweep,
     /// which is about to rebuild the feed from transcripts this message never
     /// reached.
-    func recordFailure(_ error: Error, to target: A2AEndpoint, body: String,
-                       attemptID: UUID) {
+    /// The prompt crossed the wire, but lifecycle fencing won before the UI
+    /// could publish it. Keep only portable delivery ownership; migration
+    /// re-keys it and the paused watcher can rearm without an old-route row.
+    @discardableResult
+    func recordAcceptedUntracked(handoff body: String, from sender: A2AEndpoint,
+                                 to target: A2AEndpoint, attemptID: UUID,
+                                 queued: Bool, scopeGeneration: Int,
+                                 targetGeneration: UInt64, senderGeneration: UInt64,
+                                 clientID: ObjectIdentifier) -> String {
+        let runtime = A2ARuntime.shared
+        let key = Self.deliveryKey(route: target.route, body: body, attemptID: attemptID)
+        runtime.deliveries[key] = A2ADelivery(
+            to: target.rosterID, route: target.route,
+            senderRoute: sender.route, senderRosterID: sender.rosterID,
+            submitScopeGeneration: scopeGeneration,
+            submitTargetGeneration: targetGeneration,
+            submitSenderGeneration: senderGeneration,
+            submitClientID: clientID,
+            requiresExplicitRearm: true,
+            attemptID: attemptID, bodyHash: Self.stableHash(body),
+            queuedBehindRun: queued, state: .waiting, at: Date())
+        runtime.prune()
+        runtime.pendingRearms.insert(key)
+        return key
+    }
+
+    func recordFailure(_ error: Error, from sender: A2AEndpoint,
+                       to target: A2AEndpoint, body: String, attemptID: UUID) {
         let runtime = A2ARuntime.shared
         let key = Self.deliveryKey(route: target.route, body: body, attemptID: attemptID)
         runtime.watchers.removeValue(forKey: key)?.cancel()
+        runtime.watcherRegistrations.removeValue(forKey: key)
         runtime.deliveries[key] = A2ADelivery(to: target.rosterID, route: target.route,
+                                              senderRoute: sender.route,
+                                              senderRosterID: sender.rosterID,
                                               attemptID: attemptID,
                                               bodyHash: Self.stableHash(body),
                                               queuedBehindRun: false,
@@ -1202,45 +1943,89 @@ private extension AppModel {
         guard !stored.isEmpty else { return }
         let runtime = A2ARuntime.shared
         let key = Self.deliveryKey(route: target.route, body: body, attemptID: attemptID)
-        let generation = (runtime.watcherGeneration[key] ?? 0) + 1
-        runtime.watcherGeneration[key] = generation
-        runtime.watcherScopes[key] = target.route.gatewayID
-        let scopeGeneration = runtime.scopeGenerations[target.route.gatewayID] ?? 0
-        let deadline = Date().addingTimeInterval(A2APolicy.replyDeadline)
+        let generation = runtime.installWatcher(key: key, target: target, sender: sender)
+        var scopeGeneration = runtime.scopeGenerations[target.route.gatewayID] ?? 0
+        var activeClient = client
+        var deadline = Date().addingTimeInterval(A2APolicy.replyDeadline)
         runtime.watchers[key] = Task { @MainActor [weak self] in
             defer {
                 // Only if this is still the live watch for the key.
                 if A2ARuntime.shared.watcherGeneration[key] == generation {
                     A2ARuntime.shared.watchers[key] = nil
                     A2ARuntime.shared.watcherScopes[key] = nil
+                    A2ARuntime.shared.watcherRegistrations[key] = nil
                 }
             }
             while Date() < deadline, !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(A2APolicy.replyPoll))
+                if A2ARuntime.shared.watcherIsPaused(key: key, generation: generation) {
+                    // A committed rename will update this registration in
+                    // place. Do not let the old route poll or emit a quiet
+                    // result while Hermes is moving its directory.
+                    deadline = Date().addingTimeInterval(A2APolicy.replyDeadline)
+                    continue
+                }
                 guard !Task.isCancelled, let self, self.mode == .live,
-                      (A2ARuntime.shared.scopeGenerations[target.route.gatewayID]
-                        ?? 0) == scopeGeneration else { return }
+                      let ownership = A2ARuntime.shared.watcherRegistration(
+                        key: key, generation: generation),
+                      (A2ARuntime.shared.scopeGenerations[ownership.target.route.gatewayID]
+                        ?? 0) >= scopeGeneration else { return }
+                let currentTarget = ownership.target
+                // A primary retirement or a secondary pool replacement can
+                // invalidate the captured client while preserving this watch.
+                // Reacquire by the migrated route before polling; never send
+                // the old profile name through a dead client.
+                guard let reacquired = try? await self.routedClient(for: currentTarget.route),
+                      !Task.isCancelled,
+                      let reacquiredOwnership = A2ARuntime.shared.watcherRegistration(
+                        key: key, generation: generation) else { return }
+                activeClient = reacquired
+                scopeGeneration = A2ARuntime.shared.scopeGenerations[
+                    reacquiredOwnership.target.route.gatewayID] ?? scopeGeneration
                 // Cheap probe first: nothing has been written, nothing to read.
-                let count = await self.storedMessageCount(of: stored, route: target.route,
-                                                          client: client)
+                let count = await self.storedMessageCount(of: stored,
+                                                          route: currentTarget.route,
+                                                          client: activeClient)
+                // The probe itself suspended. Re-read ownership before
+                // interpreting its count: a committed rename may have moved
+                // the watcher to a new profile while the old request was in
+                // flight. Restart that poll rather than resume the old
+                // profile or relay against its route.
+                guard let postProbeOwnership = A2ARuntime.shared.watcherRegistration(
+                    key: key, generation: generation) else { return }
+                guard postProbeOwnership.target == currentTarget else { continue }
+                guard let postProbeClient = try? await self.routedClient(
+                    for: postProbeOwnership.target.route),
+                      !Task.isCancelled,
+                      let currentAfterProbe = A2ARuntime.shared.watcherRegistration(
+                        key: key, generation: generation) else { return }
+                guard currentAfterProbe.target == currentTarget else { continue }
+                activeClient = postProbeClient
+                scopeGeneration = A2ARuntime.shared.scopeGenerations[
+                    currentAfterProbe.target.route.gatewayID] ?? scopeGeneration
                 if let count, count <= baseline { continue }
                 // Something landed. One authoritative read — `running` and
                 // `inflight` are what say the turn is finished rather than
                 // half-written (plugin.js:2566).
-                guard let live = try? await client.resumeSession(stored,
-                                                                 profile: target.route.profile,
+                guard let live = try? await activeClient.resumeSession(stored,
+                                                                 profile: currentTarget.route.profile,
                                                                  deferHistory: false),
                       !Task.isCancelled,
-                      (A2ARuntime.shared.scopeGenerations[target.route.gatewayID]
+                      let currentOwnership = A2ARuntime.shared.watcherRegistration(
+                        key: key, generation: generation),
+                      (A2ARuntime.shared.scopeGenerations[currentOwnership.target.route.gatewayID]
                         ?? 0) == scopeGeneration,
                       !live.running, live.inflight == nil,
                       let reply = A2AReplyResolver.reply(to: attributed,
                                                         in: live.messages) else { continue }
-                self.relay(reply: reply, from: target, to: sender, key: key)
+                self.relay(reply: reply, from: currentOwnership.target,
+                           to: currentOwnership.sender, key: key)
                 return
             }
             guard A2ARuntime.shared.watcherGeneration[key] == generation,
-                  (A2ARuntime.shared.scopeGenerations[target.route.gatewayID]
+                  let ownership = A2ARuntime.shared.watcherRegistration(
+                    key: key, generation: generation),
+                  (A2ARuntime.shared.scopeGenerations[ownership.target.route.gatewayID]
                     ?? 0) == scopeGeneration else { return }
             if var delivery = A2ARuntime.shared.deliveries[key], delivery.state == .waiting {
                 delivery.state = .quiet
@@ -1251,7 +2036,7 @@ private extension AppModel {
                 // what expired is this watch, not the delivery. Saying nothing
                 // here is what left the "will relay the reply here" promise
                 // with no ending at all.
-                self?.reportQuietHandoff(to: target, key: key)
+                self?.reportQuietHandoff(to: ownership.target, key: key)
             }
         }
     }
@@ -1269,7 +2054,37 @@ private extension AppModel {
     /// user row we wrote. Upstream takes the last assistant message outright
     /// (plugin.js:2569-2583); anchoring to our own row instead keeps a queued
     /// handoff from relaying the answer to whatever the bot was already doing.
-    func relay(reply: String, from target: A2AEndpoint, to sender: A2AEndpoint, key: String) {
+    func relay(reply: String, from initialTarget: A2AEndpoint,
+               to initialSender: A2AEndpoint, key: String) {
+        var target = initialTarget
+        var sender = initialSender
+        // The watch may have resumed from an RPC after lifecycle teardown. Its
+        // closure's endpoints are only fallbacks; an active registration is
+        // the source of truth and is updated in place on rename. No
+        // registration means delete/retire won the race, so do not relay.
+        if let registration = A2ARuntime.shared.watcherRegistrations[key] {
+            guard !registration.paused,
+                  A2ARuntime.shared.accepts(
+                    route: registration.target.route,
+                    generation: registration.targetGeneration),
+                  A2ARuntime.shared.accepts(
+                    route: registration.sender.route,
+                    generation: registration.senderGeneration) else { return }
+            target = registration.target
+            sender = registration.sender
+        } else if let delivery = A2ARuntime.shared.deliveries[key] {
+            guard let route = delivery.route,
+                  A2ARuntime.shared.accepts(
+                    route: route, generation: A2ARuntime.shared.routeGeneration(for: route)),
+                  let senderRoute = delivery.senderRoute,
+                  A2ARuntime.shared.accepts(
+                    route: senderRoute,
+                    generation: A2ARuntime.shared.routeGeneration(for: senderRoute)) else {
+                return
+            }
+        } else {
+            return
+        }
         let attemptID = A2ARuntime.shared.deliveries[key]?.attemptID
         if var delivery = A2ARuntime.shared.deliveries[key] {
             delivery.state = .replied
@@ -1280,6 +2095,9 @@ private extension AppModel {
                                      toBotID: sender.rosterID,
                                      time: Self.clock(), text: Self.previewLine(reply)), at: 0)
         A2ARuntime.shared.optimisticRows[replyID] = target.route.gatewayID
+        A2ARuntime.shared.optimisticOwners[replyID] = A2AOptimisticOwner(
+            target: target.route, targetRosterID: target.rosterID,
+            sender: sender.route, senderRosterID: sender.rosterID)
         recordActivity(kind: .mention, botID: sender.rosterID,
                        text: theme.copy.feedHandoffReply(theme.themeID)
                            + " @" + target.handle,

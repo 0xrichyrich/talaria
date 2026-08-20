@@ -35,6 +35,7 @@ final class MultiGatewayRuntime {
     }
 
     var routedEvents: [String: RoutedEvents] = [:]
+    var routedEventGenerations: [String: UInt64] = [:]
     /// Unread counts for bots whose gateway is not currently primary.
     /// Primary rows keep the existing `Bot.unread` storage for compatibility;
     /// gateway switches move counts between the two representations.
@@ -152,9 +153,18 @@ public extension AppModel {
         } else {
             await detachRoutedEvents(gatewayID: gatewayID)
         }
+        runtime.routedEventGenerations[gatewayID, default: 0] &+= 1
+        let generation = runtime.routedEventGenerations[gatewayID, default: 0]
 
         let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
         let handlerID = await client.addEventHandler { continuation.yield($0) }
+        let currentClient = await ConnectionRegistry.shared.clientPool.client(for: gatewayID)
+        guard runtime.routedEventGenerations[gatewayID] == generation,
+              runtime.routedEvents[gatewayID] == nil,
+              currentClient.map(ObjectIdentifier.init) == ObjectIdentifier(client) else {
+            await client.removeEventHandler(handlerID)
+            return
+        }
         let pump = Task { @MainActor [weak self] in
             for await event in stream {
                 guard let self else { return }
@@ -173,6 +183,28 @@ public extension AppModel {
     }
 
     func detachRoutedEvents(gatewayID: String) async {
+        await detachRoutedEvents(gatewayID: gatewayID, expected: nil)
+    }
+
+    /// Detach a retained source only when the caller still owns the exact pool
+    /// slot it started against. Roster failures can arrive after `adopt` has
+    /// installed a replacement, and tearing down by gateway id alone would
+    /// clear the replacement's Workspace/Operator state.
+    func detachRoutedEvents(
+        gatewayID: String, expected: GatewayClientPool.ConnectionSnapshot?
+    ) async {
+        if let expected {
+            guard gatewayID != LiveRuntime.shared.gatewayID,
+                  gatewayID != activeGatewayID,
+                  await ConnectionRegistry.shared.clientPool.isCurrent(
+                      expected, for: gatewayID) else { return }
+        }
+        // A retained secondary can own the Command Center source even while
+        // the primary socket stays up. Tear down that exact workspace scope
+        // and invalidate selected Operator reads before the pool client is
+        // released, so a late status response cannot restore old controls.
+        OperatorSettingsRuntime.shared.invalidateConnectionScope()
+        dropWorkspaceScope(gatewayID: gatewayID)
         await removeRoutedEventSubscription(gatewayID: gatewayID)
         dropApprovalScope(gatewayID: gatewayID)
         dropRoutineScope(gatewayID: gatewayID)
@@ -187,7 +219,8 @@ public extension AppModel {
         SessionsRuntime.shared.resetRoutedScope(gatewayID: gatewayID)
     }
 
-    private func removeRoutedEventSubscription(gatewayID: String) async {
+    func removeRoutedEventSubscription(gatewayID: String) async {
+        MultiGatewayRuntime.shared.routedEventGenerations[gatewayID, default: 0] &+= 1
         if let subscription = MultiGatewayRuntime.shared.routedEvents.removeValue(
             forKey: gatewayID) {
             subscription.pump.cancel()

@@ -561,7 +561,7 @@ public struct SessionSummary: Identifiable, Codable, Sendable, Equatable {
 // MARK: - Artifacts
 
 public enum ArtifactKind: String, Codable, Sendable {
-    case image, file, link
+    case image, file, link, media
 }
 
 public struct Artifact: Identifiable, Codable, Sendable, Equatable {

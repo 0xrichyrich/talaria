@@ -68,6 +68,8 @@ public struct ChatView: View {
     private let onVoice: () -> Void
 
     @State private var draft = ""
+    @State private var editingMessage: ChatMessage?
+    @State private var pendingRestore: ChatMessage?
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.talariaReducedMotion) private var reducedMotion
     @ScaledMetric(relativeTo: .body) private var softComposerSize = 14.5
@@ -154,6 +156,23 @@ public struct ChatView: View {
             // chat opened before that ran.
             model.attachChatEventRouter()
         }
+        .confirmationDialog(copy.rewindConfirmTitle(theme.id),
+                            isPresented: Binding(
+                                get: { pendingRestore != nil },
+                                set: { if !$0 { pendingRestore = nil } }),
+                            titleVisibility: .visible) {
+            Button(copy.rewindMessage(theme.id), role: .destructive) {
+                if let pendingRestore {
+                    model.rewind(to: pendingRestore, in: botID)
+                }
+                pendingRestore = nil
+            }
+            Button(copy.rewindCancel(theme.id), role: .cancel) {
+                pendingRestore = nil
+            }
+        } message: {
+            Text(copy.rewindConfirmMessage(theme.id))
+        }
     }
 
     /// Demo bots without history open on their roster preview, like the
@@ -182,7 +201,14 @@ public struct ChatView: View {
                     .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
                     .padding(.bottom, 2)
             }
-            AvatarView(bot: bot, size: 36, theme: theme)
+            ZStack {
+                BotPortraitView(model: model, bot: bot, size: 36, theme: theme)
+            }
+            .frame(width: 36, height: 36)
+            .overlay(alignment: .bottomTrailing) {
+                PetCompanionView(model: model, bot: bot)
+                    .offset(x: 3, y: 2)
+            }
             Button(action: onOpenProfile) {
                 VStack(alignment: .leading, spacing: 1) {
                     nameLine
@@ -592,6 +618,27 @@ public struct ChatView: View {
         } label: {
             Label(copy.copyMessage(theme.id), systemImage: "doc.on.doc")
         }
+        if message.author == .user, model.canActOnTranscript(message, in: botID) {
+            Button {
+                editingMessage = message
+                draft = message.text
+                composerFocused = true
+            } label: {
+                Label(copy.editMessage(theme.id), systemImage: "pencil")
+            }
+            Button(role: .destructive) {
+                pendingRestore = message
+            } label: {
+                Label(copy.rewindMessage(theme.id), systemImage: "arrow.uturn.backward")
+            }
+        }
+        if message.author == .bot, model.canActOnTranscript(message, in: botID) {
+            Button {
+                model.regenerate(from: message, in: botID)
+            } label: {
+                Label(copy.regenerateMessage(theme.id), systemImage: "arrow.clockwise")
+            }
+        }
         if model.canReact(to: message, in: botID) {
             Menu {
                 ForEach(Self.reactionEmojis, id: \.self) { emoji in
@@ -902,12 +949,48 @@ public struct ChatView: View {
         }
     }
 
+
+    @ViewBuilder private var queuedPromptStrip: some View {
+        let items = model.queuedPrompts(for: botID)
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(copy.promptQueueTitle(theme.id, count: items.count))
+                    .font(theme.id == .control ? theme.mono(9.5, weight: .semibold) : theme.body(11.5, weight: .semibold))
+                    .foregroundStyle(theme.sub)
+                ForEach(items, id: \.id) { item in
+                    HStack(spacing: 8) {
+                        Text(item.text)
+                            .font(theme.body(13))
+                            .foregroundStyle(theme.ink)
+                            .lineLimit(2)
+                        Spacer(minLength: 8)
+                        Button {
+                            model.dismissQueuedPrompt(id: item.id)
+                        } label: {
+                            Text(copy.promptQueueRemove(theme.id))
+                                .font(theme.body(12, weight: .semibold))
+                                .foregroundStyle(theme.accent)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 10)
+                    .background(theme.inset, in: RoundedRectangle(cornerRadius: theme.buttonRadius, style: .continuous))
+                }
+                Text(copy.promptQueueNotice(theme.id))
+                    .font(theme.body(10.5))
+                    .foregroundStyle(theme.faint)
+            }
+        }
+    }
+
     // MARK: - Composer
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 6) {
             // Staged attachments (attachments agent owns the tray + picker).
             AttachmentTray(model: model, botID: botID)
+            queuedPromptStrip
             if turnRunning, model.mode == .live {
                 steerHint
             }
@@ -1192,14 +1275,23 @@ public struct ChatView: View {
             showCommands = true
             return
         }
-        draft = ""
         // Slash commands are not prompts: they go to slash.exec, which appends
         // its own user echo and leaves anything staged in the tray alone for
         // the next real turn.
         if text.hasPrefix("/") {
+            draft = ""
+            editingMessage = nil
             Task { await model.runSlash(text, botID: botID) }
             return
         }
+        if let editing = editingMessage {
+            guard model.canActOnTranscript(editing, in: botID) else { return }
+            draft = ""
+            editingMessage = nil
+            model.editMessage(editing, in: botID, to: text)
+            return
+        }
+        draft = ""
         model.sendOrSteer(text: text, to: botID)
     }
 }
@@ -1267,6 +1359,29 @@ extension CopyPack {
         }
     }
 
+    func promptQueueTitle(_ theme: ThemeID, count: Int) -> String {
+        switch theme {
+        case .soft: "Queued · \(count)"
+        case .control: "QUEUED \(count)"
+        case .ink: "waiting · \(count)"
+        }
+    }
+    func promptQueueRemove(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Dismiss"
+        case .control: "DISMISS"
+        case .ink: "hide this note"
+        }
+    }
+
+    func promptQueueNotice(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Dismiss only hides this notice; Hermes still runs the queued prompt."
+        case .control: "DISMISS HIDES LOCAL MIRROR ONLY — GATEWAY EXECUTION CONTINUES"
+        case .ink: "Hiding the note does not unspeak the waiting words."
+        }
+    }
+
     func copyMessage(_ theme: ThemeID) -> String {
         switch theme {
         case .soft: "Copy text"
@@ -1280,6 +1395,54 @@ extension CopyPack {
         case .soft: "React"
         case .control: "MARK"
         case .ink: "leave a mark"
+        }
+    }
+
+    func editMessage(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Edit"
+        case .control: "REVISE"
+        case .ink: "amend the words"
+        }
+    }
+
+    func rewindMessage(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Rewind from here"
+        case .control: "RESTORE CHECKPOINT"
+        case .ink: "return to this hour"
+        }
+    }
+
+    func regenerateMessage(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Regenerate"
+        case .control: "RERUN"
+        case .ink: "ask again"
+        }
+    }
+
+    func rewindCancel(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Cancel"
+        case .control: "CANCEL"
+        case .ink: "leave it"
+        }
+    }
+
+    func rewindConfirmTitle(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Rewind this chat?"
+        case .control: "RESTORE THIS CHECKPOINT?"
+        case .ink: "unwind the later hours?"
+        }
+    }
+
+    func rewindConfirmMessage(_ theme: ThemeID) -> String {
+        switch theme {
+        case .soft: "Everything after this message will be dropped, then the same prompt runs again."
+        case .control: "DROPS THIS TURN AND EVERYTHING AFTER IT, THEN RESUBMITS."
+        case .ink: "What followed this word is struck out, and the word is spoken once more."
         }
     }
 

@@ -31,6 +31,7 @@ public enum ProtocolChecks {
         try unreadWatermarks()
         try toastPairing()
         try botModeNotices()
+        try transcriptActing()
     }
 
     static func eventEnvelopeDecoding() throws {

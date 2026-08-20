@@ -70,12 +70,30 @@ public final class AppModel {
     public var isOffline: Bool = false
     /// Messages composed while unreachable; flushed on reconnect.
     public var composeQueue: [(botID: String, text: String)] = []
+    /// Stable identity for each compose row. The tuple remains source
+    /// compatible for existing views, while flush/rekey removes only the
+    /// exact row that crossed its own await.
+    var composeQueueIDs: [UUID] = []
+    struct ComposeQueueBinding: Equatable {
+        var botID: String
+        var route: GatewayBotRoute?
+        var storedID: String?
+        var sessionID: String?
+        var chatID: ObjectIdentifier?
+    }
+    var composeQueueBindings: [UUID: ComposeQueueBinding] = [:]
+    var composeFlushActive = false
+    /// Live prompts the gateway parked behind the current turn (`queued: true`).
+    public var promptQueue: [(id: UUID, botID: String, text: String)] = []
 
     // Live mode
     public var client: GatewayClient?
 
     public init() {
         showOnboarding = !UserDefaults.standard.bool(forKey: "talaria-onboarded")
+        ConnectionRegistry.shared.setSecondaryTeardown { [weak self] gatewayID, expected in
+            await self?.detachRoutedEvents(gatewayID: gatewayID, expected: expected)
+        }
     }
 
     // MARK: - Demo mode
@@ -166,6 +184,9 @@ public final class AppModel {
         sessions = [:]
         contextMeter = []
         composeQueue = []
+        composeQueueIDs = []
+        composeQueueBindings = [:]
+        promptQueue = []
         openBotID = nil
         selectedTab = .home
         // A toast is an answer about a world that no longer exists once this
@@ -183,6 +204,101 @@ public final class AppModel {
         return fresh
     }
 
+    func normalizeComposeQueueIDs() {
+        if composeQueueIDs.count > composeQueue.count {
+            composeQueueIDs.removeLast(composeQueueIDs.count - composeQueue.count)
+        }
+        while composeQueueIDs.count < composeQueue.count {
+            composeQueueIDs.append(UUID())
+        }
+        let valid = Set(composeQueueIDs)
+        composeQueueBindings = composeQueueBindings.filter { valid.contains($0.key) }
+    }
+
+    func appendComposeQueue(botID: String, text: String, id: UUID = UUID(),
+                            route: GatewayBotRoute? = nil, storedID: String? = nil,
+                            sessionID: String? = nil, chatID: ObjectIdentifier? = nil) {
+        normalizeComposeQueueIDs()
+        guard !composeQueueIDs.contains(id) else { return }
+        composeQueue.append((botID: botID, text: text))
+        composeQueueIDs.append(id)
+        if route != nil || storedID != nil || sessionID != nil || chatID != nil {
+            composeQueueBindings[id] = ComposeQueueBinding(botID: botID, route: route,
+                storedID: storedID, sessionID: sessionID, chatID: chatID)
+        }
+    }
+
+    func reconcileComposeQueueIDs(sources: Set<String>, destination: String?) {
+        normalizeComposeQueueIDs()
+        guard destination == nil else { return }
+        let retained = zip(composeQueue, composeQueueIDs).filter {
+            !sources.contains($0.0.botID)
+        }
+        composeQueue = retained.map { $0.0 }
+        composeQueueIDs = retained.map { $0.1 }
+        let valid = Set(composeQueueIDs)
+        composeQueueBindings = composeQueueBindings.filter { valid.contains($0.key) }
+    }
+
+    func migrateComposeQueueRoute(from sourceBotID: String, to destinationBotID: String,
+                                  fromRoute: GatewayBotRoute, toRoute: GatewayBotRoute,
+                                  storedID: String, sessionID: String,
+                                  chatID: ObjectIdentifier) {
+        normalizeComposeQueueIDs()
+        for index in composeQueue.indices {
+            let id = composeQueueIDs[index]
+            guard composeQueue[index].botID == sourceBotID,
+                  let binding = composeQueueBindings[id],
+                  binding.botID == sourceBotID, binding.route == fromRoute,
+                  binding.storedID == storedID, binding.sessionID == sessionID,
+                  binding.chatID == chatID else { continue }
+            composeQueue[index].botID = destinationBotID
+            composeQueueBindings[id] = ComposeQueueBinding(
+                botID: destinationBotID, route: toRoute, storedID: storedID,
+                sessionID: sessionID, chatID: chatID)
+        }
+    }
+
+    func migrateComposeQueueSession(botID: String, route: GatewayBotRoute,
+                                    oldSessionID: String, newSessionID: String,
+                                    storedID: String, chatID: ObjectIdentifier) {
+        normalizeComposeQueueIDs()
+        for id in composeQueueIDs {
+            guard let binding = composeQueueBindings[id], binding.botID == botID,
+                  binding.route == route, binding.sessionID == oldSessionID,
+                  binding.storedID == storedID, binding.chatID == chatID else { continue }
+            composeQueueBindings[id]?.sessionID = newSessionID
+        }
+    }
+
+    func rekeyComposeQueueRoute(from sourceBotID: String, to destinationBotID: String,
+                                fromRoute: GatewayBotRoute, toRoute: GatewayBotRoute) {
+        normalizeComposeQueueIDs()
+        for index in composeQueue.indices {
+            let id = composeQueueIDs[index]
+            guard composeQueue[index].botID == sourceBotID,
+                  let binding = composeQueueBindings[id], binding.botID == sourceBotID,
+                  binding.route == fromRoute else { continue }
+            composeQueue[index].botID = destinationBotID
+            composeQueueBindings[id]?.botID = destinationBotID
+            composeQueueBindings[id]?.route = toRoute
+        }
+    }
+
+    func retireComposeQueue(botID: String, storedID: String?, chatID: ObjectIdentifier?) {
+        normalizeComposeQueueIDs()
+        let retained = zip(composeQueue, composeQueueIDs).filter { item, id in
+            guard item.botID == botID, let binding = composeQueueBindings[id] else { return true }
+            let exactChat = chatID.map { binding.chatID == $0 } ?? false
+            let exactStored = storedID.map { binding.storedID == $0 } ?? false
+            return !(exactChat || exactStored)
+        }
+        composeQueue = retained.map { $0.0 }
+        composeQueueIDs = retained.map { $0.1 }
+        let valid = Set(composeQueueIDs)
+        composeQueueBindings = composeQueueBindings.filter { valid.contains($0.key) }
+    }
+
     public func bot(_ id: String) -> Bot? {
         bots.first { $0.id == id }
     }
@@ -190,15 +306,21 @@ public final class AppModel {
     public func send(text: String, to botID: String) {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         let chat = chat(for: botID)
-        chat.messages.append(ChatMessage(author: .user, time: Self.clock(), text: text))
+        let optimistic = ChatMessage(author: .user, time: Self.clock(), text: text)
+        chat.messages.append(optimistic)
 
         if isOffline && GatewayBotRoute(qualifiedID: botID) == nil {
-            composeQueue.append((botID, text))
+            appendComposeQueue(botID: botID, text: text,
+                               route: stateRoute(for: botID) ?? gatewayRoute(for: botID),
+                               storedID: chat.storedSessionID, sessionID: chat.sessionID,
+                               chatID: ObjectIdentifier(chat))
             return
         }
         switch mode {
         case .demo: demoReply(botID: botID, chat: chat)
-        case .live: liveSend(text: text, botID: botID, chat: chat)
+        case .live:
+            liveSendSerialized(text: text, botID: botID, chat: chat,
+                               optimisticID: optimistic.id)
         }
     }
 

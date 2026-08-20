@@ -406,6 +406,94 @@ struct ProfileLifecycleTests {
         LiveRuntime.shared.gatewayID = nil
     }
 
+    @Test @MainActor func activePrimaryRetirementRestoresOnlyExactPendingStopForRename() throws {
+        let model = AppModel()
+        let gatewayID = "primary-stop-\(UUID().uuidString)"
+        let target = ProfileLifecycleTarget(
+            rosterID: "worker",
+            route: GatewayBotRoute(gatewayID: gatewayID, profile: "worker"))
+        let siblingRoute = GatewayBotRoute(gatewayID: gatewayID, profile: "sibling")
+        let targetChat = ChatState(messages: [])
+        targetChat.storedSessionID = "stored-target"
+        targetChat.sessionID = "runtime-target"
+        model.chats["worker"] = targetChat
+        let siblingChat = ChatState(messages: [])
+        siblingChat.storedSessionID = "stored-sibling"
+        model.chats[siblingRoute.qualifiedID] = siblingChat
+        LiveRuntime.shared.gatewayID = gatewayID
+        ChatRuntime.shared.pendingStopRequests["worker"] = PendingStopRequest(
+            botID: "worker", route: target.route, storedID: "stored-target",
+            sessionID: "runtime-target", chatID: ObjectIdentifier(targetChat),
+            generation: LiveRuntime.shared.generation)
+        ChatRuntime.shared.pendingStopRequests[siblingRoute.qualifiedID] = PendingStopRequest(
+            botID: siblingRoute.qualifiedID, route: siblingRoute,
+            storedID: "stored-sibling", sessionID: "runtime-sibling",
+            chatID: ObjectIdentifier(siblingChat), generation: LiveRuntime.shared.generation)
+        defer {
+            ChatRuntime.shared.pendingStopRequests.removeAll()
+            model.chats.removeValue(forKey: "worker")
+            model.chats.removeValue(forKey: target.route.qualifiedID)
+            model.chats.removeValue(forKey: siblingRoute.qualifiedID)
+            LiveRuntime.shared.gatewayID = nil
+        }
+
+        // This is the exact primary rename pre-retirement parking boundary.
+        model.parkProfileLifecycleState(target)
+        #expect(ChatRuntime.shared.pendingStopRequests[target.route.qualifiedID]?.storedID
+                == "stored-target")
+
+        // disconnectGateway clears the whole departing gateway. Lifecycle
+        // ownership restores only the captured target before reconciliation.
+        ChatRuntime.shared.clearPendingStops(forGatewayID: gatewayID)
+        #expect(ChatRuntime.shared.pendingStopRequests[target.route.qualifiedID] == nil)
+        #expect(ChatRuntime.shared.pendingStopRequests[siblingRoute.qualifiedID] == nil)
+        model.restoreProfileLifecyclePendingStop(target, parked: true)
+        #expect(ChatRuntime.shared.pendingStopRequests[target.route.qualifiedID] != nil)
+        #expect(ChatRuntime.shared.pendingStopRequests[siblingRoute.qualifiedID] == nil)
+
+        let renamed = GatewayBotRoute(gatewayID: gatewayID, profile: "renamed")
+        #expect(ChatRuntime.shared.rekeyPendingStop(
+            fromBotIDs: [target.route.qualifiedID, target.route.profile],
+            fromRoute: target.route, toBotID: renamed.qualifiedID, toRoute: renamed,
+            chatID: ObjectIdentifier(targetChat), storedID: "stored-target"))
+        #expect(ChatRuntime.shared.pendingStopRequests[target.route.qualifiedID] == nil)
+        #expect(ChatRuntime.shared.pendingStopRequests[renamed.qualifiedID]?.route == renamed)
+        #expect(ChatRuntime.shared.pendingStopRequests[siblingRoute.qualifiedID] == nil)
+    }
+
+    @Test @MainActor func refusedPrimaryRenameRestoresPendingStopToBareOwner() throws {
+        let model = AppModel()
+        let gatewayID = "primary-refused-stop-\(UUID().uuidString)"
+        let target = ProfileLifecycleTarget(
+            rosterID: "worker",
+            route: GatewayBotRoute(gatewayID: gatewayID, profile: "worker"))
+        let chat = ChatState(messages: [])
+        chat.storedSessionID = "stored-target"
+        chat.sessionID = "runtime-target"
+        model.chats["worker"] = chat
+        LiveRuntime.shared.gatewayID = gatewayID
+        ChatRuntime.shared.pendingStopRequests["worker"] = PendingStopRequest(
+            botID: "worker", route: target.route, storedID: "stored-target",
+            sessionID: "runtime-target", chatID: ObjectIdentifier(chat),
+            generation: LiveRuntime.shared.generation)
+        defer {
+            ChatRuntime.shared.pendingStopRequests.removeAll()
+            model.chats.removeValue(forKey: "worker")
+            model.chats.removeValue(forKey: target.route.qualifiedID)
+            LiveRuntime.shared.gatewayID = nil
+        }
+
+        model.parkProfileLifecycleState(target)
+        ChatRuntime.shared.clearPendingStops(forGatewayID: gatewayID)
+        model.restoreProfileLifecyclePendingStop(target, parked: true)
+        LiveRuntime.shared.gatewayID = nil
+        model.restoreParkedProfileLifecycleStateIfNeeded(target, wasActive: true)
+
+        #expect(ChatRuntime.shared.pendingStopRequests["worker"] != nil)
+        #expect(ChatRuntime.shared.pendingStopRequests[target.route.qualifiedID] == nil)
+        #expect(model.chats["worker"]?.storedSessionID == "stored-target")
+    }
+
     @Test @MainActor func failedMutationRestoresBareStateOnlyWithoutNewPrimaryOwner() {
         let target = ProfileLifecycleTarget(
             rosterID: "worker",
@@ -435,7 +523,7 @@ struct ProfileLifecycleTests {
         LiveRuntime.shared.gatewayID = nil
     }
 
-    @Test @MainActor func abortScrubsPublishersAndInvalidatesLateCompletions() throws {
+    @Test @MainActor func abortScrubsPublishersAndInvalidatesLateCompletions() async throws {
         let model = AppModel()
         LiveRuntime.shared.gatewayID = "mac"
         let target = ProfileLifecycleTarget(
@@ -490,7 +578,7 @@ struct ProfileLifecycleTests {
         #expect(A2ARuntime.shared.deliveries[deliveryKey] == nil)
         #expect(!model.profileLifecycleAccepts(lifecycle))
 
-        model.activateProfileLifecycleRoute(gatewayID: "mac", profile: "worker")
+        try await model.activateProfileLifecycleRoute(gatewayID: "mac", profile: "worker")
         let replacementLifecycle = try #require(model.profileLifecycleGenerationToken(for: "worker"))
         #expect(replacementLifecycle != lifecycle)
         #expect(model.profileLifecycleAccepts(replacementLifecycle))
@@ -498,6 +586,167 @@ struct ProfileLifecycleTests {
         LiveRuntime.shared.sessionToBot.removeAll()
         A2ARuntime.shared.reset()
         ApprovalBridges.shared.prompts.removeAll()
+    }
+
+    @Test @MainActor
+    func abortRetiresExactRouteMutationAndCanonicalKickoffState() throws {
+        let model = AppModel()
+        let gatewayID = "route-retire-\(UUID().uuidString)"
+        let profile = "worker"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: profile)
+        let siblingRoute = GatewayBotRoute(gatewayID: gatewayID, profile: "sibling")
+        let chat = ChatState(messages: [])
+        chat.storedSessionID = "stored-worker"
+        model.chats[profile] = chat
+        model.chats[siblingRoute.qualifiedID] = ChatState(messages: [])
+        LiveRuntime.shared.gatewayID = gatewayID
+        LiveRuntime.shared.sessionToBot["runtime-worker"] = profile
+        LiveRuntime.shared.sessionToBot["runtime-sibling"] = siblingRoute.qualifiedID
+        LiveRuntime.shared.workingBotIDs = [profile, siblingRoute.qualifiedID]
+
+        let actionID = UUID()
+        ChatRuntime.shared.transcriptActions[profile] = actionID
+        ChatRuntime.shared.transcriptActionGenerations[profile] = 7
+        ChatRuntime.shared.queuedBindings[actionID] = QueuedPromptBinding(
+            botID: profile, sessionID: "runtime-worker", storedID: "stored-worker",
+            route: route, eligibleAfterCurrentTurn: true, order: 1)
+        model.promptQueue = [(id: actionID, botID: profile, text: "queued")]
+
+        let siblingID = UUID()
+        ChatRuntime.shared.transcriptActions[siblingRoute.qualifiedID] = siblingID
+        let kickoff = CanonicalKickoffLease(
+            id: UUID(), botID: profile, sessionID: "runtime-worker",
+            storedID: "stored-worker", rowID: nil, chatID: ObjectIdentifier(chat),
+            route: route)
+        CanonicalChatRuntime.shared.kickoffs[profile] = kickoff.id
+        CanonicalChatRuntime.shared.kickoffLeases[profile] = kickoff
+        CanonicalChatRuntime.shared.ambiguousKickoffs[profile] = kickoff
+
+        defer {
+            ChatRuntime.shared.transcriptActions.removeAll()
+            ChatRuntime.shared.transcriptActionGenerations.removeAll()
+            ChatRuntime.shared.queuedBindings.removeAll()
+            ChatRuntime.shared.queuedLifecycles.removeAll()
+            ChatRuntime.shared.pendingQueuedSubmissions.removeAll()
+            model.promptQueue.removeAll()
+            CanonicalChatRuntime.shared.kickoffs.removeAll()
+            CanonicalChatRuntime.shared.kickoffLeases.removeAll()
+            CanonicalChatRuntime.shared.ambiguousKickoffs.removeAll()
+            model.chats.removeAll()
+            LiveRuntime.shared.sessionToBot.removeAll()
+            LiveRuntime.shared.workingBotIDs.removeAll()
+            LiveRuntime.shared.gatewayID = nil
+        }
+
+        model.abortProfileRuntime(ProfileLifecycleTarget(rosterID: profile, route: route))
+
+        #expect(ChatRuntime.shared.transcriptActions[profile] == nil)
+        #expect(ChatRuntime.shared.transcriptActionGenerations[profile] == nil)
+        #expect(ChatRuntime.shared.queuedBindings[actionID] == nil)
+        #expect(model.promptQueue.isEmpty)
+        #expect(CanonicalChatRuntime.shared.kickoffs[profile] == nil)
+        #expect(CanonicalChatRuntime.shared.kickoffLeases[profile] == nil)
+        #expect(CanonicalChatRuntime.shared.ambiguousKickoffs[profile] == nil)
+        #expect(ChatRuntime.shared.transcriptActions[siblingRoute.qualifiedID] == siblingID)
+        #expect(LiveRuntime.shared.sessionToBot["runtime-worker"] == nil)
+        #expect(LiveRuntime.shared.sessionToBot["runtime-sibling"] == siblingRoute.qualifiedID)
+        #expect(!LiveRuntime.shared.workingBotIDs.contains(profile))
+        #expect(LiveRuntime.shared.workingBotIDs.contains(siblingRoute.qualifiedID))
+    }
+
+    @Test @MainActor
+    func primaryParkingMovesQueuedPromptWithQualifiedOwnerAndRestoresIt() throws {
+        let model = AppModel()
+        let gatewayID = "queue-park-(UUID().uuidString)"
+        let profile = "worker"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: profile)
+        let chat = ChatState(messages: [])
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        model.chats[profile] = chat
+        LiveRuntime.shared.gatewayID = gatewayID
+        ChatRuntime.shared.queuedBindings.removeAll()
+        ChatRuntime.shared.queuedLifecycles.removeAll()
+        ChatRuntime.shared.pendingQueuedSubmissions.removeAll()
+        model.promptQueue.removeAll()
+        defer {
+            ChatRuntime.shared.queuedBindings.removeAll()
+            ChatRuntime.shared.queuedLifecycles.removeAll()
+            ChatRuntime.shared.pendingQueuedSubmissions.removeAll()
+            model.promptQueue.removeAll()
+            model.chats.removeAll()
+            LiveRuntime.shared.gatewayID = nil
+        }
+
+        model.enqueuePrompt("queued", botID: profile, sessionID: "runtime")
+        let rowID = try #require(model.promptQueue.first?.id)
+        model.parkProfileLifecycleState(
+            ProfileLifecycleTarget(rosterID: profile, route: route))
+
+        #expect(model.chats[route.qualifiedID] === chat)
+        #expect(model.promptQueue.first?.botID == route.qualifiedID)
+        #expect(ChatRuntime.shared.queuedBindings[rowID]?.botID == route.qualifiedID)
+
+        model.restoreParkedProfileLifecycleStateIfNeeded(
+            ProfileLifecycleTarget(rosterID: profile, route: route), wasActive: true)
+
+        #expect(model.chats[profile] === chat)
+        #expect(model.promptQueue.first?.botID == profile)
+        #expect(ChatRuntime.shared.queuedBindings[rowID]?.botID == profile)
+    }
+
+    @Test @MainActor
+    func refusedPrimaryLifecycleRestoresCanonicalPinUnderBareOwner() throws {
+        let model = AppModel()
+        let gatewayID = "pin-refused-(UUID().uuidString)"
+        let profile = "worker"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: profile)
+        let chat = ChatState(messages: [])
+        chat.storedSessionID = "stored-canonical"
+        model.chats[profile] = chat
+        LiveRuntime.shared.gatewayID = gatewayID
+        CanonicalChatRuntime.shared.pins[profile] = chat.storedSessionID
+        defer {
+            CanonicalChatRuntime.shared.pins.removeAll()
+            CanonicalChatRuntime.shared.writeCount.removeAll()
+            model.chats.removeAll()
+            LiveRuntime.shared.gatewayID = nil
+        }
+
+        model.parkProfileLifecycleCanonicalState(
+            ProfileLifecycleTarget(rosterID: profile, route: route))
+        #expect(CanonicalChatRuntime.shared.pins[profile] == nil)
+
+        // A refused primary rename restores the original bare owner. A
+        // qualified fallback would strand the canonical chat under a key the
+        // next primary roster can never resolve.
+        model.restoreParkedProfileLifecycleCanonicalStateIfNeeded(
+            ProfileLifecycleTarget(rosterID: profile, route: route), preferPrimary: true)
+
+        #expect(CanonicalChatRuntime.shared.pins[profile] == "stored-canonical")
+        #expect(CanonicalChatRuntime.shared.pins[route.qualifiedID] == nil)
+    }
+
+    @Test @MainActor
+    func roomLifecycleDeleteTombstoneReopensOnlyAfterDefinitiveRefusal() async {
+        let model = AppModel()
+        let route = GatewayBotRoute(
+            gatewayID: "room-lifecycle-(UUID().uuidString)", profile: "worker")
+        let runtime = RoomRuntime.shared
+        defer {
+            runtime.retiredProfileRoutes.remove(route)
+            runtime.profileRouteGenerations.removeValue(forKey: route)
+        }
+
+        let token = model.prepareRoomProfileLifecycle(source: route, deleting: true)
+        #expect(runtime.retiredProfileRoutes.contains(route))
+        #expect(!runtime.acceptsProfileRoute(route, generation: token.generation))
+
+        // A refused delete is the only path that may reopen the source route;
+        // an uncertain/committed delete keeps the tombstone in place.
+        await model.abortRoomProfileLifecycle(token)
+        #expect(!runtime.retiredProfileRoutes.contains(route))
+        #expect(runtime.profileRouteGeneration(route) > token.generation)
     }
 
     @Test @MainActor func unreadLifecycleRekeysSourceMarkOverStaleDestination() throws {

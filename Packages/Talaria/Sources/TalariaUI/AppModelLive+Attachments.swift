@@ -287,7 +287,9 @@ extension AppModel {
                 // during the park window fails here first — where plain text
                 // would have recovered inside submit. Re-attach and retry once.
                 guard profileLifecycleAccepts(lifecycle) else { return }
-                chat(for: botID).sessionID = nil
+                let chat = chat(for: botID)
+                parkRuntimeSessionBeforeClearing(botID: botID)
+                chat.sessionID = nil
                 sid = try await ensureSession(botID: botID, hydrate: false)
                 guard profileLifecycleAccepts(lifecycle) else { return }
                 staged = try await attach(client, sid)

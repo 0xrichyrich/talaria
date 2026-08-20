@@ -390,7 +390,13 @@ extension AppModel {
                                  enabledToolsets: enabledToolsets,
                                  uiMeta: uiMeta)
         let followApplied = try? await selectedClient.applyProfileEdit(name: id, follow)
-        activateProfileLifecycleRoute(gatewayID: targetGatewayID, profile: id)
+        do {
+            try await activateProfileLifecycleRoute(gatewayID: targetGatewayID, profile: id)
+        } catch {
+            RoomRuntime.shared.profileLifecycleError =
+                "Profile activation for \(targetGatewayID)::\(id) is pending durable room reconciliation."
+            return .partial
+        }
         if targetGatewayID == LiveRuntime.shared.gatewayID { bots.append(bot) }
         await refreshProfileRoster(gatewayID: targetGatewayID)
         guard let followApplied, follow.wasFullyApplied(followApplied) else { return .partial }
@@ -417,7 +423,13 @@ extension AppModel {
         } catch {
             return false
         }
-        activateProfileLifecycleRoute(gatewayID: context.route.gatewayID, profile: newID)
+        do {
+            try await activateProfileLifecycleRoute(gatewayID: context.route.gatewayID, profile: newID)
+        } catch {
+            RoomRuntime.shared.profileLifecycleError =
+                "Profile activation for \(context.route.gatewayID)::\(newID) is pending durable room reconciliation."
+            return false
+        }
         if context.route.gatewayID == LiveRuntime.shared.gatewayID {
             bots.append(clone)
         }
@@ -447,6 +459,11 @@ extension AppModel {
               let lifecycle = profileLifecycleGenerationToken(for: botID),
               let context = try? await profileContext(for: botID) else { return }
         guard profileLifecycleAccepts(lifecycle) else { return }
+        let capturedGeneration = LiveRuntime.shared.generation
+        let capturedClient = context.client
+        guard profileLifecycleAcceptsGatewaySnapshot(
+            route: context.route, client: capturedClient,
+            generation: capturedGeneration) else { return }
         let signals = RosterSignals.shared
         // `has_avatar` gates primary rows. Secondary roster projections do not
         // currently retain that flag, so a qualified row asks once and lets
@@ -460,13 +477,15 @@ extension AppModel {
         defer { store.endFetch(cacheID) }
         let dataURL: String?
         do {
-            dataURL = try await context.client.profileAvatar(name: context.route.profile)
+            dataURL = try await capturedClient.profileAvatar(name: context.route.profile)
         } catch {
             // A transport/provider failure is not evidence that the asset is
             // absent. Leave the cache unresolved so a later repaint can retry.
             return
         }
-        guard profileLifecycleAccepts(lifecycle) else { return }
+        guard profileLifecycleAcceptsGatewaySnapshot(
+            route: context.route, client: capturedClient,
+            generation: capturedGeneration) else { return }
         guard let dataURL,
               let data = ProfileAssetStore.decode(dataURL: dataURL),
               // Desktop's own guard, same inputs and same verdict
@@ -484,12 +503,16 @@ extension AppModel {
             // `markAbsent`, not a bare return: this is a settled verdict about
             // bytes already seen, so the row keeps its live face for good
             // instead of re-fetching and re-rejecting the same asset every poll.
-            if profileLifecycleAccepts(lifecycle), store.isCurrent(epoch: cacheEpoch) {
+            if profileLifecycleAcceptsGatewaySnapshot(
+                route: context.route, client: capturedClient,
+                generation: capturedGeneration), store.isCurrent(epoch: cacheEpoch) {
                 store.markAbsent(cacheID)
             }
             return
         }
-        if profileLifecycleAccepts(lifecycle), store.isCurrent(epoch: cacheEpoch) {
+        if profileLifecycleAcceptsGatewaySnapshot(
+            route: context.route, client: capturedClient,
+            generation: capturedGeneration), store.isCurrent(epoch: cacheEpoch) {
             store.set(data, for: cacheID)
         }
     }

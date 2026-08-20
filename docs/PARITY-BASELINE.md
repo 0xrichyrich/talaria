@@ -95,6 +95,11 @@ workspace/command-center surfaces:
 
 ## Delivery ledger
 
+Local combined follow-up (`codex/command-center-ops`, not yet on GitHub):
+transcript edit/rewind/regenerate, Gateway Operations maintenance, files/git,
+live pet face with staged Save, and the Bot Mode kickoff prompt. App Store push
+and independent live-gateway certification are still outstanding.
+
 Every item below ships as one or more independently reviewable PRs. A checked
 item means the behavior contract above is satisfied, not merely that code was
 written.
