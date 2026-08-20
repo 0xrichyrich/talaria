@@ -119,7 +119,13 @@ public struct SettingsView: View {
             .searchable(text: $search, prompt: "Search settings")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(copy.settingsBack(theme.id)) { close() }
+                    HeaderIconButton(theme: theme, size: 32, action: close) {
+                        Text(verbatim: "‹")
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
+                            .padding(.bottom, 2)
+                    }
+                    .accessibilityLabel(Text(copy.settingsBack(theme.id)))
                 }
             }
             .navigationDestination(for: SettingsDestination.self) { destination in

@@ -530,8 +530,8 @@ public struct RosterView: View {
                     .tracking(theme.id == .ink ? 1.5 : 0)
                     .foregroundStyle(theme.id == .ink ? theme.ink.opacity(0.6) : theme.ink)
             }
-            .padding(.vertical, 7)
-            .padding(.horizontal, 11)
+            .padding(.horizontal, 10)
+            .frame(height: 32)
             .chipShell(theme)
             .contentShape(Rectangle())
         }
