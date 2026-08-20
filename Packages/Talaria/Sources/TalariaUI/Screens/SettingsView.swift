@@ -2,6 +2,66 @@ import SwiftUI
 import TalariaKit
 import TalariaTheme
 
+private enum SettingsDestination: String, CaseIterable, Hashable, Identifiable {
+    case connections
+    case appearance
+    case intelligence
+    case agents
+    case operations
+    case localData
+    case about
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .connections: "Connections & Notifications"
+        case .appearance: "Appearance & Conversation"
+        case .intelligence: "Models, Voice & Memory"
+        case .agents: "Agents & Profiles"
+        case .operations: "Gateway Operations"
+        case .localData: "On-device & Privacy"
+        case .about: "About & Diagnostics"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .connections: "Gateways, APNs and notification routing"
+        case .appearance: "Theme, text, motion and transcript detail"
+        case .intelligence: "Inference providers, OAuth, voice and memory"
+        case .agents: "Rename, delete and manage Hermes profiles"
+        case .operations: "Typed configuration and gateway logs"
+        case .localData: "Solo mode, storage, exports and deletion"
+        case .about: "Versions, health, links and desktop-only boundaries"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .connections: "network"
+        case .appearance: "paintpalette.fill"
+        case .intelligence: "cpu.fill"
+        case .agents: "person.2.fill"
+        case .operations: "slider.horizontal.3"
+        case .localData: "lock.iphone"
+        case .about: "info.circle.fill"
+        }
+    }
+
+    var keywords: String {
+        switch self {
+        case .connections: "gateway cloud tailscale push apns approval mention notification"
+        case .appearance: "theme color font text size motion reduce tools reasoning transcript avatar"
+        case .intelligence: "model provider oauth endpoint api key voice speech memory stt tts"
+        case .agents: "bot profile rename delete lifecycle"
+        case .operations: "operator config logs debug level"
+        case .localData: "solo offline storage cache privacy export delete reset"
+        case .about: "version gateway health diagnostics source docs desktop"
+        }
+    }
+}
+
 // Settings — roadmap Phase 2.
 //
 // Raw YAML and environment editing do not belong on a phone. Dedicated,
@@ -27,7 +87,7 @@ public struct SettingsView: View {
     private let onBack: (() -> Void)?
 
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+    @State private var search = ""
 
     public init(model: AppModel, onBack: (() -> Void)? = nil) {
         self.model = model
@@ -36,66 +96,44 @@ public struct SettingsView: View {
 
     private var theme: ThemePack { model.theme.pack }
     private var copy: CopyPack { model.theme.copy }
-    private var reducedMotion: Bool {
-        model.settings.prefersReducedMotion(system: systemReduceMotion)
-    }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    GatewaySettingsSection(model: model, onAddGateway: addGateway)
-                        .settingsEntrance(delay: 0, reduced: reducedMotion)
-
-                    AppearanceSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.05, reduced: reducedMotion)
-
-                    // Owned by Screens/Settings/*, referenced directly: they are
-                    // in this module, and each already renders its own honest
-                    // empty/degraded state, so there is nothing for an indirection
-                    // to decide.
-                    NotificationSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.1, reduced: reducedMotion)
-
-                    ModelSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.13, reduced: reducedMotion)
-
-                    InferenceProviderSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.15, reduced: reducedMotion)
-
-                    VoiceSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.18, reduced: reducedMotion)
-
-                    ProfileLifecycleSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.2, reduced: reducedMotion)
-
-                    OperatorSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.22, reduced: reducedMotion)
-
-                    MemoryProviderSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.24, reduced: reducedMotion)
-
-                    // Solo sits above Privacy on purpose: it is the one section
-                    // here that is *not* about the gateway, and a person looking
-                    // for "does this work without a server" looks in Settings.
-                    SoloSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.26, reduced: reducedMotion)
-
-                    PrivacySettingsSection(model: model)
-                        .settingsEntrance(delay: 0.28, reduced: reducedMotion)
-
-                    AboutSettingsSection(model: model)
-                        .settingsEntrance(delay: 0.3, reduced: reducedMotion)
-
-                    DesktopPointerSection(theme: theme, copy: copy)
-                        .settingsEntrance(delay: 0.32, reduced: reducedMotion)
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(filteredDestinations) { destination in
+                        NavigationLink(value: destination) {
+                            SettingsIndexRow(destination: destination, theme: theme)
+                        }
+                        .listRowBackground(theme.panel)
+                    }
+                } footer: {
+                    Text("Settings are grouped by task. Nothing was removed; each row opens a focused page.")
+                        .foregroundStyle(theme.sub)
                 }
-                .padding(.horizontal, 18)
-                .padding(.top, 4)
-                .padding(.bottom, 60)
+            }
+            .modifier(SettingsIndexListStyle())
+            .scrollContentBackground(.hidden)
+            .background(theme.bg)
+            .navigationTitle(copy.settingsTitle(theme.id))
+            .searchable(text: $search, prompt: "Search settings")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    HeaderIconButton(theme: theme, size: 32, action: close) {
+                        Text(verbatim: "‹")
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
+                            .padding(.bottom, 2)
+                    }
+                    .accessibilityLabel(Text(copy.settingsBack(theme.id)))
+                }
+            }
+            .navigationDestination(for: SettingsDestination.self) { destination in
+                SettingsDetailPage(model: model, destination: destination,
+                                   onAddGateway: addGateway)
             }
         }
+        .tint(theme.id == .ink ? theme.ink : theme.accent)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(theme.bg)
         // The picker in Appearance is live because the screen it lives on
@@ -109,53 +147,16 @@ public struct SettingsView: View {
         }
     }
 
-    // MARK: Header
-
-    private var header: some View {
-        HStack(alignment: .center, spacing: 10) {
-            Button {
-                if let onBack { onBack() } else { dismiss() }
-            } label: {
-                Text(verbatim: "‹")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(theme.id == .ink ? theme.ink : theme.accent)
-                    .frame(width: 31, height: 31)
-                    .background(theme.id == .ink ? Color.clear : theme.panel)
-                    .clipShape(backShape)
-                    .overlay(backShape.strokeBorder(
-                        theme.id == .ink ? theme.lineStrong : theme.line, lineWidth: 1))
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(Text(copy.settingsBack(theme.id)))
-
-            VStack(alignment: .leading, spacing: 1) {
-                if theme.showsKicker {
-                    Text(copy.settingsKicker(theme.id))
-                        .font(theme.mono(9.5, weight: .semibold))
-                        .tracking(2)
-                        .foregroundStyle(theme.id == .ink ? theme.sub : theme.accent)
-                }
-                Text(copy.settingsTitle(theme.id))
-                    .font(titleFont)
-                    .foregroundStyle(theme.ink)
-            }
+    private var filteredDestinations: [SettingsDestination] {
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return SettingsDestination.allCases }
+        return SettingsDestination.allCases.filter {
+            ("\($0.title) \($0.subtitle) \($0.keywords)").lowercased().contains(query)
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 12)
-        .padding(.bottom, 10)
     }
 
-    private var backShape: RoundedRectangle {
-        let radius: CGFloat = theme.iconCornerFraction >= 0.5 ? 15.5 : 31 * theme.iconCornerFraction
-        return RoundedRectangle(cornerRadius: radius, style: .continuous)
-    }
-
-    private var titleFont: Font {
-        switch theme.id {
-        case .soft: theme.display(20)
-        case .control: theme.display(18)
-        case .ink: theme.display(22, weight: .bold).smallCaps()
-        }
+    private func close() {
+        if let onBack { onBack() } else { dismiss() }
     }
 
     /// Connections owns the probe → PKCE sign-in flow and Hermes Cloud
@@ -164,6 +165,102 @@ public struct SettingsView: View {
     private func addGateway() {
         if let onBack { onBack() } else { dismiss() }
         NotificationCenter.default.post(name: .talariaOpenConnections, object: nil)
+    }
+}
+
+private struct SettingsIndexRow: View {
+    let destination: SettingsDestination
+    let theme: ThemePack
+
+    var body: some View {
+        HStack(spacing: 13) {
+            Image(systemName: destination.symbol)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(theme.accentFg)
+                .frame(width: 32, height: 32)
+                .background(theme.accent, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(destination.title)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(theme.ink)
+                Text(destination.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(theme.sub)
+                    .lineLimit(2)
+            }
+            .padding(.vertical, 3)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct SettingsDetailPage: View {
+    let model: AppModel
+    let destination: SettingsDestination
+    let onAddGateway: () -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+
+    private var theme: ThemePack { model.theme.pack }
+    private var copy: CopyPack { model.theme.copy }
+    private var reducedMotion: Bool {
+        model.settings.prefersReducedMotion(system: systemReduceMotion)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                switch destination {
+                case .connections:
+                    GatewaySettingsSection(model: model, onAddGateway: onAddGateway)
+                    NotificationSettingsSection(model: model)
+                case .appearance:
+                    AppearanceSettingsSection(model: model)
+                case .intelligence:
+                    ModelSettingsSection(model: model)
+                    InferenceProviderSettingsSection(model: model)
+                    VoiceSettingsSection(model: model)
+                    MemoryProviderSettingsSection(model: model)
+                case .agents:
+                    ProfileLifecycleSettingsSection(model: model)
+                case .operations:
+                    OperatorSettingsSection(model: model)
+                case .localData:
+                    SoloSettingsSection(model: model)
+                    PrivacySettingsSection(model: model)
+                case .about:
+                    AboutSettingsSection(model: model)
+                    DesktopPointerSection(theme: theme, copy: copy)
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 14)
+            .settingsEntrance(delay: 0, reduced: reducedMotion)
+        }
+        .background(theme.bg)
+        .navigationTitle(destination.title)
+        .modifier(SettingsInlineNavigationTitle())
+    }
+}
+
+private struct SettingsIndexListStyle: ViewModifier {
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        content.listStyle(.insetGrouped)
+        #else
+        content.listStyle(.inset)
+        #endif
+    }
+}
+
+private struct SettingsInlineNavigationTitle: ViewModifier {
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        content.navigationBarTitleDisplayMode(.inline)
+        #else
+        content
+        #endif
     }
 }
 

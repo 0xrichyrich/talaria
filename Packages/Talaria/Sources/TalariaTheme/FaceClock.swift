@@ -33,22 +33,15 @@ import AppKit
 //   * Zero seats, or an inactive app, means no `TimelineView` is rendered at
 //     all — not a paused one. Nothing is scheduled and nothing is woken.
 //   * Cadence follows demand: 15 fps (desktop's own number) while any face is
-//     working, and **no periodic ticks whatsoever** when the whole roster is
-//     idle — just the two instants per 3.2 s where the shared blink shuts and
-//     opens. See `Cadence`.
+//     working, and a shared 5 fps breathe/gaze cadence while the roster is idle.
 //
 // Everything a face draws is a pure function of `FaceClock.shared.t`, so a bot's
 // pose is reproducible, testable without a view, and identical on every surface
 // that shows the same bot at the same instant.
 //
-// The one thing the clock deliberately does NOT carry is the idle sway. An idle
-// face moves ±1.2° over a 7.4 s cycle; sampling that on the main actor to move
-// a 46 pt avatar by a tenth of a point is the definition of a bad trade, and
-// measuring it proved the point — a 4 fps idle clock cost *more* than the
-// per-avatar loops it replaced. It is a repeating implicit animation instead,
-// owned by the render server, phase-offset per bot, and free. Which leaves the
-// blink as the only thing an idle roster asks the main actor for: 0.625 wakes
-// per second, shared across every face on screen.
+// Idle faces use one deliberately low-rate shared cadence. The body breathes
+// and the gaze drifts at avatar scale without giving every row its own timer;
+// an active face promotes that same clock to the smoother work cadence.
 
 // MARK: - The two moods
 
@@ -58,8 +51,8 @@ import AppKit
 public enum FaceMood: String, Sendable {
     /// Barely-there breathing. Blinks once every 3.2 s.
     case idle
-    /// Leaning into the work: wider sway, drifting gaze, bigger eyes, three
-    /// pulsing chin dots, and twice the blink rate.
+    /// Leaning into the work: wider sway, drifting gaze, bigger eyes and twice
+    /// the blink rate.
     case work
 }
 
@@ -88,28 +81,26 @@ public struct FacePose: Equatable, Sendable {
     public var gazeY: Double
     /// Eyes shut this instant.
     public var blink: Bool
-    /// Chin-dot opacities, 0.7 rad apart so they chase each other left to
-    /// right. Zero unless working.
-    public var dot0: Double
-    public var dot1: Double
-    public var dot2: Double
+    /// Drives the larger working-eye treatment without coupling presentation
+    /// state to a retired secondary indicator.
+    public var working: Bool
 
     public init(turn: Double, tilt: Double, roll: Double,
                 gazeX: Double, gazeY: Double, blink: Bool,
-                dot0: Double, dot1: Double, dot2: Double) {
+                working: Bool) {
         self.turn = turn; self.tilt = tilt; self.roll = roll
         self.gazeX = gazeX; self.gazeY = gazeY; self.blink = blink
-        self.dot0 = dot0; self.dot1 = dot1; self.dot2 = dot2
+        self.working = working
     }
 
     /// Working eyes are visibly larger — `ry` 2.6 against idle's 2.3
     /// (plugin.js:1362). One of the four tells that stack while a bot works.
-    public var eyeScale: Double { dot0 > 0 || dot1 > 0 || dot2 > 0 ? 2.6 / 2.3 : 1 }
+    public var eyeScale: Double { working ? 2.6 / 2.3 : 1 }
 
     /// A 1:1 port of `facePose(mood, t)` (plugin.js:998-1025). Every constant
     /// is upstream's; none are rounded or "tuned".
     ///
-    /// `phase` shifts the *continuous* channels only — sway, gaze and chin dots
+    /// `phase` shifts the continuous sway and gaze channels
     /// — so a roster does not breathe in unison. It deliberately does NOT shift
     /// the blink: upstream blinks every face on one beat, and keeping that beat
     /// shared is what makes "this one blinks twice as often" readable at a
@@ -118,7 +109,6 @@ public struct FacePose: Equatable, Sendable {
         let s = t + phase
         switch mood {
         case .work:
-            let d = s * 2.6
             return FacePose(
                 turn: -11 + sin(s * 0.48) * 8,
                 tilt: sin(s * 0.42) * 8 + sin(s * 1.1) * 1.6,
@@ -127,31 +117,24 @@ public struct FacePose: Equatable, Sendable {
                 gazeY: -1.6 + sin(s * 0.38) * 2,
                 // 190 ms shut every 1.45 s — twice as often as idle.
                 blink: t.truncatingRemainder(dividingBy: 1.45) > 1.26,
-                dot0: 0.2 + 0.8 * max(0, sin(d)),
-                dot1: 0.2 + 0.8 * max(0, sin(d - 0.7)),
-                dot2: 0.2 + 0.8 * max(0, sin(d - 1.4)))
+                working: true)
         case .idle:
             return FacePose(
                 turn: sin(s * 0.5) * 1.5,
                 tilt: sin(s * 0.27),
                 roll: sin(s * 0.85) * 1.2,
-                gazeX: 0,
-                gazeY: 0,
+                gazeX: sin(s * 0.42) * 1.5,
+                gazeY: sin(s * 0.31) * 0.65,
                 // 180 ms shut every 3.2 s.
                 blink: t.truncatingRemainder(dividingBy: 3.2) > 3.02,
-                dot0: 0, dot1: 0, dot2: 0)
+                working: false)
         }
     }
 
-    /// An idle face with its eyes open and no sway baked in.
-    ///
-    /// The idle sway is not sampled from the clock — it is a repeating implicit
-    /// animation on the render server (see `AvatarView`), because ±1.2° over a
-    /// 7.4 s cycle is not worth a main-actor wake. So an idle face's clocked
-    /// state is exactly one bit: the blink.
+    /// An idle face with its eyes open at the neutral point.
     public static let idleRest = FacePose(turn: 0, tilt: 0, roll: 0,
                                           gazeX: 0, gazeY: 0, blink: false,
-                                          dot0: 0, dot1: 0, dot2: 0)
+                                          working: false)
 
     // Upstream's idle sway is `roll: sin(t·0.85)·1.2` — ±1.2° over a 7.4 s
     // cycle. It used to be re-exported here as a pair of constants said to keep
@@ -167,19 +150,14 @@ public struct FacePose: Equatable, Sendable {
     /// The pose a face holds when motion is damped.
     ///
     /// "Reduced motion" cannot mean "reduced information": a working bot still
-    /// has to read as working with the clock switched off, which is the whole
-    /// argument for the chin dots existing. So the damped work pose is a real
-    /// sample of the work animation rather than a neutral rest — `t = 0.6`,
-    /// where the lean is a settled -8.7°, the eyes are enlarged, and the three
-    /// dots sit at a descending 1.00 / 0.81 / 0.33 that reads as mid-sequence.
-    /// (Upstream's own static render samples `t = 0`, where all three dots are
-    /// an identical 0.2 — correct for a face that is about to start moving,
-    /// wrong for one that never will.)
+    /// has to read as working with the clock switched off. The damped work pose
+    /// is therefore a real sample of the work animation rather than a neutral
+    /// rest: the lean is settled and the eyes remain enlarged.
     public static func damped(_ mood: FaceMood) -> FacePose {
         switch mood {
         case .idle:
             return FacePose(turn: 0, tilt: 0, roll: 0, gazeX: 0, gazeY: 0,
-                            blink: false, dot0: 0, dot1: 0, dot2: 0)
+                            blink: false, working: false)
         case .work:
             var pose = FacePose.at(.work, t: 0.6)
             pose.blink = false
@@ -313,11 +291,13 @@ public final class FaceClock {
 
     /// Desktop's cap: "15fps is smooth at avatar scale and bounds SVG/DOM
     /// churn" (plugin.js:1231). Earned only by a face with a continuous pose to
-    /// sample — a lean, a drifting gaze, three chasing chin dots.
+    /// sample — a lean and a drifting gaze.
     private static let workingFPS: Double = 15
+    private static let idleFPS: Double = 5
 
     /// Low Power Mode is the user asking for less of exactly this.
     private static let lowPowerFPS: Double = 8
+    private static let lowPowerIdleFPS: Double = 2.5
 
     private func recompute() {
         let working = seats.contains { $0.value }
@@ -327,14 +307,11 @@ public final class FaceClock {
             if driverTicket != 0 { driverTicket = 0 }
             return
         }
-        // No working face means nothing continuous to sample: the idle sway is
-        // a render-server animation and the gaze does not move, so the only
-        // main-actor work an idle roster has left is opening and shutting its
-        // eyes. That is two ticks per 3.2 s, for the whole screen.
-        let interval: Double? = working
-            ? 1 / (ProcessInfo.processInfo.isLowPowerModeEnabled
-                    ? Self.lowPowerFPS : Self.workingFPS)
-            : nil
+        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        let fps = working
+            ? (lowPower ? Self.lowPowerFPS : Self.workingFPS)
+            : (lowPower ? Self.lowPowerIdleFPS : Self.idleFPS)
+        let interval: Double? = 1 / fps
         let next = Cadence(interval: interval, origin: origin)
         if cadence != next { cadence = next }
 

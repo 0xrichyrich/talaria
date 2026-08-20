@@ -75,6 +75,10 @@ public struct ChatView: View {
     @ScaledMetric(relativeTo: .body) private var inkComposerSize = 15
     @State private var showModelSheet = false
     @State private var showCommands = false
+    @State private var initialTranscriptAnchor = InitialTranscriptAnchorState()
+    @State private var followingLatest = true
+    @State private var jumpToLatestToken = 0
+    @State private var transcriptGeometry = TranscriptGeometryReadiness()
     @FocusState private var composerFocused: Bool
 
     /// Tapback set, matching desktop's reaction picker.
@@ -126,8 +130,16 @@ public struct ChatView: View {
     public var body: some View {
         VStack(spacing: 0) {
             header
-            messageList
-            modelStrip
+            ZStack(alignment: .bottomTrailing) {
+                messageList
+                if showsJumpToLatest {
+                    jumpToLatestButton
+                        .padding(.trailing, 16)
+                        .padding(.bottom, 10)
+                        .transition(.scale.combined(with: .opacity))
+                }
+            }
+            if transcriptPolicy.detail == .advanced { modelStrip }
             if !quickReplies.isEmpty {
                 quickReplyRow
             }
@@ -249,19 +261,12 @@ public struct ChatView: View {
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 11) {
-                    ForEach(messages) { message in
-                        messageRow(message)
+                Group {
+                    if ChatTranscriptLayoutPolicy.usesLazyStack(messageCount: messages.count) {
+                        LazyVStack(alignment: .leading, spacing: 11) { transcriptRows }
+                    } else {
+                        VStack(alignment: .leading, spacing: 11) { transcriptRows }
                     }
-                    if transcriptPolicy.showsWorkingAvatar(
-                        isTurnRunning: turnRunning,
-                        hasLiveDetail: hasLiveTranscriptDetail
-                    ) {
-                        TranscriptWorkingAvatar(model: model, bot: bot, theme: theme,
-                                                label: copy.workingLabel(theme.id))
-                            .modifier(ChatEntrance())
-                    }
-                    Color.clear.frame(height: 1).id("chat-bottom")
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
@@ -281,21 +286,165 @@ public struct ChatView: View {
             // rather than vanishing at some threshold.
             .scrollDismissesKeyboard(.interactively)
             .defaultScrollAnchor(.bottom)
+            .coordinateSpace(name: "talaria.chat.transcript")
+            .background(
+                GeometryReader { viewport in
+                    Color.clear.preference(
+                        key: TranscriptViewportHeightKey.self,
+                        value: viewport.size.height)
+                }
+            )
+            .onPreferenceChange(TranscriptBottomInsetKey.self) { minY in
+                transcriptGeometry.recordBottom(minY: minY)
+                refreshFollowingLatest()
+            }
+            .onPreferenceChange(TranscriptViewportHeightKey.self) { height in
+                transcriptGeometry.recordViewport(height: height)
+                refreshFollowingLatest()
+            }
+            .task(id: initialTranscriptAnchorKey) {
+                guard let attempt = initialTranscriptAnchor.begin(
+                    botID: botID, messageCount: messages.count
+                ) else { return }
+                guard await anchorTranscript(proxy, attempt: attempt),
+                      initialTranscriptAnchor.complete(
+                        attempt, currentBotID: botID, isCancelled: Task.isCancelled
+                      )
+                else { return }
+                // A completed attempt had no user departure. Geometry will
+                // keep this honest once both probes have reported.
+                followingLatest = true
+            }
             .onChange(of: messages.count) {
+                guard initialTranscriptAnchor.isSettled(for: botID), followingLatest else { return }
                 withAnimation(ChatComposerLayoutPolicy.animation(
                     reducedMotion: reducedMotion, duration: 0.25
                 )) {
-                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                    proxy.scrollTo(transcriptAnchorID, anchor: .bottom)
                 }
             }
             .onChange(of: chat?.isTyping ?? false) {
+                guard followingLatest else { return }
                 withAnimation(ChatComposerLayoutPolicy.animation(
                     reducedMotion: reducedMotion, duration: 0.25
                 )) {
-                    proxy.scrollTo("chat-bottom", anchor: .bottom)
+                    proxy.scrollTo(transcriptAnchorID, anchor: .bottom)
                 }
             }
+            .onChange(of: botID) {
+                followingLatest = true
+            }
+            .onChange(of: jumpToLatestToken) {
+                withAnimation(ChatComposerLayoutPolicy.animation(
+                    reducedMotion: reducedMotion, duration: 0.25
+                )) {
+                    proxy.scrollTo(transcriptAnchorID, anchor: .bottom)
+                }
+            }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { _ in
+                        guard initialTranscriptAnchor.userDeparted(
+                            botID: botID, messageCount: messages.count
+                        ) else { return }
+                        // Taking control of the scroll settles the initial
+                        // anchor without finishing it. No later layout pass
+                        // may pull the transcript back down or restore this.
+                        followingLatest = false
+                    }
+            )
         }
+    }
+
+    private var showsJumpToLatest: Bool {
+        ChatTranscriptLayoutPolicy.showsJumpControl(
+            isFollowingLatest: followingLatest, messageCount: messages.count)
+    }
+
+    private var jumpToLatestButton: some View {
+        Button {
+            followingLatest = true
+            jumpToLatestToken += 1
+        } label: {
+            Image(systemName: "chevron.down")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(theme.id == .ink ? theme.bg : theme.accentFg)
+                .frame(width: 36, height: 36)
+                .background(theme.id == .ink ? theme.ink : theme.accent)
+                .clipShape(Circle())
+                .shadow(color: theme.ink.opacity(0.18), radius: 6, y: 2)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Jump to latest"))
+    }
+
+    private var initialTranscriptAnchorKey: String {
+        "\(botID)\u{1f}\(messages.count)\u{1f}\(String(describing: messages.last?.id))"
+    }
+
+    private var showingWorkingAvatar: Bool {
+        transcriptPolicy.showsWorkingAvatar(
+            isTurnRunning: turnRunning,
+            hasLiveDetail: hasLiveTranscriptDetail
+        )
+    }
+
+    private var transcriptAnchorID: String {
+        ChatTranscriptLayoutPolicy.anchorID(
+            lastMessageID: messages.last?.id,
+            showingWorkingAvatar: showingWorkingAvatar
+        )
+    }
+
+    @ViewBuilder private var transcriptRows: some View {
+        ForEach(messages) { message in
+            messageRow(message)
+                .id(message.id.uuidString)
+        }
+        if showingWorkingAvatar {
+            TranscriptWorkingAvatar(model: model, bot: bot, theme: theme,
+                                    label: copy.workingLabel(theme.id))
+                .modifier(ChatEntrance())
+                .id(ChatTranscriptLayoutPolicy.workingAnchorID)
+        }
+        Color.clear.frame(height: 1).id(ChatTranscriptLayoutPolicy.emptyAnchorID)
+            .background(
+                GeometryReader { geo in
+                    let frame = geo.frame(in: .named("talaria.chat.transcript"))
+                    Color.clear.preference(
+                        key: TranscriptBottomInsetKey.self,
+                        value: frame.minY)
+                }
+            )
+    }
+
+    private func refreshFollowingLatest() {
+        guard let distance = transcriptGeometry.distanceFromBottom else { return }
+        followingLatest = ChatTranscriptLayoutPolicy.isFollowingLatest(
+            distanceFromBottom: distance)
+    }
+
+    private func anchorTranscript(_ proxy: ScrollViewProxy,
+                                  attempt: InitialTranscriptAnchorState.Attempt) async -> Bool {
+        for delay in ChatTranscriptLayoutPolicy.layoutPassesMs {
+            guard initialTranscriptAnchor.shouldContinue(
+                attempt, currentBotID: botID, isCancelled: Task.isCancelled
+            ) else { return false }
+            if delay > 0 {
+                do {
+                    try await Task.sleep(for: .milliseconds(delay))
+                } catch {
+                    return false
+                }
+            } else {
+                await Task.yield()
+            }
+            guard initialTranscriptAnchor.shouldContinue(
+                attempt, currentBotID: botID, isCancelled: Task.isCancelled
+            ) else { return false }
+            proxy.scrollTo(transcriptAnchorID, anchor: .bottom)
+        }
+        return true
     }
 
     @ViewBuilder private func messageRow(_ message: ChatMessage) -> some View {
@@ -1233,5 +1382,92 @@ struct ThoughtBlock: View {
                     }
             }
         }
+    }
+}
+
+
+/// The preference stream has no meaningful scalar default: `0` can be an
+/// actual coordinate, and treating two default zeroes as a measurement makes
+/// an unlaid-out transcript look as though it is already at the live edge.
+struct TranscriptGeometryReadiness: Equatable {
+    private(set) var bottomMinY: CGFloat?
+    private(set) var viewportHeight: CGFloat?
+
+    var isReady: Bool {
+        bottomMinY != nil && (viewportHeight ?? 0) > 0
+    }
+
+    var distanceFromBottom: CGFloat? {
+        guard isReady, let bottomMinY, let viewportHeight else { return nil }
+        return bottomMinY - viewportHeight
+    }
+
+    mutating func recordBottom(minY: CGFloat?) {
+        bottomMinY = minY
+    }
+
+    mutating func recordViewport(height: CGFloat?) {
+        viewportHeight = height
+    }
+}
+
+/// One initial-anchor attempt belongs to the bot and to the user-interaction
+/// generation in which it began. A drag settles that bot without completing
+/// the attempt, invalidating every delayed pass while leaving the user's
+/// `followingLatest` choice alone.
+struct InitialTranscriptAnchorState: Equatable {
+    struct Attempt: Equatable {
+        let botID: String
+        fileprivate let generation: UInt
+    }
+
+    private(set) var settledBotID: String?
+    private var generation: UInt = 0
+
+    func begin(botID: String, messageCount: Int) -> Attempt? {
+        guard messageCount > 0, settledBotID != botID else { return nil }
+        return Attempt(botID: botID, generation: generation)
+    }
+
+    func isSettled(for botID: String) -> Bool {
+        settledBotID == botID
+    }
+
+    func shouldContinue(_ attempt: Attempt, currentBotID: String,
+                        isCancelled: Bool) -> Bool {
+        !isCancelled
+            && currentBotID == attempt.botID
+            && settledBotID != attempt.botID
+            && generation == attempt.generation
+    }
+
+    mutating func complete(_ attempt: Attempt, currentBotID: String,
+                           isCancelled: Bool = false) -> Bool {
+        guard shouldContinue(attempt, currentBotID: currentBotID,
+                             isCancelled: isCancelled)
+        else { return false }
+        settledBotID = attempt.botID
+        return true
+    }
+
+    mutating func userDeparted(botID: String, messageCount: Int) -> Bool {
+        guard messageCount > 0, settledBotID != botID else { return false }
+        generation &+= 1
+        settledBotID = botID
+        return true
+    }
+}
+
+private struct TranscriptBottomInsetKey: PreferenceKey {
+    static var defaultValue: CGFloat?
+    static func reduce(value: inout CGFloat?, nextValue: () -> CGFloat?) {
+        value = nextValue() ?? value
+    }
+}
+
+private struct TranscriptViewportHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat?
+    static func reduce(value: inout CGFloat?, nextValue: () -> CGFloat?) {
+        value = nextValue() ?? value
     }
 }

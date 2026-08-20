@@ -5,7 +5,7 @@ import TalariaKit
 //
 // Upstream calls this the "math face" — nothing about it is a static asset. The
 // body breathes, the eyes drift and blink, and a working bot leans into its
-// work with three dots pulsing under its chin. All of it is a pure function of
+// work. All of it is a pure function of
 // one shared timebase (`FaceClock`), which is what lets a long roster animate
 // for the cost of a single `TimelineView`.
 //
@@ -21,7 +21,7 @@ import TalariaKit
 //   * Everything inside the face is this view's: the body's own `roll`
 //     (upstream rolls the outline's points, not the eyes — which is what makes
 //     it read as a head rather than a spinning sticker), the projection squash,
-//     the gaze, the eye size, the blink, and the chin dots.
+//     the gaze, the eye size, and the blink.
 //
 // A host that wants both channels on one clock can drop its outer sway and let
 // `FaceClock.swayPhase(for:)` — the canonical per-bot offset — drive it instead.
@@ -91,7 +91,7 @@ public struct AvatarView: View {
     ///
     /// Not a compromise — a measurement. At 16 pt the eye is 3.4 pt tall, so a
     /// blink moves it 0.27 pt (under one pixel at 3×), the gaze travels 1.4 pt
-    /// and a chin dot is 0.9 pt across. Seating a dozen inline chips on the
+    /// across. Seating a dozen inline chips on the
     /// clock to render sub-pixel motion is pure cost. The roster (46 pt), chat
     /// header (36 pt) and mention list (20 pt) are all above the line; the
     /// 13–16 pt attribution glyphs in Artifacts and the agent inbox are below
@@ -125,7 +125,7 @@ public struct AvatarView: View {
     public var body: some View {
         if reducedMotion || size < Self.motionFloor {
             // Damped, or too small to resolve: one pose, held. `FacePose.damped`
-            // keeps the working tells (lean, big eyes, staggered chin dots) so
+            // keeps the working tells (lean and big eyes) so
             // "this bot is busy" survives motion being switched off.
             AvatarFace(pose: .damped(mood), shape: shape, hue: hue,
                        size: size, theme: theme, animatesBlink: false)
@@ -164,7 +164,7 @@ private struct LiveFace: View {
         if mood == .work {
             WorkingFace(phase: phase, shape: shape, hue: hue, size: size, theme: theme)
         } else {
-            IdleFace(shape: shape, hue: hue, size: size, theme: theme)
+            IdleFace(phase: phase, shape: shape, hue: hue, size: size, theme: theme)
         }
     }
 
@@ -201,7 +201,7 @@ private struct DriverSlot: View {
 }
 
 /// A bot mid-turn. The one kind of face with a genuinely continuous pose —
-/// lean, gaze, chin dots — so it reads the clock's `t` stream and re-renders on
+/// lean and gaze — so it reads the clock's `t` stream and re-renders on
 /// every tick.
 private struct WorkingFace: View {
     var phase: Double
@@ -217,18 +217,17 @@ private struct WorkingFace: View {
     }
 }
 
-/// A bot at rest. Reads exactly one property of the clock — the shared blink —
-/// so it wakes twice per 3.2 s no matter what its neighbours are doing, and
-/// takes no phase offset because it has no continuous channel to offset: the
-/// idle sway belongs to the container (see the header note).
+/// A bot at rest. It shares one low-rate clock with the whole roster, while a
+/// stable per-bot phase keeps the breathe/gaze motion from moving in lockstep.
 private struct IdleFace: View {
+    var phase: Double
     var shape: AvatarShape
     var hue: AvatarHue
     var size: CGFloat
     var theme: ThemePack
 
     var body: some View {
-        var pose = FacePose.idleRest
+        var pose = FacePose.at(.idle, t: FaceClock.shared.t, phase: phase)
         pose.blink = FaceClock.shared.idleBlink
         return AvatarFace(pose: pose, shape: shape, hue: hue, size: size,
                           theme: theme, animatesBlink: true)
@@ -260,7 +259,6 @@ private struct AvatarFace: View {
         ZStack {
             silhouette
             eyes
-            chinDots
         }
         .frame(width: size, height: size)
     }
@@ -307,29 +305,6 @@ private struct AvatarFace: View {
             .animation(animatesBlink ? .easeInOut(duration: 0.075) : nil, value: pose.blink)
     }
 
-    /// Three dots pulsing in sequence below the chin — upstream's clearest
-    /// at-a-glance "thinking" cue, drawn at `cy 41.2` in a 40×44 box
-    /// deliberately taller than wide to hold them (plugin.js:1376-1383). They
-    /// sit just below the avatar's own square, exactly as they sit below the
-    /// 40×40 body upstream; nothing here reflows to make room, so a bot
-    /// starting a turn never nudges its row.
-    @ViewBuilder private var chinDots: some View {
-        if pose.dot0 > 0 || pose.dot1 > 0 || pose.dot2 > 0 {
-            HStack(spacing: units(3.6 - 2.3)) {
-                dot(pose.dot0)
-                dot(pose.dot1)
-                dot(pose.dot2)
-            }
-            .offset(y: units(41.2 - 20))
-        }
-    }
-
-    private func dot(_ opacity: Double) -> some View {
-        Circle()
-            .fill(fill)
-            .frame(width: units(2.3), height: units(2.3))
-            .opacity(opacity)
-    }
 }
 
 // MARK: - Working ring

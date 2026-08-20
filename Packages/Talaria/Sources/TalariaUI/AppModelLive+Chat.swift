@@ -266,7 +266,13 @@ extension AppModel {
             startDemoTurn(botID: botID, chat: chat)
         case .live:
             let routeAvailable = !isOffline || GatewayBotRoute(qualifiedID: botID) != nil
-            if chat.isRunning, routeAvailable, !trimmed.isEmpty, let sessionID = chat.sessionID {
+            let turnInFlight = chat.isRunning || chat.isTyping
+            if turnInFlight, routeAvailable {
+                // `isTyping` is part of the same UI turn state as isRunning:
+                // message.start and resume ordering can raise it first. Never
+                // contradict the visible steer affordance by submitting a new
+                // prompt in that window. Attachments alone also cannot steer.
+                guard !trimmed.isEmpty else { return }
                 // Deliberately mention-free. Desktop has no steer path at all
                 // — its middleware only ever sees a fresh submit — so there is
                 // no upstream answer for "@ops" typed into a turn already
@@ -274,10 +280,12 @@ extension AppModel {
                 // correction aimed at THIS bot mid-thought, and firing a
                 // handoff out of one would send a half-sentence to a stranger.
                 // The handle rides along as literal text, as it does today.
-                steer(text: trimmed, botID: botID, sessionID: sessionID, chat: chat)
+                if let sessionID = chat.sessionID {
+                    steer(text: trimmed, botID: botID, sessionID: sessionID, chat: chat)
+                } else {
+                    steerAfterAttach(text: trimmed, botID: botID, chat: chat)
+                }
             } else {
-                ChatRuntime.shared.turnFloor[botID] = chat.messages.count + 1
-                chat.isRunning = routeAvailable
                 // The composer middleware runs FIRST, on the raw draft, which
                 // is where desktop registers it (plugin.js:8214 reads
                 // `draft.text`). Order is not incidental: the attachment
@@ -309,15 +317,31 @@ extension AppModel {
                 let prompt = composedPrompt(routed, botID: botID)
                 // send() appends the user bubble and submits (or queues while
                 // offline) — going around it would duplicate the bubble.
-                send(text: prompt, to: botID)
+                if chat.sessionID == nil, LiveRuntime.shared.attachTasks[botID] != nil {
+                    // A sessions-sheet selection owns the shared attach slot.
+                    // Echo now, await that exact attach, then re-evaluate the
+                    // resumed turn: an idle session receives a submit; a turn
+                    // that resumed running receives a steer. Starting another
+                    // ensureSession here used to race canonical resolution.
+                    sendAfterAttach(text: prompt, botID: botID, chat: chat,
+                                    routeAvailable: routeAvailable)
+                } else {
+                    ChatRuntime.shared.turnFloor[botID] = chat.messages.count + 1
+                    chat.isRunning = routeAvailable
+                    send(text: prompt, to: botID)
+                    if routeAvailable { startWatchdog(botID) }
+                }
                 clearAttachments(botID: botID)
-                if routeAvailable { startWatchdog(botID) }
             }
         }
     }
 
     private func steer(text: String, botID: String, sessionID: String, chat: ChatState) {
         chat.messages.append(ChatMessage(author: .user, time: AppModel.clock(), text: text))
+        deliverSteer(text: text, botID: botID, sessionID: sessionID)
+    }
+
+    private func deliverSteer(text: String, botID: String, sessionID: String) {
         Task { @MainActor in
             guard let route = gatewayRoute(for: botID),
                   let client = try? await routedClient(for: route) else { return }
@@ -329,6 +353,101 @@ extension AppModel {
             if redirected == "redirected" || redirected == "queued" { return }
             try? await client.submitPrompt(sessionID: sessionID, text: text, queued: true)
         }
+    }
+
+    /// message.start/resume can raise the UI's steer state one MainActor turn
+    /// before the runtime sid is published. Keep the user's correction,
+    /// coalesce onto (or start) the one attach, then deliver it through the
+    /// same steer/redirect/queued cascade; never downgrade it to a new
+    /// unqueued prompt.
+    private func steerAfterAttach(text: String, botID: String, chat: ChatState) {
+        let optimistic = ChatMessage(author: .user, time: AppModel.clock(), text: text)
+        chat.messages.append(optimistic)
+        Task { @MainActor in
+            do {
+                let sessionID = try await ensureSession(botID: botID, hydrate: false)
+                deliverSteer(text: text, botID: botID, sessionID: sessionID)
+            } catch is CancellationError {
+                recoverCancelledAttachIntent(
+                    text: text, botID: botID, chat: chat,
+                    optimisticID: optimistic.id, steering: true,
+                    routeAvailable: true)
+            } catch {
+                let detail = (error as? GatewayError)?.message ?? error.localizedDescription
+                chat.messages.append(ChatMessage(author: .system, text: detail))
+            }
+        }
+    }
+
+    /// Preserve a compose action issued while an explicit stored-session
+    /// resume owns `LiveRuntime.attachTasks`. The user bubble is optimistic,
+    /// but the wire verb is chosen only after the resume tells us whether a
+    /// turn survived the switch.
+    private func sendAfterAttach(text: String, botID: String, chat: ChatState,
+                                 routeAvailable: Bool) {
+        let optimistic = ChatMessage(author: .user, time: AppModel.clock(), text: text)
+        chat.messages.append(optimistic)
+        Task { @MainActor in
+            do {
+                let sessionID = try await ensureSession(botID: botID, hydrate: false)
+                if chat.isRunning || chat.isTyping {
+                    deliverSteer(text: text, botID: botID, sessionID: sessionID)
+                } else {
+                    ChatRuntime.shared.turnFloor[botID] = chat.messages.count
+                    chat.isRunning = routeAvailable
+                    liveSend(text: text, botID: botID, chat: chat)
+                    if routeAvailable { startWatchdog(botID) }
+                }
+            } catch let error as GatewayError where error.code == -3 || error.code == -7 {
+                chat.isRunning = false
+                if GatewayBotRoute(qualifiedID: botID) == nil {
+                    isOffline = true
+                    composeQueue.append((botID, text))
+                } else {
+                    chat.messages.append(ChatMessage(author: .system, text: error.message))
+                }
+            } catch is CancellationError {
+                recoverCancelledAttachIntent(
+                    text: text, botID: botID, chat: chat,
+                    optimisticID: optimistic.id, steering: false,
+                    routeAvailable: routeAvailable)
+            } catch {
+                chat.isRunning = false
+                let detail = (error as? GatewayError)?.message ?? error.localizedDescription
+                chat.messages.append(ChatMessage(author: .system, text: detail))
+            }
+        }
+    }
+
+    /// Cancellation has two meanings. An explicit selection clears the old
+    /// optimistic row (and often replaces the ChatState), so it owns the
+    /// outcome and this intent disappears with that transcript. A reconnect
+    /// or generation reset leaves the exact row in the exact chat; recover it
+    /// against an already rebound sid when possible, otherwise retain it in
+    /// the visible compose queue for the reconnect flush.
+    private func recoverCancelledAttachIntent(
+        text: String, botID: String, chat: ChatState, optimisticID: UUID,
+        steering: Bool, routeAvailable: Bool
+    ) {
+        guard let owner = chats[botID], owner === chat,
+              chat.messages.contains(where: { $0.id == optimisticID }) else { return }
+
+        if let sessionID = chat.sessionID,
+           let route = gatewayRoute(for: botID),
+           self.botID(forSession: sessionID, sourceGatewayID: route.gatewayID) == botID {
+            if steering || chat.isRunning || chat.isTyping {
+                deliverSteer(text: text, botID: botID, sessionID: sessionID)
+            } else {
+                ChatRuntime.shared.turnFloor[botID] = chat.messages.count
+                chat.isRunning = routeAvailable
+                liveSend(text: text, botID: botID, chat: chat)
+                if routeAvailable { startWatchdog(botID) }
+            }
+            return
+        }
+
+        chat.isRunning = false
+        composeQueue.append((botID, text))
     }
 
     /// Demo mode's scripted reply, owned here so the stop button can cancel it

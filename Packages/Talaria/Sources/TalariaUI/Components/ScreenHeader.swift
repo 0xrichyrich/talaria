@@ -405,14 +405,115 @@ public enum TalariaVoice {
             }
         }
         let primary = connections.first { $0.state == .connected } ?? connections.first
-        if let primary, primary.kind == .cloud {
-            switch theme {
-            case .ink: return ("BY CLOUD", .cloud)
-            case .control, .soft: return ("cloud", .cloud)
+        let label = friendlyGatewayLabel(primary, theme)
+        let tone: NetTone = {
+            if primary?.kind == .cloud { return .cloud }
+            return .up
+        }()
+        return (label, tone)
+    }
+
+    /// Never show a raw host/IP in the roster header. A saved display name
+    /// wins; otherwise Tailscale/LAN/Cloud become human words, and an address
+    /// that looks like an IP or hostname collapses to Home.
+    public static func friendlyGatewayLabel(_ connection: GatewayConnection?,
+                                            _ theme: ThemeID) -> String {
+        if let connection {
+            let trimmed = connection.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if connection.kind == .cloud {
+                return theme == .ink ? "BY CLOUD" : "Cloud"
+            }
+            if !trimmed.isEmpty,
+               !isRawGatewayLabel(trimmed, address: connection.address) {
+                return theme == .ink ? trimmed.uppercased() : trimmed
+            }
+            switch connection.kind {
+            case .cloud:
+                return theme == .ink ? "BY CLOUD" : "Cloud"
+            case .tailscale:
+                return theme == .ink ? "HOME" : "Home"
+            case .lan:
+                return theme == .ink ? "NEARBY" : "Nearby"
             }
         }
-        let name = primary?.name ?? "homelab"
-        return (theme == .ink ? name.uppercased() : name, .up)
+        return theme == .ink ? "HOME" : "Home"
+    }
+
+    public static func looksLikeNetworkAddress(_ value: String) -> Bool {
+        let candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty else { return true }
+
+        if looksLikeLiteralNetworkEndpoint(candidate) { return true }
+        let labels = candidate.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count >= 2,
+              labels.allSatisfy(isHostnameLabel)
+        else { return false }
+
+        return !looksLikeVersionLabel(candidate.lowercased())
+    }
+
+    /// A syntactically host-like saved label is still a label when it differs
+    /// from the connection endpoint. Discovery defaults mirror the endpoint's
+    /// host, so compare those case-insensitively instead of guessing intent
+    /// from capitalization. Literal IP/URL/port forms always stay private.
+    private static func isRawGatewayLabel(_ label: String, address: String) -> Bool {
+        if let addressHost = parsedNetworkHost(address) {
+            if normalizedHost(label) == addressHost { return true }
+            return looksLikeLiteralNetworkEndpoint(label)
+        }
+        return looksLikeNetworkAddress(label)
+    }
+
+    private static func parsedNetworkHost(_ address: String) -> String? {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let value = trimmed.contains("://") ? trimmed : "talaria://\(trimmed)"
+        guard let host = URLComponents(string: value)?.host, !host.isEmpty else { return nil }
+        return normalizedHost(host)
+    }
+
+    private static func normalizedHost(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]."))
+            .lowercased()
+    }
+
+    private static func looksLikeLiteralNetworkEndpoint(_ candidate: String) -> Bool {
+        let lowercased = candidate.lowercased()
+        if lowercased.contains("://") { return true }
+        if candidate.first == "[", candidate.contains("]") { return true }
+
+        let colonCount = candidate.filter { $0 == ":" }.count
+        if colonCount > 1 { return true }
+        if colonCount == 1,
+           let separator = candidate.lastIndex(of: ":") {
+            let host = candidate[..<separator]
+            let port = candidate[candidate.index(after: separator)...]
+            if !host.isEmpty, !port.isEmpty, port.allSatisfy(\.isNumber) {
+                return true
+            }
+        }
+
+        if lowercased == "localhost" { return true }
+        let labels = candidate.split(separator: ".", omittingEmptySubsequences: false)
+        return labels.count == 4 && labels.allSatisfy { label in
+            !label.isEmpty && label.allSatisfy(\.isNumber)
+        }
+    }
+
+    private static func isHostnameLabel(_ label: Substring) -> Bool {
+        guard let first = label.first, let last = label.last,
+              first != "-", last != "-"
+        else { return false }
+        return label.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
+    }
+
+    private static func looksLikeVersionLabel(_ value: String) -> Bool {
+        guard value.first == "v" else { return false }
+        let numeric = value.dropFirst()
+        let components = numeric.split(separator: ".", omittingEmptySubsequences: false)
+        return components.count >= 2
+            && components.allSatisfy { !$0.isEmpty && $0.allSatisfy(\.isNumber) }
     }
 
     /// Dot/label color for a net tone.

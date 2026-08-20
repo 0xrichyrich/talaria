@@ -106,6 +106,147 @@ private enum CanonicalAttach {
     case failed(Error)
 }
 
+/// Reconcile an authoritative stored page with UI rows that became newer
+/// while hydration was suspended. Stored projections mint fresh UUIDs, so
+/// identity alone cannot find overlap; durable row ids and a short semantic
+/// tail do. The live candidate wins presentation state (streaming, reasoning,
+/// tools) without throwing away a row id learned from storage.
+enum TranscriptHydrationMerge {
+    static func merge(history: [ChatMessage], baseline: [ChatMessage],
+                      current: [ChatMessage], clearWhenEmpty: Bool) -> [ChatMessage] {
+        guard !history.isEmpty else {
+            // Clearing is safe only when nothing changed during the fallback.
+            // A user send, assistant delta, or error that landed while REST
+            // was suspended is newer than an empty/failed response.
+            if clearWhenEmpty, current == baseline,
+               current.allSatisfy({ $0.author == .system }) {
+                return []
+            }
+            return current
+        }
+
+        let baselineByID = Dictionary(uniqueKeysWithValues: baseline.map { ($0.id, $0) })
+        let baselineUsers = trailingUserIDs(in: baseline)
+        let currentUsers = trailingUserIDs(in: current)
+        let baselineLiveTurn = liveTurnIDs(in: baseline)
+        let sameSessionTail = clearWhenEmpty ? Set<UUID>() : latestTurnIDs(in: current)
+        let candidates = current.filter { message in
+            let changed = baselineByID[message.id].map { $0 != message } ?? true
+            let live = message.isStreaming
+                || message.toolCalls.contains(where: { $0.state == .running })
+            return changed || live || baselineUsers.contains(message.id)
+                || currentUsers.contains(message.id) || baselineLiveTurn.contains(message.id)
+                || sameSessionTail.contains(message.id)
+        }
+
+        var merged = history
+        let overlap = tailOverlap(history: history, candidates: candidates,
+                                  baselineByID: baselineByID)
+        let historyStart = history.count - overlap
+        for offset in 0..<overlap {
+            merged[historyStart + offset] = overlay(
+                candidates[offset], on: merged[historyStart + offset])
+        }
+        merged.append(contentsOf: candidates.dropFirst(overlap))
+        return merged
+    }
+
+    private static func trailingUserIDs(in messages: [ChatMessage]) -> Set<UUID> {
+        Set(messages.reversed().prefix { $0.author == .user }.map(\.id))
+    }
+
+    /// A resume inflight snapshot is a turn, not two unrelated rows. Preserve
+    /// its user echo together with the streaming assistant row so a stale REST
+    /// page cannot keep the delta while dropping the prompt it answers.
+    private static func liveTurnIDs(in messages: [ChatMessage]) -> Set<UUID> {
+        guard let live = messages.lastIndex(where: {
+            $0.isStreaming || $0.toolCalls.contains(where: { $0.state == .running })
+        }) else { return [] }
+        var ids: Set<UUID> = [messages[live].id]
+        var index = live
+        while index > messages.startIndex {
+            let previous = messages.index(before: index)
+            guard messages[previous].author == .user else { break }
+            ids.insert(messages[previous].id)
+            index = previous
+        }
+        return ids
+    }
+
+    /// When hydrating the same durable binding, its latest completed turn is
+    /// also newer than a fallback page that ends early. Rebinding callers set
+    /// `clearWhenEmpty`, so rows from the session being left are never carried
+    /// into the selected conversation by this rule.
+    private static func latestTurnIDs(in messages: [ChatMessage]) -> Set<UUID> {
+        guard !messages.isEmpty else { return [] }
+        let start = messages.lastIndex(where: { $0.author == .user })
+            ?? messages.index(before: messages.endIndex)
+        return Set(messages[start...].map(\.id))
+    }
+
+    /// Stored history can have persisted none, some, or all of the candidate
+    /// live tail. Only an ordered suffix/prefix overlap is safe: semantic
+    /// prefix matching across a newly appended user row would collapse two
+    /// distinct assistant turns.
+    private static func tailOverlap(history: [ChatMessage], candidates: [ChatMessage],
+                                    baselineByID: [UUID: ChatMessage]) -> Int {
+        let limit = min(history.count, candidates.count)
+        for count in stride(from: limit, through: 1, by: -1) {
+            let start = history.count - count
+            let matches = (0..<count).allSatisfy { offset in
+                compatible(history[start + offset], candidates[offset],
+                           existedAtBaseline: baselineByID[candidates[offset].id] != nil)
+            }
+            if matches { return count }
+        }
+        return 0
+    }
+
+    private static func compatible(_ stored: ChatMessage, _ live: ChatMessage,
+                                   existedAtBaseline: Bool) -> Bool {
+        guard stored.author == live.author else { return false }
+        // A post-baseline user row is optimistic by definition. Identical
+        // text in stored history may be an older repeated prompt ("retry" is
+        // common), so only a row already present at the baseline may overlap.
+        if live.author == .user, !existedAtBaseline { return false }
+        if let rowID = live.rowID, stored.rowID == rowID { return true }
+        if stored.text == live.text { return true }
+        return existedAtBaseline && live.author == .bot
+            && !stored.text.isEmpty && !live.text.isEmpty
+            && (stored.text.hasPrefix(live.text) || live.text.hasPrefix(stored.text))
+    }
+
+    private static func overlay(_ live: ChatMessage, on stored: ChatMessage) -> ChatMessage {
+        var row = live
+        if stored.text.count > live.text.count, stored.text.hasPrefix(live.text) {
+            row.text = stored.text
+        }
+        row.time = live.time ?? stored.time
+        row.card = live.card ?? stored.card
+        row.reasoning = live.reasoning ?? stored.reasoning
+        if live.toolCalls.isEmpty { row.toolCalls = stored.toolCalls }
+        row.rowID = live.rowID ?? stored.rowID
+        return row
+    }
+}
+
+/// Hiding owned sessions is deliberately silent like desktop, but silence
+/// must not erase operational evidence. Only the two wire answers that mean
+/// "this capability/row is absent" are benign; transport, auth, routing, and
+/// every other backend failure belong in gateway diagnostics for retry sweeps.
+enum OwnedSessionHidingFailure {
+    static func isBenign(_ error: Error) -> Bool {
+        guard let gateway = error as? GatewayError else { return false }
+        return gateway.code == -32_601 || gateway.code == GatewayError.storedSessionGone
+    }
+
+    @MainActor
+    static func record(_ error: Error, gatewayID: String) {
+        guard !isBenign(error) else { return }
+        ConnectionSupervisor.shared.note(error: error, forGatewayID: gatewayID)
+    }
+}
+
 extension AppModel {
 
     /// Desktop titles every canonical chat "Bot Chat" (plugin.js:2757). The
@@ -178,6 +319,7 @@ extension AppModel {
     /// than forking a fresh session — the failure this phase exists to fix.
     func attachCanonicalSession(botID: String, route: GatewayBotRoute,
                                 client: GatewayClient, hydrate: Bool) async throws -> String {
+        try Task.checkCancellation()
         let chat = chat(for: botID)
         let runtime = CanonicalChatRuntime.shared
         let profile = route.profile
@@ -252,6 +394,7 @@ extension AppModel {
             .first(where: { !$0.id.isEmpty })?.id, !candidates.contains(newest) {
             candidates.append(newest)
         }
+        try Task.checkCancellation()
         for candidate in candidates {
             switch await attach(candidate, botID: botID, route: route,
                                 hydrate: hydrate, client: client) {
@@ -288,6 +431,7 @@ extension AppModel {
         let live = try await client.createSession(profile: profile,
                                                   title: Self.canonicalChatTitle,
                                                   hidden: true)
+        try Task.checkCancellation()
         guard !live.sessionID.isEmpty else {
             throw GatewayError(code: -8, message: "session.create returned no id")
         }
@@ -295,6 +439,7 @@ extension AppModel {
         adopt(live, storedID: stored.isEmpty ? nil : stored, botID: botID,
               sourceGatewayID: route.gatewayID)
         if !stored.isEmpty { await pinCanonicalChat(stored, botID: botID) }
+        try Task.checkCancellation()
         return live.sessionID
     }
 
@@ -305,6 +450,7 @@ extension AppModel {
         let chat = chat(for: botID)
         let rebinding = chat.storedSessionID != target
         do {
+            try Task.checkCancellation()
             // Full projection in the ack: `defer_history` returns a bounded
             // stub (methods_session.py:434-439) and leaves history to a REST
             // shape that has proven flaky, so one round trip with
@@ -312,6 +458,7 @@ extension AppModel {
             // `openStoredSession` makes.
             let live = try await client.resumeSession(target, profile: route.profile,
                                                       deferHistory: false)
+            try Task.checkCancellation()
             guard !live.sessionID.isEmpty else {
                 return .failed(GatewayError(code: -8, message: "session.resume returned no id"))
             }
@@ -319,11 +466,14 @@ extension AppModel {
             let stored = live.storedSessionID.isEmpty ? target : live.storedSessionID
             adopt(live, storedID: stored, botID: botID,
                   sourceGatewayID: route.gatewayID)
-            if hydrate {
-                await hydrateCanonical(live, botID: botID, profile: route.profile,
-                                       client: client, clearWhenEmpty: rebinding)
-            }
+            // Seed the resume snapshot before REST yields. Any message.delta
+            // that lands during fallback then extends this exact live row and
+            // hydration's merge preserves the newer value.
             replayInflight(live, botID: botID)
+            if hydrate {
+                try await hydrateCanonical(live, botID: botID, profile: route.profile,
+                                           client: client, clearWhenEmpty: rebinding)
+            }
             replayPendingPrompts(live, sourceGatewayID: route.gatewayID)
             return .attached(sessionID: live.sessionID, storedID: stored)
         } catch let error as GatewayError where error.code == GatewayError.storedSessionGone {
@@ -405,29 +555,40 @@ extension AppModel {
     /// omitted messages.
     private func hydrateCanonical(_ live: LiveSession, botID: String, profile: String,
                                   client: GatewayClient,
-                                  clearWhenEmpty: Bool) async {
-        var history = Self.chatMessages(fromTranscript: .array(live.messages))
-        if history.isEmpty, !live.storedSessionID.isEmpty,
-           let payload = try? await client.latestSessionMessages(storedID: live.storedSessionID,
-                                                                 profile: profile) {
+                                  clearWhenEmpty: Bool) async throws {
+        try await Self.hydrateTranscript(
+            chat: chat(for: botID),
+            resumeMessages: live.messages,
+            clearWhenEmpty: clearWhenEmpty,
+            fallback: {
+                guard !live.storedSessionID.isEmpty else { return nil }
+                return try? await client.latestSessionMessages(
+                    storedID: live.storedSessionID, profile: profile)
+            },
+            accepts: { true })
+    }
+
+    /// Shared by canonical and explicit stored-session opens, and deliberately
+    /// testable with a suspended fallback. `baseline` is sampled immediately
+    /// before the only suspension; the merge can therefore distinguish stale
+    /// stored rows from user/assistant state that arrived afterward.
+    static func hydrateTranscript(
+        chat: ChatState,
+        resumeMessages: [JSONValue],
+        clearWhenEmpty: Bool,
+        fallback: @MainActor () async -> JSONValue?,
+        accepts: @MainActor () -> Bool
+    ) async throws {
+        let baseline = chat.messages
+        var history = Self.chatMessages(fromTranscript: .array(resumeMessages))
+        if history.isEmpty, let payload = await fallback() {
             history = Self.chatMessages(fromTranscript: payload)
         }
-        let chat = chat(for: botID)
-        guard !history.isEmpty else {
-            // An empty chat must LOOK empty rather than borrow the roster
-            // preview as a fake message. Only a transcript of our own system
-            // lines is cleared — anything the user typed stays.
-            if clearWhenEmpty, chat.messages.allSatisfy({ $0.author == .system }) {
-                chat.messages = []
-            }
-            return
-        }
-        // Keep a user bubble typed while the resume was in flight: prompt.submit
-        // has not persisted it yet, so replacing the transcript wholesale would
-        // swallow the message the user is watching for.
-        let optimistic = Array(chat.messages.reversed().prefix { $0.author == .user }.reversed())
-        let known = Set(history.suffix(8).filter { $0.author == .user }.map(\.text))
-        chat.messages = history + optimistic.filter { !known.contains($0.text) }
+        try Task.checkCancellation()
+        guard accepts() else { throw CancellationError() }
+        chat.messages = TranscriptHydrationMerge.merge(
+            history: history, baseline: baseline, current: chat.messages,
+            clearWhenEmpty: clearWhenEmpty)
     }
 
     // MARK: The pin
@@ -533,4 +694,66 @@ extension GatewayClient {
         }
         return try await restJSON(path: "api/sessions/\(storedID)/messages", query: query)
     }
+}
+
+
+extension AppModel {
+    /// Reconcile every Bot Mode-owned stored session onto `hidden:true`
+    /// (plugin.js:setHideBotChats). Canonical pins plus room member sessions
+    /// stay out of shared recents; the per-bot Sessions sheet still lists them
+    /// via `include_hidden`. Older gateways reject `session.set_hidden`; that
+    /// is unsupported, not a toast.
+    func hideOwnedBotSessions() async {
+        guard mode == .live else { return }
+        var grouped: [String: Set<String>] = [:]
+        func add(_ gatewayID: String?, _ sessionID: String) {
+            let sid = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let gatewayID, !gatewayID.isEmpty, !sid.isEmpty else { return }
+            grouped[gatewayID, default: []].insert(sid)
+        }
+        let fallback = LiveRuntime.shared.gatewayID
+        for (botID, pin) in CanonicalChatRuntime.shared.pins {
+            add(gatewayRoute(for: botID)?.gatewayID ?? fallback, pin)
+        }
+        for room in rooms {
+            for (memberID, sessionID) in room.memberSessions {
+                add(gatewayRoute(for: memberID)?.gatewayID ?? fallback, sessionID)
+            }
+        }
+        for (gatewayID, ids) in grouped {
+            do {
+                let client = try await routedClient(gatewayID: gatewayID)
+                for sid in ids {
+                    do { _ = try await client.setSessionHidden(sid, hidden: true) }
+                    catch { OwnedSessionHidingFailure.record(error, gatewayID: gatewayID) }
+                }
+            } catch {
+                OwnedSessionHidingFailure.record(error, gatewayID: gatewayID)
+            }
+        }
+    }
+
+    /// Desktop's "New chat with this agent": a scratch session on this
+    /// profile, explicitly NOT the forever-chat (plugin.js:3503). The
+    /// `/new` guard's copy points here.
+    public func openScratchChat(botID: String) async {
+        let botID = resolvedBotID(botID)
+        guard mode == .live else { return }
+        do {
+            guard let route = gatewayRoute(for: botID) else { throw GatewayRouteError.noRoute }
+            let client = try await routedClient(for: route)
+            let live = try await client.createSession(profile: route.profile, hidden: false)
+            let stored = live.storedSessionID.isEmpty ? live.sessionID : live.storedSessionID
+            guard !stored.isEmpty else {
+                throw GatewayError(code: -8, message: "session.create returned no id")
+            }
+            openStoredSession(stored, botID: botID)
+        } catch {
+            toast(kind: .failure,
+                  title: theme.copy.toastScratchFailed(theme.themeID),
+                  message: (error as? GatewayError)?.message ?? error.localizedDescription,
+                  botID: botID)
+        }
+    }
+
 }

@@ -22,12 +22,11 @@ public struct TranscriptPresentationPolicy: Sendable, Equatable {
         detail == .advanced
     }
 
-    /// Quiet mode is avatar-first while work is active and retains failures
-    /// afterward. Running and successfully completed details remain in the
-    /// model and appear immediately when Advanced is enabled.
+    /// Quiet mode is avatar-only while work is active. Every tool detail,
+    /// including failures, remains in the model and appears immediately when
+    /// Advanced is enabled; none of it competes with the bot-focused view.
     public func visibleToolCalls(_ calls: [ToolCall]) -> [ToolCall] {
-        guard detail == .quiet else { return calls }
-        return calls.filter { $0.state == .failed }
+        detail == .quiet ? [] : calls
     }
 
     /// A quiet transcript always uses the face as its busy affordance.
@@ -86,6 +85,64 @@ public enum ChatComposerActionPolicy {
         // Stop until the current turn settles.
         if isTurnRunning { return text.isEmpty ? .stop : .steer }
         return hasPayload ? .submit : .disabled
+    }
+}
+
+/// Chat transcript scrolling facts. A long LazyVStack only measures the
+/// rows near the current estimated offset, so anchoring to a trailing spacer
+/// can land on a blank region until the user drags. Eager stacks stay fully
+/// measured; lazy stacks scroll to the last real message (or the working
+/// avatar) across a few layout passes.
+public enum ChatTranscriptLayoutPolicy {
+    public static let eagerStackLimit = 64
+    public static let layoutPassesMs: [UInt64] = [16, 120, 360]
+    public static let workingAnchorID = "chat-working"
+    public static let emptyAnchorID = "chat-bottom"
+
+    public static func usesLazyStack(messageCount: Int) -> Bool {
+        messageCount > eagerStackLimit
+    }
+
+    public static func anchorID(lastMessageID: UUID?, showingWorkingAvatar: Bool) -> String {
+        // The working row is a real, measured LazyVStack child. Never target
+        // the trailing geometry probe for a live turn: on a long transcript
+        // SwiftUI can satisfy that estimated spacer offset before measuring
+        // the tail rows, leaving the entire viewport blank until a drag.
+        if showingWorkingAvatar { return workingAnchorID }
+        if let lastMessageID { return lastMessageID.uuidString }
+        return emptyAnchorID
+    }
+
+    /// How far from the latest row still counts as "following" the live turn.
+    public static let followBottomSlop: CGFloat = 120
+
+    public static func isFollowingLatest(distanceFromBottom: CGFloat) -> Bool {
+        distanceFromBottom <= followBottomSlop
+    }
+
+    public static func showsJumpControl(isFollowingLatest: Bool, messageCount: Int) -> Bool {
+        !isFollowingLatest && messageCount > 0
+    }
+}
+
+/// Interactive pop for the custom chat overlay. Talaria does not use a
+/// NavigationStack for bot chats, so iOS never installs its system edge
+/// gesture. These thresholds match that gesture closely enough to feel native
+/// without stealing horizontal scrolls from the transcript.
+public enum ChatSwipeBackPolicy {
+    public static let edgeWidth: CGFloat = 28
+    public static let minimumDistance: CGFloat = 16
+    public static let commitFraction: CGFloat = 0.28
+    public static let commitVelocity: CGFloat = 720
+
+    public static func shouldBegin(startX: CGFloat) -> Bool {
+        startX <= edgeWidth
+    }
+
+    public static func shouldCommit(translationX: CGFloat, predictedX: CGFloat,
+                                    containerWidth: CGFloat) -> Bool {
+        let width = max(containerWidth, 1)
+        return translationX >= width * commitFraction || predictedX >= commitVelocity
     }
 }
 

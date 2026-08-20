@@ -86,6 +86,36 @@ private actor ColdApprovalFake {
 }
 
 final class PushDeviceMutationQueueTests: XCTestCase {
+    func testRelayContractSurfacesConfigurationAndDeliveryFailures() throws {
+        let status: JSONValue = [
+            "apns_configured": .bool(false),
+            "apns_missing_env": .array([.string("TALARIA_APNS_KEY_ID"),
+                                         .string("TALARIA_APNS_TEAM_ID")]),
+        ]
+        XCTAssertEqual(PushRelayContract.configurationIssue(status),
+                       "missing TALARIA_APNS_KEY_ID, TALARIA_APNS_TEAM_ID")
+        XCTAssertEqual(PushRelayContract.configurationIssue(["relay_disabled": .bool(true)]),
+                       "the relay is disabled")
+        XCTAssertEqual(PushRelayContract.configurationIssue([
+            "relay_disabled": .bool(true),
+            "apns_configured": .bool(false),
+            "apns_missing_env": .array([.string("TALARIA_APNS_KEY_ID")]),
+        ]), "the relay is disabled; missing TALARIA_APNS_KEY_ID")
+        XCTAssertNil(PushRelayContract.configurationIssue(["apns_configured": .bool(true)]))
+
+        XCTAssertNoThrow(try PushRelayContract.validateTestResponse([
+            "results": .array([["ok": .bool(true), "status": .number(200)]])
+        ]))
+        XCTAssertThrowsError(try PushRelayContract.validateTestResponse([
+            "results": .array([[
+                "ok": .bool(false), "status": .number(403),
+                "reason": .string("InvalidProviderToken"),
+            ]])
+        ])) { error in
+            XCTAssertEqual((error as? GatewayError)?.message,
+                           "APNs rejected the test push (403 InvalidProviderToken).")
+        }
+    }
     func testRapidFilterIntentCannotEnterBeforeFirstMutationFinishes() {
         var admission = PushFilterMutationAdmission()
         XCTAssertTrue(admission.claim())
