@@ -116,7 +116,10 @@ struct SessionRef: Sendable, Equatable {
     /// Exact source of both the profile and durable session id.
     var gatewayID: String
     var botID: String
-    /// Durable session key (session.resume / REST transcript id).
+    /// Durable session key (session.resume / REST transcript id). This is
+    /// transcript provenance only; it is not filesystem authority. Artifact
+    /// bytes still require a separately validated managed-root admission at
+    /// the fetch boundary.
     var storedID: String
 
     func rosterID(activeGatewayID: String?) -> String? {
@@ -1169,6 +1172,15 @@ enum ArtifactScan {
         "zip", "tar", "gz", "avi", "flac", "m4a", "mkv", "mp3", "ogg", "opus", "wav", "webm",
         "mp4", "mov", "html", "log", "py", "swift", "ts", "tsx", "js", "yaml", "yml", "toml",
     ]
+
+    /// Values that address the gateway host. A transcript may mention one of
+    /// these, but that mention is never itself an authorization to read it;
+    /// AppModel's artifact admission gate must prove managed-root containment
+    /// before any REST file route or prefetch can use the value.
+    static func isGatewayPath(_ value: String) -> Bool {
+        !value.hasPrefix("data:") && !value.hasPrefix("http://")
+            && !value.hasPrefix("https://")
+    }
 
     /// Tools that *produce* things. Reading a file is not an artifact; writing,
     /// generating, rendering, downloading or exporting one is.

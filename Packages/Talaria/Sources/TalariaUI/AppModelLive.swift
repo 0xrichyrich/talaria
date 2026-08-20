@@ -43,6 +43,11 @@ final class LiveRuntime {
     var defaultBotID: String?
     /// In-flight create/resume per bot so a tap + a send never double-create.
     var attachTasks: [String: Task<String, Error>] = [:]
+    /// Runtime sid captured immediately before a reconnect parks the primary
+    /// chats. The visible ChatState may be cleared while the transport is
+    /// replaced, but mutation leases still need this old sid as their binding
+    /// proof when the durable session adopts its new sid.
+    var reconnectParkedSessionIDs: [String: String] = [:]
     /// Normalized base URL of the connected gateway (mirror of the client's,
     /// readable without hopping onto its actor).
     var baseURL: URL?
@@ -58,6 +63,11 @@ final class LiveRuntime {
 
     func resetSessionState() {
         sessionToBot.removeAll()
+        for task in ChatRuntime.shared.reconciliationTasks.values { task.cancel() }
+        ChatRuntime.shared.reconciliationTasks.removeAll()
+        ChatRuntime.shared.reconciliationTokens.removeAll()
+        ChatRuntime.shared.reconcilingBots.removeAll()
+        ChatRuntime.shared.deferredReconciliationBots.removeAll()
         // Primary reconnects must not erase sessions that are still attached
         // through retained secondary clients.
         workingBotIDs = Set(workingBotIDs.filter { GatewayBotRoute(qualifiedID: $0) != nil })
@@ -74,6 +84,7 @@ final class LiveRuntime {
     func resetRoutedState(gatewayID: String) {
         routedSessionToBot = routedSessionToBot.filter { $0.key.gatewayID != gatewayID }
         approvalTargets = approvalTargets.filter { $0.value.bot.gatewayID != gatewayID }
+        ChatRuntime.shared.clearPendingStops(forGatewayID: gatewayID)
         let prefix = gatewayID + GatewayBotRoute.separator
         workingBotIDs = Set(workingBotIDs.filter { !$0.hasPrefix(prefix) })
         let tasks = attachTasks.filter { $0.key.hasPrefix(prefix) }
@@ -91,6 +102,16 @@ struct ApprovalResponseTarget: Equatable {
     var requestID: String
     var storedID: String? = nil
     var botID: String? = nil
+}
+
+extension LiveSession {
+    /// Hermes may encode an absent partial-turn block as JSON `null`. Treat
+    /// that shape exactly like a missing block at every lifecycle boundary;
+    /// a non-nil `.null` must not keep an idle stop fenced or the UI running.
+    var hasInflightTurn: Bool {
+        guard let inflight else { return false }
+        return inflight != .null
+    }
 }
 
 extension AppModel {
@@ -113,11 +134,21 @@ extension AppModel {
         let runtime = LiveRuntime.shared
 
         // Tear down any previous link.
+        // A user-initiated gateway switch must not carry parked runtime ids
+        // from the departed source. Supervised reconnect sets this flag before
+        // calling here, so its explicit old-sid migration survives the reset.
+        if !ConnectionSupervisor.shared.isReconnecting {
+            runtime.reconnectParkedSessionIDs.removeAll()
+        }
         runtime.generation += 1
         runtime.reconnectTask?.cancel(); runtime.reconnectTask = nil
         runtime.monitorTask?.cancel(); runtime.monitorTask = nil
         runtime.eventPump?.cancel(); runtime.eventPump = nil
         if let gatewayID = runtime.gatewayID { dropApprovalScope(gatewayID: gatewayID) }
+        if !ConnectionSupervisor.shared.isReconnecting,
+           let departingGatewayID = runtime.gatewayID {
+            ChatRuntime.shared.clearPendingStops(forGatewayID: departingGatewayID)
+        }
         runtime.resetSessionState()
         // Session ids are per-gateway; a pin from the previous one resolves to
         // nothing (or worse, something else) here.
@@ -189,6 +220,9 @@ extension AppModel {
         runtime.monitorTask?.cancel(); runtime.monitorTask = nil
         runtime.eventPump?.cancel(); runtime.eventPump = nil
         if let gatewayID = departingGatewayID { dropApprovalScope(gatewayID: gatewayID) }
+        if let departingGatewayID {
+            ChatRuntime.shared.clearPendingStops(forGatewayID: departingGatewayID)
+        }
         runtime.resetSessionState()
         // Teardown while both the captured source id and its client still
         // exist. Clearing either first makes A2A mistake a deliberate primary
@@ -204,6 +238,7 @@ extension AppModel {
         }
         runtime.baseURL = nil
         runtime.gatewayID = nil
+        runtime.reconnectParkedSessionIDs.removeAll()
         client = nil
         isOffline = false
         // Each area's router owns state belonging to *that* gateway. Without
@@ -247,6 +282,20 @@ extension AppModel {
     }
 
     private func dropPerGatewayCaches(gatewayID: String?) {
+        // Command Center is source-qualified state, but it outlives the sheet
+        // and therefore cannot rely on view disappearance to notice a real
+        // socket teardown. Invalidate Operator reads even when the selected
+        // source is a retained secondary; late status replies must not paint
+        // over a new connection generation.
+        OperatorSettingsRuntime.shared.invalidateConnectionScope()
+        if let gatewayID {
+            dropWorkspaceScope(gatewayID: gatewayID)
+        } else if let workspaceGatewayID = WorkspaceRuntime.shared.gatewayID {
+            // A partially-installed/launch-time client can have no primary id
+            // while WorkspaceRuntime still owns a source. Clear that exact
+            // scope rather than leaving its controls and backup ShareLink live.
+            dropWorkspaceScope(gatewayID: workspaceGatewayID)
+        }
         if let gatewayID {
             // Skills/MCP/plugin state carries profile names that are only
             // meaningful inside this gateway. Keep foreign-source states, but
@@ -487,20 +536,92 @@ extension AppModel {
 
     func bindSession(_ live: LiveSession, botID: String, sourceGatewayID: String? = nil) {
         let chat = chat(for: botID)
-        chat.sessionID = live.sessionID
-        if !live.storedSessionID.isEmpty { chat.storedSessionID = live.storedSessionID }
         let runtime = LiveRuntime.shared
+        // Some legacy resume callers clear the visible sid before they reach
+        // this helper. Keep the parked sid as an explicit old binding so the
+        // same durable operation leases migrate instead of being silently
+        // orphaned by the nil gap.
+        let oldSessionID = chat.sessionID ?? runtime.reconnectParkedSessionIDs[botID]
+        let newStoredID = live.storedSessionID.isEmpty ? nil : live.storedSessionID
+        let durableID = newStoredID ?? chat.storedSessionID
         let gatewayID = sourceGatewayID ?? gatewayRoute(for: botID)?.gatewayID
+            ?? runtime.gatewayID
+        let bindingChanged = oldSessionID != nil && oldSessionID != live.sessionID
+            || (newStoredID != nil && chat.storedSessionID != newStoredID)
+        let bindingRoute = gatewayID.map { gatewayID in
+            gatewayRoute(for: botID).flatMap { existing in
+                existing.gatewayID == gatewayID ? existing : nil
+            } ?? GatewayBotRoute(
+                gatewayID: gatewayID,
+                profile: GatewayBotRoute(qualifiedID: botID)?.profile ?? botID)
+        }
+        if let bindingRoute {
+            ChatRuntime.shared.migratePendingStop(
+                botID: botID, route: bindingRoute, sessionID: live.sessionID,
+                storedID: durableID, generation: runtime.generation,
+                chatID: ObjectIdentifier(chat))
+        }
+        if bindingChanged, let gatewayID, let route = bindingRoute {
+            ChatRuntime.shared.migrateMutationState(
+                botID: botID, route: route, sessionID: live.sessionID,
+                storedID: durableID, generation: runtime.generation,
+                chatID: ObjectIdentifier(chat))
+            if var kickoff = CanonicalChatRuntime.shared.ambiguousKickoffs[botID] {
+                if kickoff.chatID == ObjectIdentifier(chat),
+                   kickoff.storedID == (durableID ?? ""),
+                   route.gatewayID == gatewayID {
+                    kickoff.sessionID = live.sessionID
+                    CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = kickoff
+                } else {
+                    CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = nil
+                    CanonicalChatRuntime.shared.kickoffs[botID] = nil
+                }
+            }
+            if ChatRuntime.shared.transcriptActions[botID] != nil {
+                if newStoredID != nil, chat.storedSessionID != newStoredID {
+                    ChatRuntime.shared.transcriptActions[botID] = nil
+                    ChatRuntime.shared.transcriptActionGenerations[botID] = nil
+                } else if ChatRuntime.shared.transcriptFences[botID] == nil {
+                    ChatRuntime.shared.transcriptActionGenerations[botID] = runtime.generation
+                }
+            }
+            if let old = oldSessionID, old != live.sessionID {
+                if runtime.sessionToBot[old] == botID {
+                    runtime.sessionToBot.removeValue(forKey: old)
+                }
+                let routed = GatewaySessionRoute(gatewayID: gatewayID, sessionID: old)
+                if runtime.routedSessionToBot[routed] == botID {
+                    runtime.routedSessionToBot.removeValue(forKey: routed)
+                }
+            }
+        }
+
+        chat.sessionID = live.sessionID
+        if let newStoredID { chat.storedSessionID = newStoredID }
         if gatewayID == runtime.gatewayID {
             runtime.sessionToBot[live.sessionID] = botID
         } else if let gatewayID {
             runtime.routedSessionToBot[GatewaySessionRoute(gatewayID: gatewayID,
                                                            sessionID: live.sessionID)] = botID
         }
+        runtime.reconnectParkedSessionIDs[botID] = nil
         if live.running {
             setWorking(botID, true)
             chat.isTyping = true
         }
+        // The legacy bind path is also an authoritative adoption boundary.
+        // Give any retained no-replay lease one read-only retry opportunity;
+        // the scheduler coalesces with adopt's call when both paths meet.
+        scheduleRetainedMutationReconciliation(botID: botID)
+        drainPendingMutationWork(botID: botID)
+    }
+
+    /// Preserve the currently visible runtime binding before a recovery path
+    /// deliberately clears it. Adoption then has an explicit old SID to
+    /// migrate unresolved mutation/kickoff state through the nil window.
+    func parkRuntimeSessionBeforeClearing(botID: String) {
+        guard let sessionID = chats[botID]?.sessionID, !sessionID.isEmpty else { return }
+        LiveRuntime.shared.reconnectParkedSessionIDs[botID] = sessionID
     }
 
     /// Map transcript rows to chat messages. Two shapes reach here and both
@@ -768,6 +889,9 @@ extension AppModel {
             if let owner = self.botID(forSession: sid, sourceGatewayID: sourceGatewayID) {
                 let chat = chat(for: owner)
                 if chat.sessionID == sid || chat.storedSessionID == sid {
+                    if chat.sessionID == sid {
+                        LiveRuntime.shared.reconnectParkedSessionIDs[owner] = sid
+                    }
                     chat.sessionID = nil
                     chat.isTyping = false
                 }
@@ -1092,10 +1216,17 @@ extension AppModel {
         // it's a cold resume from the durable key.
         for (botID, chat) in chats where GatewayBotRoute(qualifiedID: botID) == nil {
             guard let stored = chat.storedSessionID else { continue }
+            if let sessionID = chat.sessionID, !sessionID.isEmpty {
+                runtime.reconnectParkedSessionIDs[botID] = sessionID
+            }
             chat.sessionID = nil
             chat.isTyping = false
             if let live = try? await client.resumeSession(stored, profile: botID, deferHistory: true) {
-                bindSession(live, botID: botID)
+                // Route this legacy reconnect path through the same adoption
+                // boundary as supervised reconnects so unresolved mutation
+                // and kickoff leases migrate from the parked sid.
+                adopt(live, storedID: live.storedSessionID.isEmpty ? stored : live.storedSessionID,
+                      botID: botID, sourceGatewayID: runtime.gatewayID ?? "")
                 replayInflight(live, botID: botID)
                 replayPendingPrompts(live)
             }

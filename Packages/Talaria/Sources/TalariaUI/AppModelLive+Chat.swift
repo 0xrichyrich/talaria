@@ -52,6 +52,36 @@ final class ChatRuntime {
     var transcriptActionGenerations: [String: Int] = [:]
     var transcriptFences: [String: TranscriptActionFence] = [:]
 
+    /// Mid-turn mutations are no-replay operations too. A lost `steer` or
+    /// `redirect` receipt must not fall through to the next verb: the gateway
+    /// may already have accepted the first one. Keep the exact request here
+    /// until a resume/transcript read proves what happened.
+    var steerActions: [String: SteerMutationLease] = [:]
+    var steerFences: [String: SteerMutationFence] = [:]
+
+    /// An interrupt is a mutation too. While one is in flight the visible
+    /// turn remains running; an uncertain answer leaves this fence in place so
+    /// a new prompt cannot race the unknown stop.
+    var stopActions: [String: StopTurnLease] = [:]
+    var stopFences: [String: StopTurnFence] = [:]
+
+    /// At most one authoritative retry may be in flight for a bot. Retained
+    /// mutation/kickoff fences are deliberately not replayed; this coalescer
+    /// only schedules read/resume reconciliation when a reconnect, adoption,
+    /// or user tap gives us a fresh opportunity to prove the old operation.
+    var reconciliationTasks: [String: Task<Void, Never>] = [:]
+    var reconciliationTokens: [String: UUID] = [:]
+    var reconcilingBots: Set<String> = []
+    /// A stop tap that arrived while another mutation owned the bot. It is a
+    /// user intent, not a second interrupt; drain it only after the owner has
+    /// settled or retained fence reconciliation has had its read attempt. The
+    /// value is the exact binding at the tap, not merely the profile name:
+    /// reusing a bot id for a newly-opened session must never inherit A's stop.
+    var pendingStopRequests: [String: PendingStopRequest] = [:]
+    /// A steer/stop/kickoff fence created while a different authoritative
+    /// read was active. Retry the read after that owner releases the bot.
+    var deferredReconciliationBots: Set<String> = []
+
     /// Local mirrors of gateway-accepted queued prompts. The public tuple in
     /// AppModel remains presentation-only; this side table supplies exact
     /// session identity and lifecycle eligibility without text deduplication.
@@ -68,6 +98,198 @@ final class ChatRuntime {
         // An ambiguous destructive submit survives a connection generation.
         // Only authoritative hydration of the same source/session, or an
         // explicit bind to a different durable session, may retire it.
+    }
+
+    /// A reconnect may assign a new runtime sid to the same durable session.
+    /// The operation boundary belongs to the durable binding, not the old
+    /// sid, so unresolved leases/fences must move with it. A different route
+    /// or an unproven durable key is a replacement session and retires the
+    /// old state instead.
+    func migrateMutationState(botID: String, route: GatewayBotRoute,
+                              sessionID: String, storedID: String?,
+                              generation: Int, chatID: ObjectIdentifier) {
+        if var action = steerActions[botID] {
+            if action.route == route, Self.sameDurable(action.storedID, storedID) {
+                action.sessionID = sessionID
+                action.generation = generation
+                steerActions[botID] = action
+            } else {
+                steerActions[botID] = nil
+            }
+        }
+        if var fence = steerFences[botID] {
+            if fence.route == route, Self.sameDurable(fence.storedID, storedID) {
+                fence.sessionID = sessionID
+                fence.generation = generation
+                steerFences[botID] = fence
+            } else {
+                steerFences[botID] = nil
+            }
+        }
+        if var action = stopActions[botID] {
+            if action.route == route, Self.sameDurable(action.storedID, storedID) {
+                action.sessionID = sessionID
+                action.generation = generation
+                stopActions[botID] = action
+            } else {
+                stopActions[botID] = nil
+            }
+        }
+        // An unaddressable stop is held by the reattach path below; it has no
+        // old route/session to migrate and must not be mistaken for a stale
+        // operation merely because its sentinel route differs.
+        if var fence = stopFences[botID], !fence.unaddressable {
+            if fence.route == route, Self.sameDurable(fence.storedID, storedID) {
+                fence.sessionID = sessionID
+                fence.generation = generation
+                stopFences[botID] = fence
+            } else {
+                stopFences[botID] = nil
+            }
+        }
+        if var fence = transcriptFences[botID] {
+            if fence.gatewayID == route.gatewayID, fence.profile == route.profile,
+               fence.storedID == (storedID ?? ""), !fence.storedID.isEmpty {
+                fence.sessionID = sessionID
+                fence.generation = generation
+                transcriptFences[botID] = fence
+            } else {
+                transcriptFences[botID] = nil
+            }
+        }
+        migratePendingStop(botID: botID, route: route, sessionID: sessionID,
+                           storedID: storedID, generation: generation, chatID: chatID)
+    }
+
+    /// Move a deferred stop across a runtime-sid rotation only when the route,
+    /// durable session, and exact ChatState are unchanged. A changed durable
+    /// binding is a new conversation, even when the profile id is reused.
+    func migratePendingStop(botID: String, route: GatewayBotRoute,
+                            sessionID: String, storedID: String?,
+                            generation: Int, chatID: ObjectIdentifier) {
+        guard var pending = pendingStopRequests[botID] else { return }
+        guard pending.chatID == chatID,
+              pending.route == route,
+              Self.sameDurable(pending.storedID, storedID) else {
+            pendingStopRequests[botID] = nil
+            return
+        }
+        pending.sessionID = sessionID
+        pending.generation = generation
+        pendingStopRequests[botID] = pending
+    }
+
+    func clearPendingStop(botID: String) {
+        pendingStopRequests[botID] = nil
+    }
+
+    func clearPendingStopIfStored(_ storedID: String, botID: String) {
+        guard pendingStopRequests[botID]?.storedID == storedID else { return }
+        pendingStopRequests[botID] = nil
+    }
+
+    func clearPendingStops(forGatewayID gatewayID: String) {
+        pendingStopRequests = pendingStopRequests.filter {
+            $0.value.route.gatewayID != gatewayID
+        }
+    }
+
+    /// Remove deferred interrupts for one source-qualified profile. A
+    /// secondary profile can share a gateway with other profiles, so a
+    /// gateway-wide scrub would incorrectly retire their user intent too.
+    func clearPendingStops(forRoute route: GatewayBotRoute) {
+        pendingStopRequests = pendingStopRequests.filter {
+            $0.value.route != route
+        }
+    }
+
+    /// Move a deferred stop with its ChatState when lifecycle parking changes
+    /// a primary bot from its bare key to a source-qualified key (or back).
+    /// The route, durable row, and exact reference identity must all agree;
+    /// a destination collision cancels the old entry fail-closed.
+    @discardableResult
+    func movePendingStopBindingKey(fromBotID: String, toBotID: String,
+                                   route: GatewayBotRoute,
+                                   chatID: ObjectIdentifier,
+                                   storedID: String?) -> Bool {
+        guard fromBotID != toBotID else { return true }
+        guard let pending = pendingStopRequests[fromBotID],
+              pending.route == route,
+              pending.chatID == chatID,
+              Self.sameDurable(pending.storedID, storedID),
+              pendingStopRequests[toBotID] == nil else {
+            pendingStopRequests[fromBotID] = nil
+            return false
+        }
+        var moved = pending
+        moved.botID = toBotID
+        pendingStopRequests[fromBotID] = nil
+        pendingStopRequests[toBotID] = moved
+        return true
+    }
+
+    /// Re-key a deferred interrupt across a confirmed source-profile rename.
+    /// The runtime sid is deliberately dropped: Hermes retires the old
+    /// profile backend during the rename, and only a later authoritative
+    /// bind/adopt may supply the new sid. Preserve the intent only when one
+    /// exact old entry proves the same durable row and ChatState owns it;
+    /// otherwise cancel the old entry fail-closed instead of guessing which
+    /// destination chat should receive the stop.
+    @discardableResult
+    func rekeyPendingStop(fromBotIDs: Set<String>, fromRoute: GatewayBotRoute,
+                          toBotID: String, toRoute: GatewayBotRoute,
+                          chatID: ObjectIdentifier, storedID: String?) -> Bool {
+        let sourceKeys = pendingStopRequests
+            .filter { key, pending in
+                fromBotIDs.contains(key) && pending.route == fromRoute
+            }
+            .map(\.key)
+        guard let durable = storedID, !durable.isEmpty,
+              fromRoute.gatewayID == toRoute.gatewayID,
+              fromRoute != toRoute else {
+            for key in sourceKeys { pendingStopRequests[key] = nil }
+            return false
+        }
+
+        let candidates = sourceKeys.filter { key in
+            guard let pending = pendingStopRequests[key] else { return false }
+            return pending.chatID == chatID && Self.sameDurable(pending.storedID, durable)
+        }
+        guard candidates.count == 1, let sourceKey = candidates.first,
+              pendingStopRequests[toBotID] == nil,
+              var pending = pendingStopRequests[sourceKey] else {
+            // A duplicate, collision, or mismatched durable/chat identity is
+            // not evidence that the old intent belongs to the new route.
+            // Retire every old-route candidate; never leave an orphaned stop
+            // that could later drain into a reused profile id.
+            for key in sourceKeys { pendingStopRequests[key] = nil }
+            return false
+        }
+
+        pending.botID = toBotID
+        pending.route = toRoute
+        pending.sessionID = nil
+        pending.generation = LiveRuntime.shared.generation
+        pendingStopRequests[sourceKey] = nil
+        pendingStopRequests[toBotID] = pending
+        return true
+    }
+
+    /// Keep an exact deferred stop when the sessions sheet reopens the same
+    /// durable row. A route that is temporarily unavailable during reconnect
+    /// is left for bind/adopt to prove; a known replacement route retires it.
+    func pendingStopMatchesReopen(botID: String, storedID: String,
+                                  chatID: ObjectIdentifier,
+                                  route: GatewayBotRoute?) -> Bool {
+        guard let pending = pendingStopRequests[botID],
+              pending.chatID == chatID,
+              Self.sameDurable(pending.storedID, storedID) else { return false }
+        return route.map { pending.route == $0 } ?? true
+    }
+
+    static func sameDurable(_ lhs: String?, _ rhs: String?) -> Bool {
+        guard let lhs, !lhs.isEmpty, let rhs, !rhs.isEmpty else { return false }
+        return lhs == rhs
     }
 
     /// tool.generating placeholders carry no tool_id — this prefix marks them
@@ -103,6 +325,10 @@ struct TranscriptActionLease {
     var chatID: ObjectIdentifier
     var optimisticID: UUID
     var baseline: [ChatMessage]
+    /// The no-replay fence is justified only after the destructive RPC has
+    /// crossed its acceptance boundary. A route/client failure before this
+    /// point is a definite non-attempt, even if its transport error is noisy.
+    var submitStarted = false
 }
 
 struct QueuedPromptBinding: Equatable {
@@ -140,6 +366,90 @@ struct StopTurnLease {
     var sessionID: String
     var storedID: String?
     var chatID: ObjectIdentifier
+    /// Identity for the exact interrupt attempt. Defaults preserve the small
+    /// memberwise initializer used by older tests/callers.
+    var id: UUID = UUID()
+    var requestStarted = false
+    var generation: Int = -1
+}
+
+enum SteerMutationStage: String, Equatable {
+    case steer
+    case redirect
+    case queuedSubmit
+}
+
+struct SteerMutationLease: Equatable {
+    var id: UUID
+    var botID: String
+    var route: GatewayBotRoute
+    var sessionID: String
+    var storedID: String?
+    var chatID: ObjectIdentifier
+    var optimisticID: UUID
+    var text: String
+    var stage: SteerMutationStage = .steer
+    var requestStarted = false
+    var generation: Int = -1
+    /// Durable rows that existed before this operation's optimistic bubble.
+    /// Text is not identity: a repeated prompt must not satisfy reconciliation
+    /// merely because an older row has the same body.
+    var baselineDurableRowIDs: Set<Int> = []
+    var baselineDurableRowCount: Int = 0
+    /// User bodies that existed at the operation boundary (including an
+    /// optimistic row that has not acquired a durable id). An in-flight
+    /// snapshot is operation-specific only when it does not merely repeat
+    /// one of these prior turns.
+    var baselineDurableUserTexts: Set<String> = []
+}
+
+/// The request is held after an ambiguous response. The optimistic row is
+/// intentionally identified separately: it is not evidence that the gateway
+/// accepted the mutation.
+struct SteerMutationFence: Equatable {
+    var operationID: UUID
+    var botID: String
+    var route: GatewayBotRoute
+    var sessionID: String
+    var storedID: String?
+    var chatID: ObjectIdentifier
+    var optimisticID: UUID
+    var text: String
+    var stage: SteerMutationStage
+    var generation: Int = -1
+    /// Snapshot of durable transcript identity/count before the mutation.
+    /// Reconciliation may clear this fence only with a post-operation row (or
+    /// an exact in-flight marker), never a historical duplicate.
+    var baselineDurableRowIDs: Set<Int> = []
+    var baselineDurableRowCount: Int = 0
+    /// See `SteerMutationLease.baselineDurableUserTexts`.
+    var baselineDurableUserTexts: Set<String> = []
+}
+
+struct StopTurnFence: Equatable {
+    var operationID: UUID
+    var botID: String
+    var route: GatewayBotRoute
+    var sessionID: String
+    var storedID: String?
+    var chatID: ObjectIdentifier
+    var generation: Int = -1
+    /// No wire request could be addressed at the time of the stop tap. This
+    /// local fence blocks new sends until `adopt` receives an authoritative
+    /// live session for the same durable chat.
+    var unaddressable: Bool = false
+}
+
+/// A stop tap waiting behind another mutation. Every field participates in
+/// ownership: a later ChatState or durable session using the same bot id must
+/// not inherit the earlier user's interrupt intent.
+struct PendingStopRequest: Equatable {
+    var botID: String
+    var route: GatewayBotRoute
+    var storedID: String?
+    var sessionID: String?
+    var chatID: ObjectIdentifier
+    var generation: Int
 }
 
 enum PromptSubmitReceipt {
@@ -158,6 +468,21 @@ enum PromptSubmitReceipt {
     static func isAuthoritativelyQueued(_ value: JSONValue) -> Bool {
         value["status"]?.stringValue == "queued" && value["ok"]?.boolValue != false
     }
+
+    /// A queued fallback is only mirrorable when Hermes explicitly says
+    /// `queued`. A refusal is definitive; every other shape (including a
+    /// streaming answer from a queued request) is an uncertain acceptance
+    /// boundary and must not be followed by another mutation.
+    static func requireQueued(_ value: JSONValue, operation: String) throws {
+        if value["ok"]?.boolValue == false
+            || ["error", "rejected", "refused"].contains(value["status"]?.stringValue ?? "") {
+            throw GatewayError(code: 409, message: "Hermes refused \(operation.lowercased()).")
+        }
+        guard value["status"]?.stringValue == "queued" else {
+            throw AckValidationError(operation: operation,
+                                     detail: "Hermes did not return an authoritative queued status.")
+        }
+    }
 }
 
 enum PromptMutationFailure {
@@ -169,6 +494,48 @@ enum PromptMutationFailure {
             return url.code == .timedOut || url.code == .networkConnectionLost
         }
         return false
+    }
+}
+
+enum SteerMutationReconciliation {
+    /// A resume projection is authoritative evidence only when it names the
+    /// exact correction. `running == true` alone is insufficient: the turn
+    /// could have been running before the correction arrived.
+    @MainActor
+    static func hasRemoteEvidence(
+        _ live: LiveSession, text: String,
+        baselineDurableRowIDs: Set<Int>, baselineDurableRowCount: Int,
+        baselineDurableUserTexts: Set<String> = []
+    ) -> Bool {
+        // `inflight.user` is a body, not an operation id. It is useful only
+        // when the same durable body was not already present at the boundary;
+        // otherwise a lost response could settle against an older turn.
+        if live.inflight?["user"]?.stringValue == text,
+           !baselineDurableUserTexts.contains(text) { return true }
+        return hasPostOperationDurableRow(
+            AppModel.chatMessages(fromTranscript: .array(live.messages)), text: text,
+            baselineDurableRowIDs: baselineDurableRowIDs,
+            baselineDurableRowCount: baselineDurableRowCount)
+    }
+
+    /// A durable row proves acceptance only when it was not present in the
+    /// pre-operation snapshot and the authoritative page did not shrink the
+    /// durable row set. The count guard rejects empty/stale pages while the
+    /// identity guard rejects an older persisted row with the same text.
+    static func hasPostOperationDurableRow(
+        _ messages: [ChatMessage], text: String,
+        baselineDurableRowIDs: Set<Int>, baselineDurableRowCount: Int
+    ) -> Bool {
+        let durableRowIDs = Set(messages.compactMap(\.rowID))
+        // A page with the same count can still be a stale/replaced page. The
+        // complete pre-operation identity set must survive the authoritative
+        // read before any new row can prove this operation landed.
+        guard baselineDurableRowIDs.isSubset(of: durableRowIDs),
+              durableRowIDs.count >= baselineDurableRowCount else { return false }
+        return messages.contains { message in
+            message.author == .user && message.text == text
+                && message.rowID.map { !baselineDurableRowIDs.contains($0) } == true
+        }
     }
 }
 
@@ -184,6 +551,20 @@ enum TranscriptActionReconciliation {
 }
 
 extension AppModel {
+
+    /// `AppModel.send` already owns the optimistic user echo. Await a birth or
+    /// explicit attach that has published a runtime sid before handing the
+    /// prompt to the ordinary submit path; otherwise a kickoff can overtake
+    /// this visible first row on the wire.
+    func liveSendSerialized(text: String, botID: String, chat: ChatState) {
+        Task { @MainActor in
+            if let pending = LiveRuntime.shared.attachTasks[botID] {
+                _ = try? await pending.value
+            }
+            guard mode == .live, !mutationIsFenced(botID: botID) else { return }
+            liveSend(text: text, botID: botID, chat: chat)
+        }
+    }
 
     // MARK: - Router attachment
 
@@ -406,6 +787,13 @@ extension AppModel {
             chat.messages.append(ChatMessage(author: .user, time: AppModel.clock(), text: trimmed))
             startDemoTurn(botID: botID, chat: chat)
         case .live:
+            // An unresolved mutation owns this exact session. Do not append a
+            // new optimistic row or issue a second wire verb while the first
+            // operation is being reconciled.
+            guard !mutationIsFenced(botID: botID) else {
+                scheduleRetainedMutationReconciliation(botID: botID)
+                return
+            }
             let routeAvailable = !isOffline || GatewayBotRoute(qualifiedID: botID) != nil
             let turnInFlight = chat.isRunning || chat.isTyping
             if turnInFlight, routeAvailable {
@@ -421,7 +809,8 @@ extension AppModel {
                 // correction aimed at THIS bot mid-thought, and firing a
                 // handoff out of one would send a half-sentence to a stranger.
                 // The handle rides along as literal text, as it does today.
-                if let sessionID = chat.sessionID {
+                if let sessionID = chat.sessionID,
+                   LiveRuntime.shared.attachTasks[botID] == nil {
                     steer(text: trimmed, botID: botID, sessionID: sessionID, chat: chat)
                 } else {
                     steerAfterAttach(text: trimmed, botID: botID, chat: chat)
@@ -458,7 +847,7 @@ extension AppModel {
                 let prompt = composedPrompt(routed, botID: botID)
                 // send() appends the user bubble and submits (or queues while
                 // offline) — going around it would duplicate the bubble.
-                if chat.sessionID == nil, LiveRuntime.shared.attachTasks[botID] != nil {
+                if LiveRuntime.shared.attachTasks[botID] != nil {
                     // A sessions-sheet selection owns the shared attach slot.
                     // Echo now, await that exact attach, then re-evaluate the
                     // resumed turn: an idle session receives a submit; a turn
@@ -477,48 +866,438 @@ extension AppModel {
         }
     }
 
-    private func steer(text: String, botID: String, sessionID: String, chat: ChatState) {
-        chat.messages.append(ChatMessage(author: .user, time: AppModel.clock(), text: text))
-        deliverSteer(text: text, botID: botID, sessionID: sessionID)
+    /// A stop, transcript action, or ambiguous mid-turn mutation is an
+    /// operation boundary, not a UI hint. The composer must stay inert until
+    /// that exact operation is accepted, rejected, or reconciled.
+    func mutationIsFenced(botID: String) -> Bool {
+        let runtime = ChatRuntime.shared
+        return runtime.transcriptFences[botID] != nil
+            || runtime.transcriptActions[botID] != nil
+            || runtime.steerFences[botID] != nil
+            || runtime.steerActions[botID] != nil
+            || runtime.stopFences[botID] != nil
+            || runtime.stopActions[botID] != nil
+            || CanonicalChatRuntime.shared.ambiguousKickoffs[botID] != nil
     }
 
-    private func deliverSteer(text: String, botID: String, sessionID: String) {
-        let submission = beginQueuedSubmission(botID: botID, sessionID: sessionID)
-        Task { @MainActor in
-            guard let route = gatewayRoute(for: botID),
-                  let client = try? await routedClient(for: route) else {
-                discardQueuedSubmission(submission)
-                return
+    /// During supervised reconnect the visible chat sid is intentionally nil
+    /// for a short window. Ownership checks must consult the explicit parked
+    /// sid too, or an old task that receives an ambiguous response in that
+    /// window could release without creating the fence that adoption needs to
+    /// migrate.
+    func bindingSessionID(for botID: String) -> String? {
+        chats[botID]?.sessionID ?? LiveRuntime.shared.reconnectParkedSessionIDs[botID]
+    }
+
+    func bindingRouteMatches(_ route: GatewayBotRoute, botID: String) -> Bool {
+        if gatewayRoute(for: botID) == route { return true }
+        return LiveRuntime.shared.reconnectParkedSessionIDs[botID] != nil
+            && stateRoute(for: botID) == route
+    }
+
+    /// A retained ambiguous mutation is a read-only recovery obligation, not
+    /// a permanent lock. Re-enter it after a reconnect/adoption or a blocked
+    /// user tap. The task is coalesced per bot so one tap cannot start several
+    /// resumes, and it never sends steer/redirect/submit/interrupt again.
+    func retainedMutationNeedsReconciliation(botID: String) -> Bool {
+        let runtime = ChatRuntime.shared
+        return runtime.steerFences[botID] != nil
+            || runtime.stopFences[botID] != nil
+            || CanonicalChatRuntime.shared.ambiguousKickoffs[botID] != nil
+    }
+
+    /// Check the exact binding captured when a deferred stop was tapped. A
+    /// route/durable/chat mismatch retires the intent; a temporary runtime-sid
+    /// or generation gap remains parked for bindSession/adopt to migrate.
+    private func pendingStopStillOwnsBinding(_ pending: PendingStopRequest) -> Bool {
+        guard let chat = chats[pending.botID],
+              ObjectIdentifier(chat) == pending.chatID,
+              chat.storedSessionID == pending.storedID else { return false }
+        if let route = pendingStopRoute(botID: pending.botID), route != pending.route {
+            return false
+        }
+        let currentSession = bindingSessionID(for: pending.botID)
+        guard currentSession == pending.sessionID else { return false }
+        return LiveRuntime.shared.generation == pending.generation
+    }
+
+    /// Drain work deferred behind a different mutation. A pending stop is
+    /// issued only once every other operation/fence is gone; a deferred
+    /// authoritative read is retried before the pending stop is considered.
+    func drainPendingMutationWork(botID: String) {
+        let runtime = ChatRuntime.shared
+        guard !runtime.reconcilingBots.contains(botID),
+              runtime.reconciliationTasks[botID] == nil else { return }
+
+        if runtime.deferredReconciliationBots.contains(botID) {
+            if retainedMutationNeedsReconciliation(botID: botID) {
+                // Do not spin a read loop while the source is unavailable;
+                // reconnect/adoption/tap will provide the next boundary.
+                guard mode == .live, gatewayRoute(for: botID) != nil else { return }
+                runtime.deferredReconciliationBots.remove(botID)
+                if scheduleRetainedMutationReconciliation(botID: botID) { return }
+            } else {
+                runtime.deferredReconciliationBots.remove(botID)
             }
-            let steered = (try? await client.steerTurn(sessionID: sessionID, text: text)) ?? ""
-            if steered == "queued" {
-                acceptQueuedSubmission(submission, text: text)
-                return
+        }
+
+        guard let pending = runtime.pendingStopRequests[botID] else { return }
+        guard pendingStopStillOwnsBinding(pending) else {
+            // If the exact ChatState/durable route is gone, this is A's intent
+            // and must not be drained into a replacement B. A temporary
+            // generation/sid gap is retained for bindSession to migrate; the
+            // binding check above intentionally treats only exact ownership
+            // as drainable.
+            if chats[botID].map({ ObjectIdentifier($0) == pending.chatID }) == false
+                || chats[botID]?.storedSessionID != pending.storedID
+                || pendingStopRoute(botID: botID).map({ $0 != pending.route }) == true {
+                runtime.pendingStopRequests[botID] = nil
             }
-            // Too late to steer: re-aim the turn, and failing that queue the
-            // text behind it rather than interrupting what is running.
-            let redirected = (try? await client.redirectTurn(sessionID: sessionID, text: text)) ?? ""
-            if redirected == "redirected" || redirected == "queued" {
-                if redirected == "queued" {
-                    acceptQueuedSubmission(submission, text: text)
-                } else {
-                    discardQueuedSubmission(submission)
+            return
+        }
+        guard
+              runtime.steerActions[botID] == nil,
+              runtime.steerFences[botID] == nil,
+              runtime.stopActions[botID] == nil,
+              runtime.stopFences[botID] == nil,
+              runtime.transcriptActions[botID] == nil,
+              runtime.transcriptFences[botID] == nil,
+              CanonicalChatRuntime.shared.ambiguousKickoffs[botID] == nil else { return }
+        runtime.pendingStopRequests[botID] = nil
+        stopTurn(botID: botID)
+    }
+
+    @discardableResult
+    func scheduleRetainedMutationReconciliation(botID: String) -> Bool {
+        guard mode == .live,
+              retainedMutationNeedsReconciliation(botID: botID),
+              let route = gatewayRoute(for: botID) else { return false }
+        let runtime = ChatRuntime.shared
+        guard runtime.reconciliationTasks[botID] == nil,
+              !runtime.reconcilingBots.contains(botID) else { return false }
+        let token = UUID()
+        runtime.reconciliationTokens[botID] = token
+        let task = Task { @MainActor [weak self] in
+            defer {
+                if ChatRuntime.shared.reconciliationTokens[botID] == token {
+                    ChatRuntime.shared.reconciliationTokens[botID] = nil
+                    ChatRuntime.shared.reconciliationTasks[botID] = nil
                 }
+                self?.drainPendingMutationWork(botID: botID)
+            }
+            guard let self, !Task.isCancelled,
+                  let client = try? await self.routedClient(for: route) else { return }
+
+            if let fence = ChatRuntime.shared.steerFences[botID] {
+                await self.reconcileSteerMutationViaGateway(fence, client: client)
+            }
+            guard !Task.isCancelled else { return }
+            if let fence = ChatRuntime.shared.stopFences[botID] {
+                await self.reconcileStopTurnViaGateway(
+                    fence, note: self.theme.copy.stopNote(self.theme.themeID), client: client)
+            }
+            guard !Task.isCancelled else { return }
+            if let lease = CanonicalChatRuntime.shared.ambiguousKickoffs[botID] {
+                await self.reconcileAmbiguousCanonicalKickoff(
+                    lease, route: route, client: client)
+            }
+        }
+        runtime.reconciliationTasks[botID] = task
+        return true
+    }
+
+    private func steer(text: String, botID: String, sessionID: String, chat: ChatState) {
+        chat.messages.append(ChatMessage(author: .user, time: AppModel.clock(), text: text))
+        deliverSteer(text: text, botID: botID, sessionID: sessionID,
+                     optimisticID: chat.messages.last?.id)
+    }
+
+    private func deliverSteer(text: String, botID: String, sessionID: String,
+                              optimisticID: UUID? = nil) {
+        guard !mutationIsFenced(botID: botID),
+              let route = gatewayRoute(for: botID) else { return }
+        let submission = beginQueuedSubmission(botID: botID, sessionID: sessionID)
+        let chat = chat(for: botID)
+        let baselineMessages = optimisticID.map { optimisticID in
+            chat.messages.filter { $0.id != optimisticID }
+        } ?? chat.messages
+        let baselineDurableRowIDs = Set(baselineMessages.compactMap(\.rowID))
+        let baselineDurableUserTexts: Set<String> = Set(baselineMessages.compactMap { message -> String? in
+            // A pre-operation optimistic row has no durable id yet, but its
+            // body can still be the old in-flight turn. Keep all prior user
+            // bodies here; the durable-id proof remains separately strict.
+            guard message.author == .user else { return nil }
+            return message.text
+        })
+        let lease = SteerMutationLease(
+            id: UUID(), botID: botID, route: route, sessionID: sessionID,
+            storedID: chat.storedSessionID, chatID: ObjectIdentifier(chat),
+            optimisticID: optimisticID ?? chat.messages.last?.id ?? UUID(), text: text,
+            generation: LiveRuntime.shared.generation,
+            baselineDurableRowIDs: baselineDurableRowIDs,
+            baselineDurableRowCount: baselineDurableRowIDs.count,
+            baselineDurableUserTexts: baselineDurableUserTexts)
+        ChatRuntime.shared.steerActions[botID] = lease
+        Task { @MainActor in
+            var lease = lease
+            guard let client = try? await routedClient(for: route) else {
+                discardQueuedSubmission(submission)
+                finishSteerMutation(lease)
                 return
             }
             do {
-                let receipt = try await client.submitPrompt(sessionID: sessionID, text: text,
-                                                            queued: true)
-                if PromptSubmitReceipt.isAuthoritativelyQueued(receipt) {
+                lease.stage = .steer
+                lease.requestStarted = true
+                updateSteerMutation(lease)
+                let wireSessionID = ChatRuntime.shared.steerActions[botID]?.id == lease.id
+                    ? ChatRuntime.shared.steerActions[botID]?.sessionID ?? sessionID
+                    : sessionID
+                let steered = try await client.steerTurn(sessionID: wireSessionID, text: text)
+                switch steered {
+                case "queued":
                     acceptQueuedSubmission(submission, text: text)
-                } else {
-                    discardQueuedSubmission(submission)
+                    finishSteerMutation(lease)
+                    return
+                case "rejected":
+                    // A wire-level rejection is definitive. It is the only
+                    // answer that permits trying the next operation.
+                    break
+                default:
+                    throw AckValidationError(
+                        operation: "session.steer",
+                        detail: "Hermes did not return an authoritative steer status.")
                 }
+
+                // Too late to steer: re-aim the turn, and failing that queue
+                // the text behind it rather than interrupting what is running.
+                lease.stage = .redirect
+                lease.requestStarted = true
+                updateSteerMutation(lease)
+                let redirectSessionID = ChatRuntime.shared.steerActions[botID]?.id == lease.id
+                    ? ChatRuntime.shared.steerActions[botID]?.sessionID ?? sessionID
+                    : sessionID
+                let redirected = try await client.redirectTurn(
+                    sessionID: redirectSessionID, text: text)
+                switch redirected {
+                case "redirected":
+                    discardQueuedSubmission(submission)
+                    finishSteerMutation(lease)
+                    return
+                case "queued":
+                    acceptQueuedSubmission(submission, text: text)
+                    finishSteerMutation(lease)
+                    return
+                case "rejected":
+                    // A definitive redirect rejection permits the queued
+                    // submit fallback below; no ambiguous answer was seen.
+                    break
+                default:
+                    throw AckValidationError(
+                        operation: "session.redirect",
+                        detail: "Hermes did not return an authoritative redirect status.")
+                }
+
+                lease.stage = .queuedSubmit
+                lease.requestStarted = true
+                updateSteerMutation(lease)
+                let queuedSessionID = ChatRuntime.shared.steerActions[botID]?.id == lease.id
+                    ? ChatRuntime.shared.steerActions[botID]?.sessionID ?? sessionID
+                    : sessionID
+                let receipt = try await client.submitPrompt(
+                    sessionID: queuedSessionID, text: text, queued: true)
+                try PromptSubmitReceipt.requireQueued(receipt,
+                                                      operation: "Queued steer")
+                acceptQueuedSubmission(submission, text: text)
+                finishSteerMutation(lease)
             } catch {
                 discardQueuedSubmission(submission)
-                // No accepted `queued` receipt means there is nothing honest to
-                // mirror locally. The optimistic transcript row remains visible.
+                await handleSteerFailure(lease, error: error, client: client)
             }
+        }
+    }
+
+    private func updateSteerMutation(_ lease: SteerMutationLease) {
+        guard let active = ChatRuntime.shared.steerActions[lease.botID],
+              active.id == lease.id else { return }
+        var updated = lease
+        // Keep the current durable binding if adopt migrated it while this
+        // task was suspended at a client/transport await.
+        updated.route = active.route
+        updated.sessionID = active.sessionID
+        updated.storedID = active.storedID
+        updated.chatID = active.chatID
+        updated.generation = active.generation
+        ChatRuntime.shared.steerActions[lease.botID] = updated
+    }
+
+    private func releaseSteerMutation(_ lease: SteerMutationLease) {
+        if ChatRuntime.shared.steerActions[lease.botID]?.id == lease.id {
+            ChatRuntime.shared.steerActions[lease.botID] = nil
+        }
+        drainPendingMutationWork(botID: lease.botID)
+    }
+
+    private func finishSteerMutation(_ lease: SteerMutationLease) {
+        releaseSteerMutation(lease)
+        if ChatRuntime.shared.steerFences[lease.botID]?.operationID == lease.id {
+            ChatRuntime.shared.steerFences[lease.botID] = nil
+        }
+        drainPendingMutationWork(botID: lease.botID)
+    }
+
+    private func fenceSteerMutationIfOwned(_ lease: SteerMutationLease) {
+        let runtime = ChatRuntime.shared
+        guard let active = runtime.steerActions[lease.botID], active.id == lease.id,
+              let chat = chats[lease.botID], ObjectIdentifier(chat) == active.chatID,
+              bindingSessionID(for: lease.botID) == active.sessionID,
+              chat.storedSessionID == active.storedID,
+              bindingRouteMatches(active.route, botID: lease.botID) else { return }
+        runtime.steerFences[lease.botID] = SteerMutationFence(
+            operationID: active.id, botID: active.botID, route: active.route,
+            sessionID: active.sessionID, storedID: active.storedID,
+            chatID: active.chatID, optimisticID: active.optimisticID,
+            text: active.text, stage: active.stage, generation: active.generation,
+            baselineDurableRowIDs: active.baselineDurableRowIDs,
+            baselineDurableRowCount: active.baselineDurableRowCount,
+            baselineDurableUserTexts: active.baselineDurableUserTexts)
+    }
+
+    private func handleSteerFailure(_ lease: SteerMutationLease, error: Error,
+                                    client: GatewayClient) async {
+        let ambiguous = lease.requestStarted && PromptMutationFailure.isAmbiguous(error)
+        guard ChatRuntime.shared.steerActions[lease.botID]?.id == lease.id else {
+            if ambiguous { fenceSteerMutationIfOwned(lease) }
+            return
+        }
+        guard ambiguous else {
+            releaseSteerMutation(lease)
+            if let chat = chats[lease.botID], ObjectIdentifier(chat) == lease.chatID {
+                let detail = (error as? GatewayError)?.message ?? error.localizedDescription
+                chat.messages.append(ChatMessage(author: .system, text: detail))
+            }
+            return
+        }
+
+        fenceSteerMutationIfOwned(lease)
+        releaseSteerMutation(lease)
+        guard let fence = ChatRuntime.shared.steerFences[lease.botID],
+              fence.operationID == lease.id else { return }
+        await reconcileSteerMutationViaGateway(fence, client: client)
+    }
+
+    /// Production wiring for both the first ambiguous response and every
+    /// later reconnect/adoption/tap retry. The closures only resume and read;
+    /// no mutation verb is attempted from reconciliation.
+    private func reconcileSteerMutationViaGateway(
+        _ fence: SteerMutationFence, client: GatewayClient
+    ) async {
+        guard !ChatRuntime.shared.reconcilingBots.contains(fence.botID) else {
+            ChatRuntime.shared.deferredReconciliationBots.insert(fence.botID)
+            return
+        }
+        ChatRuntime.shared.reconcilingBots.insert(fence.botID)
+        defer {
+            ChatRuntime.shared.reconcilingBots.remove(fence.botID)
+            drainPendingMutationWork(botID: fence.botID)
+        }
+        let generation = LiveRuntime.shared.generation
+        await reconcileSteerMutation(
+            fence,
+            resume: {
+                let target = fence.storedID ?? fence.sessionID
+                return try await client.resumeSession(target, profile: fence.route.profile,
+                                                      deferHistory: false)
+            },
+            hydrate: { [weak self] live in
+                guard let self else { return }
+                let chat = self.chat(for: fence.botID)
+                let baseline = chat.messages
+                self.adopt(live, storedID: live.storedSessionID.isEmpty
+                           ? fence.storedID : live.storedSessionID,
+                           botID: fence.botID, sourceGatewayID: fence.route.gatewayID)
+                self.replayInflight(live, botID: fence.botID)
+                var history = AppModel.chatMessages(fromTranscript: .array(live.messages))
+                if history.isEmpty, let stored = fence.storedID, !stored.isEmpty {
+                    let payload = try await client.latestSessionMessages(
+                        storedID: stored, profile: fence.route.profile)
+                    history = AppModel.chatMessages(fromTranscript: payload)
+                }
+                guard LiveRuntime.shared.generation >= generation,
+                      self.bindingRouteMatches(fence.route, botID: fence.botID) else {
+                    throw CancellationError()
+                }
+                chat.messages = TranscriptHydrationMerge.merge(
+                    history: history, baseline: baseline,
+                    current: chat.messages, clearWhenEmpty: false)
+            },
+            accepts: { [weak self] in
+                guard let self,
+                      LiveRuntime.shared.generation >= generation,
+                      self.bindingRouteMatches(fence.route, botID: fence.botID),
+                      let chat = self.chats[fence.botID],
+                      ObjectIdentifier(chat) == fence.chatID,
+                      (fence.storedID == nil || chat.storedSessionID == fence.storedID)
+                else { return false }
+                return true
+            })
+    }
+
+    /// Read-only reconciliation for an ambiguous steer/redirect/queued-submit
+    /// response. No subsequent mutation is attempted from this path.
+    func reconcileSteerMutation(
+        _ fence: SteerMutationFence,
+        resume: @MainActor () async throws -> LiveSession,
+        hydrate: @MainActor (LiveSession) async throws -> Void,
+        accepts: @MainActor () -> Bool
+    ) async {
+        let runtime = ChatRuntime.shared
+        guard runtime.steerFences[fence.botID]?.operationID == fence.operationID else { return }
+        do {
+            let live = try await resume()
+            let sameDurableSession: Bool
+            if let storedID = fence.storedID, !storedID.isEmpty {
+                sameDurableSession = live.storedSessionID == storedID
+            } else {
+                sameDurableSession = false
+            }
+            guard runtime.steerFences[fence.botID]?.operationID == fence.operationID,
+                  (live.sessionID == fence.sessionID || sameDurableSession),
+                  (fence.storedID == nil || live.storedSessionID == fence.storedID),
+                  (fence.generation < 0 || LiveRuntime.shared.generation >= fence.generation),
+                  accepts() else { return }
+            try await hydrate(live)
+            guard let activeFence = runtime.steerFences[fence.botID],
+                  activeFence.operationID == fence.operationID, accepts() else { return }
+            let durableUserTexts: Set<String> = Set(chats[activeFence.botID]?.messages.compactMap { message -> String? in
+                guard message.author == .user, message.rowID != nil,
+                      message.id != activeFence.optimisticID else { return nil }
+                return message.text
+            } ?? [])
+            let remote = SteerMutationReconciliation.hasRemoteEvidence(
+                live, text: activeFence.text,
+                baselineDurableRowIDs: activeFence.baselineDurableRowIDs,
+                baselineDurableRowCount: activeFence.baselineDurableRowCount,
+                baselineDurableUserTexts: activeFence.baselineDurableUserTexts.union(durableUserTexts))
+            let hydrated = chats[activeFence.botID].map {
+                SteerMutationReconciliation.hasPostOperationDurableRow(
+                    $0.messages, text: activeFence.text,
+                    baselineDurableRowIDs: activeFence.baselineDurableRowIDs,
+                    baselineDurableRowCount: activeFence.baselineDurableRowCount)
+            } == true
+            // A successful read with neither the in-flight marker nor a
+            // durable row is not a reconciliation. Keep the fence: clearing
+            // it would permit a duplicate correction whose first answer was
+            // merely lost.
+            guard remote || hydrated else { return }
+            if runtime.steerFences[fence.botID]?.operationID == fence.operationID {
+                runtime.steerFences[fence.botID] = nil
+            }
+            if runtime.steerActions[fence.botID]?.id == fence.operationID {
+                runtime.steerActions[fence.botID] = nil
+            }
+        } catch {
+            // Uncertainty remains explicit. The fence survives until a later
+            // authoritative resume proves the exact text's fate.
         }
     }
 
@@ -533,7 +1312,8 @@ extension AppModel {
         Task { @MainActor in
             do {
                 let sessionID = try await ensureSession(botID: botID, hydrate: false)
-                deliverSteer(text: text, botID: botID, sessionID: sessionID)
+                deliverSteer(text: text, botID: botID, sessionID: sessionID,
+                             optimisticID: optimistic.id)
             } catch is CancellationError {
                 recoverCancelledAttachIntent(
                     text: text, botID: botID, chat: chat,
@@ -558,7 +1338,8 @@ extension AppModel {
             do {
                 let sessionID = try await ensureSession(botID: botID, hydrate: false)
                 if chat.isRunning || chat.isTyping {
-                    deliverSteer(text: text, botID: botID, sessionID: sessionID)
+                    deliverSteer(text: text, botID: botID, sessionID: sessionID,
+                                 optimisticID: optimistic.id)
                 } else {
                     ChatRuntime.shared.turnFloor[botID] = chat.messages.count
                     chat.isRunning = routeAvailable
@@ -603,7 +1384,8 @@ extension AppModel {
            let route = gatewayRoute(for: botID),
            self.botID(forSession: sessionID, sourceGatewayID: route.gatewayID) == botID {
             if steering || chat.isRunning || chat.isTyping {
-                deliverSteer(text: text, botID: botID, sessionID: sessionID)
+                deliverSteer(text: text, botID: botID, sessionID: sessionID,
+                             optimisticID: optimisticID)
             } else {
                 ChatRuntime.shared.turnFloor[botID] = chat.messages.count
                 chat.isRunning = routeAvailable
@@ -720,8 +1502,13 @@ extension AppModel {
         runtime.transcriptActionGenerations[botID] = lease.generation
         Task { @MainActor in
             let route = GatewayBotRoute(gatewayID: lease.gatewayID, profile: lease.profile)
+            var submitStarted = false
             do {
                 let client = try await routedClient(for: route)
+                // From this line onward a lost answer may represent an
+                // accepted destructive mutation. Before it, no mutation was
+                // sent and no durable fence is justified.
+                submitStarted = true
                 let result = try await client.submitPrompt(sessionID: sid, text: plan.text,
                                                            truncate: plan.truncate)
                 try PromptSubmitReceipt.requireAccepted(result, operation: "Transcript action")
@@ -738,7 +1525,7 @@ extension AppModel {
                 releaseTranscriptAction(lease)
                 startWatchdog(botID)
             } catch {
-                let ambiguous = PromptMutationFailure.isAmbiguous(error)
+                let ambiguous = submitStarted && PromptMutationFailure.isAmbiguous(error)
                 guard ownsTranscriptAction(lease) else {
                     if ambiguous { fenceTranscriptActionIfDurableTargetStillOwned(lease) }
                     releaseTranscriptAction(lease)
@@ -762,9 +1549,13 @@ extension AppModel {
 
     private func ownsTranscriptAction(_ lease: TranscriptActionLease) -> Bool {
         guard ChatRuntime.shared.transcriptActions[lease.botID] == lease.id,
-              LiveRuntime.shared.generation == lease.generation,
               let chat = chats[lease.botID], ObjectIdentifier(chat) == lease.chatID else { return false }
-        return chat.sessionID == lease.sessionID && chat.storedSessionID == lease.storedID
+        let sameDurableBinding = chat.storedSessionID == lease.storedID
+        let generationOwned = LiveRuntime.shared.generation == lease.generation
+            || (sameDurableBinding
+                && ChatRuntime.shared.transcriptActionGenerations[lease.botID]
+                    == LiveRuntime.shared.generation)
+        return generationOwned && (chat.sessionID == lease.sessionID || sameDurableBinding)
     }
 
     func fenceTranscriptActionIfDurableTargetStillOwned(_ lease: TranscriptActionLease) {
@@ -773,9 +1564,9 @@ extension AppModel {
               let route = gatewayRoute(for: lease.botID),
               route.gatewayID == lease.gatewayID, route.profile == lease.profile else { return }
         ChatRuntime.shared.transcriptFences[lease.botID] = TranscriptActionFence(
-            operationID: lease.id, sessionID: lease.sessionID, storedID: lease.storedID,
+            operationID: lease.id, sessionID: chat.sessionID ?? lease.sessionID, storedID: lease.storedID,
             gatewayID: lease.gatewayID, profile: lease.profile,
-            generation: lease.generation)
+            generation: LiveRuntime.shared.generation)
     }
 
     private func releaseTranscriptAction(_ lease: TranscriptActionLease) {
@@ -796,16 +1587,7 @@ extension AppModel {
         }
         guard let route = gatewayRoute(for: lease.botID),
               let client = try? await routedClient(for: route) else {
-            if !ambiguous, let chat = chats[lease.botID], ownsTranscriptBinding(lease) {
-                let newer = TranscriptActionReconciliation.newerRows(
-                    current: chat.messages, baseline: lease.baseline,
-                    optimisticID: lease.optimisticID)
-                chat.messages = TranscriptHydrationMerge.merge(
-                    history: lease.baseline, baseline: [], current: newer,
-                    clearWhenEmpty: true)
-                chat.isRunning = false
-                chat.isTyping = false
-            }
+            if !ambiguous { restoreDefiniteTranscriptFailure(lease) }
             releaseTranscriptAction(lease)
             return
         }
@@ -846,20 +1628,33 @@ extension AppModel {
             }
         } catch {
             releaseTranscriptAction(lease)
+            // A definite refusal is proof that the destructive operation did
+            // not cross its acceptance boundary. Even if the read-back also
+            // fails, restore only the optimistic projection and release the
+            // action; fencing this path would strand edit/rewind forever.
             if !ambiguous {
-                ChatRuntime.shared.transcriptFences[lease.botID] = TranscriptActionFence(
-                    operationID: lease.id, sessionID: lease.sessionID,
-                    storedID: lease.storedID, gatewayID: route.gatewayID,
-                    profile: route.profile, generation: lease.generation)
+                restoreDefiniteTranscriptFailure(lease)
             }
-            if ownsTranscriptBinding(lease) { chat(for: lease.botID).isRunning = false }
         }
     }
 
+    private func restoreDefiniteTranscriptFailure(_ lease: TranscriptActionLease) {
+        guard ownsTranscriptBinding(lease), let chat = chats[lease.botID] else { return }
+        let newer = TranscriptActionReconciliation.newerRows(
+            current: chat.messages, baseline: lease.baseline,
+            optimisticID: lease.optimisticID)
+        chat.messages = TranscriptHydrationMerge.merge(
+            history: lease.baseline, baseline: [], current: newer,
+            clearWhenEmpty: true)
+        chat.isRunning = false
+        chat.isTyping = false
+    }
+
     private func ownsTranscriptBinding(_ lease: TranscriptActionLease) -> Bool {
-        guard LiveRuntime.shared.generation == lease.generation,
-              let chat = chats[lease.botID], ObjectIdentifier(chat) == lease.chatID else { return false }
-        return chat.sessionID == lease.sessionID && chat.storedSessionID == lease.storedID
+        guard let chat = chats[lease.botID], ObjectIdentifier(chat) == lease.chatID else { return false }
+        let sameDurableBinding = chat.storedSessionID == lease.storedID
+        return (LiveRuntime.shared.generation == lease.generation || sameDurableBinding)
+            && (chat.sessionID == lease.sessionID || sameDurableBinding)
     }
 
 
@@ -1042,6 +1837,66 @@ extension AppModel {
     }
     // MARK: - Stop (session.interrupt)
 
+    /// Stop is itself a mutation. If steer/redirect or another authoritative
+    /// read currently owns the bot, retain the user's stop intent and drain it
+    /// only after that owner settles; sending interrupt concurrently would
+    /// create two unresolved fences with no safe ordering.
+    func deferStopUntilMutationSettles(botID: String, wasRunning: Bool) -> Bool {
+        guard mode == .live else { return false }
+        let runtime = ChatRuntime.shared
+        if runtime.stopActions[botID] != nil || runtime.stopFences[botID] != nil {
+            scheduleRetainedMutationReconciliation(botID: botID)
+            return true
+        }
+        let blocked = runtime.steerActions[botID] != nil
+            || runtime.steerFences[botID] != nil
+            || runtime.transcriptActions[botID] != nil
+            || runtime.transcriptFences[botID] != nil
+            || runtime.reconcilingBots.contains(botID)
+            || runtime.reconciliationTasks[botID] != nil
+            || CanonicalChatRuntime.shared.ambiguousKickoffs[botID] != nil
+        guard blocked else { return false }
+        if wasRunning,
+           let pending = pendingStopRequest(botID: botID) {
+            runtime.pendingStopRequests[botID] = pending
+        }
+        scheduleRetainedMutationReconciliation(botID: botID)
+        return true
+    }
+
+    /// Resolve the binding route. Prefer the mutation owner because a reconnect
+    /// can temporarily make the visible route nil.
+    private func pendingStopRoute(botID: String) -> GatewayBotRoute? {
+        let runtime = ChatRuntime.shared
+        return runtime.steerActions[botID]?.route
+            ?? runtime.steerFences[botID]?.route
+            ?? runtime.stopActions[botID]?.route
+            ?? runtime.stopFences[botID]?.route
+            ?? runtime.transcriptFences[botID].map {
+                GatewayBotRoute(gatewayID: $0.gatewayID, profile: $0.profile)
+            }
+            ?? gatewayRoute(for: botID)
+            ?? stateRoute(for: botID)
+    }
+
+    /// Capture the owner route/session at the tap. Prefer the mutation owner
+    /// because a reconnect can temporarily make the visible route nil.
+    private func pendingStopRequest(botID: String) -> PendingStopRequest? {
+        let runtime = ChatRuntime.shared
+        let chat = chat(for: botID)
+        guard let route = pendingStopRoute(botID: botID) else { return nil }
+        let sessionID = bindingSessionID(for: botID)
+            ?? runtime.steerActions[botID]?.sessionID
+            ?? runtime.steerFences[botID]?.sessionID
+            ?? runtime.stopActions[botID]?.sessionID
+            ?? runtime.stopFences[botID]?.sessionID
+            ?? runtime.transcriptFences[botID]?.sessionID
+        return PendingStopRequest(
+            botID: botID, route: route, storedID: chat.storedSessionID,
+            sessionID: sessionID, chatID: ObjectIdentifier(chat),
+            generation: LiveRuntime.shared.generation)
+    }
+
     /// Halt the running turn. The gateway also cancels queued prompts, releases
     /// blocking clarify/sudo/secret prompts and denies every pending approval
     /// for the session (ws-protocol §6.2) — so the local approval cards for
@@ -1049,72 +1904,279 @@ extension AppModel {
     public func stopTurn(botID: String) {
         let chat = chat(for: botID)
         let wasRunning = chat.isRunning || chat.isTyping
-        chat.isRunning = false
-        chat.isTyping = false
-        clearWatchdog(botID)
-        finishRunningTools(in: chat, interrupted: true)
         ChatRuntime.shared.demoTurns[botID]?.cancel()
         ChatRuntime.shared.demoTurns[botID] = nil
+
+        // A retained uncertain stop is retried through authoritative resume,
+        // never by issuing a second interrupt. A stop tapped during another
+        // mutation is retained and drained after that mutation's outcome.
+        if deferStopUntilMutationSettles(botID: botID, wasRunning: wasRunning) {
+            return
+        }
 
         guard wasRunning else { return }
         let note = theme.copy.stopNote(theme.themeID)
 
-        guard mode == .live, let sessionID = chat.sessionID,
-              let route = gatewayRoute(for: botID) else {
+        // Demo work is wholly local, so cancellation is an authoritative stop.
+        // Live work stays visibly running until session.interrupt is accepted.
+        guard mode == .live else {
+            chat.isRunning = false
+            chat.isTyping = false
+            clearWatchdog(botID)
+            finishRunningTools(in: chat, interrupted: true)
             chat.messages.append(ChatMessage(author: .system, text: note))
+            return
+        }
+
+        guard ChatRuntime.shared.stopActions[botID] == nil,
+              ChatRuntime.shared.stopFences[botID] == nil else {
+            scheduleRetainedMutationReconciliation(botID: botID)
+            return
+        }
+
+        guard let sessionID = chat.sessionID,
+              let route = gatewayRoute(for: botID) else {
+            // There is no addressable interrupt. Keep a local fence anyway:
+            // claiming idle here would permit a new submit against unknown
+            // work after a reconnect. `adopt` retires this sentinel only
+            // after an authoritative reattach names the same durable chat.
+            let sentinelRoute = GatewayBotRoute(
+                gatewayID: "__unaddressable__", profile: botID)
+            ChatRuntime.shared.stopFences[botID] = StopTurnFence(
+                operationID: UUID(), botID: botID, route: sentinelRoute,
+                sessionID: "", storedID: chat.storedSessionID,
+                chatID: ObjectIdentifier(chat),
+                generation: LiveRuntime.shared.generation,
+                unaddressable: true)
+            chat.isRunning = true
+            chat.isTyping = true
+            chat.messages.append(ChatMessage(
+                author: .system,
+                text: "Unable to stop this turn while the gateway is unavailable."))
             return
         }
         let lease = StopTurnLease(
             botID: botID, route: route, sessionID: sessionID,
-            storedID: chat.storedSessionID, chatID: ObjectIdentifier(chat))
+            storedID: chat.storedSessionID, chatID: ObjectIdentifier(chat),
+            generation: LiveRuntime.shared.generation)
+        ChatRuntime.shared.stopActions[botID] = lease
         Task { @MainActor in
+            var attempt = lease
             do {
-                let client = try await routedClient(for: lease.route)
-                try await client.interruptSession(sessionID)
-                applyStopCompletion(lease, note: note)
+                let client = try await routedClient(for: attempt.route)
+                guard let active = ChatRuntime.shared.stopActions[botID],
+                      active.id == attempt.id else { return }
+                attempt.route = active.route
+                attempt.sessionID = active.sessionID
+                attempt.storedID = active.storedID
+                attempt.chatID = active.chatID
+                attempt.generation = active.generation
+                attempt.requestStarted = true
+                ChatRuntime.shared.stopActions[botID] = attempt
+                try await client.interruptSession(attempt.sessionID)
+                applyStopCompletion(attempt, note: note)
             } catch {
-                guard stopCompletionIsOwned(lease) else { return }
-                let detail = (error as? GatewayError)?.message ?? error.localizedDescription
-                chat.messages.append(ChatMessage(author: .system, text: detail))
+                let ambiguous = attempt.requestStarted && PromptMutationFailure.isAmbiguous(error)
+                if ambiguous {
+                    fenceStopTurnIfOwned(attempt)
+                    releaseStopTurn(attempt)
+                    guard let fence = ChatRuntime.shared.stopFences[botID],
+                          fence.operationID == attempt.id,
+                          let reconcileClient = try? await self.routedClient(for: fence.route)
+                    else { return }
+                    await reconcileStopTurnViaGateway(
+                        fence, note: note, client: reconcileClient)
+                } else {
+                    releaseStopTurn(attempt)
+                    guard self.stopCompletionIsOwned(attempt) else { return }
+                    // A definitive interrupt failure is not evidence that the
+                    // turn ended. Restore the running affordance before
+                    // releasing the operation so a new call cannot take the
+                    // submit path against still-live work.
+                    chat.isRunning = true
+                    chat.isTyping = true
+                    let detail = (error as? GatewayError)?.message ?? error.localizedDescription
+                    // The interrupt did not have an ambiguous acceptance
+                    // boundary. The turn is still running and may be retried.
+                    chat.messages.append(ChatMessage(author: .system, text: detail))
+                }
             }
         }
     }
 
+    private func releaseStopTurn(_ lease: StopTurnLease) {
+        if ChatRuntime.shared.stopActions[lease.botID]?.id == lease.id {
+            ChatRuntime.shared.stopActions[lease.botID] = nil
+        }
+    }
+
+    private func fenceStopTurnIfOwned(_ lease: StopTurnLease) {
+        guard let active = ChatRuntime.shared.stopActions[lease.botID], active.id == lease.id,
+              stopCompletionIsOwned(active) else { return }
+        ChatRuntime.shared.stopFences[lease.botID] = StopTurnFence(
+            operationID: active.id, botID: active.botID, route: active.route,
+            sessionID: active.sessionID, storedID: active.storedID,
+            chatID: active.chatID, generation: active.generation)
+    }
+
+    private func reconcileStopTurnViaGateway(
+        _ fence: StopTurnFence, note: String, client: GatewayClient
+    ) async {
+        guard !ChatRuntime.shared.reconcilingBots.contains(fence.botID) else {
+            ChatRuntime.shared.deferredReconciliationBots.insert(fence.botID)
+            return
+        }
+        ChatRuntime.shared.reconcilingBots.insert(fence.botID)
+        defer {
+            ChatRuntime.shared.reconcilingBots.remove(fence.botID)
+            drainPendingMutationWork(botID: fence.botID)
+        }
+        await reconcileStopTurn(
+            fence, note: note,
+            resume: {
+                let target = fence.storedID ?? fence.sessionID
+                return try await client.resumeSession(
+                    target, profile: fence.route.profile, deferHistory: false)
+            },
+            accepts: {
+                self.stopFenceStillAddresses(fence)
+            })
+    }
+
+    private func stopFenceStillAddresses(_ fence: StopTurnFence) -> Bool {
+        guard !fence.unaddressable,
+              let current = ChatRuntime.shared.stopFences[fence.botID],
+              current.operationID == fence.operationID,
+              let chat = chats[fence.botID], ObjectIdentifier(chat) == current.chatID,
+              bindingSessionID(for: fence.botID) == current.sessionID,
+              (current.storedID == nil || chat.storedSessionID == current.storedID),
+              (current.generation < 0 || LiveRuntime.shared.generation >= current.generation),
+              bindingRouteMatches(current.route, botID: fence.botID) else { return false }
+        return true
+    }
+
+    /// Reconcile an interrupt whose response was lost. Only a resumed idle
+    /// session with no in-flight turn proves the stop; every other projection
+    /// keeps the fence and truthful running state until a later read.
+    func reconcileStopTurn(
+        _ fence: StopTurnFence,
+        note: String,
+        resume: @MainActor () async throws -> LiveSession,
+        accepts: @MainActor () -> Bool
+    ) async {
+        guard ChatRuntime.shared.stopFences[fence.botID]?.operationID == fence.operationID else { return }
+        do {
+            let live = try await resume()
+            let sameDurableSession: Bool
+            if let storedID = fence.storedID, !storedID.isEmpty {
+                sameDurableSession = live.storedSessionID == storedID
+            } else {
+                sameDurableSession = false
+            }
+            guard ChatRuntime.shared.stopFences[fence.botID]?.operationID == fence.operationID,
+                  (live.sessionID == fence.sessionID || sameDurableSession),
+                  (fence.storedID == nil || live.storedSessionID == fence.storedID),
+                  (fence.generation < 0 || LiveRuntime.shared.generation >= fence.generation),
+                  accepts() else { return }
+            // A running projection, or a partial in-flight turn despite
+            // `running: false`, is not an idle proof. Keep the fence and the
+            // visible running state until both signals agree on idle; only
+            // `!running && inflight == nil` may settle the interrupt.
+            guard !live.running, !live.hasInflightTurn else {
+                if let chat = chats[fence.botID], ObjectIdentifier(chat) == fence.chatID {
+                    chat.isRunning = true
+                    chat.isTyping = true
+                }
+                return
+            }
+            guard let activeFence = ChatRuntime.shared.stopFences[fence.botID],
+                  activeFence.operationID == fence.operationID else { return }
+            let lease = StopTurnLease(
+                botID: fence.botID, route: activeFence.route,
+                sessionID: live.sessionID,
+                storedID: live.storedSessionID.isEmpty ? activeFence.storedID : live.storedSessionID,
+                chatID: activeFence.chatID, id: activeFence.operationID,
+                requestStarted: true, generation: activeFence.generation)
+            let ownedBeforeCleanup = stopCompletionIsOwned(lease)
+            applyStopCompletion(lease, note: note)
+            // The authoritative resume/acceptance closure is allowed to be
+            // the only live binding proof during the short reconnect window
+            // where `gatewayRoute` is not published yet. The exact fence/chat
+            // identity still protects against a replacement session; once the
+            // projection is !running with no real inflight turn, settle the UI
+            // even if the generic receipt cleanup could not resolve a route.
+            if !ownedBeforeCleanup,
+               let chat = chats[fence.botID], ObjectIdentifier(chat) == fence.chatID,
+               (chat.sessionID == live.sessionID || sameDurableSession),
+               (fence.storedID == nil || chat.storedSessionID == fence.storedID) {
+                clearWatchdog(fence.botID)
+                chat.isRunning = false
+                chat.isTyping = false
+                finishRunningTools(in: chat, interrupted: true)
+                chat.messages.append(ChatMessage(author: .system, text: note))
+            }
+        } catch {
+            // Keep the stop fence and truthful running state until a later
+            // authoritative read settles the exact session.
+        }
+    }
+
     func stopCompletionIsOwned(_ lease: StopTurnLease) -> Bool {
-        guard let chat = chats[lease.botID], ObjectIdentifier(chat) == lease.chatID,
-              chat.sessionID == lease.sessionID,
-              chat.storedSessionID == lease.storedID,
-              let route = gatewayRoute(for: lease.botID) else { return false }
-        return route == lease.route
+        let active = ChatRuntime.shared.stopActions[lease.botID].flatMap {
+            $0.id == lease.id ? $0 : nil
+        }
+        let target = active ?? lease
+        guard let chat = chats[target.botID], ObjectIdentifier(chat) == target.chatID,
+              bindingSessionID(for: target.botID) == target.sessionID,
+              chat.storedSessionID == target.storedID,
+              (target.generation < 0 || LiveRuntime.shared.generation == target.generation),
+              bindingRouteMatches(target.route, botID: target.botID) else { return false }
+        return true
     }
 
     func applyStopCompletion(_ lease: StopTurnLease, note: String) {
-        let session = GatewaySessionRoute(gatewayID: lease.route.gatewayID,
-                                          sessionID: lease.sessionID)
+        // A reconnect may have migrated the side-table action to a fresh
+        // runtime sid before this old task received its receipt. Cleanup the
+        // durable operation's current address, while still matching by id so
+        // a replacement operation cannot be touched by the late response.
+        let cleanupLease = ChatRuntime.shared.stopActions[lease.botID].flatMap {
+            $0.id == lease.id ? $0 : nil
+        } ?? lease
+        let owned = stopCompletionIsOwned(cleanupLease)
+        let session = GatewaySessionRoute(gatewayID: cleanupLease.route.gatewayID,
+                                          sessionID: cleanupLease.sessionID)
         let stale = LiveRuntime.shared.approvalTargets.compactMap { key, target in
-            target.session == session && target.bot == lease.route
-                && target.botID == lease.botID
-                && target.storedID == lease.storedID ? key : nil
+            target.session == session && target.bot == cleanupLease.route
+                && target.botID == cleanupLease.botID
+                && target.storedID == cleanupLease.storedID ? key : nil
         }
         for id in stale { LiveRuntime.shared.approvalTargets[id] = nil }
         for id in stale { ApprovalBridges.shared.details[id] = nil }
         approvals.removeAll { stale.contains($0.id) }
         ApprovalBridges.shared.prompts.removeAll {
             $0.gatewayID == session.gatewayID
-                && $0.profile == lease.route.profile
-                && $0.botID == lease.botID
-                && $0.storedID == lease.storedID
+            && $0.profile == cleanupLease.route.profile
+                && $0.botID == cleanupLease.botID
+                && $0.storedID == cleanupLease.storedID
                 && $0.sessionID == session.sessionID
         }
         removeQueuedPrompts(QueuedPromptSession(
-            botID: lease.botID, sessionID: lease.sessionID,
-            storedID: lease.storedID, route: lease.route))
-        recomputeApprovalStatus(for: lease.botID)
+            botID: cleanupLease.botID, sessionID: cleanupLease.sessionID,
+            storedID: cleanupLease.storedID, route: cleanupLease.route))
+        recomputeApprovalStatus(for: cleanupLease.botID)
         // The interrupt receipt proves A was stopped even when the visible
         // chat rebound to B while the RPC was in flight. Cleanup above follows
         // the captured gateway/session; only the transcript note follows the
         // still-visible ChatState binding.
-        guard stopCompletionIsOwned(lease), let chat = chats[lease.botID] else { return }
+        releaseStopTurn(cleanupLease)
+        if ChatRuntime.shared.stopFences[cleanupLease.botID]?.operationID == cleanupLease.id {
+            ChatRuntime.shared.stopFences[cleanupLease.botID] = nil
+        }
+        guard owned, let chat = chats[cleanupLease.botID] else { return }
+        clearWatchdog(cleanupLease.botID)
+        chat.isRunning = false
+        chat.isTyping = false
+        finishRunningTools(in: chat, interrupted: true)
         chat.messages.append(ChatMessage(author: .system, text: note))
     }
 

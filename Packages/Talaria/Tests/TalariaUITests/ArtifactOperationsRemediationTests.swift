@@ -264,6 +264,90 @@ final class ArtifactOperationsRemediationTests: XCTestCase {
     }
 
     @MainActor
+    func testCancelledArtifactWaiterCannotDeleteMediaOwnedBySecondWaiter() async throws {
+        let store = ArtifactStore.shared
+        store.flush()
+        defer { store.flush() }
+
+        let folder = FileManager.default.temporaryDirectory
+            .appending(path: "talaria-media-two-waiters-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appending(path: "clip.mp4")
+        try Data("shared media".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let source = ArtifactProvenance(gatewayID: "gateway", profile: "worker",
+                                        sessionID: "session", value: "/managed/clip.mp4")
+        let body = ArtifactBody.media(file)
+        let task = Task<ArtifactBody, Never> { body }
+        let first = store.acquire(for: source) { task }
+        let second = store.acquire(for: source) { task }
+
+        store.release(first, cancelIfLast: true)
+        store.discard(body, lease: first)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path),
+                      "a cancelled waiter cannot delete a file still owned by a sibling")
+
+        XCTAssertTrue(store.finish(body, lease: second, for: source))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path),
+                      "the cache owner keeps shared media alive after publication")
+        _ = await task.value
+    }
+
+    @MainActor
+    func testMediaSweepDeletesOrphansButPreservesOldCachedAndInflightMedia() async throws {
+        let store = ArtifactStore.shared
+        store.flush()
+        defer { store.flush() }
+        let manager = FileManager.default
+        let old = Date().addingTimeInterval(-7_200)
+
+        func makeOldMediaFolder(_ label: String) throws -> (folder: URL, file: URL) {
+            let folder = manager.temporaryDirectory
+                .appending(path: "talaria-media-\(label)-\(UUID().uuidString)")
+            try manager.createDirectory(at: folder, withIntermediateDirectories: true)
+            let file = folder.appending(path: "clip.mp4")
+            try Data("media".utf8).write(to: file)
+            try manager.setAttributes([.modificationDate: old], ofItemAtPath: folder.path)
+            return (folder, file)
+        }
+
+        let cached = try makeOldMediaFolder("cached")
+        let cachedSource = ArtifactProvenance(
+            gatewayID: "gateway", profile: "worker", sessionID: "cached-session",
+            value: "/managed/cached.mp4")
+        let cachedBody = ArtifactBody.media(cached.file)
+        let cachedLease = store.acquire(for: cachedSource) { Task { cachedBody } }
+        XCTAssertTrue(store.finish(cachedBody, lease: cachedLease, for: cachedSource))
+
+        let inflight = try makeOldMediaFolder("inflight")
+        let inflightSource = ArtifactProvenance(
+            gatewayID: "gateway", profile: "worker", sessionID: "inflight-session",
+            value: "/managed/inflight.mp4")
+        let inflightBody = ArtifactBody.media(inflight.file)
+        let inflightLease = store.acquire(for: inflightSource) { Task { inflightBody } }
+        store.retainInflightMedia(inflightBody, lease: inflightLease)
+
+        let orphan = try makeOldMediaFolder("orphan")
+        let orphanModified = try XCTUnwrap(
+            manager.attributesOfItem(atPath: orphan.folder.path)[.modificationDate] as? Date)
+        XCTAssertLessThan(orphanModified, Date().addingTimeInterval(-3_600),
+                          "fixture must be older than the media TTL")
+        store.sweepOrphanMediaDownloads()
+
+        XCTAssertTrue(manager.fileExists(atPath: cached.file.path),
+                      "an old media body owned by ArtifactStore must survive TTL cleanup")
+        XCTAssertTrue(manager.fileExists(atPath: inflight.file.path),
+                      "an in-flight media result must survive TTL cleanup")
+        XCTAssertFalse(manager.fileExists(atPath: orphan.folder.path),
+                        "unowned old media folders remain safe to reap")
+
+        store.release(inflightLease, cancelIfLast: true)
+        _ = await inflightLease.task.value
+        store.discard(inflightBody, lease: inflightLease)
+    }
+
+    @MainActor
     func testInlineDataCapAndOwnedShareCleanup() throws {
         let exactBytes = ArtifactStore.maxFetchBytes
         let exactEncoded = String(repeating: "A", count: ((exactBytes + 2) / 3) * 4)
@@ -289,6 +373,173 @@ final class ArtifactOperationsRemediationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: cachedMedia.path),
                       "share cleanup must never delete cached media")
         try FileManager.default.removeItem(at: cachedMedia)
+    }
+
+    @MainActor
+    func testTranscriptHostPathsRequireValidatedManagedRootAndRejectCredentialPaths() {
+        let gateway = "gateway-a"
+        let root = "/srv/hermes-managed"
+        let admitted = AppModel.artifactPathAdmission(
+            "/srv/hermes-managed/renders/output.png", gatewayID: gateway,
+            workspaceGatewayID: gateway, managedRoots: [root])
+        XCTAssertEqual(admitted, .managed(path: "/srv/hermes-managed/renders/output.png",
+                                          root: root))
+
+        XCTAssertEqual(
+            AppModel.artifactPathAdmission("/Users/alice/.hermes/auth.json",
+                                           gatewayID: gateway,
+                                           workspaceGatewayID: gateway,
+                                           managedRoots: [root]),
+            .unproven,
+            "a transcript-mentioned absolute credential path is not a managed-file proof")
+        XCTAssertEqual(
+            AppModel.artifactPathAdmission("/srv/hermes-managed/.ssh/id_ed25519",
+                                           gatewayID: gateway,
+                                           workspaceGatewayID: gateway,
+                                           managedRoots: [root]),
+            .unproven,
+            "sensitive paths remain blocked even when lexically under the managed root")
+        XCTAssertEqual(
+            AppModel.artifactPathAdmission("/srv/hermes-managed/../outside/report.png",
+                                           gatewayID: gateway,
+                                           workspaceGatewayID: gateway,
+                                           managedRoots: [root]),
+            .unproven,
+            "normalization must not widen the managed root")
+        XCTAssertEqual(
+            AppModel.artifactPathAdmission("/srv/hermes-managed/renders/output.png",
+                                           gatewayID: gateway,
+                                           workspaceGatewayID: "gateway-b",
+                                           managedRoots: [root]),
+            .unproven,
+            "a root from another gateway cannot authorize this transcript")
+    }
+
+    @MainActor
+    func testManagedArtifactProofRejectsSymlinkResolvedOutsideLockedRoot() throws {
+        let requested = "/srv/hermes-managed/renders/credential.png"
+        let lexical = AppModel.artifactPathAdmission(
+            requested, gatewayID: "gateway-a", workspaceGatewayID: "gateway-a",
+            managedRoots: ["/srv/hermes-managed"])
+        XCTAssertEqual(lexical, .managed(path: requested, root: "/srv/hermes-managed"))
+
+        // The gateway's locked read route resolves the symlink before returning
+        // `path`. A response that resolves outside the locked root must not be
+        // accepted merely because the requested spelling was lexical-in-root.
+        let response: JSONValue = .object([
+            "name": .string("credential.png"),
+            "path": .string("/Users/hermes/.config/credentials.png"),
+            "root": .string("/srv/hermes-managed"),
+            "locked_root": .string("/srv/hermes-managed"),
+            "mime_type": .string("image/png"),
+            "size": .number(3),
+            "data_url": .string("data:image/png;base64,YWJj"),
+        ])
+        XCTAssertThrowsError(try GatewayREST.authoritativeManagedRead(
+            response, requestedPath: requested),
+        "the artifact reader must not accept a symlink escape")
+        XCTAssertThrowsError(try ManagedFileBody(validatingManaged: response,
+                                                 requestedPath: requested),
+        "the authoritative managed response must reject a symlink escape")
+    }
+
+    @MainActor
+    func testUnprovenTranscriptArtifactFailsClosedBeforeGatewayFetch() async {
+        let workspace = WorkspaceRuntime.shared
+        let priorGateway = workspace.gatewayID
+        let priorRoots = workspace.fileRoots
+        let priorSources = workspace.fileRootSources
+        let feeds = FeedsRuntime.shared
+        let priorSessions = feeds.artifactSessions
+        defer {
+            workspace.gatewayID = priorGateway
+            workspace.fileRoots = priorRoots
+            workspace.fileRootSources = priorSources
+            feeds.artifactSessions = priorSessions
+        }
+
+        workspace.gatewayID = "gateway-a"
+        workspace.fileRoots = ["/srv/hermes-managed"]
+        workspace.fileRootSources = ["/srv/hermes-managed": .managed]
+
+        let artifact = AppModel.artifact(from: "/Users/alice/.hermes/credentials.json",
+                                         botID: "worker", sessionID: "session-1",
+                                         sessionTitle: "render", at: Date())
+        feeds.artifactSessions[artifact.id] = SessionRef(
+            gatewayID: "gateway-a", botID: "worker", storedID: "session-1")
+        let model = AppModel()
+        model.mode = .live
+
+        let body = await model.loadArtifact(artifact)
+        guard case .unavailable(.unproven) = body else {
+            return XCTFail("an unproven transcript host path must not reach any REST file route")
+        }
+    }
+
+    @MainActor
+    func testDataURLBoundHonorsMissingAndFalseDeclaredSizes() {
+        let bytes = Data([0x01, 0x02, 0x03, 0x04])
+        let value = "data:application/octet-stream;base64,\(bytes.base64EncodedString())"
+
+        if case .image(let decoded) = AppModel.boundedArtifactDataURL(value, declaredSize: nil) {
+            XCTAssertEqual(decoded, bytes, "missing size is still bounded by encoded and decoded checks")
+        } else {
+            XCTFail("a small data URL without a size declaration should decode")
+        }
+        if case .image(let decoded) = AppModel.boundedArtifactDataURL(value,
+                                                                       declaredSize: bytes.count) {
+            XCTAssertEqual(decoded, bytes)
+        } else {
+            XCTFail("a truthful declared size should be accepted")
+        }
+        if case .unavailable(.unreadable(_)) = AppModel.boundedArtifactDataURL(value,
+                                                                                declaredSize: bytes.count - 1) {
+            // A false low declaration is rejected after exact decode.
+        } else {
+            XCTFail("a false declared size must not be trusted")
+        }
+        if case .unavailable(.tooLarge) = AppModel.boundedArtifactDataURL(value,
+                                                                           declaredSize: ArtifactStore.maxFetchBytes + 1) {
+            // The server-declared ceiling is checked before decode.
+        } else {
+            XCTFail("a declared size over the mobile ceiling must fail closed")
+        }
+
+        let maximumBase64Characters = ((ArtifactStore.maxFetchBytes + 2) / 3) * 4
+        let oversizedEncoded = String(repeating: "A", count: maximumBase64Characters + 4)
+        let oversized = "data:image/png;base64,\(oversizedEncoded)"
+        XCTAssertNil(AppModel.dataURLDecodedUpperBound(oversized),
+                     "encoded-length preflight must reject oversized payloads")
+        if case .unavailable(.tooLarge) = AppModel.boundedArtifactDataURL(oversized,
+                                                                            declaredSize: nil) {
+            // Missing server size cannot bypass encoded-length preflight.
+        } else {
+            XCTFail("an oversized encoded payload without a size must fail before decode")
+        }
+    }
+
+    func testDeclaredFileSizeRejectsNonFiniteAndOutOfRangeNumbers() {
+        let valid: JSONValue = .object(["size": .number(4)])
+        XCTAssertEqual(try? GatewayREST.validatedDeclaredByteSize(valid), 4)
+        XCTAssertNil(try? GatewayREST.validatedDeclaredByteSize(.object([:])))
+
+        let malformed: [Double] = [
+            1e300,
+            Double.nan,
+            Double.infinity,
+            -Double.infinity,
+            -1,
+            1.5,
+            Double(Int.max),
+        ]
+        for raw in malformed {
+            XCTAssertThrowsError(
+                try GatewayREST.validatedDeclaredByteSize(.object(["size": .number(raw)])),
+                "size (raw) must be rejected before Int conversion")
+        }
+        XCTAssertThrowsError(try GatewayREST.validatedDeclaredByteSize(
+            .object(["byteSize": .string("NaN")]))
+        )
     }
 }
 #endif

@@ -66,9 +66,10 @@ public final class WorkspaceRuntime {
     func begin(gatewayID: String?) -> UInt64 {
         let changedGateway = self.gatewayID != gatewayID
         loadTask?.cancel()
-        backupDownloadTask?.cancel()
-        backupDownloadTask = nil; backupDownloadOwner = nil; backupDownloadRunning = false
-        removeBackupExport()
+        // A source change invalidates both an in-flight transfer and the
+        // completed export it produced. A tab change must not call this path;
+        // the Command Center owns that distinction at its sheet boundary.
+        if changedGateway { endCommandCenter() }
         self.gatewayID = gatewayID
         if changedGateway {
             projectUncertain = ""; fileUncertain = ""; gitUncertain = ""
@@ -152,6 +153,18 @@ public final class WorkspaceRuntime {
         backupExportURL = nil
     }
 
+    /// Cancel a transfer and discard its owned local export. This is reserved
+    /// for a whole Command Center dismissal, source change, or explicit
+    /// replacement; section views must not call it from `onDisappear` because
+    /// switching tabs unmounts those sections.
+    func endCommandCenter() {
+        backupDownloadTask?.cancel()
+        backupDownloadTask = nil
+        backupDownloadOwner = nil
+        backupDownloadRunning = false
+        removeBackupExport()
+    }
+
     func claimMutation() -> UUID? {
         guard mutationOwner == nil, GatewayMaintenanceRuntime.shared.fence == nil else { return nil }
         let owner = UUID()
@@ -218,6 +231,10 @@ enum WorkspaceActionPollPolicy {
 }
 
 enum WorkspaceCommandCenterRequest {
+    static func allows(mode: AppMode) -> Bool {
+        mode == .live
+    }
+
     static func resolve(explicit: String?, active: String?, available: [String]) -> String? {
         if let explicit {
             let requested = explicit.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -260,6 +277,10 @@ private final class WorkspaceBackupDownloadLimiter: NSObject, URLSessionDownload
 public extension AppModel {
     @discardableResult
     func requestCommandCenter(gatewayID: String? = nil) -> Bool {
+        guard WorkspaceCommandCenterRequest.allows(mode: mode) else {
+            WorkspaceRuntime.shared.error = "Command Center is available only with a live gateway connection."
+            return false
+        }
         let available = ConnectionRegistry.shared.saved.map(\.id)
         guard let resolved = WorkspaceCommandCenterRequest.resolve(
             explicit: gatewayID, active: activeGatewayID ?? LiveRuntime.shared.gatewayID,
@@ -297,7 +318,10 @@ public extension AppModel {
     }
 
     func prepareWorkspace(gatewayID requested: String? = nil) {
-        guard mode == .live else { return }
+        guard WorkspaceCommandCenterRequest.allows(mode: mode) else {
+            WorkspaceRuntime.shared.error = "Command Center is available only with a live gateway connection."
+            return
+        }
         let runtime = WorkspaceRuntime.shared
         guard !runtime.mutationBusy, !runtime.systemActionRunning, !runtime.commandRunning else {
             runtime.error = "Wait for the current source-qualified operation before changing workspace scope."
@@ -339,10 +363,7 @@ public extension AppModel {
         let runtime = WorkspaceRuntime.shared
         guard runtime.gatewayID == gatewayID else { return }
         runtime.loadTask?.cancel()
-        runtime.backupDownloadTask?.cancel()
-        runtime.backupDownloadTask = nil; runtime.backupDownloadOwner = nil
-        runtime.backupDownloadRunning = false
-        runtime.removeBackupExport()
+        runtime.endCommandCenter()
         runtime.generation &+= 1
         runtime.gatewayID = nil
         runtime.clearPublishedData()

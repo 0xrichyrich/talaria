@@ -605,10 +605,16 @@ extension AppModel {
     /// names it so the next open or send re-resumes from the durable key —
     /// the same treatment the `session.reclaimed` event gets
     /// (AppModelLive.swift), and for the same reason.
-    private func unbindDeadRuntime(sid: String, botID: String) {
+    func unbindDeadRuntime(sid: String, botID: String) {
         let runtime = LiveRuntime.shared
         runtime.sessionToBot.removeValue(forKey: sid)
-        if chats[botID]?.sessionID == sid { chats[botID]?.sessionID = nil }
+        if chats[botID]?.sessionID == sid {
+            // The durable resume that follows must know which runtime binding
+            // the unresolved mutation belonged to, even while ChatState is
+            // intentionally nilled during the reattach window.
+            parkRuntimeSessionBeforeClearing(botID: botID)
+            chats[botID]?.sessionID = nil
+        }
         // Approval cards bound to a dead runtime cannot be answered: the
         // request id resolves to no session, so both buttons would fail
         // silently. Leaving an unanswerable card up is worse than none.

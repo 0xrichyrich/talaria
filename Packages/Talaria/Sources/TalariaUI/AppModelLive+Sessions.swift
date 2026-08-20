@@ -217,6 +217,19 @@ extension AppModel {
         let openGeneration = sessionsRuntime.beginOpen(botID: botID)
         let connectionGeneration = runtime.generation
 
+        // An explicit session selection replaces the binding at this tap,
+        // except when it is reopening the exact durable row that owns a
+        // deferred stop. Keep that intent through the temporary nil sid; the
+        // subsequent resume/bind proves the same ChatState and durable route.
+        // A different durable row (or known route) retires the old intent so
+        // it cannot drain into a reused profile id.
+        let reopenRoute = stateRoute(for: botID) ?? gatewayRoute(for: botID)
+        let preservesPendingStop = ChatRuntime.shared.pendingStopMatchesReopen(
+            botID: botID, storedID: id, chatID: ObjectIdentifier(chat), route: reopenRoute)
+        if !preservesPendingStop {
+            ChatRuntime.shared.clearPendingStop(botID: botID)
+        }
+
         // Unbind first: a send racing this must not land in the session we
         // are leaving, and an in-flight attach for the old session is stale.
         // This open installs its own replacement in the SAME attach slot
@@ -684,6 +697,13 @@ extension AppModel {
     private func dropSessionRow(_ id: String, botID: String) {
         let runtime = SessionsRuntime.shared
         let key = SessionsRuntime.key(botID: botID, sessionID: id)
+        // A deleted durable row can never receive the deferred interrupt that
+        // was captured for it. Clear before mutating ChatState so a later
+        // replacement session cannot inherit the intent.
+        ChatRuntime.shared.clearPendingStopIfStored(id, botID: botID)
+        if chats[botID]?.storedSessionID == id {
+            ChatRuntime.shared.clearPendingStop(botID: botID)
+        }
         runtime.titles[key] = nil
         runtime.previews[key] = nil
         if let chat = chats[botID] {

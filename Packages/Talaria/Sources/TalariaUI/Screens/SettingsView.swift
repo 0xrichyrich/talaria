@@ -125,7 +125,12 @@ public struct SettingsView: View {
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .accessibilityHint(Text("Opens the source-qualified workspace controls"))
+                            .disabled(!WorkspaceCommandCenterRequest.allows(mode: model.mode))
+                            .accessibilityHint(Text(
+                                WorkspaceCommandCenterRequest.allows(mode: model.mode)
+                                    ? "Opens the source-qualified workspace controls"
+                                    : "Connect a live gateway to enable Command Center"
+                            ))
                             .listRowBackground(theme.panel)
                         } else {
                             NavigationLink(value: destination) {

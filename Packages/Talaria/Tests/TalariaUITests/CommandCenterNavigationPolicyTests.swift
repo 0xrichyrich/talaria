@@ -51,5 +51,16 @@ final class CommandCenterNavigationPolicyTests: XCTestCase {
             WorkspaceCommandCenterRequest.resolve(explicit: nil, active: nil, available: [])
         )
     }
+
+    func testCommandCenterEntryIsLiveOnlyEvenWhenSavedGatewaysExist() {
+        XCTAssertFalse(WorkspaceCommandCenterRequest.allows(mode: .demo))
+        XCTAssertTrue(WorkspaceCommandCenterRequest.allows(mode: .live))
+    }
+
+    @MainActor
+    func testDemoRequestFailsClosedBeforeResolvingSavedGateway() {
+        let model = AppModel()
+        XCTAssertFalse(model.requestCommandCenter(gatewayID: "saved-gateway"))
+    }
 }
 #endif

@@ -1,6 +1,61 @@
 import SwiftUI
+import Observation
 import TalariaKit
 import TalariaTheme
+
+/// Connection-owned invalidation for Operator's source-qualified reads. The
+/// view's local task id catches picker changes; this revision catches a real
+/// gateway teardown/replacement even when the saved gateway row remains.
+@MainActor
+@Observable
+final class OperatorSettingsRuntime {
+    static let shared = OperatorSettingsRuntime()
+
+    private(set) var connectionRevision: UInt64 = 0
+
+    func invalidateConnectionScope() {
+        connectionRevision &+= 1
+    }
+
+    /// Fence status requests before a reconnect starts awaiting the existing
+    /// client. The client identity is intentionally unchanged during that
+    /// await, so the epoch is the only boundary that rejects a late REST
+    /// response while the transport is being replaced.
+    func beginReconnectAttempt() {
+        invalidateConnectionScope()
+    }
+
+    /// A successful reconnect gets a fresh post-dial scope as well. Keeping a
+    /// separate bump preserves the same rule if the client actor completes its
+    /// dial while an older status request is still returning.
+    func completeReconnectAttempt() {
+        invalidateConnectionScope()
+    }
+}
+
+enum OperatorStatusRequestPolicy {
+    static func allowsPublication(isOffline: Bool, reconnecting: Bool,
+                                  requestedGatewayID: String?, activeGatewayID: String?) -> Bool {
+        guard !reconnecting else { return false }
+        guard isOffline else { return true }
+        guard let requestedGatewayID, let activeGatewayID else { return false }
+        return requestedGatewayID != activeGatewayID
+    }
+
+    static func accepts(capturedScopeKey: String, currentScopeKey: String,
+                        capturedViewGeneration: Int, currentViewGeneration: Int,
+                        capturedConnectionRevision: UInt64,
+                        currentConnectionRevision: UInt64,
+                        capturedLiveGeneration: Int, currentLiveGeneration: Int,
+                        capturedClient: ObjectIdentifier,
+                        currentClient: ObjectIdentifier?) -> Bool {
+        capturedScopeKey == currentScopeKey
+            && capturedViewGeneration == currentViewGeneration
+            && capturedConnectionRevision == currentConnectionRevision
+            && capturedLiveGeneration == currentLiveGeneration
+            && currentClient == capturedClient
+    }
+}
 
 // Phone-relevant Hermes runtime controls that were explicitly left open by
 // the original Settings pass. These are all ordinary authenticated config or
@@ -593,6 +648,10 @@ public struct OperatorSettingsSection: View {
     @State private var draftMaxTurns = 500
     @State private var draftImageMode = "auto"
     @State private var isLoading = false
+    @State private var selectedGatewayStatus: GatewayStatus?
+    @State private var selectedGatewayStatusError: String?
+    @State private var isLoadingGatewayStatus = false
+    @State private var gatewayStatusGeneration = 0
     @State private var busyField: String?
     @State private var notice: String?
     @State private var noticeIsWarning = false
@@ -650,6 +709,7 @@ public struct OperatorSettingsSection: View {
         .task(id: scopeKey) {
             let key = scopeKey
             prepareForScope(key)
+            await loadGatewayStatus(scopeKey: key)
             await loadConfig(scopeKey: key)
             guard stateScopeKey == key else { return }
             await loadLogs(scopeKey: key)
@@ -689,6 +749,14 @@ public struct OperatorSettingsSection: View {
                                            runtime: LiveRuntime.shared.gatewayID)
     }
 
+    private var selectedGatewayName: String {
+        if let targetGatewayID,
+           let gateway = gatewayChoices.first(where: { $0.id == targetGatewayID }) {
+            return gateway.name
+        }
+        return targetGatewayID ?? "No live gateway"
+    }
+
     private var profileChoices: [Bot] {
         let target = targetGatewayID
         return model.unionRosterBots.filter { bot in
@@ -703,7 +771,12 @@ public struct OperatorSettingsSection: View {
     }
 
     private var scopeKey: String {
-        "\(targetGatewayID ?? "demo")\u{1f}\(targetProfile ?? "__gateway__")"
+        let clientIdentity = model.client.map { String(describing: ObjectIdentifier($0)) } ?? "none"
+        return "\(targetGatewayID ?? "demo")\u{1f}\(targetProfile ?? "__gateway__")"
+            + "\u{1f}\(OperatorSettingsRuntime.shared.connectionRevision)"
+            + "\u{1f}\(LiveRuntime.shared.generation)\u{1f}\(clientIdentity)"
+            + "\u{1f}\(model.isOffline ? "offline" : "online")"
+            + "\u{1f}\(ConnectionSupervisor.shared.isReconnecting ? "reconnecting" : "steady")"
     }
 
     private var gatewayPickerSection: some View {
@@ -743,21 +816,41 @@ public struct OperatorSettingsSection: View {
     }
 
     private var systemSection: some View {
-        let status = model.gatewayStatus
+        let status = selectedGatewayStatus
         return SettingsSection(theme: theme, title: copy.settingsCommandCenter(theme.id),
                                footnote: copy.settingsCommandCenterNote(theme.id)) {
             SettingsGroup(theme: theme) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(copy.settingsGatewayRunning(theme.id, running: status?.gatewayRunning == true))
-                        .font(SettingsType.rowTitle(theme))
-                    Text(copy.settingsGatewaySessions(theme.id,
-                                                      version: status?.version ?? "—",
-                                                      sessions: status?.activeSessions ?? 0,
-                                                      agents: status?.activeAgents ?? 0))
+                    Text("Selected gateway: \(selectedGatewayName)")
                         .font(SettingsType.rowSubtitle(theme)).foregroundStyle(theme.sub)
+                    if let status {
+                        Text(copy.settingsGatewayRunning(theme.id, running: status.gatewayRunning))
+                            .font(SettingsType.rowTitle(theme))
+                        Text(copy.settingsGatewaySessions(theme.id,
+                                                          version: status.version ?? "—",
+                                                          sessions: status.activeSessions,
+                                                          agents: status.activeAgents))
+                            .font(SettingsType.rowSubtitle(theme)).foregroundStyle(theme.sub)
+                        Text("Health: \(status.overall)")
+                            .font(SettingsType.rowSubtitle(theme)).foregroundStyle(theme.sub)
+                    } else if isLoadingGatewayStatus {
+                        Text("Checking selected gateway status…")
+                            .font(SettingsType.rowTitle(theme))
+                    } else if let selectedGatewayStatusError {
+                        Text("Selected gateway status unavailable")
+                            .font(SettingsType.rowTitle(theme)).foregroundStyle(theme.warn)
+                        Text(selectedGatewayStatusError)
+                            .font(theme.mono(10)).foregroundStyle(theme.warn)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("Selected gateway status unavailable")
+                            .font(SettingsType.rowTitle(theme)).foregroundStyle(theme.sub)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .modifier(SettingsRowChrome(theme: theme, isLast: false))
+                .modifier(SettingsRowChrome(theme: theme, isLast: true))
+            }
+            SettingsGroup(theme: theme) {
                 SettingsActionRow(theme: theme, title: copy.settingsRestartGateway(theme.id),
                                   isBusy: actionName == "gateway-restart" && action.running,
                                   isLast: false) {
@@ -1088,6 +1181,10 @@ public struct OperatorSettingsSection: View {
         draftMaxTurns = 500
         draftImageMode = "auto"
         isLoading = false
+        selectedGatewayStatus = nil
+        selectedGatewayStatusError = nil
+        isLoadingGatewayStatus = false
+        gatewayStatusGeneration &+= 1
         busyField = nil
         notice = nil
         logs = GatewayLogSnapshot(.null, fallbackFile: logFile)
@@ -1121,6 +1218,106 @@ public struct OperatorSettingsSection: View {
         if let gatewayID { return try await model.routedClient(gatewayID: gatewayID) }
         if let client = model.client { return client }
         throw AppModel.GatewayRouteError.noRoute
+    }
+
+    private func loadGatewayStatus(scopeKey key: String) async {
+        guard stateScopeKey == key else { return }
+        gatewayStatusGeneration &+= 1
+        let capturedStatusGeneration = gatewayStatusGeneration
+        let captured = generation
+        let gatewayID = targetGatewayID
+        let statusGatewayID = gatewayID ?? model.activeGatewayID ?? LiveRuntime.shared.gatewayID
+        let capturedConnectionRevision = OperatorSettingsRuntime.shared.connectionRevision
+        let capturedLiveGeneration = LiveRuntime.shared.generation
+        isLoadingGatewayStatus = true
+        selectedGatewayStatus = nil
+        selectedGatewayStatusError = nil
+        defer {
+            if isCurrent(key, generation: captured),
+               gatewayStatusGeneration == capturedStatusGeneration {
+                isLoadingGatewayStatus = false
+            }
+        }
+        guard model.mode == .live, statusMayPublish(requestedGatewayID: gatewayID) else { return }
+        var capturedClient: ObjectIdentifier?
+        do {
+            let client = try await targetClient(gatewayID: gatewayID)
+            let clientIdentity = ObjectIdentifier(client)
+            capturedClient = clientIdentity
+            guard await statusRequestIsCurrent(
+                key: key, generation: captured,
+                statusGeneration: capturedStatusGeneration,
+                gatewayID: statusGatewayID,
+                requestedGatewayID: gatewayID,
+                capturedConnectionRevision: capturedConnectionRevision,
+                capturedLiveGeneration: capturedLiveGeneration,
+                capturedClient: clientIdentity
+            ) else { return }
+            let loaded = try await client.status()
+            guard await statusRequestIsCurrent(
+                key: key, generation: captured,
+                statusGeneration: capturedStatusGeneration,
+                gatewayID: statusGatewayID,
+                requestedGatewayID: gatewayID,
+                capturedConnectionRevision: capturedConnectionRevision,
+                capturedLiveGeneration: capturedLiveGeneration,
+                capturedClient: clientIdentity
+            ) else { return }
+            selectedGatewayStatus = loaded
+        } catch {
+            guard let capturedClient,
+                  await statusRequestIsCurrent(
+                      key: key, generation: captured,
+                      statusGeneration: capturedStatusGeneration,
+                      gatewayID: statusGatewayID,
+                      requestedGatewayID: gatewayID,
+                      capturedConnectionRevision: capturedConnectionRevision,
+                      capturedLiveGeneration: capturedLiveGeneration,
+                      capturedClient: capturedClient
+                  ) else { return }
+            selectedGatewayStatusError = error.localizedDescription
+        }
+    }
+
+    private func statusRequestIsCurrent(
+        key: String, generation capturedGeneration: Int,
+        statusGeneration capturedStatusGeneration: Int,
+        gatewayID: String?, requestedGatewayID: String?, capturedConnectionRevision: UInt64,
+        capturedLiveGeneration: Int, capturedClient: ObjectIdentifier
+    ) async -> Bool {
+        guard isCurrent(key, generation: capturedGeneration),
+              gatewayStatusGeneration == capturedStatusGeneration,
+              model.mode == .live,
+              statusMayPublish(requestedGatewayID: requestedGatewayID) else { return false }
+        let currentClient: GatewayClient?
+        if let gatewayID, gatewayID != model.activeGatewayID {
+            currentClient = await ConnectionRegistry.shared.clientPool.client(for: gatewayID)
+        } else {
+            currentClient = model.client
+        }
+        return OperatorStatusRequestPolicy.accepts(
+            capturedScopeKey: key, currentScopeKey: scopeKey,
+            capturedViewGeneration: capturedGeneration, currentViewGeneration: generation,
+            capturedConnectionRevision: capturedConnectionRevision,
+            currentConnectionRevision: OperatorSettingsRuntime.shared.connectionRevision,
+            capturedLiveGeneration: capturedLiveGeneration,
+            currentLiveGeneration: LiveRuntime.shared.generation,
+            capturedClient: capturedClient,
+            currentClient: currentClient.map(ObjectIdentifier.init)
+        )
+    }
+
+    /// A primary status response is not useful while that primary is offline
+    /// or any reconnect attempt is in flight. Saved secondary gateways remain
+    /// eligible when the primary is merely offline, because their exact pool
+    /// client is an independent source.
+    private func statusMayPublish(requestedGatewayID: String?) -> Bool {
+        OperatorStatusRequestPolicy.allowsPublication(
+            isOffline: model.isOffline,
+            reconnecting: ConnectionSupervisor.shared.isReconnecting,
+            requestedGatewayID: requestedGatewayID,
+            activeGatewayID: model.activeGatewayID
+        )
     }
 
     private func loadConfig(scopeKey key: String) async {

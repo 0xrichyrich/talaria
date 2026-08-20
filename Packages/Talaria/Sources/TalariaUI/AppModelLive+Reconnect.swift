@@ -47,6 +47,12 @@ final class ConnectionSupervisor {
     var isReconnecting = false
     /// Last status-probe result per saved-gateway id.
     var diagnostics: [String: GatewayDiagnostics] = [:]
+    /// Probe seam for deterministic lifecycle tests. Production always uses
+    /// the real unauthenticated status endpoint; tests replace this briefly
+    /// while exercising AppModel.refreshConnectionHealth end to end.
+    @ObservationIgnored var healthProbe:
+        @Sendable (SavedGateway) async -> (ConnectionState, GatewayDiagnostics) =
+            GatewayDiagnostics.probe
 
     @ObservationIgnored let keychain = KeychainStore()
     /// App-lifetime watch loop; nil until the first start request.
@@ -280,13 +286,14 @@ extension AppModel {
         let registry = ConnectionRegistry.shared
         let saved = registry.saved
         guard !saved.isEmpty else { return }
+        let healthProbe = ConnectionSupervisor.shared.healthProbe
 
         let results = await withTaskGroup(
             of: (SavedGateway, ConnectionState, GatewayDiagnostics).self
         ) { group -> [(SavedGateway, ConnectionState, GatewayDiagnostics)] in
             for gateway in saved {
                 group.addTask { @Sendable in
-                    let (state, diagnostics) = await GatewayDiagnostics.probe(gateway)
+                    let (state, diagnostics) = await healthProbe(gateway)
                     return (gateway, state, diagnostics)
                 }
             }
@@ -311,7 +318,24 @@ extension AppModel {
                 if isActiveGateway(gateway), !isOffline {
                     registry.noteState(.connected, pingMS: merged.pingMS, forURL: base)
                 } else {
-                    registry.noteState(state, pingMS: merged.pingMS, forURL: base)
+                    // A REST probe is diagnostic for a saved secondary. It
+                    // must not claim the live-source beacon merely because
+                    // that gateway answered successfully.
+                    let authRequired: Bool
+                    switch merged.authMode {
+                    case .open:
+                        authRequired = false
+                    case .oauth, .gated:
+                        authRequired = true
+                    case .unknown:
+                        authRequired = registry.health[gateway.id]?.authRequired ?? false
+                    }
+                    registry.noteProbeHealth(
+                        ConnectionRegistry.Health(state: state,
+                                                 pingMS: merged.pingMS,
+                                                 version: merged.version,
+                                                 authRequired: authRequired),
+                        forURL: base)
                 }
             }
         }
@@ -334,6 +358,12 @@ extension AppModel {
         // One dial at a time: the backoff loop, the banner button and the
         // foreground hook can all arrive at once.
         guard !supervisor.isReconnecting else { return false }
+        // Fence Operator status before the first await below. Reconnecting
+        // the same GatewayClient preserves its object identity, so a client
+        // check alone would let an old /api/status response publish while the
+        // transport is being replaced. This bump also remains in force on
+        // every failure path, including expired credentials and dial errors.
+        OperatorSettingsRuntime.shared.beginReconnectAttempt()
         guard mode == .live, let base = runtime.baseURL else { return false }
         guard let credential = supervisor.keychain.load(for: base) else {
             supervisor.reauthGateway = base
@@ -347,7 +377,10 @@ extension AppModel {
         // dialing so nothing can submit into a session that no longer exists.
         let primaryChats = chats.filter { GatewayBotRoute(qualifiedID: $0.key) == nil }
         let parked = primaryChats.filter { $0.value.storedSessionID != nil }.map(\.key)
-        for chat in primaryChats.values {
+        for (botID, chat) in primaryChats {
+            if let sessionID = chat.sessionID, !sessionID.isEmpty {
+                runtime.reconnectParkedSessionIDs[botID] = sessionID
+            }
             chat.sessionID = nil
             chat.isTyping = false
         }
@@ -387,6 +420,7 @@ extension AppModel {
     private func adoptReconnectedLink(base: URL, parked: [String]) async {
         let runtime = LiveRuntime.shared
         runtime.generation += 1
+        OperatorSettingsRuntime.shared.completeReconnectAttempt()
         runtime.resetSessionState()
         // Pending approvals replay through session.resume below; keeping the
         // old cards would let the user answer request ids that no longer exist.
@@ -584,6 +618,9 @@ extension AppModel {
     /// that knows every primary surface to clear. Source-qualified remote chat
     /// state is restored afterward because those clients remain connected.
     private func flushWorldForGatewaySwitch() {
+        if let departingGatewayID = LiveRuntime.shared.gatewayID {
+            ChatRuntime.shared.clearPendingStops(forGatewayID: departingGatewayID)
+        }
         preservePrimaryUnreadForGatewaySwitch()
         let remoteChats = chats.filter { GatewayBotRoute(qualifiedID: $0.key) != nil }
         let remoteApprovals = approvals.filter { GatewayBotRoute(qualifiedID: $0.botID) != nil }

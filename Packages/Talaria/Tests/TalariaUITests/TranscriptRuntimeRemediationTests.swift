@@ -280,7 +280,9 @@ final class TranscriptRuntimeRemediationTests: XCTestCase {
 
         var didResume = false
         var didHydrate = false
-        let authoritative = ChatMessage(author: .bot, text: "authoritative intro", rowID: 1)
+        let authoritativeKickoff = ChatMessage(
+            author: .user, text: AppModel.canonicalKickoffPrompt, rowID: 1)
+        let authoritative = ChatMessage(author: .bot, text: "authoritative intro", rowID: 2)
         await model.reconcileAmbiguousCanonicalKickoff(
             lease, sourceGatewayID: "gateway",
             resume: {
@@ -292,16 +294,135 @@ final class TranscriptRuntimeRemediationTests: XCTestCase {
             },
             hydrate: { _ in
                 didHydrate = true
-                chat.messages = [authoritative]
+                chat.messages = [authoritativeKickoff, authoritative]
             },
             accepts: { true })
 
         XCTAssertTrue(didResume)
         XCTAssertTrue(didHydrate)
-        XCTAssertEqual(chat.messages, [authoritative])
+        XCTAssertEqual(chat.messages, [authoritativeKickoff, authoritative])
         XCTAssertNil(CanonicalChatRuntime.shared.kickoffs[botID])
         XCTAssertNil(CanonicalChatRuntime.shared.ambiguousKickoffs[botID])
         CanonicalChatRuntime.shared.pins[botID] = nil
+    }
+
+    @MainActor
+    func testAmbiguousKickoffKeepsFenceAfterEmptyHydration() async {
+        let model = AppModel()
+        let botID = "bot-empty-hydration"
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        let historical = ChatMessage(
+            author: .user, text: AppModel.canonicalKickoffPrompt, rowID: 42)
+        chat.messages = [historical]
+        let lease = CanonicalKickoffLease(
+            id: UUID(), botID: botID, sessionID: "runtime", storedID: "stored",
+            rowID: nil, chatID: ObjectIdentifier(chat), submitStarted: true,
+            baselineDurableRowIDs: [42], baselineDurableRowCount: 1)
+        CanonicalChatRuntime.shared.kickoffs[botID] = lease.id
+        CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = lease
+
+        await model.reconcileAmbiguousCanonicalKickoff(
+            lease, sourceGatewayID: "gateway",
+            resume: {
+                LiveSession(.object([
+                    "session_id": .string("runtime"),
+                    "stored_session_id": .string("stored"),
+                ]))
+            },
+            hydrate: { _ in chat.messages = [] },
+            accepts: { true })
+
+        XCTAssertEqual(CanonicalChatRuntime.shared.kickoffs[botID], lease.id)
+        XCTAssertEqual(CanonicalChatRuntime.shared.ambiguousKickoffs[botID], lease)
+        CanonicalChatRuntime.shared.kickoffs[botID] = nil
+        CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = nil
+    }
+
+    @MainActor
+    func testAmbiguousKickoffRequiresCompleteBaselineIDsAndOperationSpecificInflight() async {
+        let model = AppModel()
+        let botID = "canonical-adversarial-evidence"
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        let prompt = AppModel.canonicalKickoffPrompt
+        let historical = ChatMessage(author: .user, text: prompt, rowID: 42)
+        chat.messages = [historical]
+        let lease = CanonicalKickoffLease(
+            id: UUID(), botID: botID, sessionID: "runtime", storedID: "stored",
+            rowID: nil, chatID: ObjectIdentifier(chat), submitStarted: true,
+            baselineDurableRowIDs: [42, 43], baselineDurableRowCount: 2,
+            baselineDurableUserTexts: [prompt])
+        CanonicalChatRuntime.shared.kickoffs[botID] = lease.id
+        CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = lease
+
+        let staleReplacement = LiveSession(.object([
+            "session_id": .string("runtime"),
+            "stored_session_id": .string("stored"),
+            "messages": [[
+                "role": .string("user"), "text": .string(prompt),
+                "row_id": .number(91),
+            ], [
+                "role": .string("assistant"), "text": .string("other"),
+                "row_id": .number(92),
+            ]],
+        ]))
+        await model.reconcileAmbiguousCanonicalKickoff(
+            lease, sourceGatewayID: "gateway",
+            resume: { staleReplacement },
+            hydrate: { live in
+                chat.messages = AppModel.chatMessages(fromTranscript: .array(live.messages))
+            },
+            accepts: { true })
+        XCTAssertEqual(CanonicalChatRuntime.shared.ambiguousKickoffs[botID], lease)
+
+        let duplicateInflight = LiveSession(.object([
+            "session_id": .string("runtime"),
+            "stored_session_id": .string("stored"),
+            "inflight": ["user": .string(prompt)],
+            "messages": [[
+                "role": .string("user"), "text": .string(prompt),
+                "row_id": .number(42),
+            ], [
+                "role": .string("assistant"), "text": .string("other"),
+                "row_id": .number(43),
+            ]],
+        ]))
+        await model.reconcileAmbiguousCanonicalKickoff(
+            lease, sourceGatewayID: "gateway",
+            resume: { duplicateInflight },
+            hydrate: { live in
+                chat.messages = AppModel.chatMessages(fromTranscript: .array(live.messages))
+            },
+            accepts: { true })
+        XCTAssertEqual(CanonicalChatRuntime.shared.ambiguousKickoffs[botID], lease,
+                       "a preexisting same-text inflight body cannot settle kickoff")
+
+        let accepted = LiveSession(.object([
+            "session_id": .string("runtime"),
+            "stored_session_id": .string("stored"),
+            "messages": [[
+                "role": .string("user"), "text": .string("old"),
+                "row_id": .number(42),
+            ], [
+                "role": .string("assistant"), "text": .string("old answer"),
+                "row_id": .number(43),
+            ], [
+                "role": .string("user"), "text": .string(prompt),
+                "row_id": .number(91),
+            ]],
+        ]))
+        await model.reconcileAmbiguousCanonicalKickoff(
+            lease, sourceGatewayID: "gateway",
+            resume: { accepted },
+            hydrate: { live in
+                chat.messages = AppModel.chatMessages(fromTranscript: .array(live.messages))
+            },
+            accepts: { true })
+        XCTAssertNil(CanonicalChatRuntime.shared.kickoffs[botID])
+        XCTAssertNil(CanonicalChatRuntime.shared.ambiguousKickoffs[botID])
     }
 
     @MainActor
@@ -630,6 +751,855 @@ final class TranscriptRuntimeRemediationTests: XCTestCase {
         XCTAssertEqual(newer.map(\.id), [changedBot.id, freshTool.id])
         XCTAssertFalse(newer.contains(where: { $0.id == oldUser.id }))
         XCTAssertFalse(newer.contains(where: { $0.id == optimistic.id }))
+    }
+
+    @MainActor
+    func testLostSteerResponseAndFailedReconcileKeepExactFence() async {
+        let model = AppModel()
+        let botID = "steer-fenced"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: "worker")
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        let fence = SteerMutationFence(
+            operationID: UUID(), botID: botID, route: route,
+            sessionID: "runtime", storedID: "stored", chatID: ObjectIdentifier(chat),
+            optimisticID: UUID(), text: "adjust", stage: .steer)
+        ChatRuntime.shared.steerFences[botID] = fence
+
+        await model.reconcileSteerMutation(
+            fence,
+            resume: { throw GatewayError(code: -7, message: "lost response") },
+            hydrate: { _ in XCTFail("failed resume must not hydrate") },
+            accepts: { true })
+
+        XCTAssertEqual(ChatRuntime.shared.steerFences[botID], fence)
+        XCTAssertTrue(model.mutationIsFenced(botID: botID))
+        ChatRuntime.shared.steerFences[botID] = nil
+    }
+
+    @MainActor
+    func testSteerFenceClearsOnlyWhenResumeNamesExactCorrection() async {
+        let model = AppModel()
+        let botID = "steer-exact"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: "worker")
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        let historicalDuplicate = ChatMessage(author: .user, text: "adjust", rowID: 42)
+        chat.messages = [historicalDuplicate]
+        let fence = SteerMutationFence(
+            operationID: UUID(), botID: botID, route: route,
+            sessionID: "runtime", storedID: "stored", chatID: ObjectIdentifier(chat),
+            optimisticID: UUID(), text: "adjust", stage: .redirect,
+            baselineDurableRowIDs: [42], baselineDurableRowCount: 1)
+        ChatRuntime.shared.steerFences[botID] = fence
+
+        let unrelated = LiveSession(.object([
+            "session_id": .string("runtime"),
+            "stored_session_id": .string("stored"),
+            "messages": [[
+                "role": .string("user"), "text": .string("adjust"),
+                "row_id": .number(42),
+            ]],
+        ]))
+        await model.reconcileSteerMutation(
+            fence,
+            resume: { unrelated },
+            hydrate: { _ in chat.messages = [historicalDuplicate] },
+            accepts: { true })
+        XCTAssertEqual(ChatRuntime.shared.steerFences[botID], fence,
+                       "a historical duplicate must not settle a lost steer")
+
+        let exact = LiveSession(.object([
+            "session_id": .string("runtime"),
+            "stored_session_id": .string("stored"),
+            "messages": [[
+                "role": .string("user"), "text": .string("adjust"),
+                "row_id": .number(42),
+            ], [
+                "role": .string("user"), "text": .string("adjust"),
+                "row_id": .number(91),
+            ]],
+        ]))
+        await model.reconcileSteerMutation(
+            fence,
+            resume: { exact },
+            hydrate: { live in
+                chat.messages = AppModel.chatMessages(fromTranscript: .array(live.messages))
+            },
+            accepts: { true })
+        XCTAssertNil(ChatRuntime.shared.steerFences[botID])
+    }
+
+    @MainActor
+    func testSteerReconcileRequiresCompleteBaselineDurableIDSubset() async {
+        let model = AppModel()
+        let botID = "steer-baseline-subset"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: "worker")
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        let fence = SteerMutationFence(
+            operationID: UUID(), botID: botID, route: route,
+            sessionID: "runtime", storedID: "stored", chatID: ObjectIdentifier(chat),
+            optimisticID: UUID(), text: "adjust", stage: .steer,
+            baselineDurableRowIDs: [42, 43], baselineDurableRowCount: 2,
+            baselineDurableUserTexts: ["adjust"])
+        ChatRuntime.shared.steerFences[botID] = fence
+
+        let sameCountReplacement = LiveSession(.object([
+            "session_id": .string("runtime"),
+            "stored_session_id": .string("stored"),
+            "messages": [[
+                "role": .string("user"), "text": .string("adjust"),
+                "row_id": .number(91),
+            ], [
+                "role": .string("assistant"), "text": .string("other"),
+                "row_id": .number(92),
+            ]],
+        ]))
+        await model.reconcileSteerMutation(
+            fence,
+            resume: { sameCountReplacement },
+            hydrate: { live in
+                chat.messages = AppModel.chatMessages(fromTranscript: .array(live.messages))
+            },
+            accepts: { true })
+        XCTAssertEqual(ChatRuntime.shared.steerFences[botID], fence,
+                       "equal counts with replaced baseline ids are not evidence")
+
+        let complete = LiveSession(.object([
+            "session_id": .string("runtime"),
+            "stored_session_id": .string("stored"),
+            "messages": [[
+                "role": .string("user"), "text": .string("old"),
+                "row_id": .number(42),
+            ], [
+                "role": .string("assistant"), "text": .string("old answer"),
+                "row_id": .number(43),
+            ], [
+                "role": .string("user"), "text": .string("adjust"),
+                "row_id": .number(91),
+            ]],
+        ]))
+        await model.reconcileSteerMutation(
+            fence,
+            resume: { complete },
+            hydrate: { live in
+                chat.messages = AppModel.chatMessages(fromTranscript: .array(live.messages))
+            },
+            accepts: { true })
+        XCTAssertNil(ChatRuntime.shared.steerFences[botID])
+    }
+
+    @MainActor
+    func testSteerInflightDuplicateTextIsNotOperationSpecificEvidence() async {
+        let model = AppModel()
+        let botID = "steer-inflight-duplicate"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: "worker")
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        let historical = ChatMessage(author: .user, text: "adjust", rowID: 42)
+        chat.messages = [historical]
+        let fence = SteerMutationFence(
+            operationID: UUID(), botID: botID, route: route,
+            sessionID: "runtime", storedID: "stored", chatID: ObjectIdentifier(chat),
+            optimisticID: UUID(), text: "adjust", stage: .redirect,
+            baselineDurableRowIDs: [42], baselineDurableRowCount: 1,
+            baselineDurableUserTexts: ["adjust"])
+        ChatRuntime.shared.steerFences[botID] = fence
+
+        let live = LiveSession(.object([
+            "session_id": .string("runtime"),
+            "stored_session_id": .string("stored"),
+            "inflight": ["user": .string("adjust")],
+            "messages": [[
+                "role": .string("user"), "text": .string("adjust"),
+                "row_id": .number(42),
+            ]],
+        ]))
+        await model.reconcileSteerMutation(
+            fence,
+            resume: { live },
+            hydrate: { _ in chat.messages = [historical] },
+            accepts: { true })
+
+        XCTAssertEqual(ChatRuntime.shared.steerFences[botID], fence,
+                       "an old duplicate body in inflight cannot settle a lost steer")
+        ChatRuntime.shared.steerFences[botID] = nil
+    }
+
+    @MainActor
+    func testSameDurableRuntimeSIDRotationMigratesMutationAndKickoffLeases() {
+        let model = AppModel()
+        let botID = "worker"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: botID)
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime-old"
+        chat.storedSessionID = "stored"
+        LiveRuntime.shared.gatewayID = "gateway"
+        let previousGeneration = LiveRuntime.shared.generation
+        LiveRuntime.shared.generation = 17
+
+        let steerID = UUID()
+        ChatRuntime.shared.steerActions[botID] = SteerMutationLease(
+            id: steerID, botID: botID, route: route, sessionID: "runtime-old",
+            storedID: "stored", chatID: ObjectIdentifier(chat),
+            optimisticID: UUID(), text: "adjust")
+        ChatRuntime.shared.steerFences[botID] = SteerMutationFence(
+            operationID: steerID, botID: botID, route: route, sessionID: "runtime-old",
+            storedID: "stored", chatID: ObjectIdentifier(chat), optimisticID: UUID(),
+            text: "adjust", stage: .steer)
+        let stopID = UUID()
+        ChatRuntime.shared.stopActions[botID] = StopTurnLease(
+            botID: botID, route: route, sessionID: "runtime-old", storedID: "stored",
+            chatID: ObjectIdentifier(chat), id: stopID, generation: 3)
+        ChatRuntime.shared.stopFences[botID] = StopTurnFence(
+            operationID: stopID, botID: botID, route: route, sessionID: "runtime-old",
+            storedID: "stored", chatID: ObjectIdentifier(chat), generation: 3)
+        let kickoff = CanonicalKickoffLease(
+            id: UUID(), botID: botID, sessionID: "runtime-old", storedID: "stored",
+            rowID: nil, chatID: ObjectIdentifier(chat), submitStarted: true)
+        CanonicalChatRuntime.shared.kickoffs[botID] = kickoff.id
+        CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = kickoff
+
+        model.adopt(LiveSession(.object([
+            "session_id": .string("runtime-new"),
+            "stored_session_id": .string("stored"),
+        ])), storedID: "stored", botID: botID, sourceGatewayID: "gateway")
+
+        XCTAssertEqual(ChatRuntime.shared.steerActions[botID]?.sessionID, "runtime-new")
+        XCTAssertEqual(ChatRuntime.shared.steerFences[botID]?.sessionID, "runtime-new")
+        XCTAssertEqual(ChatRuntime.shared.stopActions[botID]?.sessionID, "runtime-new")
+        XCTAssertEqual(ChatRuntime.shared.stopFences[botID]?.sessionID, "runtime-new")
+        XCTAssertEqual(ChatRuntime.shared.stopFences[botID]?.generation,
+                       LiveRuntime.shared.generation)
+        XCTAssertEqual(CanonicalChatRuntime.shared.ambiguousKickoffs[botID]?.sessionID,
+                       "runtime-new")
+
+        ChatRuntime.shared.steerActions[botID] = nil
+        ChatRuntime.shared.steerFences[botID] = nil
+        ChatRuntime.shared.stopActions[botID] = nil
+        ChatRuntime.shared.stopFences[botID] = nil
+        CanonicalChatRuntime.shared.kickoffs[botID] = nil
+        CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = nil
+        LiveRuntime.shared.sessionToBot["runtime-new"] = nil
+        LiveRuntime.shared.gatewayID = nil
+        LiveRuntime.shared.generation = previousGeneration
+    }
+
+    @MainActor
+    func testReconnectParkedSIDMigratesLeasesWhenVisibleSessionIsNil() {
+        let model = AppModel()
+        let botID = "parked-binding"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: botID)
+        let chat = model.chat(for: botID)
+        chat.sessionID = nil
+        chat.storedSessionID = "stored"
+        LiveRuntime.shared.gatewayID = "gateway"
+        LiveRuntime.shared.reconnectParkedSessionIDs[botID] = "runtime-old"
+
+        let steerID = UUID()
+        ChatRuntime.shared.steerActions[botID] = SteerMutationLease(
+            id: steerID, botID: botID, route: route, sessionID: "runtime-old",
+            storedID: "stored", chatID: ObjectIdentifier(chat), optimisticID: UUID(),
+            text: "adjust")
+        ChatRuntime.shared.steerFences[botID] = SteerMutationFence(
+            operationID: steerID, botID: botID, route: route, sessionID: "runtime-old",
+            storedID: "stored", chatID: ObjectIdentifier(chat), optimisticID: UUID(),
+            text: "adjust", stage: .steer)
+        let stopID = UUID()
+        ChatRuntime.shared.stopActions[botID] = StopTurnLease(
+            botID: botID, route: route, sessionID: "runtime-old", storedID: "stored",
+            chatID: ObjectIdentifier(chat), id: stopID)
+        ChatRuntime.shared.stopFences[botID] = StopTurnFence(
+            operationID: stopID, botID: botID, route: route, sessionID: "runtime-old",
+            storedID: "stored", chatID: ObjectIdentifier(chat))
+        let kickoff = CanonicalKickoffLease(
+            id: UUID(), botID: botID, sessionID: "runtime-old", storedID: "stored",
+            rowID: nil, chatID: ObjectIdentifier(chat), submitStarted: true)
+        CanonicalChatRuntime.shared.kickoffs[botID] = kickoff.id
+        CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = kickoff
+
+        model.adopt(LiveSession(.object([
+            "session_id": .string("runtime-new"),
+            "stored_session_id": .string("stored"),
+        ])), storedID: "stored", botID: botID, sourceGatewayID: "gateway")
+
+        XCTAssertEqual(ChatRuntime.shared.steerActions[botID]?.sessionID, "runtime-new")
+        XCTAssertEqual(ChatRuntime.shared.steerFences[botID]?.sessionID, "runtime-new")
+        XCTAssertEqual(ChatRuntime.shared.stopActions[botID]?.sessionID, "runtime-new")
+        XCTAssertEqual(ChatRuntime.shared.stopFences[botID]?.sessionID, "runtime-new")
+        XCTAssertEqual(CanonicalChatRuntime.shared.ambiguousKickoffs[botID]?.sessionID,
+                       "runtime-new")
+        XCTAssertNil(LiveRuntime.shared.reconnectParkedSessionIDs[botID])
+
+        ChatRuntime.shared.steerActions[botID] = nil
+        ChatRuntime.shared.steerFences[botID] = nil
+        ChatRuntime.shared.stopActions[botID] = nil
+        ChatRuntime.shared.stopFences[botID] = nil
+        CanonicalChatRuntime.shared.kickoffs[botID] = nil
+        CanonicalChatRuntime.shared.ambiguousKickoffs[botID] = nil
+        LiveRuntime.shared.reconnectParkedSessionIDs[botID] = nil
+        LiveRuntime.shared.sessionToBot["runtime-new"] = nil
+        LiveRuntime.shared.gatewayID = nil
+    }
+
+    @MainActor
+    func testLegacyBindSessionUsesParkedSIDMigrationPath() {
+        let model = AppModel()
+        let botID = "legacy-bind"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: botID)
+        let chat = model.chat(for: botID)
+        chat.sessionID = nil
+        chat.storedSessionID = "stored"
+        LiveRuntime.shared.gatewayID = "gateway"
+        LiveRuntime.shared.reconnectParkedSessionIDs[botID] = "runtime-old"
+        let operationID = UUID()
+        ChatRuntime.shared.steerFences[botID] = SteerMutationFence(
+            operationID: operationID, botID: botID, route: route, sessionID: "runtime-old",
+            storedID: "stored", chatID: ObjectIdentifier(chat), optimisticID: UUID(),
+            text: "adjust", stage: .redirect)
+
+        model.bindSession(LiveSession(.object([
+            "session_id": .string("runtime-new"),
+            "stored_session_id": .string("stored"),
+        ])), botID: botID, sourceGatewayID: "gateway")
+
+        XCTAssertEqual(chat.sessionID, "runtime-new")
+        XCTAssertEqual(ChatRuntime.shared.steerFences[botID]?.sessionID, "runtime-new")
+        XCTAssertEqual(LiveRuntime.shared.sessionToBot["runtime-new"], botID)
+        XCTAssertNil(LiveRuntime.shared.reconnectParkedSessionIDs[botID])
+
+        ChatRuntime.shared.steerFences[botID] = nil
+        LiveRuntime.shared.sessionToBot["runtime-new"] = nil
+        LiveRuntime.shared.gatewayID = nil
+    }
+
+    @MainActor
+    func testDeadRuntimeParksOldSIDBeforeNilAndAdoptMigratesSteerFence() {
+        let model = AppModel()
+        let botID = "dead-runtime-park"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: botID)
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime-old"
+        chat.storedSessionID = "stored"
+        LiveRuntime.shared.gatewayID = "gateway"
+        LiveRuntime.shared.sessionToBot["runtime-old"] = botID
+        let operationID = UUID()
+        ChatRuntime.shared.steerFences[botID] = SteerMutationFence(
+            operationID: operationID, botID: botID, route: route,
+            sessionID: "runtime-old", storedID: "stored", chatID: ObjectIdentifier(chat),
+            optimisticID: UUID(), text: "adjust", stage: .steer)
+
+        model.unbindDeadRuntime(sid: "runtime-old", botID: botID)
+
+        XCTAssertNil(chat.sessionID)
+        XCTAssertEqual(LiveRuntime.shared.reconnectParkedSessionIDs[botID], "runtime-old")
+        model.adopt(LiveSession(.object([
+            "session_id": .string("runtime-new"),
+            "stored_session_id": .string("stored"),
+        ])), storedID: "stored", botID: botID, sourceGatewayID: "gateway")
+        XCTAssertEqual(ChatRuntime.shared.steerFences[botID]?.sessionID, "runtime-new")
+
+        ChatRuntime.shared.steerFences[botID] = nil
+        LiveRuntime.shared.sessionToBot["runtime-new"] = nil
+        LiveRuntime.shared.reconnectParkedSessionIDs[botID] = nil
+        LiveRuntime.shared.gatewayID = nil
+    }
+
+    @MainActor
+    func testAttachmentSessionNotFoundParkingHookMigratesStopFence() {
+        let model = AppModel()
+        let botID = "attachment-session-recovery"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: botID)
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime-old"
+        chat.storedSessionID = "stored"
+        LiveRuntime.shared.gatewayID = "gateway"
+        let operationID = UUID()
+        ChatRuntime.shared.stopFences[botID] = StopTurnFence(
+            operationID: operationID, botID: botID, route: route,
+            sessionID: "runtime-old", storedID: "stored", chatID: ObjectIdentifier(chat))
+
+        // This is the exact parking operation used by stageOnGateway's
+        // sessionNotFound recovery before it clears ChatState.sessionID.
+        model.parkRuntimeSessionBeforeClearing(botID: botID)
+        chat.sessionID = nil
+        model.adopt(LiveSession(.object([
+            "session_id": .string("runtime-new"),
+            "stored_session_id": .string("stored"),
+        ])), storedID: "stored", botID: botID, sourceGatewayID: "gateway")
+
+        XCTAssertEqual(ChatRuntime.shared.stopFences[botID]?.sessionID, "runtime-new")
+        ChatRuntime.shared.stopFences[botID] = nil
+        LiveRuntime.shared.sessionToBot["runtime-new"] = nil
+        LiveRuntime.shared.reconnectParkedSessionIDs[botID] = nil
+        LiveRuntime.shared.gatewayID = nil
+    }
+
+    @MainActor
+    func testStopTapDuringSteerReconciliationQueuesAndDrainsAfterOwner() {
+        let model = AppModel()
+        model.mode = .live
+        let botID = "stop-after-steer"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: botID)
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        chat.isRunning = true
+        let steerID = UUID()
+        ChatRuntime.shared.steerFences[botID] = SteerMutationFence(
+            operationID: steerID, botID: botID, route: route, sessionID: "runtime",
+            storedID: "stored", chatID: ObjectIdentifier(chat), optimisticID: UUID(),
+            text: "adjust", stage: .redirect)
+        ChatRuntime.shared.reconcilingBots.insert(botID)
+
+        model.stopTurn(botID: botID)
+
+        XCTAssertNotNil(ChatRuntime.shared.pendingStopRequests[botID])
+        XCTAssertNil(ChatRuntime.shared.stopFences[botID],
+                     "the stop must not issue a second mutation during steer reconciliation")
+
+        ChatRuntime.shared.reconcilingBots.remove(botID)
+        ChatRuntime.shared.steerFences[botID] = nil
+        model.drainPendingMutationWork(botID: botID)
+
+        XCTAssertNil(ChatRuntime.shared.pendingStopRequests[botID])
+        XCTAssertTrue(ChatRuntime.shared.stopFences[botID]?.unaddressable == true,
+                      "the deferred stop intent must be drained once steer releases")
+        XCTAssertTrue(chat.isRunning)
+
+        ChatRuntime.shared.stopFences[botID] = nil
+        ChatRuntime.shared.clearPendingStop(botID: botID)
+        LiveRuntime.shared.reconnectParkedSessionIDs[botID] = nil
+        LiveRuntime.shared.gatewayID = nil
+    }
+
+    @MainActor
+    func testPendingStopMigratesRuntimeSIDOnlyForSameDurableRoute() {
+        let model = AppModel()
+        model.mode = .live
+        let botID = "pending-stop-migrate-\(UUID().uuidString)"
+        let route = GatewayBotRoute(gatewayID: "gateway-a", profile: botID)
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime-a"
+        chat.storedSessionID = "stored-a"
+        chat.isRunning = true
+        LiveRuntime.shared.gatewayID = "gateway-a"
+        let steerID = UUID()
+        ChatRuntime.shared.steerFences[botID] = SteerMutationFence(
+            operationID: steerID, botID: botID, route: route, sessionID: "runtime-a",
+            storedID: "stored-a", chatID: ObjectIdentifier(chat), optimisticID: UUID(),
+            text: "adjust", stage: .redirect)
+        ChatRuntime.shared.reconcilingBots.insert(botID)
+
+        model.stopTurn(botID: botID)
+        let oldGeneration = LiveRuntime.shared.generation
+        XCTAssertEqual(ChatRuntime.shared.pendingStopRequests[botID]?.sessionID, "runtime-a")
+
+        model.adopt(LiveSession(.object([
+            "session_id": .string("runtime-b"),
+            "stored_session_id": .string("stored-a"),
+            "running": .bool(true),
+        ])), storedID: "stored-a", botID: botID, sourceGatewayID: "gateway-a")
+
+        XCTAssertEqual(ChatRuntime.shared.pendingStopRequests[botID]?.sessionID, "runtime-b")
+        XCTAssertEqual(ChatRuntime.shared.pendingStopRequests[botID]?.storedID, "stored-a")
+        XCTAssertEqual(ChatRuntime.shared.pendingStopRequests[botID]?.route, route)
+        XCTAssertEqual(ChatRuntime.shared.pendingStopRequests[botID]?.generation, oldGeneration)
+
+        ChatRuntime.shared.clearPendingStop(botID: botID)
+        ChatRuntime.shared.steerFences[botID] = nil
+        ChatRuntime.shared.reconcilingBots.remove(botID)
+        LiveRuntime.shared.sessionToBot["runtime-b"] = nil
+        LiveRuntime.shared.reconnectParkedSessionIDs[botID] = nil
+        LiveRuntime.shared.gatewayID = nil
+    }
+
+    @MainActor
+    func testPendingStopDoesNotFollowExplicitOpenToReplacementSession() {
+        let model = AppModel()
+        model.mode = .live
+        let botID = "pending-stop-open-\(UUID().uuidString)"
+        let route = GatewayBotRoute(gatewayID: "gateway-a", profile: botID)
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime-a"
+        chat.storedSessionID = "stored-a"
+        chat.isRunning = true
+        LiveRuntime.shared.gatewayID = "gateway-a"
+        ChatRuntime.shared.steerFences[botID] = SteerMutationFence(
+            operationID: UUID(), botID: botID, route: route, sessionID: "runtime-a",
+            storedID: "stored-a", chatID: ObjectIdentifier(chat), optimisticID: UUID(),
+            text: "adjust", stage: .redirect)
+        ChatRuntime.shared.reconcilingBots.insert(botID)
+        model.stopTurn(botID: botID)
+        XCTAssertNotNil(ChatRuntime.shared.pendingStopRequests[botID])
+
+        model.openStoredSession("stored-b", botID: botID)
+        XCTAssertNil(ChatRuntime.shared.pendingStopRequests[botID],
+                     "explicit open must retire A's deferred interrupt")
+
+        SessionsRuntime.shared.openGenerations[botID, default: 0] &+= 1
+        LiveRuntime.shared.generation &+= 1
+        ChatRuntime.shared.steerFences[botID] = nil
+        ChatRuntime.shared.reconcilingBots.remove(botID)
+        LiveRuntime.shared.gatewayID = nil
+    }
+
+    @MainActor
+    func testPendingStopSurvivesReopenOfSameDurableSession() {
+        let model = AppModel()
+        model.mode = .live
+        let botID = "pending-stop-reopen-" + UUID().uuidString
+        let route = GatewayBotRoute(gatewayID: "gateway-reopen", profile: botID)
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime-a"
+        chat.storedSessionID = "stored-a"
+        chat.isRunning = true
+        LiveRuntime.shared.gatewayID = route.gatewayID
+        ChatRuntime.shared.steerFences[botID] = SteerMutationFence(
+            operationID: UUID(), botID: botID, route: route, sessionID: "runtime-a",
+            storedID: "stored-a", chatID: ObjectIdentifier(chat), optimisticID: UUID(),
+            text: "adjust", stage: .redirect)
+        ChatRuntime.shared.reconcilingBots.insert(botID)
+        model.stopTurn(botID: botID)
+        XCTAssertNotNil(ChatRuntime.shared.pendingStopRequests[botID])
+
+        // The sessions sheet reopens A while resume temporarily clears the
+        // runtime sid. The exact durable/chat binding still owns the intent.
+        model.openStoredSession("stored-a", botID: botID)
+        XCTAssertNotNil(ChatRuntime.shared.pendingStopRequests[botID],
+                        "same durable reopen must retain the deferred stop")
+
+        SessionsRuntime.shared.openGenerations[botID, default: 0] &+= 1
+        LiveRuntime.shared.generation &+= 1
+        ChatRuntime.shared.pendingStopRequests[botID] = nil
+        ChatRuntime.shared.steerFences[botID] = nil
+        ChatRuntime.shared.reconcilingBots.remove(botID)
+        LiveRuntime.shared.gatewayID = nil
+    }
+
+    @MainActor
+    func testSourceQualifiedPendingStopRekeysOnlyWithExactDurableChatOwnership() {
+        let model = AppModel()
+        let oldBotID = "gateway-profile::old"
+        let newBotID = "gateway-profile::new"
+        let oldRoute = GatewayBotRoute(gatewayID: "gateway-profile", profile: "old")
+        let newRoute = GatewayBotRoute(gatewayID: "gateway-profile", profile: "new")
+        let chat = model.chat(for: oldBotID)
+        chat.storedSessionID = "stored-a"
+        ChatRuntime.shared.pendingStopRequests[oldBotID] = PendingStopRequest(
+            botID: oldBotID, route: oldRoute, storedID: "stored-a", sessionID: "runtime-a",
+            chatID: ObjectIdentifier(chat), generation: LiveRuntime.shared.generation)
+
+        XCTAssertTrue(ChatRuntime.shared.rekeyPendingStop(
+            fromBotIDs: [oldBotID], fromRoute: oldRoute,
+            toBotID: newBotID, toRoute: newRoute,
+            chatID: ObjectIdentifier(chat), storedID: "stored-a"))
+        XCTAssertNil(ChatRuntime.shared.pendingStopRequests[oldBotID])
+        XCTAssertEqual(ChatRuntime.shared.pendingStopRequests[newBotID]?.route, newRoute)
+        XCTAssertEqual(ChatRuntime.shared.pendingStopRequests[newBotID]?.storedID, "stored-a")
+        XCTAssertNil(ChatRuntime.shared.pendingStopRequests[newBotID]?.sessionID,
+                     "a renamed profile must await a new authoritative runtime sid")
+
+        // A mismatched ChatState/durable row cancels the old route instead of
+        // guessing that the destination owns the user's interrupt.
+        ChatRuntime.shared.pendingStopRequests[newBotID] = nil
+        ChatRuntime.shared.pendingStopRequests[oldBotID] = PendingStopRequest(
+            botID: oldBotID, route: oldRoute, storedID: "stored-old", sessionID: "runtime-old",
+            chatID: ObjectIdentifier(chat), generation: LiveRuntime.shared.generation)
+        XCTAssertFalse(ChatRuntime.shared.rekeyPendingStop(
+            fromBotIDs: [oldBotID], fromRoute: oldRoute,
+            toBotID: newBotID, toRoute: newRoute,
+            chatID: ObjectIdentifier(chat), storedID: "stored-new"))
+        XCTAssertNil(ChatRuntime.shared.pendingStopRequests[oldBotID])
+        XCTAssertNil(ChatRuntime.shared.pendingStopRequests[newBotID])
+    }
+
+    @MainActor
+    func testDeletingOneSecondaryProfileClearsOnlyItsSourceQualifiedPendingStop() {
+        let model = AppModel()
+        let oldRoute = GatewayBotRoute(gatewayID: "gateway-delete", profile: "old")
+        let siblingRoute = GatewayBotRoute(gatewayID: "gateway-delete", profile: "sibling")
+        let oldBotID = oldRoute.qualifiedID
+        let siblingBotID = siblingRoute.qualifiedID
+        let oldChat = model.chat(for: oldBotID)
+        let siblingChat = model.chat(for: siblingBotID)
+        ChatRuntime.shared.pendingStopRequests[oldBotID] = PendingStopRequest(
+            botID: oldBotID, route: oldRoute, storedID: "stored-old", sessionID: "runtime-old",
+            chatID: ObjectIdentifier(oldChat), generation: LiveRuntime.shared.generation)
+        ChatRuntime.shared.pendingStopRequests[siblingBotID] = PendingStopRequest(
+            botID: siblingBotID, route: siblingRoute, storedID: "stored-sibling",
+            sessionID: "runtime-sibling", chatID: ObjectIdentifier(siblingChat),
+            generation: LiveRuntime.shared.generation)
+
+        ChatRuntime.shared.clearPendingStops(forRoute: oldRoute)
+
+        XCTAssertNil(ChatRuntime.shared.pendingStopRequests[oldBotID])
+        XCTAssertNotNil(ChatRuntime.shared.pendingStopRequests[siblingBotID],
+                        "deleting one secondary profile must not clear its sibling")
+        ChatRuntime.shared.pendingStopRequests[siblingBotID] = nil
+    }
+
+    @MainActor
+    func testPendingStopDoesNotFollowDeletedSessionIntoReplacement() async {
+        let model = AppModel()
+        model.mode = .live
+        let botID = "pending-stop-delete-\(UUID().uuidString)"
+        let route = GatewayBotRoute(gatewayID: "gateway-a", profile: botID)
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime-a"
+        chat.storedSessionID = "stored-a"
+        chat.isRunning = true
+        LiveRuntime.shared.gatewayID = "gateway-a"
+        ChatRuntime.shared.steerFences[botID] = SteerMutationFence(
+            operationID: UUID(), botID: botID, route: route, sessionID: "runtime-a",
+            storedID: "stored-a", chatID: ObjectIdentifier(chat), optimisticID: UUID(),
+            text: "adjust", stage: .redirect)
+        ChatRuntime.shared.reconcilingBots.insert(botID)
+        model.stopTurn(botID: botID)
+        XCTAssertNotNil(ChatRuntime.shared.pendingStopRequests[botID])
+
+        model.mode = .demo
+        _ = await model.deleteStoredSession("stored-a", botID: botID)
+        XCTAssertNil(ChatRuntime.shared.pendingStopRequests[botID],
+                     "deleting A must clear its deferred interrupt")
+
+        chat.sessionID = "runtime-b"
+        chat.storedSessionID = "stored-b"
+        chat.isRunning = true
+        ChatRuntime.shared.steerFences[botID] = nil
+        ChatRuntime.shared.reconcilingBots.remove(botID)
+        model.mode = .live
+        model.drainPendingMutationWork(botID: botID)
+        XCTAssertTrue(chat.isRunning)
+        XCTAssertNil(ChatRuntime.shared.stopActions[botID])
+        XCTAssertNil(ChatRuntime.shared.stopFences[botID])
+        LiveRuntime.shared.gatewayID = nil
+    }
+
+    @MainActor
+    func testPendingStopCannotDrainAfterGatewaySwitchToB() {
+        let model = AppModel()
+        model.mode = .live
+        let botID = "pending-stop-switch-\(UUID().uuidString)"
+        let routeA = GatewayBotRoute(gatewayID: "gateway-a", profile: botID)
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime-a"
+        chat.storedSessionID = "stored-a"
+        chat.isRunning = true
+        LiveRuntime.shared.gatewayID = "gateway-a"
+        ChatRuntime.shared.steerFences[botID] = SteerMutationFence(
+            operationID: UUID(), botID: botID, route: routeA, sessionID: "runtime-a",
+            storedID: "stored-a", chatID: ObjectIdentifier(chat), optimisticID: UUID(),
+            text: "adjust", stage: .redirect)
+        ChatRuntime.shared.reconcilingBots.insert(botID)
+        model.stopTurn(botID: botID)
+        XCTAssertEqual(ChatRuntime.shared.pendingStopRequests[botID]?.route, routeA)
+
+        // Model the switch's new source reusing the same profile id and ChatState.
+        ChatRuntime.shared.steerFences[botID] = nil
+        ChatRuntime.shared.reconcilingBots.remove(botID)
+        LiveRuntime.shared.gatewayID = "gateway-b"
+        chat.sessionID = "runtime-b"
+        chat.storedSessionID = "stored-b"
+        chat.isRunning = true
+        model.drainPendingMutationWork(botID: botID)
+
+        XCTAssertNil(ChatRuntime.shared.pendingStopRequests[botID])
+        XCTAssertNil(ChatRuntime.shared.stopActions[botID])
+        XCTAssertNil(ChatRuntime.shared.stopFences[botID])
+        XCTAssertTrue(chat.isRunning, "B must not inherit A's stop intent")
+        LiveRuntime.shared.gatewayID = nil
+    }
+
+    @MainActor
+    func testAmbiguousInterruptReadFailureRetainsRunningAndFence() async {
+        let model = AppModel()
+        let botID = "stop-fenced"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: "worker")
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        chat.isRunning = true
+        let fence = StopTurnFence(
+            operationID: UUID(), botID: botID, route: route,
+            sessionID: "runtime", storedID: "stored", chatID: ObjectIdentifier(chat))
+        ChatRuntime.shared.stopFences[botID] = fence
+
+        await model.reconcileStopTurn(
+            fence, note: "Stopped",
+            resume: { throw GatewayError(code: -7, message: "resume failed") },
+            accepts: { true })
+
+        XCTAssertTrue(chat.isRunning)
+        XCTAssertEqual(ChatRuntime.shared.stopFences[botID], fence)
+        XCTAssertTrue(model.mutationIsFenced(botID: botID))
+        ChatRuntime.shared.stopFences[botID] = nil
+    }
+
+    @MainActor
+    func testInterruptReconcileRunningProjectionRetainsFenceUntilIdle() async {
+        let model = AppModel()
+        let botID = "stop-running"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: "worker")
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        chat.isRunning = true
+        let fence = StopTurnFence(
+            operationID: UUID(), botID: botID, route: route,
+            sessionID: "runtime", storedID: "stored", chatID: ObjectIdentifier(chat))
+        ChatRuntime.shared.stopFences[botID] = fence
+
+        await model.reconcileStopTurn(
+            fence, note: "Stopped",
+            resume: {
+                LiveSession(.object([
+                    "session_id": .string("runtime"),
+                    "stored_session_id": .string("stored"),
+                    "running": .bool(true),
+                ]))
+            },
+            accepts: { true })
+
+        XCTAssertEqual(ChatRuntime.shared.stopFences[botID], fence)
+        XCTAssertTrue(chat.isRunning)
+        ChatRuntime.shared.stopFences[botID] = nil
+    }
+
+    @MainActor
+    func testInterruptFalseRunningWithInflightDoesNotSettleStop() async {
+        let model = AppModel()
+        let botID = "stop-inflight"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: "worker")
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        chat.isRunning = true
+        let fence = StopTurnFence(
+            operationID: UUID(), botID: botID, route: route,
+            sessionID: "runtime", storedID: "stored", chatID: ObjectIdentifier(chat))
+        ChatRuntime.shared.stopFences[botID] = fence
+
+        await model.reconcileStopTurn(
+            fence, note: "Stopped",
+            resume: {
+                LiveSession(.object([
+                    "session_id": .string("runtime"),
+                    "stored_session_id": .string("stored"),
+                    "running": .bool(false),
+                    "inflight": ["user": .string("still running")],
+                ]))
+            },
+            accepts: { true })
+
+        XCTAssertEqual(ChatRuntime.shared.stopFences[botID], fence)
+        XCTAssertTrue(chat.isRunning)
+        XCTAssertTrue(model.mutationIsFenced(botID: botID))
+        ChatRuntime.shared.stopFences[botID] = nil
+    }
+
+    @MainActor
+    func testInterruptFalseRunningWithNullInflightSettlesStopAndUIIdle() async {
+        let model = AppModel()
+        let botID = "stop-null-inflight"
+        let route = GatewayBotRoute(gatewayID: "gateway", profile: "worker")
+        let chat = model.chat(for: botID)
+        chat.sessionID = "runtime"
+        chat.storedSessionID = "stored"
+        chat.isRunning = true
+        let fence = StopTurnFence(
+            operationID: UUID(), botID: botID, route: route,
+            sessionID: "runtime", storedID: "stored", chatID: ObjectIdentifier(chat))
+        ChatRuntime.shared.stopFences[botID] = fence
+
+        await model.reconcileStopTurn(
+            fence, note: "Stopped",
+            resume: {
+                LiveSession(.object([
+                    "session_id": .string("runtime"),
+                    "stored_session_id": .string("stored"),
+                    "running": .bool(false),
+                    "inflight": .null,
+                ]))
+            },
+            accepts: { true })
+
+        XCTAssertNil(ChatRuntime.shared.stopFences[botID])
+        XCTAssertFalse(chat.isRunning)
+        XCTAssertFalse(chat.isTyping)
+        XCTAssertFalse(model.mutationIsFenced(botID: botID))
+    }
+
+    @MainActor
+    func testCanonicalBirthSuppressesInvisibleKickoffBehindFirstUserPrompt() {
+        let model = AppModel()
+        let chat = model.chat(for: "birth")
+        chat.messages = [ChatMessage(author: .user, text: "first prompt")]
+
+        XCTAssertFalse(model.canonicalKickoffShouldSubmit(chat: chat))
+        XCTAssertTrue(model.canonicalKickoffShouldSubmit(chat: ChatState()))
+    }
+
+    func testSteerAndRedirectReceiptsRejectRawFalseBeforeStatus() {
+        XCTAssertThrowsError(try SessionMutationReceipt.requireStatus(
+            .object(["ok": .bool(false), "status": .string("queued")]),
+            operation: "session.steer", accepted: ["queued", "rejected"])) { error in
+            XCTAssertEqual((error as? GatewayError)?.code, 409)
+        }
+        XCTAssertThrowsError(try SessionMutationReceipt.requireStatus(
+            .object(["ok": .bool(false), "status": .string("redirected")]),
+            operation: "session.redirect", accepted: ["redirected", "queued", "rejected"])) { error in
+            XCTAssertEqual((error as? GatewayError)?.code, 409)
+        }
+        XCTAssertEqual(try? SessionMutationReceipt.requireStatus(
+            .object(["ok": .bool(true), "status": .string("queued")]),
+            operation: "session.steer", accepted: ["queued", "rejected"]), "queued")
+    }
+
+    @MainActor
+    func testUnaddressableLiveStopFencesUntilAuthoritativeReattach() {
+        let model = AppModel()
+        model.mode = .live
+        let botID = "unaddressable-stop"
+        let chat = model.chat(for: botID)
+        chat.storedSessionID = "stored"
+        chat.isRunning = true
+        LiveRuntime.shared.gatewayID = nil
+        model.stopTurn(botID: botID)
+
+        XCTAssertTrue(chat.isRunning)
+        XCTAssertTrue(ChatRuntime.shared.stopFences[botID]?.unaddressable == true)
+        XCTAssertTrue(model.mutationIsFenced(botID: botID))
+        let countBeforeBlockedSend = chat.messages.count
+        model.sendOrSteer(text: "must wait", to: botID)
+        XCTAssertEqual(chat.messages.count, countBeforeBlockedSend,
+                       "an unaddressable stop must block a new submit")
+
+        model.adopt(LiveSession(.object([
+            "session_id": .string("runtime-reattached"),
+            "stored_session_id": .string("stored"),
+            "running": .bool(false),
+        ])), storedID: "stored", botID: botID, sourceGatewayID: "gateway")
+        XCTAssertNil(ChatRuntime.shared.stopFences[botID])
+        XCTAssertFalse(chat.isRunning)
+        XCTAssertEqual(chat.sessionID, "runtime-reattached")
+        LiveRuntime.shared.routedSessionToBot.removeValue(
+            forKey: GatewaySessionRoute(gatewayID: "gateway", sessionID: "runtime-reattached"))
+    }
+
+    func testDefinitePromptRefusalIsNotAmbiguousEvenWhenReadbackWouldFail() {
+        let refusal = GatewayError(code: 409, message: "refused")
+        XCTAssertFalse(PromptMutationFailure.isAmbiguous(refusal))
+        XCTAssertThrowsError(try PromptSubmitReceipt.requireAccepted(
+            .object(["ok": .bool(false), "status": .string("rejected")]),
+            operation: "Transcript action")) { error in
+            XCTAssertFalse(PromptMutationFailure.isAmbiguous(error))
+        }
     }
 }
 

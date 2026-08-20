@@ -3,6 +3,18 @@ import XCTest
 @testable import TalariaKit
 @testable import TalariaUI
 
+private actor AdoptionTaskBox {
+    private var task: Task<Void, Never>?
+
+    func store(_ task: Task<Void, Never>) {
+        self.task = task
+    }
+
+    func wait() async {
+        await task?.value
+    }
+}
+
 final class WorkspaceCommandCenterTests: XCTestCase {
     func testWorkspaceRouteDoesNotCollideAcrossGatewayOrProfile() {
         let a = GatewayWorkspaceRoute(gatewayID: "mini", profile: "default")
@@ -621,6 +633,81 @@ final class WorkspaceCommandCenterTests: XCTestCase {
     }
 
     @MainActor
+    func testRealDisconnectDropsWorkspaceScopeAndInvalidatesOperatorReads() async throws {
+        let model = AppModel()
+        let workspace = WorkspaceRuntime.shared
+        let live = LiveRuntime.shared
+        let gatewayID = "teardown-\(UUID().uuidString)"
+        let folder = FileManager.default.temporaryDirectory
+            .appending(path: "talaria-backup-teardown-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let export = folder.appending(path: "backup.zip")
+        try Data("backup".utf8).write(to: export)
+
+        workspace.gatewayID = gatewayID
+        workspace.projects = [HermesProject(.object(["id": .string("stale")]))]
+        workspace.backupExportURL = export
+        live.gatewayID = gatewayID
+        live.baseURL = nil
+        live.generation &+= 1
+        let revision = OperatorSettingsRuntime.shared.connectionRevision
+
+        await model.disconnectGateway()
+
+        XCTAssertNil(workspace.gatewayID)
+        XCTAssertTrue(workspace.projects.isEmpty)
+        XCTAssertNil(workspace.backupExportURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+        XCTAssertGreaterThan(OperatorSettingsRuntime.shared.connectionRevision, revision)
+        XCTAssertNil(live.gatewayID)
+    }
+
+    @MainActor
+    func testSecondaryTeardownDropsSelectedWorkspaceScopeAndBackupExport() async throws {
+        let model = AppModel()
+        let workspace = WorkspaceRuntime.shared
+        let gatewayID = "secondary-teardown-(UUID().uuidString)"
+        let folder = FileManager.default.temporaryDirectory
+            .appending(path: "talaria-secondary-backup-(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let export = folder.appending(path: "backup.zip")
+        try Data("backup".utf8).write(to: export)
+
+        workspace.gatewayID = gatewayID
+        workspace.backupExportURL = export
+        let revision = OperatorSettingsRuntime.shared.connectionRevision
+
+        await model.detachRoutedEvents(gatewayID: gatewayID)
+
+        XCTAssertNil(workspace.gatewayID)
+        XCTAssertNil(workspace.backupExportURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+        XCTAssertGreaterThan(OperatorSettingsRuntime.shared.connectionRevision, revision)
+    }
+
+    @MainActor
+    func testCompletedBackupExportSurvivesSectionUnmountUntilCommandCenterDismissal() throws {
+        let runtime = WorkspaceRuntime.shared
+        let folder = FileManager.default.temporaryDirectory
+            .appending(path: "talaria-backup-tab-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let export = folder.appending(path: "backup.zip")
+        try Data("backup".utf8).write(to: export)
+
+        runtime.gatewayID = "same-source"
+        runtime.backupExportURL = export
+
+        // A section disappearing while switching tabs has no cleanup hook.
+        XCTAssertNotNil(runtime.backupExportURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: export.path))
+
+        runtime.endCommandCenter()
+        XCTAssertNil(runtime.backupExportURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+        _ = runtime.begin(gatewayID: nil)
+    }
+
+    @MainActor
     func testWorkspaceScopeSwitchPreservesAndConsultsOperatorMaintenanceFence() {
         let maintenance = GatewayMaintenanceRuntime.shared
         let workspace = WorkspaceRuntime.shared
@@ -644,6 +731,333 @@ final class WorkspaceCommandCenterTests: XCTestCase {
         XCTAssertNil(workspace.claimMutation(),
                      "Command Center must not overlap a persistent operator action")
         XCTAssertEqual(maintenance.fence?.outcome, .accepted(pid: 73))
+    }
+
+    func testOperatorStatusLateResponsesRequireSourceClientAndConnectionFence() {
+        let first = GatewayClient(baseURL: URL(string: "https://first.example")!,
+                                  credential: .sessionToken("unused"))
+        let replacement = GatewayClient(baseURL: URL(string: "https://second.example")!,
+                                        credential: .sessionToken("unused"))
+        let client = ObjectIdentifier(first)
+        let same = OperatorStatusRequestPolicy.accepts(
+            capturedScopeKey: "secondary\u{1f}__gateway__",
+            currentScopeKey: "secondary\u{1f}__gateway__",
+            capturedViewGeneration: 2, currentViewGeneration: 2,
+            capturedConnectionRevision: 7, currentConnectionRevision: 7,
+            capturedLiveGeneration: 11, currentLiveGeneration: 11,
+            capturedClient: client, currentClient: client)
+        XCTAssertTrue(same)
+        XCTAssertFalse(OperatorStatusRequestPolicy.accepts(
+            capturedScopeKey: "secondary\u{1f}__gateway__",
+            currentScopeKey: "other\u{1f}__gateway__",
+            capturedViewGeneration: 2, currentViewGeneration: 2,
+            capturedConnectionRevision: 7, currentConnectionRevision: 7,
+            capturedLiveGeneration: 11, currentLiveGeneration: 11,
+            capturedClient: client, currentClient: client))
+        XCTAssertFalse(OperatorStatusRequestPolicy.accepts(
+            capturedScopeKey: "secondary\u{1f}__gateway__",
+            currentScopeKey: "secondary\u{1f}__gateway__",
+            capturedViewGeneration: 2, currentViewGeneration: 2,
+            capturedConnectionRevision: 7, currentConnectionRevision: 8,
+            capturedLiveGeneration: 11, currentLiveGeneration: 11,
+            capturedClient: client, currentClient: client))
+        XCTAssertFalse(OperatorStatusRequestPolicy.accepts(
+            capturedScopeKey: "secondary\u{1f}__gateway__",
+            currentScopeKey: "secondary\u{1f}__gateway__",
+            capturedViewGeneration: 2, currentViewGeneration: 2,
+            capturedConnectionRevision: 7, currentConnectionRevision: 7,
+            capturedLiveGeneration: 11, currentLiveGeneration: 12,
+            capturedClient: client, currentClient: client))
+        XCTAssertFalse(OperatorStatusRequestPolicy.accepts(
+            capturedScopeKey: "secondary\u{1f}__gateway__",
+            currentScopeKey: "secondary\u{1f}__gateway__",
+            capturedViewGeneration: 2, currentViewGeneration: 2,
+            capturedConnectionRevision: 7, currentConnectionRevision: 7,
+            capturedLiveGeneration: 11, currentLiveGeneration: 11,
+            capturedClient: client, currentClient: ObjectIdentifier(replacement)))
+    }
+
+    @MainActor
+    func testReconnectSuccessFencesDelayedOperatorStatusBeforeAndAfterDial() async {
+        let runtime = OperatorSettingsRuntime.shared
+        let sourceKey = "primary\u{1f}__gateway__"
+        let client = GatewayClient(baseURL: URL(string: "https://reconnect.example")!,
+                                   credential: .sessionToken("unused"))
+        let clientID = ObjectIdentifier(client)
+        let capturedRevision = runtime.connectionRevision
+
+        runtime.beginReconnectAttempt()
+        await Task.yield() // Model the status REST await overlapping the dial.
+
+        XCTAssertFalse(OperatorStatusRequestPolicy.accepts(
+            capturedScopeKey: sourceKey, currentScopeKey: sourceKey,
+            capturedViewGeneration: 3, currentViewGeneration: 3,
+            capturedConnectionRevision: capturedRevision,
+            currentConnectionRevision: runtime.connectionRevision,
+            capturedLiveGeneration: 19, currentLiveGeneration: 19,
+            capturedClient: clientID, currentClient: clientID),
+            "same-client status must be fenced before reconnect completes")
+        XCTAssertFalse(OperatorStatusRequestPolicy.allowsPublication(
+            isOffline: true, reconnecting: true,
+            requestedGatewayID: nil, activeGatewayID: "primary"),
+            "a status task restarted during reconnect must stay silent")
+
+        runtime.completeReconnectAttempt()
+        XCTAssertFalse(OperatorStatusRequestPolicy.accepts(
+            capturedScopeKey: sourceKey, currentScopeKey: sourceKey,
+            capturedViewGeneration: 3, currentViewGeneration: 3,
+            capturedConnectionRevision: capturedRevision,
+            currentConnectionRevision: runtime.connectionRevision,
+            capturedLiveGeneration: 19, currentLiveGeneration: 19,
+            capturedClient: clientID, currentClient: clientID),
+            "a successful reconnect must keep the pre-dial response stale")
+    }
+
+    @MainActor
+    func testReconnectFailureKeepsDelayedOperatorStatusFenced() async {
+        let runtime = OperatorSettingsRuntime.shared
+        let sourceKey = "primary\u{1f}__gateway__"
+        let client = GatewayClient(baseURL: URL(string: "https://failed-reconnect.example")!,
+                                   credential: .sessionToken("unused"))
+        let clientID = ObjectIdentifier(client)
+        let capturedRevision = runtime.connectionRevision
+
+        runtime.beginReconnectAttempt()
+        await Task.yield() // Model a failed client.connect returning later.
+
+        XCTAssertFalse(OperatorStatusRequestPolicy.accepts(
+            capturedScopeKey: sourceKey, currentScopeKey: sourceKey,
+            capturedViewGeneration: 4, currentViewGeneration: 4,
+            capturedConnectionRevision: capturedRevision,
+            currentConnectionRevision: runtime.connectionRevision,
+            capturedLiveGeneration: 27, currentLiveGeneration: 27,
+            capturedClient: clientID, currentClient: clientID),
+            "a failed reconnect must not release the pre-dial status response")
+        XCTAssertFalse(OperatorStatusRequestPolicy.allowsPublication(
+            isOffline: true, reconnecting: false,
+            requestedGatewayID: nil, activeGatewayID: "primary"),
+            "offline primary status must stay unavailable after dial failure")
+    }
+
+    @MainActor
+    func testRegistrySecondaryRosterFailureTearsDownWorkspaceBeforePoolDisconnect() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let workspace = WorkspaceRuntime.shared
+        let gateway = try XCTUnwrap(registry.upsert(
+            urlString: "https://registry-secondary-\(UUID().uuidString).example",
+            name: "Registry secondary", credential: .sessionToken("unused")))
+        defer { registry.remove(id: gateway.id) }
+
+        let client = GatewayClient(baseURL: try XCTUnwrap(gateway.baseURL),
+                                   credential: .sessionToken("unused"))
+        await registry.clientPool.adopt(client, for: gateway.id)
+
+        workspace.gatewayID = gateway.id
+        workspace.projects = [HermesProject(.object(["id": .string("stale")]))]
+        let generation = workspace.generation
+        let loadTask = Task { @MainActor in
+            while !Task.isCancelled { await Task.yield() }
+        }
+        workspace.loadTask = loadTask
+        let revision = OperatorSettingsRuntime.shared.connectionRevision
+
+        await registry.enumerateSecondaryRosters(excluding: [], minInterval: 0)
+
+        XCTAssertNil(workspace.gatewayID)
+        XCTAssertTrue(workspace.projects.isEmpty)
+        XCTAssertGreaterThan(workspace.generation, generation)
+        XCTAssertFalse(workspace.matches(gateway.id, generation),
+                       "registry teardown must fence in-flight workspace loads")
+        XCTAssertTrue(loadTask.isCancelled)
+        XCTAssertGreaterThan(OperatorSettingsRuntime.shared.connectionRevision, revision)
+        let disconnectedClient = await registry.clientPool.client(for: gateway.id)
+        XCTAssertNil(disconnectedClient, "the failed roster client must still be released")
+        _ = await loadTask.value
+        _ = model
+    }
+
+    @MainActor
+    func testStaleSecondaryRosterFailureCannotTearDownAdoptedReplacement() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let workspace = WorkspaceRuntime.shared
+        let gateway = try XCTUnwrap(registry.upsert(
+            urlString: "https://registry-replacement-\(UUID().uuidString).example",
+            name: "Registry replacement", credential: .sessionToken("unused")))
+        defer { registry.remove(id: gateway.id) }
+
+        let baseURL = try XCTUnwrap(gateway.baseURL)
+        let oldClient = GatewayClient(baseURL: baseURL, credential: .sessionToken("old"))
+        let replacement = GatewayClient(baseURL: baseURL, credential: .sessionToken("new"))
+        await registry.clientPool.adopt(oldClient, for: gateway.id)
+        let oldConnection = try await registry.clientPool.connectWithGeneration(
+            gatewayID: gateway.id, baseURL: baseURL, credential: .sessionToken("old"))
+
+        workspace.gatewayID = gateway.id
+        workspace.projects = [HermesProject(.object(["id": .string("replacement-state")]))]
+        let generation = workspace.generation
+        let revision = OperatorSettingsRuntime.shared.connectionRevision
+
+        // Model an old profiles.list failure arriving after primary adoption
+        // has installed a replacement client in the same pool slot.
+        await registry.clientPool.adopt(replacement, for: gateway.id)
+        let staleTeardown = await registry.teardownSecondaryConnection(
+            gatewayID: gateway.id, expected: oldConnection)
+        XCTAssertFalse(staleTeardown)
+
+        XCTAssertEqual(workspace.gatewayID, gateway.id)
+        XCTAssertEqual(workspace.projects.first?.id, "replacement-state")
+        XCTAssertEqual(workspace.generation, generation)
+        XCTAssertEqual(OperatorSettingsRuntime.shared.connectionRevision, revision)
+        let current = try await registry.clientPool.connectWithGeneration(
+            gatewayID: gateway.id, baseURL: baseURL, credential: .sessionToken("new"))
+        XCTAssertEqual(ObjectIdentifier(current.client), ObjectIdentifier(replacement))
+        XCTAssertEqual(current.generation, oldConnection.generation &+ 1)
+
+        await model.detachRoutedEvents(gatewayID: gateway.id)
+        await registry.clientPool.disconnect(gatewayID: gateway.id)
+        _ = workspace.begin(gatewayID: nil)
+    }
+
+    @MainActor
+    func testSecondaryHealthDoesNotReplacePrimaryLiveBeacon() {
+        let defaults = UserDefaults(suiteName: "talaria-health-\(UUID().uuidString)")!
+        let registry = ConnectionRegistry(defaults: defaults)
+        let primary = try! XCTUnwrap(registry.upsert(
+            urlString: "https://health-primary-\(UUID().uuidString).example",
+            name: "Primary", credential: nil))
+        let secondary = try! XCTUnwrap(registry.upsert(
+            urlString: "https://health-secondary-\(UUID().uuidString).example",
+            name: "Secondary", credential: nil))
+        let primaryURL = try! XCTUnwrap(primary.baseURL)
+        let secondaryURL = try! XCTUnwrap(secondary.baseURL)
+
+        registry.noteState(.connected, pingMS: 4, forURL: primaryURL)
+        registry.noteProbeHealth(.init(state: .connected, pingMS: 21,
+                                       version: "secondary", authRequired: false),
+                                 forURL: secondaryURL)
+
+        XCTAssertEqual(registry.liveGatewayURL, primaryURL)
+        XCTAssertEqual(registry.health[primary.id]?.state, .connected)
+        XCTAssertEqual(registry.health[secondary.id]?.state, .connected)
+        XCTAssertEqual(registry.health[secondary.id]?.version, "secondary")
+    }
+
+    @MainActor
+    func testRefreshConnectionHealthKeepsHealthySecondaryDiagnosticOnly() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let supervisor = ConnectionSupervisor.shared
+        let runtime = LiveRuntime.shared
+        let primary = try XCTUnwrap(registry.upsert(
+            urlString: "https://refresh-primary-\(UUID().uuidString).example",
+            name: "Refresh primary", credential: nil))
+        let secondary = try XCTUnwrap(registry.upsert(
+            urlString: "https://refresh-secondary-\(UUID().uuidString).example",
+            name: "Refresh secondary", credential: nil))
+        let primaryURL = try XCTUnwrap(primary.baseURL)
+        let previousProbe = supervisor.healthProbe
+        let previousPrimaryDiagnostics = supervisor.diagnostics[primary.id]
+        let previousSecondaryDiagnostics = supervisor.diagnostics[secondary.id]
+        let previousMode = model.mode
+        let previousClient = model.client
+        let previousBaseURL = runtime.baseURL
+        let previousGatewayID = runtime.gatewayID
+
+        defer {
+            supervisor.healthProbe = previousProbe
+            supervisor.diagnostics[primary.id] = previousPrimaryDiagnostics
+            supervisor.diagnostics[secondary.id] = previousSecondaryDiagnostics
+            model.mode = previousMode
+            model.client = previousClient
+            runtime.baseURL = previousBaseURL
+            runtime.gatewayID = previousGatewayID
+            registry.remove(id: primary.id)
+            registry.remove(id: secondary.id)
+            _ = AppModel()
+        }
+
+        model.mode = .live
+        model.client = GatewayClient(baseURL: primaryURL,
+                                     credential: .sessionToken("unused"))
+        runtime.baseURL = primaryURL
+        runtime.gatewayID = primary.id
+        registry.noteState(.connected, pingMS: 3, forURL: primaryURL)
+        supervisor.healthProbe = { gateway in
+            if gateway.id == primary.id {
+                return (.connected, GatewayDiagnostics(version: "primary",
+                                                        authMode: .open,
+                                                        pingMS: 5))
+            }
+            if gateway.id == secondary.id {
+                return (.connected, GatewayDiagnostics(version: "secondary",
+                                                        authMode: .oauth,
+                                                        pingMS: 11))
+            }
+            return (.offline, GatewayDiagnostics(lastError: "test fixture"))
+        }
+
+        await model.refreshConnectionHealth()
+
+        XCTAssertEqual(registry.liveGatewayURL, primaryURL,
+                       "a healthy secondary probe must not become the active source")
+        XCTAssertEqual(registry.health[primary.id]?.state, .connected)
+        XCTAssertEqual(registry.health[secondary.id]?.state, .connected)
+        XCTAssertEqual(registry.health[secondary.id]?.pingMS, 11)
+        XCTAssertEqual(registry.health[secondary.id]?.version, "secondary")
+        XCTAssertTrue(registry.health[secondary.id]?.authRequired == true)
+    }
+
+    @MainActor
+    func testReplacementAdoptionIsBlockedDuringTeardownCallbackAndStateMutation() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let workspace = WorkspaceRuntime.shared
+        let gateway = try XCTUnwrap(registry.upsert(
+            urlString: "https://registry-interleave-\(UUID().uuidString).example",
+            name: "Registry interleave", credential: .sessionToken("unused")))
+        defer {
+            registry.setSecondaryTeardown(nil)
+            registry.remove(id: gateway.id)
+            _ = AppModel()
+        }
+
+        let baseURL = try XCTUnwrap(gateway.baseURL)
+        let oldClient = GatewayClient(baseURL: baseURL, credential: .sessionToken("old"))
+        let replacement = GatewayClient(baseURL: baseURL, credential: .sessionToken("new"))
+        let adoption = AdoptionTaskBox()
+        await registry.clientPool.adopt(oldClient, for: gateway.id)
+        let oldConnection = try await registry.clientPool.connectWithGeneration(
+            gatewayID: gateway.id, baseURL: baseURL, credential: .sessionToken("old"))
+        workspace.gatewayID = gateway.id
+        workspace.projects = [HermesProject(.object(["id": .string("interleaved")]))]
+
+        registry.setSecondaryTeardown { gatewayID, expected in
+            // Adoption is intentionally launched while teardown owns the
+            // lease.  The pool must hold it until AppModel has dropped the
+            // old source scope; awaiting adoption here would deadlock on the
+            // same lease and would not model a real reconnect race.
+            let task = Task {
+                await registry.clientPool.adopt(replacement, for: gatewayID)
+            }
+            await adoption.store(task)
+            await model.detachRoutedEvents(gatewayID: gatewayID, expected: expected)
+        }
+        let result = await registry.teardownSecondaryConnection(
+            gatewayID: gateway.id, expected: oldConnection)
+
+        XCTAssertTrue(result)
+        XCTAssertNil(workspace.gatewayID)
+        XCTAssertTrue(workspace.projects.isEmpty)
+        // Let the adoption task pass the released lease before asserting the
+        // replacement identity.  It must not be disconnected by the stale
+        // teardown that preceded it.
+        await adoption.wait()
+        let current = try await registry.clientPool.connectWithGeneration(
+            gatewayID: gateway.id, baseURL: baseURL, credential: .sessionToken("new"))
+        XCTAssertEqual(ObjectIdentifier(current.client), ObjectIdentifier(replacement))
+        await registry.clientPool.disconnect(gatewayID: gateway.id)
     }
 
 }

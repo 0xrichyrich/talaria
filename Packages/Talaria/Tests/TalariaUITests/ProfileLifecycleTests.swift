@@ -406,6 +406,94 @@ struct ProfileLifecycleTests {
         LiveRuntime.shared.gatewayID = nil
     }
 
+    @Test @MainActor func activePrimaryRetirementRestoresOnlyExactPendingStopForRename() throws {
+        let model = AppModel()
+        let gatewayID = "primary-stop-\(UUID().uuidString)"
+        let target = ProfileLifecycleTarget(
+            rosterID: "worker",
+            route: GatewayBotRoute(gatewayID: gatewayID, profile: "worker"))
+        let siblingRoute = GatewayBotRoute(gatewayID: gatewayID, profile: "sibling")
+        let targetChat = ChatState(messages: [])
+        targetChat.storedSessionID = "stored-target"
+        targetChat.sessionID = "runtime-target"
+        model.chats["worker"] = targetChat
+        let siblingChat = ChatState(messages: [])
+        siblingChat.storedSessionID = "stored-sibling"
+        model.chats[siblingRoute.qualifiedID] = siblingChat
+        LiveRuntime.shared.gatewayID = gatewayID
+        ChatRuntime.shared.pendingStopRequests["worker"] = PendingStopRequest(
+            botID: "worker", route: target.route, storedID: "stored-target",
+            sessionID: "runtime-target", chatID: ObjectIdentifier(targetChat),
+            generation: LiveRuntime.shared.generation)
+        ChatRuntime.shared.pendingStopRequests[siblingRoute.qualifiedID] = PendingStopRequest(
+            botID: siblingRoute.qualifiedID, route: siblingRoute,
+            storedID: "stored-sibling", sessionID: "runtime-sibling",
+            chatID: ObjectIdentifier(siblingChat), generation: LiveRuntime.shared.generation)
+        defer {
+            ChatRuntime.shared.pendingStopRequests.removeAll()
+            model.chats.removeValue(forKey: "worker")
+            model.chats.removeValue(forKey: target.route.qualifiedID)
+            model.chats.removeValue(forKey: siblingRoute.qualifiedID)
+            LiveRuntime.shared.gatewayID = nil
+        }
+
+        // This is the exact primary rename pre-retirement parking boundary.
+        model.parkProfileLifecycleState(target)
+        #expect(ChatRuntime.shared.pendingStopRequests[target.route.qualifiedID]?.storedID
+                == "stored-target")
+
+        // disconnectGateway clears the whole departing gateway. Lifecycle
+        // ownership restores only the captured target before reconciliation.
+        ChatRuntime.shared.clearPendingStops(forGatewayID: gatewayID)
+        #expect(ChatRuntime.shared.pendingStopRequests[target.route.qualifiedID] == nil)
+        #expect(ChatRuntime.shared.pendingStopRequests[siblingRoute.qualifiedID] == nil)
+        model.restoreProfileLifecyclePendingStop(target, parked: true)
+        #expect(ChatRuntime.shared.pendingStopRequests[target.route.qualifiedID] != nil)
+        #expect(ChatRuntime.shared.pendingStopRequests[siblingRoute.qualifiedID] == nil)
+
+        let renamed = GatewayBotRoute(gatewayID: gatewayID, profile: "renamed")
+        #expect(ChatRuntime.shared.rekeyPendingStop(
+            fromBotIDs: [target.route.qualifiedID, target.route.profile],
+            fromRoute: target.route, toBotID: renamed.qualifiedID, toRoute: renamed,
+            chatID: ObjectIdentifier(targetChat), storedID: "stored-target"))
+        #expect(ChatRuntime.shared.pendingStopRequests[target.route.qualifiedID] == nil)
+        #expect(ChatRuntime.shared.pendingStopRequests[renamed.qualifiedID]?.route == renamed)
+        #expect(ChatRuntime.shared.pendingStopRequests[siblingRoute.qualifiedID] == nil)
+    }
+
+    @Test @MainActor func refusedPrimaryRenameRestoresPendingStopToBareOwner() throws {
+        let model = AppModel()
+        let gatewayID = "primary-refused-stop-\(UUID().uuidString)"
+        let target = ProfileLifecycleTarget(
+            rosterID: "worker",
+            route: GatewayBotRoute(gatewayID: gatewayID, profile: "worker"))
+        let chat = ChatState(messages: [])
+        chat.storedSessionID = "stored-target"
+        chat.sessionID = "runtime-target"
+        model.chats["worker"] = chat
+        LiveRuntime.shared.gatewayID = gatewayID
+        ChatRuntime.shared.pendingStopRequests["worker"] = PendingStopRequest(
+            botID: "worker", route: target.route, storedID: "stored-target",
+            sessionID: "runtime-target", chatID: ObjectIdentifier(chat),
+            generation: LiveRuntime.shared.generation)
+        defer {
+            ChatRuntime.shared.pendingStopRequests.removeAll()
+            model.chats.removeValue(forKey: "worker")
+            model.chats.removeValue(forKey: target.route.qualifiedID)
+            LiveRuntime.shared.gatewayID = nil
+        }
+
+        model.parkProfileLifecycleState(target)
+        ChatRuntime.shared.clearPendingStops(forGatewayID: gatewayID)
+        model.restoreProfileLifecyclePendingStop(target, parked: true)
+        LiveRuntime.shared.gatewayID = nil
+        model.restoreParkedProfileLifecycleStateIfNeeded(target, wasActive: true)
+
+        #expect(ChatRuntime.shared.pendingStopRequests["worker"] != nil)
+        #expect(ChatRuntime.shared.pendingStopRequests[target.route.qualifiedID] == nil)
+        #expect(model.chats["worker"]?.storedSessionID == "stored-target")
+    }
+
     @Test @MainActor func failedMutationRestoresBareStateOnlyWithoutNewPrimaryOwner() {
         let target = ProfileLifecycleTarget(
             rosterID: "worker",

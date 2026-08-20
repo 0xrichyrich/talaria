@@ -34,49 +34,70 @@ public struct CommandCenterView: View {
 
     public var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                sourcePicker
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(Section.allCases) { item in
-                            Button { section = item } label: {
-                                CommandSectionChip(title: item.rawValue, selected: section == item,
-                                                   theme: theme)
+            Group {
+                if model.mode == .live {
+                    VStack(spacing: 0) {
+                        sourcePicker
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(Section.allCases) { item in
+                                    Button { section = item } label: {
+                                        CommandSectionChip(title: item.rawValue, selected: section == item,
+                                                           theme: theme)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityAddTraits(section == item ? .isSelected : [])
+                                }
                             }
-                            .buttonStyle(.plain)
-                            .accessibilityAddTraits(section == item ? .isSelected : [])
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 8)
+
+                        Group {
+                            switch section {
+                            case .projects: WorkspaceProjectsSection(model: model, close: { dismiss() })
+                            case .files: WorkspaceFilesSection(model: model)
+                            case .review: WorkspaceGitSection(model: model)
+                            case .commands: WorkspaceCommandsSection(model: model)
+                            case .system: WorkspaceSystemSection(model: model, close: { dismiss() })
+                            }
                         }
                     }
-                }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 8)
-
-                Group {
-                    switch section {
-                    case .projects: WorkspaceProjectsSection(model: model, close: { dismiss() })
-                    case .files: WorkspaceFilesSection(model: model)
-                    case .review: WorkspaceGitSection(model: model)
-                    case .commands: WorkspaceCommandsSection(model: model)
-                    case .system: WorkspaceSystemSection(model: model, close: { dismiss() })
-                    }
+                    .background(theme.bg)
+                } else {
+                    ContentUnavailableView(
+                        "Command Center unavailable",
+                        systemImage: "square.grid.2x2.slash",
+                        description: Text("Connect a live gateway before opening workspace controls.")
+                    )
+                    .padding()
+                    .background(theme.bg)
                 }
             }
-            .background(theme.bg)
             .navigationTitle("Command Center")
             .modifier(CommandInlineTitle())
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
-                ToolbarItem(placement: .primaryAction) {
-                    Button { Task { await model.refreshWorkspace() } } label: {
-                        Image(systemName: "arrow.clockwise")
+                if model.mode == .live {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button { Task { await model.refreshWorkspace() } } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .disabled(runtime.loading || runtime.mutationBusy
+                                  || runtime.systemActionRunning || runtime.commandRunning)
+                        .accessibilityLabel("Refresh Command Center")
                     }
-                    .disabled(runtime.loading || runtime.mutationBusy
-                              || runtime.systemActionRunning || runtime.commandRunning)
-                    .accessibilityLabel("Refresh Command Center")
                 }
             }
         }
-        .task { model.prepareWorkspace(gatewayID: initialGatewayID) }
+        .task(id: model.mode) {
+            guard model.mode == .live else { return }
+            model.prepareWorkspace(gatewayID: initialGatewayID)
+        }
+        .onChange(of: model.mode) { _, mode in
+            if mode != .live { runtime.endCommandCenter() }
+        }
+        .onDisappear { runtime.endCommandCenter() }
     }
 
     @ViewBuilder private var sourcePicker: some View {
@@ -1272,10 +1293,6 @@ private struct WorkspaceSystemSection: View {
             Button("Cancel", role: .cancel) { pending = nil }
         } message: {
             Text(confirmMessage)
-        }
-        .onDisappear {
-            model.cancelWorkspaceBackupDownload()
-            runtime.removeBackupExport()
         }
     }
 

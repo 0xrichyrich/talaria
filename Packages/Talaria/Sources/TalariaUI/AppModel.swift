@@ -78,6 +78,9 @@ public final class AppModel {
 
     public init() {
         showOnboarding = !UserDefaults.standard.bool(forKey: "talaria-onboarded")
+        ConnectionRegistry.shared.setSecondaryTeardown { [weak self] gatewayID, expected in
+            await self?.detachRoutedEvents(gatewayID: gatewayID, expected: expected)
+        }
     }
 
     // MARK: - Demo mode
@@ -201,7 +204,7 @@ public final class AppModel {
         }
         switch mode {
         case .demo: demoReply(botID: botID, chat: chat)
-        case .live: liveSend(text: text, botID: botID, chat: chat)
+        case .live: liveSendSerialized(text: text, botID: botID, chat: chat)
         }
     }
 

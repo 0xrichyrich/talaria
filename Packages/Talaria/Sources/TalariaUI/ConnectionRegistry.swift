@@ -147,6 +147,19 @@ public struct SecondaryRosterProblem: Sendable, Equatable, Identifiable {
     }
 }
 
+private actor SecondaryConnectionCapture {
+    private(set) var snapshot: GatewayClientPool.ConnectionSnapshot?
+
+    func record(_ snapshot: GatewayClientPool.ConnectionSnapshot) {
+        self.snapshot = snapshot
+    }
+}
+
+private struct SecondaryRosterFetch: Sendable {
+    var profiles: [HermesProfile]
+    var connection: GatewayClientPool.ConnectionSnapshot
+}
+
 @MainActor
 @Observable
 public final class ConnectionRegistry {
@@ -192,6 +205,11 @@ public final class ConnectionRegistry {
     @ObservationIgnored private var probeTask: Task<Void, Never>?
     /// One enumeration pass at a time; a foreground burst must not stack dials.
     @ObservationIgnored private var enumerationTask: Task<Void, Never>?
+    /// AppModel owns source-qualified UI teardown. Keep only a weak capture in
+    /// the installed closure so the registry singleton cannot retain the app
+    /// model, and invoke it before releasing a failed secondary client.
+    @ObservationIgnored private var secondaryTeardown:
+        (@MainActor (String, GatewayClientPool.ConnectionSnapshot) async -> Void)?
     /// gateway id → when we last *attempted* a dial, so a gateway that refuses
     /// to answer is not re-dialled on every probe tick.
     @ObservationIgnored private var lastEnumerationAttempt: [String: Date] = [:]
@@ -308,6 +326,14 @@ public final class ConnectionRegistry {
         health[row.id] = h
     }
 
+    /// Record a status-probe answer without changing the live-source beacon.
+    /// Only the primary WebSocket calls `noteState(.connected)` or
+    /// `noteBotCount`; a healthy secondary must remain diagnostic state only.
+    internal func noteProbeHealth(_ value: Health, forURL url: URL) {
+        guard let row = gateway(forURL: url) else { return }
+        health[row.id] = value
+    }
+
     // MARK: - Health probes
 
     /// Keep the rows fresh while the Connections screen (or the app) is in
@@ -325,6 +351,16 @@ public final class ConnectionRegistry {
     public func stopAutoProbe() {
         probeTask?.cancel()
         probeTask = nil
+    }
+
+    /// Install the owner-side teardown for retained secondary connections.
+    /// This is deliberately a callback rather than a registry → AppModel
+    /// reference: ConnectionRegistry is also used by routing and health
+    /// surfaces, and a strong reference here would make the app model and its
+    /// singleton lifetime-coupled.
+    internal func setSecondaryTeardown(_ handler:
+                                       (@MainActor (String, GatewayClientPool.ConnectionSnapshot) async -> Void)?) {
+        secondaryTeardown = handler
     }
 
     /// Probe every saved gateway in parallel.
@@ -349,10 +385,11 @@ public final class ConnectionRegistry {
             health[gateway.id] = Health(state: .offline)
             return
         }
-        health[gateway.id] = Health(state: .connecting,
-                                    pingMS: health[gateway.id]?.pingMS,
-                                    version: health[gateway.id]?.version,
-                                    authRequired: health[gateway.id]?.authRequired ?? false)
+        noteProbeHealth(Health(state: .connecting,
+                               pingMS: health[gateway.id]?.pingMS,
+                               version: health[gateway.id]?.version,
+                               authRequired: health[gateway.id]?.authRequired ?? false),
+                        forURL: base)
         let auth = GatewayAuthClient(baseURL: base, session: probeSession)
         let clock = ContinuousClock()
         let start = clock.now
@@ -360,12 +397,13 @@ public final class ConnectionRegistry {
             let status = try await auth.status()
             let elapsed = start.duration(to: clock.now)
             let ms = max(1, Int((elapsed / .milliseconds(1)).rounded()))
-            health[gateway.id] = Health(state: .connected, pingMS: ms,
-                                        version: status.version,
-                                        authRequired: status.authRequired)
+            noteProbeHealth(Health(state: .connected, pingMS: ms,
+                                   version: status.version,
+                                   authRequired: status.authRequired),
+                            forURL: base)
         } catch {
             let timedOut = (error as? URLError)?.code == .timedOut
-            health[gateway.id] = Health(state: timedOut ? .asleep : .offline)
+            noteProbeHealth(Health(state: timedOut ? .asleep : .offline), forURL: base)
         }
     }
 
@@ -451,15 +489,36 @@ public final class ConnectionRegistry {
             return
         }
 
+        let capture = SecondaryConnectionCapture()
         do {
-            let profiles = try await Self.withTimeout(seconds: 12) {
-                let client = try await self.clientPool.connect(
+            let fetched = try await Self.withTimeout(seconds: 12) {
+                let connection = try await self.clientPool.connectWithGeneration(
                     gatewayID: gateway.id, baseURL: base, credential: credential)
                 // include_sessions gives the preview + last_active in the same
                 // round trip (methods_profiles.py:22-31); a foreign row is only
                 // worth painting if it can say when that machine last spoke.
-                return try await client.listProfiles(includeSessions: true)
+                await capture.record(connection)
+                return SecondaryRosterFetch(
+                    profiles: try await connection.client.listProfiles(includeSessions: true),
+                    connection: connection)
             }
+            // A replacement/adoption may have won while profiles.list was
+            // suspended. Its answer must not overwrite the replacement's
+            // roster state.
+            guard base.absoluteString != liveGatewayURL?.absoluteString,
+                  let lease = await clientPool.acquireLease(
+                      fetched.connection, for: gateway.id) else {
+                return
+            }
+            // The live source can switch while lease acquisition suspends on
+            // the pool actor. Re-check the same source fence immediately
+            // before publishing, so a newly-live gateway never receives a
+            // roster fetched while it was secondary.
+            guard base.absoluteString != liveGatewayURL?.absoluteString else {
+                await clientPool.release(lease)
+                return
+            }
+            let profiles = fetched.profiles
             let rows = profiles
                 .filter { !$0.name.isEmpty }
                 .map(Self.secondaryProfile(from:))
@@ -467,21 +526,69 @@ public final class ConnectionRegistry {
                                                            fetchedAt: Date(),
                                                            freshness: .fresh)
             noteBotCountForSecondary(rows.count, gatewayID: gateway.id)
+            await clientPool.release(lease)
         } catch let error as GatewayError where error.code == GatewayClient.methodNotFound {
-            await clientPool.disconnect(gatewayID: gateway.id)
+            guard let expected = await capture.snapshot,
+                  await teardownSecondaryConnection(gatewayID: gateway.id, expected: expected) else {
+                return
+            }
             // A gateway too old for profiles.list has no roster to contribute.
             // Hide the surface rather than showing an error nobody can act on.
             mark(gateway.id, .unsupported)
         } catch AuthError.sessionExpired {
-            await clientPool.disconnect(gatewayID: gateway.id)
+            guard let expected = await capture.snapshot,
+                  await teardownSecondaryConnection(gatewayID: gateway.id, expected: expected) else {
+                return
+            }
             // The credential is gone/rejected; ConnectionSupervisor owns the
             // re-auth prompt for the LIVE gateway, and a secondary simply
             // reads as needing sign-in until the user switches to it.
             mark(gateway.id, .needsSignIn)
         } catch {
-            await clientPool.disconnect(gatewayID: gateway.id)
+            guard let expected = await capture.snapshot,
+                  await teardownSecondaryConnection(gatewayID: gateway.id, expected: expected) else {
+                return
+            }
             mark(gateway.id, .stale)
         }
+    }
+
+    /// Drop source-qualified UI state while the failed client identity is
+    /// still known, then release the pooled transport. The ordering matters:
+    /// `dropWorkspaceScope` advances its generation and cancels in-flight
+    /// loads, so a response already suspended on this client cannot publish
+    /// after the pool slot disappears.
+    internal func teardownSecondaryConnection(
+        gatewayID: String, expected: GatewayClientPool.ConnectionSnapshot
+    ) async -> Bool {
+        guard let gateway = saved.first(where: { $0.id == gatewayID }),
+              gateway.urlString != liveGatewayURL?.absoluteString,
+              let lease = await clientPool.acquireLease(expected, for: gatewayID) else {
+            return false
+        }
+        // Lease acquisition may have suspended while the user switched to
+        // this gateway. Do not let a stale secondary failure tear down the
+        // newly-active source.
+        guard gateway.urlString != liveGatewayURL?.absoluteString else {
+            await clientPool.release(lease)
+            return false
+        }
+        if let secondaryTeardown {
+            await secondaryTeardown(gatewayID, expected)
+        }
+        // AppModel teardown is async and can overlap a user-initiated source
+        // switch. Revalidate before the guarded pool removal as well; the
+        // lease protects replacement adoption, while this fence protects a
+        // source that became active during the callback.
+        guard gateway.urlString != liveGatewayURL?.absoluteString else {
+            await clientPool.release(lease)
+            return false
+        }
+        if await clientPool.disconnectIfCurrent(expected, for: gatewayID, lease: lease) {
+            return true
+        }
+        await clientPool.release(lease)
+        return false
     }
 
     /// Roster size for a gateway we are not connected to, so the Connections

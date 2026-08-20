@@ -173,6 +173,28 @@ public extension AppModel {
     }
 
     func detachRoutedEvents(gatewayID: String) async {
+        await detachRoutedEvents(gatewayID: gatewayID, expected: nil)
+    }
+
+    /// Detach a retained source only when the caller still owns the exact pool
+    /// slot it started against. Roster failures can arrive after `adopt` has
+    /// installed a replacement, and tearing down by gateway id alone would
+    /// clear the replacement's Workspace/Operator state.
+    func detachRoutedEvents(
+        gatewayID: String, expected: GatewayClientPool.ConnectionSnapshot?
+    ) async {
+        if let expected {
+            guard gatewayID != LiveRuntime.shared.gatewayID,
+                  gatewayID != activeGatewayID,
+                  await ConnectionRegistry.shared.clientPool.isCurrent(
+                      expected, for: gatewayID) else { return }
+        }
+        // A retained secondary can own the Command Center source even while
+        // the primary socket stays up. Tear down that exact workspace scope
+        // and invalidate selected Operator reads before the pool client is
+        // released, so a late status response cannot restore old controls.
+        OperatorSettingsRuntime.shared.invalidateConnectionScope()
+        dropWorkspaceScope(gatewayID: gatewayID)
         await removeRoutedEventSubscription(gatewayID: gatewayID)
         dropApprovalScope(gatewayID: gatewayID)
         dropRoutineScope(gatewayID: gatewayID)
