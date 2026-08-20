@@ -31,6 +31,11 @@ final class SessionsRuntime {
     /// bot id → why the last list fetch failed (nil once one succeeds).
     var loadErrors: [String: String] = [:]
 
+    /// Bot id → explicit stored-session selection generation. Cancelling a
+    /// task is not enough to fence a WebSocket/REST reply that was already on
+    /// the wire, so every completion also proves it still owns the selection.
+    var openGenerations: [String: UInt64] = [:]
+
     /// The extra event handler behind `attachSessionEventRouter()`, and the
     /// client it is registered on. A reconnect re-dials the transport but
     /// keeps the same `GatewayClient` (and its handler table); only a new
@@ -43,6 +48,15 @@ final class SessionsRuntime {
 
     static func key(botID: String, sessionID: String) -> String {
         botID + "\u{0}" + sessionID
+    }
+
+    func beginOpen(botID: String) -> UInt64 {
+        openGenerations[botID, default: 0] &+= 1
+        return openGenerations[botID, default: 0]
+    }
+
+    func acceptsOpen(botID: String, generation: UInt64) -> Bool {
+        openGenerations[botID] == generation
     }
 
     private static func botID(from key: String) -> String {
@@ -199,8 +213,15 @@ extension AppModel {
         let runtime = LiveRuntime.shared
         guard mode == .live, let lifecycle else { return }
 
+        let sessionsRuntime = SessionsRuntime.shared
+        let openGeneration = sessionsRuntime.beginOpen(botID: botID)
+        let connectionGeneration = runtime.generation
+
         // Unbind first: a send racing this must not land in the session we
         // are leaving, and an in-flight attach for the old session is stale.
+        // This open installs its own replacement in the SAME attach slot
+        // below. A send before session.resume returns therefore awaits this
+        // exact selection instead of starting canonical resolution in parallel.
         runtime.attachTasks[botID]?.cancel()
         runtime.attachTasks[botID] = nil
         if let old = chat.sessionID, let route = gatewayRoute(for: botID) {
@@ -213,60 +234,130 @@ extension AppModel {
         }
         chat.sessionID = nil
         chat.storedSessionID = id
+        chat.isRunning = false
         chat.isTyping = false
         chat.usage = nil
         chat.contextSegments = []
         chat.messages = []
+        ChatRuntime.shared.submitWatchdogs[botID]?.cancel()
+        ChatRuntime.shared.submitWatchdogs[botID] = nil
+        ChatRuntime.shared.turnFloor[botID] = nil
+        runtime.workingBotIDs.remove(botID)
+        if let idx = bots.firstIndex(where: { $0.id == botID }) {
+            bots[idx].task = nil
+            bots[idx].status = approvals.contains(where: { $0.botID == botID })
+                ? .approval : .idle
+        }
         // The durable key is also what a reconnect resumes from.
         runtime.lastSessionByBot[botID] = id
 
+        let task = Task<String, Error> { @MainActor in
+            let requireCurrentOpen: @MainActor () throws -> Void = {
+                try Task.checkCancellation()
+                guard SessionsRuntime.shared.acceptsOpen(
+                    botID: botID, generation: openGeneration),
+                    LiveRuntime.shared.generation == connectionGeneration,
+                    self.profileLifecycleAccepts(lifecycle) else {
+                    throw CancellationError()
+                }
+            }
+
+            try requireCurrentOpen()
+            guard let route = self.gatewayRoute(for: botID) else {
+                throw GatewayRouteError.noRoute
+            }
+            let client = try await self.routedClient(for: route)
+            try requireCurrentOpen()
+            await self.attachRoutedEventsIfNeeded(client: client,
+                                                  gatewayID: route.gatewayID)
+            try requireCurrentOpen()
+            // Full projection in the ack (deferHistory returns a bounded
+            // stub) — one round trip, authoritative rows, same tradeoff
+            // ensureSession makes.
+            let live = try await client.resumeSession(id, profile: route.profile,
+                                                      deferHistory: false)
+            try requireCurrentOpen()
+            guard !live.sessionID.isEmpty else {
+                throw GatewayError(code: -8, message: "session.resume returned no id")
+            }
+            let stored = live.storedSessionID.isEmpty ? id : live.storedSessionID
+            chat.storedSessionID = stored
+            // Clear state from the session we left, then derive the selected
+            // session's turn state before yielding to REST hydration. Events
+            // that arrive after bindSession are newer and may refine it.
+            chat.isRunning = live.running
+            chat.isTyping = false
+            self.bindSession(live, botID: botID, sourceGatewayID: route.gatewayID)
+            runtime.lastSessionByBot[botID] = stored
+            self.replayInflight(live, botID: botID)
+
+            try await Self.hydrateTranscript(
+                chat: chat,
+                resumeMessages: live.messages,
+                clearWhenEmpty: true,
+                fallback: {
+                    try? await client.latestSessionMessages(storedID: stored,
+                                                            profile: route.profile)
+                },
+                accepts: {
+                    SessionsRuntime.shared.acceptsOpen(
+                        botID: botID, generation: openGeneration)
+                        && LiveRuntime.shared.generation == connectionGeneration
+                        && self.profileLifecycleAccepts(lifecycle)
+                })
+            try requireCurrentOpen()
+
+            // Same replay every other resume path uses: the approval keeps
+            // its real choice set, and a parked clarify is recovered too.
+            self.replayPendingPrompts(live, sourceGatewayID: route.gatewayID)
+            // Context is ancillary to the binding. Do not keep the shared
+            // attach task occupied behind this extra RPC: sends may proceed as
+            // soon as resume + transcript hydration are coherent. The exact
+            // sid and both generations still fence the detached completion.
+            Task { @MainActor [weak self] in
+                await Task.yield()
+                guard let self,
+                      SessionsRuntime.shared.acceptsOpen(
+                        botID: botID, generation: openGeneration),
+                      LiveRuntime.shared.generation == connectionGeneration,
+                      self.profileLifecycleAccepts(lifecycle),
+                      chat.sessionID == live.sessionID,
+                      let segments = try? await client.contextBreakdown(live.sessionID),
+                      SessionsRuntime.shared.acceptsOpen(
+                        botID: botID, generation: openGeneration),
+                      LiveRuntime.shared.generation == connectionGeneration,
+                      self.profileLifecycleAccepts(lifecycle),
+                      chat.sessionID == live.sessionID else { return }
+                chat.contextSegments = segments
+                self.contextMeter = segments
+            }
+            return live.sessionID
+        }
+        runtime.attachTasks[botID] = task
+
         Task { @MainActor in
+            defer {
+                if LiveRuntime.shared.attachTasks[botID] == task {
+                    LiveRuntime.shared.attachTasks[botID] = nil
+                }
+            }
             do {
-                guard let route = self.gatewayRoute(for: botID) else {
-                    throw GatewayRouteError.noRoute
-                }
-                let client = try await self.routedClient(for: route)
-                guard self.profileLifecycleAccepts(lifecycle) else { return }
-                await self.attachRoutedEventsIfNeeded(client: client,
-                                                      gatewayID: route.gatewayID)
-                guard self.profileLifecycleAccepts(lifecycle) else { return }
-                // Full projection in the ack (deferHistory returns a bounded
-                // stub) — one round trip, authoritative rows, same tradeoff
-                // ensureSession makes.
-                let live = try await client.resumeSession(id, profile: route.profile,
-                                                          deferHistory: false)
-                guard self.profileLifecycleAccepts(lifecycle) else { return }
-                guard !live.sessionID.isEmpty else {
-                    throw GatewayError(code: -8, message: "session.resume returned no id")
-                }
-                chat.sessionID = live.sessionID
-                chat.storedSessionID = live.storedSessionID.isEmpty ? id : live.storedSessionID
-                self.bindSession(live, botID: botID, sourceGatewayID: route.gatewayID)
-                runtime.lastSessionByBot[botID] = chat.storedSessionID ?? id
-
-                var history = AppModel.chatMessages(fromTranscript: .array(live.messages))
-                if history.isEmpty, let stored = chat.storedSessionID,
-                   let payload = try? await client.latestSessionMessages(storedID: stored,
-                                                                         profile: route.profile) {
-                    guard self.profileLifecycleAccepts(lifecycle) else { return }
-                    history = AppModel.chatMessages(fromTranscript: payload)
-                }
-                guard self.profileLifecycleAccepts(lifecycle) else { return }
-                chat.messages = history
-
-                if live.running {
-                    chat.isTyping = true
-                    runtime.workingBotIDs.insert(botID)
-                    if let idx = self.bots.firstIndex(where: { $0.id == botID }) {
-                        self.bots[idx].status = .working
-                    }
-                }
-                // Same replay every other resume path uses: the approval keeps
-                // its real choice set, and a parked clarify is recovered too.
-                self.replayPendingPrompts(live, sourceGatewayID: route.gatewayID)
-                await self.refreshContext(botID: botID)
+                _ = try await task.value
+            } catch is CancellationError {
+                // A newer selection/reconnect owns the visible result.
             } catch {
-                guard self.profileLifecycleAccepts(lifecycle) else { return }
+                guard SessionsRuntime.shared.acceptsOpen(
+                    botID: botID, generation: openGeneration),
+                    LiveRuntime.shared.generation == connectionGeneration,
+                    self.profileLifecycleAccepts(lifecycle) else { return }
+                chat.isRunning = false
+                chat.isTyping = false
+                runtime.workingBotIDs.remove(botID)
+                if let idx = self.bots.firstIndex(where: { $0.id == botID }) {
+                    self.bots[idx].task = nil
+                    self.bots[idx].status = self.approvals.contains(where: { $0.botID == botID })
+                        ? .approval : .idle
+                }
                 chat.messages.append(ChatMessage(
                     author: .system, text: Self.sessionFailure(error, theme: self.theme)))
                 // …and out loud (plugin.js:6782 `notifyError(err, 'Could not
