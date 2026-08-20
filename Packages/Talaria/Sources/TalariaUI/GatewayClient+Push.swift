@@ -3,13 +3,18 @@ import TalariaKit
 
 enum PushRelayContract {
     static func configurationIssue(_ relay: JSONValue) -> String? {
-        if relay["relay_disabled"]?.boolValue == true { return "the relay is disabled" }
-        guard relay["apns_configured"]?.boolValue == false else { return nil }
-        let missing = relay["apns_missing_env"]?.arrayValue?
-            .compactMap(\.stringValue).filter { !$0.isEmpty } ?? []
-        return missing.isEmpty
-            ? "APNs credentials are incomplete"
-            : "missing \(missing.joined(separator: ", "))"
+        var issues: [String] = []
+        if relay["relay_disabled"]?.boolValue == true {
+            issues.append("the relay is disabled")
+        }
+        if relay["apns_configured"]?.boolValue == false {
+            let missing = relay["apns_missing_env"]?.arrayValue?
+                .compactMap(\.stringValue).filter { !$0.isEmpty } ?? []
+            issues.append(missing.isEmpty
+                ? "APNs credentials are incomplete"
+                : "missing \(missing.joined(separator: ", "))")
+        }
+        return issues.isEmpty ? nil : issues.joined(separator: "; ")
     }
 
     static func validateTestResponse(_ response: JSONValue) throws {

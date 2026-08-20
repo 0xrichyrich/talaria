@@ -113,12 +113,35 @@ final class TranscriptComposerPolicyTests: XCTestCase {
                                    ping: "12ms", botCount: 6)
         XCTAssertTrue(TalariaVoice.looksLikeNetworkAddress("100.87.108.5"))
         XCTAssertTrue(TalariaVoice.looksLikeNetworkAddress("100.87.108.5:9119"))
+        XCTAssertTrue(TalariaVoice.looksLikeNetworkAddress("studio.local"))
+        XCTAssertTrue(TalariaVoice.looksLikeNetworkAddress("api.example.com"))
+        XCTAssertTrue(TalariaVoice.looksLikeNetworkAddress("[fd7a:115c:a1e0::1]:9119"))
+        XCTAssertTrue(TalariaVoice.looksLikeNetworkAddress("localhost:9119"))
         XCTAssertFalse(TalariaVoice.looksLikeNetworkAddress("Home"))
+        XCTAssertTrue(TalariaVoice.looksLikeNetworkAddress("John.Doe"))
+        XCTAssertTrue(TalariaVoice.looksLikeNetworkAddress("NAS.office"))
+        XCTAssertFalse(TalariaVoice.looksLikeNetworkAddress("v2.0"))
         XCTAssertEqual(TalariaVoice.friendlyGatewayLabel(ip, .soft), "Home")
         let named = GatewayConnection(id: "b", name: "Studio", kind: .lan,
                                       address: "studio.local", state: .connected,
                                       ping: "4ms", botCount: 2)
         XCTAssertEqual(TalariaVoice.friendlyGatewayLabel(named, .soft), "Studio")
+        let dottedName = GatewayConnection(id: "d", name: "John.Doe", kind: .lan,
+                                           address: "studio.local", state: .connected,
+                                           ping: "4ms", botCount: 2)
+        XCTAssertEqual(TalariaVoice.friendlyGatewayLabel(dottedName, .soft), "John.Doe")
+        let lowercaseDottedName = GatewayConnection(
+            id: "f", name: "john.doe", kind: .lan, address: "studio.local",
+            state: .connected, ping: "4ms", botCount: 2)
+        XCTAssertEqual(TalariaVoice.friendlyGatewayLabel(lowercaseDottedName, .soft), "john.doe")
+        let mixedCaseRawHost = GatewayConnection(
+            id: "g", name: "NAS.office", kind: .lan, address: "nas.OFFICE:9119",
+            state: .connected, ping: "4ms", botCount: 2)
+        XCTAssertEqual(TalariaVoice.friendlyGatewayLabel(mixedCaseRawHost, .soft), "Nearby")
+        let versionName = GatewayConnection(id: "e", name: "v2.0", kind: .tailscale,
+                                            address: "100.87.108.5:9119", state: .connected,
+                                            ping: "12ms", botCount: 2)
+        XCTAssertEqual(TalariaVoice.friendlyGatewayLabel(versionName, .soft), "v2.0")
         let cloud = GatewayConnection(id: "c", name: "org", kind: .cloud,
                                       address: "acme", state: .connected,
                                       ping: "", botCount: 1)
@@ -127,12 +150,53 @@ final class TranscriptComposerPolicyTests: XCTestCase {
     }
 
     func testJumpToLatestAppearsOnlyAfterLeavingTheLiveEdge() {
+        var geometry = TranscriptGeometryReadiness()
+        XCTAssertFalse(geometry.isReady)
+        XCTAssertNil(geometry.distanceFromBottom)
+        geometry.recordBottom(minY: 0)
+        geometry.recordViewport(height: 0)
+        XCTAssertFalse(geometry.isReady, "preference defaults are not live geometry")
+        XCTAssertNil(geometry.distanceFromBottom)
+        geometry.recordViewport(height: 640)
+        XCTAssertTrue(geometry.isReady)
+        XCTAssertEqual(geometry.distanceFromBottom, -640)
+
         XCTAssertTrue(ChatTranscriptLayoutPolicy.isFollowingLatest(distanceFromBottom: 0))
         XCTAssertTrue(ChatTranscriptLayoutPolicy.isFollowingLatest(distanceFromBottom: 120))
         XCTAssertFalse(ChatTranscriptLayoutPolicy.isFollowingLatest(distanceFromBottom: 121))
         XCTAssertFalse(ChatTranscriptLayoutPolicy.showsJumpControl(isFollowingLatest: true, messageCount: 40))
         XCTAssertTrue(ChatTranscriptLayoutPolicy.showsJumpControl(isFollowingLatest: false, messageCount: 40))
         XCTAssertFalse(ChatTranscriptLayoutPolicy.showsJumpControl(isFollowingLatest: false, messageCount: 0))
+    }
+
+    func testInitialAnchorBeginsWhenAnEmptyTranscriptReceivesItsFirstMessage() {
+        var state = InitialTranscriptAnchorState()
+        XCTAssertNil(state.begin(botID: "default", messageCount: 0))
+
+        let attempt = state.begin(botID: "default", messageCount: 1)
+        XCTAssertNotNil(attempt)
+        XCTAssertTrue(state.shouldContinue(attempt!, currentBotID: "default",
+                                           isCancelled: false))
+        XCTAssertTrue(state.complete(attempt!, currentBotID: "default"))
+        XCTAssertTrue(state.isSettled(for: "default"))
+        XCTAssertNil(state.begin(botID: "default", messageCount: 2))
+    }
+
+    func testUserScrollOrCancellationStopsEveryRemainingInitialAnchorPass() {
+        var state = InitialTranscriptAnchorState()
+        let cancelled = state.begin(botID: "default", messageCount: 1)!
+        XCTAssertFalse(state.shouldContinue(cancelled, currentBotID: "default",
+                                            isCancelled: true))
+        XCTAssertFalse(state.complete(cancelled, currentBotID: "default",
+                                      isCancelled: true))
+
+        let departed = state.begin(botID: "default", messageCount: 1)!
+        XCTAssertTrue(state.userDeparted(botID: "default", messageCount: 1))
+        XCTAssertFalse(state.shouldContinue(departed, currentBotID: "default",
+                                            isCancelled: false))
+        XCTAssertFalse(state.complete(departed, currentBotID: "default"),
+                       "a departed attempt must not restore followingLatest")
+        XCTAssertTrue(state.isSettled(for: "default"))
     }
 
     func testChatSwipeBackOnlyCommitsFromTheLeadingEdge() {

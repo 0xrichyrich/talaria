@@ -96,6 +96,11 @@ final class PushDeviceMutationQueueTests: XCTestCase {
                        "missing TALARIA_APNS_KEY_ID, TALARIA_APNS_TEAM_ID")
         XCTAssertEqual(PushRelayContract.configurationIssue(["relay_disabled": .bool(true)]),
                        "the relay is disabled")
+        XCTAssertEqual(PushRelayContract.configurationIssue([
+            "relay_disabled": .bool(true),
+            "apns_configured": .bool(false),
+            "apns_missing_env": .array([.string("TALARIA_APNS_KEY_ID")]),
+        ]), "the relay is disabled; missing TALARIA_APNS_KEY_ID")
         XCTAssertNil(PushRelayContract.configurationIssue(["apns_configured": .bool(true)]))
 
         XCTAssertNoThrow(try PushRelayContract.validateTestResponse([

@@ -75,11 +75,10 @@ public struct ChatView: View {
     @ScaledMetric(relativeTo: .body) private var inkComposerSize = 15
     @State private var showModelSheet = false
     @State private var showCommands = false
-    @State private var transcriptAnchoredBotID: String?
+    @State private var initialTranscriptAnchor = InitialTranscriptAnchorState()
     @State private var followingLatest = true
     @State private var jumpToLatestToken = 0
-    @State private var transcriptBottomMinY: CGFloat = 0
-    @State private var transcriptViewportHeight: CGFloat = 0
+    @State private var transcriptGeometry = TranscriptGeometryReadiness()
     @FocusState private var composerFocused: Bool
 
     /// Tapback set, matching desktop's reaction picker.
@@ -296,21 +295,28 @@ public struct ChatView: View {
                 }
             )
             .onPreferenceChange(TranscriptBottomInsetKey.self) { minY in
-                transcriptBottomMinY = minY
+                transcriptGeometry.recordBottom(minY: minY)
                 refreshFollowingLatest()
             }
             .onPreferenceChange(TranscriptViewportHeightKey.self) { height in
-                transcriptViewportHeight = height
+                transcriptGeometry.recordViewport(height: height)
                 refreshFollowingLatest()
             }
             .task(id: initialTranscriptAnchorKey) {
-                guard transcriptAnchoredBotID != botID, !messages.isEmpty else { return }
-                await anchorTranscript(proxy)
+                guard let attempt = initialTranscriptAnchor.begin(
+                    botID: botID, messageCount: messages.count
+                ) else { return }
+                guard await anchorTranscript(proxy, attempt: attempt),
+                      initialTranscriptAnchor.complete(
+                        attempt, currentBotID: botID, isCancelled: Task.isCancelled
+                      )
+                else { return }
+                // A completed attempt had no user departure. Geometry will
+                // keep this honest once both probes have reported.
                 followingLatest = true
-                transcriptAnchoredBotID = botID
             }
             .onChange(of: messages.count) {
-                guard transcriptAnchoredBotID == botID, followingLatest else { return }
+                guard initialTranscriptAnchor.isSettled(for: botID), followingLatest else { return }
                 withAnimation(ChatComposerLayoutPolicy.animation(
                     reducedMotion: reducedMotion, duration: 0.25
                 )) {
@@ -335,6 +341,18 @@ public struct ChatView: View {
                     proxy.scrollTo(transcriptAnchorID, anchor: .bottom)
                 }
             }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { _ in
+                        guard initialTranscriptAnchor.userDeparted(
+                            botID: botID, messageCount: messages.count
+                        ) else { return }
+                        // Taking control of the scroll settles the initial
+                        // anchor without finishing it. No later layout pass
+                        // may pull the transcript back down or restore this.
+                        followingLatest = false
+                    }
+            )
         }
     }
 
@@ -401,21 +419,32 @@ public struct ChatView: View {
     }
 
     private func refreshFollowingLatest() {
-        let distance = transcriptBottomMinY - transcriptViewportHeight
+        guard let distance = transcriptGeometry.distanceFromBottom else { return }
         followingLatest = ChatTranscriptLayoutPolicy.isFollowingLatest(
             distanceFromBottom: distance)
     }
 
-    private func anchorTranscript(_ proxy: ScrollViewProxy) async {
+    private func anchorTranscript(_ proxy: ScrollViewProxy,
+                                  attempt: InitialTranscriptAnchorState.Attempt) async -> Bool {
         for delay in ChatTranscriptLayoutPolicy.layoutPassesMs {
-            guard !Task.isCancelled else { return }
+            guard initialTranscriptAnchor.shouldContinue(
+                attempt, currentBotID: botID, isCancelled: Task.isCancelled
+            ) else { return false }
             if delay > 0 {
-                try? await Task.sleep(for: .milliseconds(delay))
+                do {
+                    try await Task.sleep(for: .milliseconds(delay))
+                } catch {
+                    return false
+                }
             } else {
                 await Task.yield()
             }
+            guard initialTranscriptAnchor.shouldContinue(
+                attempt, currentBotID: botID, isCancelled: Task.isCancelled
+            ) else { return false }
             proxy.scrollTo(transcriptAnchorID, anchor: .bottom)
         }
+        return true
     }
 
     @ViewBuilder private func messageRow(_ message: ChatMessage) -> some View {
@@ -1357,16 +1386,88 @@ struct ThoughtBlock: View {
 }
 
 
+/// The preference stream has no meaningful scalar default: `0` can be an
+/// actual coordinate, and treating two default zeroes as a measurement makes
+/// an unlaid-out transcript look as though it is already at the live edge.
+struct TranscriptGeometryReadiness: Equatable {
+    private(set) var bottomMinY: CGFloat?
+    private(set) var viewportHeight: CGFloat?
+
+    var isReady: Bool {
+        bottomMinY != nil && (viewportHeight ?? 0) > 0
+    }
+
+    var distanceFromBottom: CGFloat? {
+        guard isReady, let bottomMinY, let viewportHeight else { return nil }
+        return bottomMinY - viewportHeight
+    }
+
+    mutating func recordBottom(minY: CGFloat?) {
+        bottomMinY = minY
+    }
+
+    mutating func recordViewport(height: CGFloat?) {
+        viewportHeight = height
+    }
+}
+
+/// One initial-anchor attempt belongs to the bot and to the user-interaction
+/// generation in which it began. A drag settles that bot without completing
+/// the attempt, invalidating every delayed pass while leaving the user's
+/// `followingLatest` choice alone.
+struct InitialTranscriptAnchorState: Equatable {
+    struct Attempt: Equatable {
+        let botID: String
+        fileprivate let generation: UInt
+    }
+
+    private(set) var settledBotID: String?
+    private var generation: UInt = 0
+
+    func begin(botID: String, messageCount: Int) -> Attempt? {
+        guard messageCount > 0, settledBotID != botID else { return nil }
+        return Attempt(botID: botID, generation: generation)
+    }
+
+    func isSettled(for botID: String) -> Bool {
+        settledBotID == botID
+    }
+
+    func shouldContinue(_ attempt: Attempt, currentBotID: String,
+                        isCancelled: Bool) -> Bool {
+        !isCancelled
+            && currentBotID == attempt.botID
+            && settledBotID != attempt.botID
+            && generation == attempt.generation
+    }
+
+    mutating func complete(_ attempt: Attempt, currentBotID: String,
+                           isCancelled: Bool = false) -> Bool {
+        guard shouldContinue(attempt, currentBotID: currentBotID,
+                             isCancelled: isCancelled)
+        else { return false }
+        settledBotID = attempt.botID
+        return true
+    }
+
+    mutating func userDeparted(botID: String, messageCount: Int) -> Bool {
+        guard messageCount > 0, settledBotID != botID else { return false }
+        generation &+= 1
+        settledBotID = botID
+        return true
+    }
+}
+
 private struct TranscriptBottomInsetKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
+    static var defaultValue: CGFloat?
+    static func reduce(value: inout CGFloat?, nextValue: () -> CGFloat?) {
+        value = nextValue() ?? value
     }
 }
 
 private struct TranscriptViewportHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
+    static var defaultValue: CGFloat?
+    static func reduce(value: inout CGFloat?, nextValue: () -> CGFloat?) {
+        value = nextValue() ?? value
     }
 }
