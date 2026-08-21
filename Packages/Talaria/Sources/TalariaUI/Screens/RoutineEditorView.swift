@@ -18,6 +18,34 @@ import TalariaTheme
 // stay readable, editing/history/pinning disappear, and pause/resume/delete —
 // which ride the socket — keep working.
 
+/// Existing-job controls are only authoritative after the full REST detail has
+/// arrived. The socket listing is a useful read-only projection, but it does
+/// not carry enough fields to safely edit or save a routine.
+enum RoutineEditorDetailPolicy {
+    static func allowsEditingExisting(
+        restAvailable: Bool,
+        hasAuthoritativeDetail: Bool,
+        quarantined: Bool
+    ) -> Bool {
+        restAvailable && hasAuthoritativeDetail && !quarantined
+    }
+
+    static func allowsSubmittingExisting(
+        restAvailable: Bool,
+        hasAuthoritativeDetail: Bool,
+        quarantined: Bool,
+        dirty: Bool,
+        saving: Bool,
+        busy: Bool
+    ) -> Bool {
+        !saving && !busy && dirty
+            && allowsEditingExisting(
+                restAvailable: restAvailable,
+                hasAuthoritativeDetail: hasAuthoritativeDetail,
+                quarantined: quarantined)
+    }
+}
+
 public struct RoutineEditorView: View {
 
     public enum Mode: Equatable {
@@ -153,7 +181,13 @@ public struct RoutineEditorView: View {
         guard !title.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
         guard scriptOnly || !instruction.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
         if isCreating { return normalizedSchedule != nil }
-        return restAvailable && !quarantined && dirty
+        return RoutineEditorDetailPolicy.allowsSubmittingExisting(
+            restAvailable: restAvailable,
+            hasAuthoritativeDetail: job != nil,
+            quarantined: quarantined,
+            dirty: dirty,
+            saving: saving,
+            busy: busy)
     }
 
     public var body: some View {
@@ -162,6 +196,7 @@ public struct RoutineEditorView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     noticeBlock
+                    detailStatusBlock
                     healthBlock
                     editorBlock
                     inferenceBlock
@@ -350,9 +385,40 @@ public struct RoutineEditorView: View {
             noticeLine(errorLine, tone: theme.danger)
         } else if let noteLine {
             noticeLine(noteLine, tone: theme.ok)
-        } else if let routine, let failure = runtime.detailError[routine.id] {
-            noticeLine(failure, tone: theme.danger)
         }
+    }
+
+    /// A listing row can render before the authoritative REST record arrives.
+    /// Keep all detail-backed controls read-only in that interval, and make a
+    /// failed read an explicit retry state rather than letting Save become a
+    /// no-op behind an absent `job`.
+    @ViewBuilder private var detailStatusBlock: some View {
+        if !isCreating, let routine, job == nil, restAvailable {
+            VStack(alignment: .leading, spacing: 7) {
+                if runtime.loadingDetail.contains(routine.id) {
+                    noticeLine(copy.routineDetailLoading(theme.id), tone: theme.faint)
+                } else if let failure = runtime.detailError[routine.id] {
+                    noticeLine(failure, tone: theme.danger)
+                    retryDetailButton
+                } else {
+                    noticeLine(copy.routineDetailUnavailable(theme.id), tone: theme.warn)
+                    retryDetailButton
+                }
+            }
+        }
+    }
+
+    private var retryDetailButton: some View {
+        Button { retryDetail() } label: {
+            Text(copy.routineRetryDetail(theme.id))
+                .font(chipFont)
+                .foregroundStyle(theme.accent)
+                .padding(.vertical, 6)
+                .padding(.horizontal, 11)
+                .chipShell(theme)
+        }
+        .buttonStyle(.plain)
+        .disabled(saving || busy || runtime.loadingDetail.contains(routine?.id ?? ""))
     }
 
     private func noticeLine(_ text: String, tone: Color) -> some View {
@@ -473,7 +539,10 @@ public struct RoutineEditorView: View {
     private var editorBlock: some View {
         // Editing an existing routine needs the REST PUT; without it the
         // fields would take input that could never be saved.
-        let editable = isCreating || (restAvailable && !quarantined)
+        let editable = isCreating || RoutineEditorDetailPolicy.allowsEditingExisting(
+            restAvailable: restAvailable,
+            hasAuthoritativeDetail: job != nil,
+            quarantined: quarantined)
 
         return VStack(alignment: .leading, spacing: 7) {
             sectionLabel(copy.routineTitleLabel(theme.id))
@@ -598,12 +667,16 @@ public struct RoutineEditorView: View {
     // MARK: - Inference (the fail-closed axis)
 
     @ViewBuilder private var inferenceBlock: some View {
-        if restAvailable, !scriptOnly {
+        if restAvailable, (isCreating || job != nil), !scriptOnly {
             VStack(alignment: .leading, spacing: 8) {
                 sectionLabel(copy.routineInferenceLabel(theme.id))
-                field(providerPlaceholder, text: $providerPin, lines: 1, editable: !quarantined)
-                field(modelPlaceholder, text: $modelPin, lines: 1, editable: !quarantined)
-                reasoningEffortBlock(editable: !quarantined, scriptOnly: false)
+                let editable = isCreating || RoutineEditorDetailPolicy.allowsEditingExisting(
+                    restAvailable: restAvailable,
+                    hasAuthoritativeDetail: job != nil,
+                    quarantined: quarantined)
+                field(providerPlaceholder, text: $providerPin, lines: 1, editable: editable)
+                field(modelPlaceholder, text: $modelPin, lines: 1, editable: editable)
+                reasoningEffortBlock(editable: editable, scriptOnly: false)
                 if let job, job.model == nil || job.provider == nil {
                     Text(copy.routineFollowsGateway(theme.id))
                         .font(footFont)
@@ -967,7 +1040,10 @@ public struct RoutineEditorView: View {
     }
 
     private func save() {
-        guard let job else { return }
+        guard let job else {
+            errorLine = copy.routineDetailUnavailable(theme.id)
+            return
+        }
         saving = true; errorLine = nil; noteLine = nil
         Task { @MainActor in
             defer { saving = false }
@@ -989,6 +1065,13 @@ public struct RoutineEditorView: View {
                 errorLine = AppModel.reason(error)
             }
         }
+    }
+
+    private func retryDetail() {
+        guard !saving, !busy else { return }
+        errorLine = nil
+        noteLine = nil
+        Task { await load(initial: false) }
     }
 
     private func pin(_ job: CronJobDetail) {

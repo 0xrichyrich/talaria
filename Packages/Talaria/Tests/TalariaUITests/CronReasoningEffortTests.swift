@@ -3,6 +3,29 @@ import XCTest
 @testable import TalariaKit
 @testable import TalariaUI
 
+private actor DelayedCronAddGate {
+    private var released = false
+    private var arrived = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func waitForRelease() async {
+        arrived = true
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func hasArrived() -> Bool { arrived }
+
+    func release() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+}
+
 final class CronReasoningEffortTests: XCTestCase {
     func testListAndDetailPreserveRawOptionalValue() {
         let listed = CronJobRecord([
@@ -127,6 +150,56 @@ final class CronReasoningEffortTests: XCTestCase {
         XCTAssertFalse(CronSourceMutationFence.accepts(
             fence, primaryGatewayID: "homelab", primaryGeneration: 10,
             retainedGenerations: ["homelab": 4]))
+    }
+
+    func testDelayedAddAndRetainedPoolReplacementRefuseRESTPatch() async {
+        let gate = DelayedCronAddGate()
+        let add = Task {
+            await gate.waitForRelease()
+            return "job-accepted"
+        }
+        while !(await gate.hasArrived()) { await Task.yield() }
+
+        // The retained client occupying this gateway id is replaced while the
+        // irreversible socket add is suspended.
+        await gate.release()
+        let jobID = await add.value
+        let source = CronSourceMutationFence(
+            gatewayID: "homelab", profile: nil, generation: .retained(4))
+        let decision = CronCreatePostAddPolicy.decision(
+            sourceFence: source,
+            primaryGatewayID: "primary",
+            primaryGeneration: 10,
+            retainedGenerations: ["homelab": 5],
+            hasRESTOnlyFields: true,
+            hasJobID: !jobID.isEmpty,
+            hasRESTAuthority: true,
+            restSupported: true)
+
+        var restPatchCount = 0
+        if decision.shouldIssueRESTPatch { restPatchCount += 1 }
+        XCTAssertEqual(decision, .acceptedButStale)
+        XCTAssertTrue(decision.preservesAcceptedAdd)
+        XCTAssertTrue(decision.requiresRecoveryNotice)
+        XCTAssertFalse(decision.shouldIssueRESTPatch)
+        XCTAssertEqual(restPatchCount, 0)
+    }
+
+    func testRoutineEditorLocksExistingMutationUntilDetailIsAuthoritative() {
+        XCTAssertFalse(RoutineEditorDetailPolicy.allowsEditingExisting(
+            restAvailable: true, hasAuthoritativeDetail: false, quarantined: false))
+        XCTAssertFalse(RoutineEditorDetailPolicy.allowsSubmittingExisting(
+            restAvailable: true, hasAuthoritativeDetail: false, quarantined: false,
+            dirty: true, saving: false, busy: false))
+
+        XCTAssertTrue(RoutineEditorDetailPolicy.allowsEditingExisting(
+            restAvailable: true, hasAuthoritativeDetail: true, quarantined: false))
+        XCTAssertTrue(RoutineEditorDetailPolicy.allowsSubmittingExisting(
+            restAvailable: true, hasAuthoritativeDetail: true, quarantined: false,
+            dirty: true, saving: false, busy: false))
+        XCTAssertFalse(RoutineEditorDetailPolicy.allowsSubmittingExisting(
+            restAvailable: false, hasAuthoritativeDetail: true, quarantined: false,
+            dirty: true, saving: false, busy: false))
     }
 }
 #endif

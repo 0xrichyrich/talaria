@@ -107,6 +107,57 @@ struct CronSourceMutationFence: Sendable, Equatable {
     }
 }
 
+/// The socket create is the irreversible half of a new routine.  Once it has
+/// returned a job id, the caller must distinguish an accepted add from the
+/// optional REST completion instead of treating a lost source as permission to
+/// retry or remove the job.
+enum CronCreatePostAddDecision: Sendable, Equatable {
+    /// The source changed while `cronAdd` was in flight.  No activity, cache
+    /// publication, or REST patch may be attributed to the old source.
+    case acceptedButStale
+    /// The socket add is complete and there are no REST-only fields to apply.
+    case accepted
+    /// The captured source is still authoritative and the REST patch is safe.
+    case readyForREST
+    /// The add is complete, but requested REST-only fields could not be
+    /// attempted from the captured authority.  The caller must surface the
+    /// recoverable partial result.
+    case acceptedWithoutREST
+
+    var shouldIssueRESTPatch: Bool { self == .readyForREST }
+    var preservesAcceptedAdd: Bool { true }
+    var requiresRecoveryNotice: Bool {
+        self == .acceptedButStale || self == .acceptedWithoutREST
+    }
+}
+
+enum CronCreatePostAddPolicy {
+    static func decision(
+        sourceFence: CronSourceMutationFence,
+        primaryGatewayID: String?,
+        primaryGeneration: Int,
+        retainedGenerations: [String: UInt64],
+        hasRESTOnlyFields: Bool,
+        hasJobID: Bool,
+        hasRESTAuthority: Bool,
+        restSupported: Bool
+    ) -> CronCreatePostAddDecision {
+        guard CronSourceMutationFence.accepts(
+            sourceFence,
+            primaryGatewayID: primaryGatewayID,
+            primaryGeneration: primaryGeneration,
+            retainedGenerations: retainedGenerations
+        ) else {
+            return .acceptedButStale
+        }
+        guard hasRESTOnlyFields else { return .accepted }
+        guard hasJobID, hasRESTAuthority, restSupported else {
+            return .acceptedWithoutREST
+        }
+        return .readyForREST
+    }
+}
+
 /// Existing-job authority adds the UI row identity to the source fence. The
 /// profile is part of `RoutineTarget`, so a refresh that moves the same raw job
 /// id to another profile store invalidates this fence even if the source
@@ -518,6 +569,12 @@ public extension AppModel {
             canonicalEffort = nil
         }
 
+        var extras: [String: JSONValue] = [:]
+        if !deliver.isEmpty { extras["deliver"] = .string(deliver.joined(separator: ",")) }
+        if let model, !model.isEmpty { extras["model"] = .string(model) }
+        if let provider, !provider.isEmpty { extras["provider"] = .string(provider) }
+        if let canonicalEffort { extras["reasoning_effort"] = .string(canonicalEffort) }
+
         let jobID = try await client.cronAdd(
             name: Self.namespacedTitle(botID: botProfile, title: cleanTitle),
             schedule: normalized,
@@ -526,40 +583,61 @@ public extension AppModel {
             repeatCount: repeatForever ? nil : 1,
             continuity: continuity)
 
+        // `cronAdd` has committed an irreversible job.  Re-check the exact
+        // source before publishing activity, refreshing the list, or issuing
+        // the REST half.  A retained pool client can be replaced while the
+        // socket call is suspended; in that case preserve the accepted add as
+        // a recoverable partial result and never retry it against a new source.
+        guard cronMutationFenceAccepts(sourceFence) else {
+            throw GatewayError(code: -4,
+                               message: theme.copy.routineMadeSourceChanged(theme.themeID))
+        }
+        let postAddDecision = CronCreatePostAddPolicy.decision(
+            sourceFence: sourceFence,
+            primaryGatewayID: LiveRuntime.shared.gatewayID,
+            primaryGeneration: LiveRuntime.shared.generation,
+            retainedGenerations: MultiGatewayRuntime.shared.routedEventGenerations,
+            hasRESTOnlyFields: !extras.isEmpty,
+            hasJobID: !jobID.isEmpty,
+            hasRESTAuthority: restAuthority != nil,
+            restSupported: CronDetailRuntime.shared.restSupported[gatewayID] != false)
+        guard postAddDecision != .acceptedButStale else {
+            throw GatewayError(code: -4,
+                               message: theme.copy.routineMadeSourceChanged(theme.themeID))
+        }
+
         recordActivity(kind: .routine, botID: botID,
                        text: theme.copy.feedRoutineAdded(theme.themeID) + " — " + cleanTitle,
                        subtext: normalized)
 
-        var extras: [String: JSONValue] = [:]
-        if !deliver.isEmpty { extras["deliver"] = .string(deliver.joined(separator: ",")) }
-        if let model, !model.isEmpty { extras["model"] = .string(model) }
-        if let provider, !provider.isEmpty { extras["provider"] = .string(provider) }
-        if let canonicalEffort { extras["reasoning_effort"] = .string(canonicalEffort) }
-
-        guard !extras.isEmpty else {
-            await refreshRoutinesLive(force: true)
-            return
-        }
-        guard !jobID.isEmpty, let (base, credential) = restAuthority,
-              CronDetailRuntime.shared.restSupported[gatewayID] != false else {
+        guard postAddDecision != .acceptedWithoutREST else {
             await refreshRoutinesLive(force: true)
             throw GatewayError(code: -4,
                                message: theme.copy.routineMadeNotRouted(theme.themeID))
         }
+        guard postAddDecision.shouldIssueRESTPatch,
+              let (base, credential) = restAuthority else {
+            await refreshRoutinesLive(force: true)
+            return
+        }
+        var sourceChangedAfterREST = false
         do {
             let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
                                                             jobID: jobID, profile: sourceFence.profile,
                                                             updates: extras)
-            if cronMutationFenceAccepts(sourceFence) {
-                let routineID: String
-                if case .primary = sourceFence.generation {
-                    routineID = jobID
-                } else {
-                    routineID = GatewayRoutineRoute(
-                        gatewayID: gatewayID, jobID: jobID).qualifiedID
-                }
-                CronDetailRuntime.shared.detail[routineID] = saved
+            guard cronMutationFenceAccepts(sourceFence) else {
+                sourceChangedAfterREST = true
+                throw GatewayError(code: -4,
+                                   message: theme.copy.routineMadeSourceChanged(theme.themeID))
             }
+            let routineID: String
+            if case .primary = sourceFence.generation {
+                routineID = jobID
+            } else {
+                routineID = GatewayRoutineRoute(
+                    gatewayID: gatewayID, jobID: jobID).qualifiedID
+            }
+            CronDetailRuntime.shared.detail[routineID] = saved
             await refreshRoutinesLive(force: true)
         } catch {
             if cronMutationFenceAccepts(sourceFence),
@@ -570,7 +648,10 @@ public extension AppModel {
             // The routine exists and WILL fire; only the route/pin did not
             // land. Say exactly that — the alternative, deleting a job the
             // gateway already scheduled, is worse than an unrouted one.
-            await refreshRoutinesLive(force: true)
+            if cronMutationFenceAccepts(sourceFence) {
+                await refreshRoutinesLive(force: true)
+            }
+            if sourceChangedAfterREST { throw error }
             throw GatewayError(code: -4, message: theme.copy.routineMadeNotRouted(theme.themeID))
         }
     }
@@ -820,6 +901,30 @@ public extension CopyPack {
         case .soft: "ROUTINE"
         case .control: "CRON JOB"
         case .ink: "THE RITE"
+        }
+    }
+
+    func routineDetailLoading(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Loading the full routine detail…"
+        case .control: "READING AUTHORITATIVE JOB DETAIL…"
+        case .ink: "Reading the whole rite…"
+        }
+    }
+
+    func routineDetailUnavailable(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The full routine detail is unavailable, so editing is paused."
+        case .control: "DETAIL UNAVAILABLE · EDITING LOCKED UNTIL READ SUCCEEDS"
+        case .ink: "The whole rite could not be read, so its words remain untouched."
+        }
+    }
+
+    func routineRetryDetail(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Retry detail"
+        case .control: "RETRY DETAIL"
+        case .ink: "Read again"
         }
     }
 
@@ -1203,6 +1308,16 @@ public extension CopyPack {
         case .control: "JOB CREATED · DELIVER/MODEL NOT APPLIED — EDIT TO RETRY"
         case .ink: "The rite is inscribed, but its channel and mind were not bound. "
             + "Open it and try once more."
+        }
+    }
+
+    func routineMadeSourceChanged(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The routine was created, but the gateway changed before Talaria "
+            + "could confirm it. Open it to verify; no automatic retry was attempted."
+        case .control: "JOB CREATED · SOURCE CHANGED BEFORE CONFIRMATION — VERIFY IN EDITOR"
+        case .ink: "The rite is inscribed, but its gateway changed before it could be "
+            + "witnessed. Open it to verify; it was not retried."
         }
     }
 
