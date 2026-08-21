@@ -1054,6 +1054,61 @@ final class RoomRoutingTests: XCTestCase {
         XCTAssertNil(projection.rooms[legacyKey])
     }
 
+    func testIDProjectionSettingsAtomicallyRemoveMemberAndAvatarBeforeSync() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("talaria-room-id-settings-\(UUID().uuidString)",
+                                   isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = RoomStore(baseDirectory: base)
+        let key = "id:desktop-room"
+        let original = RoomProjectionEnvelope(rooms: [
+            key: RoomProjectionRoom(
+                name: "Shared",
+                roomID: "desktop-room",
+                log: [RoomProjectionEntry(
+                    id: "message-1",
+                    from: RoomProjectionAuthor(kind: .user, name: "You"),
+                    text: "hello", at: 1, thread: "thread-1")],
+                revision: 7,
+                members: ["one", "two", "three"].map {
+                    RoomProjectionMember(name: $0, connectionID: "mini",
+                                         sourceScoped: true)
+                },
+                image: "data:image/png;base64,aGVsbG8="),
+        ])
+        let hydrated = try await store.reconcileRoomProjection(
+            original, allowedGatewayIDs: ["mini"])
+        let room = try XCTUnwrap(hydrated.rooms.first)
+        let runtime = RoomRuntime.shared
+        runtime.store = store
+        runtime.rooms = hydrated.rooms
+        runtime.avatarData = hydrated.projectedImages
+
+        try await AppModel().updateRoomSettings(
+            room.id, name: "Renamed", members: Array(room.members.prefix(2)),
+            removeAvatar: true)
+
+        let fresh = RoomStore(baseDirectory: base)
+        let reloadedValue = try await fresh.room(id: room.id)
+        let reloaded = try XCTUnwrap(reloadedValue)
+        let projection = try await fresh.roomProjection()
+        XCTAssertEqual(reloaded.name, "Renamed")
+        XCTAssertEqual(reloaded.members.map(\.route.profile), ["one", "two"])
+        XCTAssertEqual(reloaded.rawProjectionRevision, 8)
+        XCTAssertEqual(projection.rooms[key]?.revision, 8)
+        XCTAssertEqual(projection.rooms[key]?.members.map(\.name), ["one", "two"])
+        XCTAssertEqual(projection.rooms[key]?.image, "")
+        XCTAssertNil(runtime.avatarData[room.id])
+
+        let restarted = try await fresh.reconcileRoomProjection(
+            original, allowedGatewayIDs: ["mini"])
+        XCTAssertEqual(restarted.rooms.first?.name, "Renamed")
+        XCTAssertEqual(restarted.rooms.first?.members.map(\.route.profile), ["one", "two"])
+        XCTAssertEqual(restarted.roomProjection.rooms[key]?.image, "")
+        XCTAssertTrue(restarted.projectedImages.isEmpty)
+    }
+
     func testLateMetadataCompletionCannotRemoveRenamedDestinationMutation() async throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("talaria-room-late-metadata-\(UUID().uuidString)",

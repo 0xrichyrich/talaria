@@ -63,7 +63,8 @@ public struct RoomView: View {
                 unresolvedPanel(room)
                 activityPanel(room)
                 timeline(room)
-                RoomComposer(theme: theme, members: room.members,
+                RoomComposer(theme: theme,
+                             members: room.members.filter { !$0.isFrozenProjection },
                              placeholder: "New thread in \(room.name)…",
                              submitLabel: "New Thread") { text, attachments in
                     _ = try await model.sendRoomMessage(roomID: roomID, text: text,
@@ -259,7 +260,8 @@ public struct RoomView: View {
                         .font(theme.body(10)).foregroundStyle(theme.faint)
                 }.buttonStyle(.plain)
                 ForEach(entries) { entry in entryRow(entry, room: room) }
-                RoomComposer(theme: theme, members: room.members,
+                RoomComposer(theme: theme,
+                             members: room.members.filter { !$0.isFrozenProjection },
                              placeholder: "Reply in thread…", submitLabel: "Reply") { text, attachments in
                     _ = try await model.sendRoomMessage(roomID: roomID, text: text,
                                                         threadID: thread.id,
@@ -489,10 +491,11 @@ private struct RoomSettingsView: View {
     private func unavailableMemberRow(_ member: RoomMember) -> some View {
         HStack(spacing: 9) {
             Circle().fill(theme.faint.opacity(0.15)).frame(width: 32, height: 32)
-                .overlay(Image(systemName: "moon.zzz").font(.system(size: 11)).foregroundStyle(theme.faint))
+                .overlay(Image(systemName: member.isFrozenProjection ? "lock" : "moon.zzz")
+                    .font(.system(size: 11)).foregroundStyle(theme.faint))
             VStack(alignment: .leading, spacing: 1) {
                 Text(member.title ?? member.route.profile)
-                Text("@\(member.handle) · \(member.sourceLabel ?? member.route.gatewayID) · offline")
+                Text("@\(member.handle) · \(member.sourceLabel ?? member.route.gatewayID) · \(member.isFrozenProjection ? "shared · view only" : "offline")")
                     .font(theme.mono(8)).foregroundStyle(theme.faint)
             }
             Spacer()

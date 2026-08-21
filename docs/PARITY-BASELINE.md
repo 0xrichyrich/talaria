@@ -74,8 +74,9 @@ typed CAS wire contract plus a bounded version-3 decoder, merger, tombstone
 model, separately persisted projection ledger, protected room hydration,
 reachable-credentialed-gateway publication, conflict retry/read-back, and reconnect
 reseeding. Its existing rooms remain full, durable local rooms. Cross-client
-convergence is implemented and automated-test covered but remains uncertified
-until the retained live matrix passes. The other net changes are host update receipts
+storage/scheduler policy is automated-test covered, while production wiring
+and end-to-end convergence remain uncertified until the retained live matrix
+passes. The other net changes are host update receipts
 and fleet code identity, container first-boot key generation, Telegram final
 rendering, and Cloud MCP documentation; the current audit classifies their
 client impact file by file.
@@ -162,8 +163,9 @@ gateway PTY:
   The bounded `hermes-bots-groups` projection now adds explicit shared
   tombstones, safe protected hydration, reachable-credentialed-gateway fan-out, and
   per-key `ui_meta` compare-and-swap with retry/read-back. Cross-client room
-  convergence remains provisional until the live conflict/reconnect matrix is
-  retained.
+  descriptors from another client's local connection registry remain visible
+  as view-only frozen seats and are never routed by a guessed label. Convergence
+  remains provisional until the live conflict/reconnect matrix is retained.
 - Current Hermes also exposes agent-guided `tour.request` prompts and whole-turn
   activity across transcript gaps. Talaria's room work includes the bounded
   current-run activity feed; tours and transcript activity remain queued with

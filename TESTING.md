@@ -302,7 +302,9 @@ Retain a two-Desktop/one-phone report covering:
 
 1. Hydration of name, picture, source-qualified members, and bounded recent
    transcript from each attached gateway without replacing Talaria's full
-   protected local transcript.
+   protected local transcript. A foreign client-local connection id must stay
+   visible as a view-only frozen seat, never route by label, and become live
+   only after an exact configured gateway identity exists.
 2. A concurrent Desktop/phone write conflict followed by reread, stable-id
    merge, CAS retry, exact revision increment, and read-back confirmation.
 3. Rename with the same immutable room id; disband with a final `id:`

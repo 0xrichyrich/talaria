@@ -1153,13 +1153,14 @@ public extension AppModel {
                 && previousProjectionKey.hasPrefix("name:")
             let promotedProjectionKey = RoomProjectionEnvelope.idKey(
                 before.id.description)
-            let projectionIntent = promotesLegacyProjection
-                ? RoomProjectionMergeIntent(
-                    changedRooms: [promotedProjectionKey],
-                    deletedRooms: [previousProjectionKey],
-                    writeRevision: before.rawProjectionRevision == .max
-                        ? .max : before.rawProjectionRevision + 1)
-                : nil
+            let changedProjectionKey = promotesLegacyProjection
+                ? promotedProjectionKey : previousProjectionKey
+            let projectionIntent = RoomProjectionMergeIntent(
+                changedRooms: [changedProjectionKey],
+                deletedRooms: promotesLegacyProjection ? [previousProjectionKey] : [],
+                writeRevision: before.rawProjectionRevision == .max
+                    ? .max : before.rawProjectionRevision + 1,
+                clearedImages: removeAvatar ? [changedProjectionKey] : [])
             let result: RoomRecord
             do {
                 result = try await RoomRuntime.shared.store.mutate(
@@ -1202,7 +1203,7 @@ public extension AppModel {
             else if removeAvatar { RoomRuntime.shared.avatarData[roomID] = nil }
             RoomRuntime.shared.replace(result)
             scheduleRoomProjectionSync(
-                changedRooms: [roomProjectionKey(result)],
+                changedRooms: [changedProjectionKey],
                 deletedRooms: promotesLegacyProjection ? [previousProjectionKey] : []
             )
             await flushRoomMetadataOutboxAlreadyAdmitted()
@@ -1227,13 +1228,13 @@ public extension AppModel {
         let promotesLegacyProjection = room.name != normalized
             && previousProjectionKey.hasPrefix("name:")
         let promotedProjectionKey = RoomProjectionEnvelope.idKey(room.id.description)
-        let projectionIntent = promotesLegacyProjection
-            ? RoomProjectionMergeIntent(
-                changedRooms: [promotedProjectionKey],
-                deletedRooms: [previousProjectionKey],
-                writeRevision: room.rawProjectionRevision == .max
-                    ? .max : room.rawProjectionRevision + 1)
-            : nil
+        let changedProjectionKey = promotesLegacyProjection
+            ? promotedProjectionKey : previousProjectionKey
+        let projectionIntent = RoomProjectionMergeIntent(
+            changedRooms: [changedProjectionKey],
+            deletedRooms: promotesLegacyProjection ? [previousProjectionKey] : [],
+            writeRevision: room.rawProjectionRevision == .max
+                ? .max : room.rawProjectionRevision + 1)
         room = try await RoomRuntime.shared.store.mutate(
             roomID: roomID, metadataMutations: metadata,
             projectionIntent: projectionIntent
@@ -1247,7 +1248,7 @@ public extension AppModel {
         }
         RoomRuntime.shared.replace(room)
         scheduleRoomProjectionSync(
-            changedRooms: [roomProjectionKey(room)],
+            changedRooms: [changedProjectionKey],
             deletedRooms: promotesLegacyProjection ? [previousProjectionKey] : []
         )
     }
