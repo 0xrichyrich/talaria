@@ -17,6 +17,26 @@ final class RoomStoreTests: XCTestCase {
         ]
     }
 
+    private func projectedMembers() -> [RoomProjectionMember] {
+        [
+            RoomProjectionMember(name: "research", handle: "research",
+                                 connectionID: "mini", connectionLabel: "Mini",
+                                 sourceScoped: true),
+            RoomProjectionMember(name: "ops", handle: "ops",
+                                 connectionID: "lab", connectionLabel: "Lab",
+                                 sourceScoped: true),
+        ]
+    }
+
+    private func projectedRoom(name: String = "Shared", revision: UInt64 = 1,
+                               entries: [RoomProjectionEntry] = [],
+                               members: [RoomProjectionMember]? = nil,
+                               image: String? = nil) -> RoomProjectionRoom {
+        RoomProjectionRoom(name: name, roomID: "opaque-room", log: entries,
+                           revision: revision, members: members ?? projectedMembers(),
+                           image: image)
+    }
+
     func testStandaloneRoomRoundTripsWithoutProfileMetadata() async throws {
         let base = try temporaryBase()
         defer { try? FileManager.default.removeItem(at: base) }
@@ -956,6 +976,273 @@ final class RoomStoreTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? RoomStoreError, .corruptIndex)
         }
+    }
+
+    func testOpaqueProjectionIdentitiesHydrateDeterministicallyAndPublishUnchanged() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let key = "id:desktop/opaque-room"
+        let entry = RoomProjectionEntry(
+            id: "message:opaque/7",
+            from: RoomProjectionAuthor(kind: .member, name: "research", source: "mini"),
+            text: "from Desktop", at: 1_700_000_000_000,
+            thread: "thread:opaque/main"
+        )
+        let projection = RoomProjectionEnvelope(rooms: [
+            key: RoomProjectionRoom(name: "Opaque", roomID: "desktop/opaque-room",
+                                    log: [entry], revision: 4,
+                                    members: projectedMembers()),
+        ])
+
+        let store = RoomStore(baseDirectory: base)
+        let result = try await store.reconcileRoomProjection(projection)
+        let room = try XCTUnwrap(result.rooms.first)
+        XCTAssertEqual(room.id, RoomProjectionEnvelope.localRoomID(forProjectionKey: key))
+        XCTAssertEqual(room.rawProjectionRoomKey, key)
+        XCTAssertEqual(room.rawProjectionRevision, 4)
+        XCTAssertEqual(room.entries.first?.rawProjectionEntryID, "message:opaque/7")
+        XCTAssertEqual(room.entries.first?.rawProjectionThreadID, "thread:opaque/main")
+        XCTAssertEqual(room.entries.first?.memberRoute,
+                       GatewayBotRoute(gatewayID: "mini", profile: "research"))
+
+        let republished = RoomProjectionEnvelope.projecting(result.rooms, updatedAt: 9)
+        XCTAssertEqual(Set(republished.rooms.keys), [key])
+        XCTAssertEqual(republished.rooms[key]?.roomID, "desktop/opaque-room")
+        XCTAssertEqual(republished.rooms[key]?.log.first?.id, "message:opaque/7")
+        XCTAssertEqual(republished.rooms[key]?.log.first?.thread, "thread:opaque/main")
+        XCTAssertEqual(republished.rooms[key]?.revision, 4)
+
+        let uuid = UUID(uuidString: "5D35C654-7692-49B2-BC23-2D36EDDCFB40")!
+        XCTAssertEqual(RoomProjectionEnvelope.localRoomID(
+            forProjectionKey: "id:\(uuid.uuidString)")?.rawValue, uuid)
+        XCTAssertEqual(RoomProjectionEnvelope.localThreadID(
+            forProjectionID: uuid.uuidString)?.rawValue, uuid)
+        XCTAssertEqual(RoomProjectionEnvelope.localEntryID(
+            forProjectionID: uuid.uuidString)?.rawValue, uuid)
+        XCTAssertEqual(RoomProjectionEnvelope.localRoomID(forProjectionKey: key),
+                       RoomProjectionEnvelope.localRoomID(forProjectionKey: key))
+        XCTAssertNotEqual(RoomProjectionEnvelope.localThreadID(
+            forProjectionID: "same-opaque")?.rawValue,
+                          RoomProjectionEnvelope.localEntryID(
+            forProjectionID: "same-opaque")?.rawValue)
+    }
+
+    func testColdProjectionHydrationPersistsRichRoomLedgerAndStrictImageBytes() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let imageBytes = Data([0x89, 0x50, 0x4e, 0x47, 1, 2, 3])
+        let image = "data:image/png;base64,\(imageBytes.base64EncodedString())"
+        let log = [
+            RoomProjectionEntry(
+                id: "u-1", from: RoomProjectionAuthor(kind: .user, name: "You"),
+                text: "question", at: 1_000, thread: "topic-a"),
+            RoomProjectionEntry(
+                id: "m-1", from: RoomProjectionAuthor(
+                    kind: .member, name: "ops", source: "lab"),
+                text: "answer", at: 2_000, thread: "topic-a"),
+        ]
+        let projection = RoomProjectionEnvelope(updatedAt: 3, rooms: [
+            "id:opaque-room": projectedRoom(entries: log, image: image),
+        ])
+        let store = RoomStore(baseDirectory: base)
+        let committed = try await store.reconcileRoomProjection(projection)
+        let room = try XCTUnwrap(committed.rooms.first)
+
+        XCTAssertEqual(room.members.map(\.route), [
+            GatewayBotRoute(gatewayID: "mini", profile: "research"),
+            GatewayBotRoute(gatewayID: "lab", profile: "ops"),
+        ])
+        XCTAssertEqual(room.entries.map(\.text), ["question", "answer"])
+        XCTAssertEqual(room.threads.count, 1)
+        XCTAssertEqual(committed.projectedImages[room.id], imageBytes)
+
+        let reader = RoomStore(baseDirectory: base)
+        let restored = try await reader.loadAll()
+        let restoredProjection = try await reader.roomProjection()
+        XCTAssertEqual(restored, committed.rooms)
+        XCTAssertEqual(restoredProjection, committed.roomProjection)
+
+        let malformed = RoomProjectionEnvelope(rooms: [
+            "id:bad-image": RoomProjectionRoom(
+                name: "Bad image", roomID: "bad-image", log: [], revision: 1,
+                members: projectedMembers(), image: "data:image/png;base64,%%%"),
+        ])
+        let afterMalformed = try await reader.reconcileRoomProjection(malformed)
+        let badID = try XCTUnwrap(RoomProjectionEnvelope.localRoomID(
+            forProjectionKey: "id:bad-image"))
+        XCTAssertNotNil(afterMalformed.rooms.first { $0.id == badID })
+        XCTAssertNil(afterMalformed.projectedImages[badID])
+    }
+
+    func testRichSameIDEntryAndRuntimeStateWinWhileMissingProjectionRowsUnion() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let key = "id:opaque-room"
+        let initial = RoomProjectionEnvelope(rooms: [
+            key: projectedRoom(entries: [RoomProjectionEntry(
+                id: "shared-message",
+                from: RoomProjectionAuthor(kind: .user, name: "You"),
+                text: "projected original", at: 1_000, thread: "topic")]),
+        ])
+        let store = RoomStore(baseDirectory: base)
+        let first = try await store.reconcileRoomProjection(initial)
+        let roomID = try XCTUnwrap(first.rooms.first?.id)
+        let attachment = try await store.storeBlob(
+            roomID: roomID, data: Data([4, 5, 6]), fileName: "rich.bin",
+            mediaType: "application/octet-stream")
+        let rich = try await store.mutate(roomID: roomID) { room in
+            room.entries[0].text = "full protected local text"
+            room.entries[0].attachments = [attachment]
+            room.memberSessions[room.members[0].route.qualifiedID] = "stored-session"
+            let thread = room.entries[0].threadID!
+            room.watermarks[RoomEngine.watermarkKey(
+                threadID: thread, member: room.members[0].route)] = 1
+            room.attempts = [RoomAttempt(
+                threadID: thread, member: room.members[0].route, epoch: room.epoch,
+                promptText: "protected attempt", storedSessionID: "stored",
+                runtimeSessionID: "runtime", state: .accepted,
+                baselineMessageCount: 1)]
+        }
+
+        let incoming = RoomProjectionEnvelope(rooms: [
+            key: projectedRoom(revision: 2, entries: [
+                RoomProjectionEntry(
+                    id: "shared-message",
+                    from: RoomProjectionAuthor(kind: .user, name: "You"),
+                    text: "short remote replacement", at: 1_000, thread: "topic"),
+                RoomProjectionEntry(
+                    id: "new-message",
+                    from: RoomProjectionAuthor(kind: .member, name: "ops", source: "lab"),
+                    text: "missing remote row", at: 2_000, thread: "topic"),
+            ]),
+        ])
+        let reconciled = try await store.reconcileRoomProjection(incoming)
+        let room = try XCTUnwrap(reconciled.rooms.first { $0.id == roomID })
+        XCTAssertEqual(room.entries.map(\.text),
+                       ["full protected local text", "missing remote row"])
+        XCTAssertEqual(room.entries[0].attachments, [attachment])
+        XCTAssertEqual(room.memberSessions, rich.memberSessions)
+        XCTAssertEqual(room.watermarks, rich.watermarks)
+        XCTAssertEqual(room.attempts, rich.attempts)
+        let payload = try await store.readBlob(roomID: roomID, attachment: attachment)
+        XCTAssertEqual(payload, Data([4, 5, 6]))
+    }
+
+    func testHigherRevisionRenamesSameRoomAndPreservesRicherMemberFields() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let key = "id:rename-opaque"
+        let store = RoomStore(baseDirectory: base)
+        let first = try await store.reconcileRoomProjection(RoomProjectionEnvelope(rooms: [
+            key: RoomProjectionRoom(name: "Old", roomID: "rename-opaque", log: [],
+                                    revision: 1, members: projectedMembers()),
+        ]))
+        let roomID = try XCTUnwrap(first.rooms.first?.id)
+        _ = try await store.mutate(roomID: roomID) { room in
+            room.members[0].title = "Rich local title"
+            room.members[0].friendlyName = "Research Buddy"
+            room.members[0].rawDisplayName = "Research Core"
+            room.members[0].sourceLabel = "Trusted Mini"
+        }
+        var newerMembers = projectedMembers()
+        newerMembers[0].handle = "remote-handle"
+        newerMembers[0].connectionLabel = "Remote Label"
+        let renamed = try await store.reconcileRoomProjection(RoomProjectionEnvelope(rooms: [
+            key: RoomProjectionRoom(name: "New", roomID: "rename-opaque", log: [],
+                                    revision: 2, members: newerMembers),
+        ]))
+        let room = try XCTUnwrap(renamed.rooms.first { $0.id == roomID })
+        XCTAssertEqual(renamed.rooms.count, 1)
+        XCTAssertEqual(room.name, "New")
+        XCTAssertEqual(room.rawProjectionRevision, 2)
+        XCTAssertEqual(room.members[0].title, "Rich local title")
+        XCTAssertEqual(room.members[0].friendlyName, "Research Buddy")
+        XCTAssertEqual(room.members[0].rawDisplayName, "Research Core")
+        XCTAssertEqual(room.members[0].sourceLabel, "Trusted Mini")
+        XCTAssertEqual(room.members[0].handle, "research")
+    }
+
+    func testProjectionTombstonesDeleteMatchingRichRoomsUnlessExplicitlyPreserved() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let idKey = "id:tombstone-opaque"
+        let legacyKey = "name:Legacy"
+        let store = RoomStore(baseDirectory: base)
+        let hydrated = try await store.reconcileRoomProjection(RoomProjectionEnvelope(rooms: [
+            idKey: RoomProjectionRoom(name: "ID room", roomID: "tombstone-opaque",
+                                      log: [], revision: 3, members: projectedMembers()),
+            legacyKey: RoomProjectionRoom(name: "Legacy", log: [], revision: 3,
+                                          members: projectedMembers()),
+        ]))
+        let idRoomID = try XCTUnwrap(RoomProjectionEnvelope.localRoomID(
+            forProjectionKey: idKey))
+        let legacyRoomID = try XCTUnwrap(RoomProjectionEnvelope.localRoomID(
+            forProjectionKey: legacyKey))
+        XCTAssertEqual(Set(hydrated.rooms.map(\.id)), [idRoomID, legacyRoomID])
+
+        let fenced = try await store.reconcileRoomProjection(
+            RoomProjectionEnvelope(deleted: [idKey: 1, legacyKey: 3]),
+            preservingRoomIDs: [idRoomID])
+        XCTAssertNotNil(fenced.rooms.first { $0.id == idRoomID })
+        XCTAssertNil(fenced.rooms.first { $0.id == legacyRoomID })
+        XCTAssertNil(fenced.roomProjection.rooms[idKey])
+        XCTAssertNil(fenced.roomProjection.rooms[legacyKey])
+
+        // The durable id tombstone remains authoritative after the temporary
+        // preservation fence is released. An empty projection is omission,
+        // but it does not erase that explicit prior deletion.
+        let released = try await store.reconcileRoomProjection(RoomProjectionEnvelope())
+        XCTAssertNil(released.rooms.first { $0.id == idRoomID })
+        XCTAssertTrue(released.rooms.isEmpty)
+    }
+
+    func testMalformedModernMembersOrUnroutableAuthorsRemainLedgerOnly() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let malformedMembers = [
+            RoomProjectionMember(name: "research", connectionID: "mini",
+                                 sourceScoped: true),
+            RoomProjectionMember(name: "legacy-bare"),
+        ]
+        let badAuthorLog = [RoomProjectionEntry(
+            id: "bad-author",
+            from: RoomProjectionAuthor(kind: .member, name: "ghost", source: "unknown"),
+            text: "cannot route safely", at: 1, thread: "main")]
+        let projection = RoomProjectionEnvelope(rooms: [
+            "id:bad-members": RoomProjectionRoom(
+                name: "Bad members", roomID: "bad-members", log: [], revision: 1,
+                members: malformedMembers),
+            "id:bad-author": RoomProjectionRoom(
+                name: "Bad author", roomID: "bad-author", log: badAuthorLog,
+                revision: 1, members: projectedMembers()),
+        ])
+        let store = RoomStore(baseDirectory: base)
+        let result = try await store.reconcileRoomProjection(projection)
+        XCTAssertTrue(result.rooms.isEmpty)
+        XCTAssertEqual(Set(result.roomProjection.rooms.keys),
+                       ["id:bad-members", "id:bad-author"])
+
+        let reader = RoomStore(baseDirectory: base)
+        let restoredRooms = try await reader.loadAll()
+        let restoredProjection = try await reader.roomProjection()
+        XCTAssertTrue(restoredRooms.isEmpty)
+        XCTAssertEqual(restoredProjection, result.roomProjection)
+    }
+
+    func testProjectionOmissionNeverDeletesHydratedRichRoom() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = RoomStore(baseDirectory: base)
+        let first = try await store.reconcileRoomProjection(RoomProjectionEnvelope(rooms: [
+            "id:omitted": RoomProjectionRoom(name: "Omitted", roomID: "omitted",
+                                              log: [], revision: 1,
+                                              members: projectedMembers()),
+        ]))
+        let roomID = try XCTUnwrap(first.rooms.first?.id)
+        let omitted = try await store.reconcileRoomProjection(
+            RoomProjectionEnvelope(updatedAt: 99))
+        XCTAssertNotNil(omitted.rooms.first { $0.id == roomID })
+        XCTAssertNotNil(omitted.roomProjection.rooms["id:omitted"])
     }
 }
 #endif
