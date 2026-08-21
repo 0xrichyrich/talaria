@@ -111,7 +111,7 @@ enum RoomProjectionHydration {
                                    key: String, id: RoomID,
                                    allowedGatewayIDs: Set<String>) -> RoomRecord? {
         guard !projected.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let members = routableMembers(
+              let members = hydratedMembers(
                 projected.members, preserving: [],
                 allowedGatewayIDs: allowedGatewayIDs),
               members.count >= RoomEngine.minimumMembers else { return nil }
@@ -141,6 +141,18 @@ enum RoomProjectionHydration {
                                 allowedGatewayIDs: Set<String>) -> ExistingHydration {
         var room = existing
         room.rawProjectionRoomKey = key
+        // Routing authority is device-local, not a revisioned room identity
+        // field. An unchanged projection must thaw a formerly frozen seat when
+        // that exact gateway is configured later (and freeze it if authority is
+        // removed). Apply only the two authority fields and retain every rich
+        // descriptor/session/transcript value.
+        var authorityCandidate = room
+        updateRoutingAuthority(
+            projected.members, in: &authorityCandidate,
+            allowedGatewayIDs: allowedGatewayIDs)
+        if (try? RoomEngine.validate(authorityCandidate)) != nil {
+            room = authorityCandidate
+        }
         // A first exact-key association may safely consume revision zero. Once
         // associated, only a strictly newer revision may change identity.
         let revisionWins = existing.rawProjectionRoomKey == nil
@@ -150,9 +162,9 @@ enum RoomProjectionHydration {
 
         if revisionWins {
             if !projected.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               let members = routableMembers(
+               let members = hydratedMembers(
                 projected.members,
-                preserving: existing.members + existing.formerMembers,
+                preserving: room.members + room.formerMembers,
                 allowedGatewayIDs: allowedGatewayIDs
             ), members.count >= RoomEngine.minimumMembers {
                 var identityCandidate = room
@@ -188,7 +200,34 @@ enum RoomProjectionHydration {
                                  acceptedIdentityOverlay: acceptedIdentityOverlay)
     }
 
-    private static func routableMembers(_ projected: [RoomProjectionMember],
+    private static func updateRoutingAuthority(
+        _ projected: [RoomProjectionMember], in room: inout RoomRecord,
+        allowedGatewayIDs: Set<String>
+    ) {
+        var authority: [GatewayBotRoute: (raw: String, frozen: Bool)] = [:]
+        for value in projected where value.sourceScoped {
+            let gateway = value.connectionID?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let profile = value.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !gateway.isEmpty, !profile.isEmpty,
+                  !gateway.contains(GatewayBotRoute.separator) else { continue }
+            let route = GatewayBotRoute(gatewayID: gateway, profile: profile)
+            guard GatewayBotRoute(qualifiedID: route.qualifiedID) == route else { continue }
+            authority[route] = (gateway, !allowedGatewayIDs.contains(gateway))
+        }
+        for index in room.members.indices {
+            guard let value = authority[room.members[index].route] else { continue }
+            room.members[index].rawProjectionConnectionID = value.raw
+            room.members[index].isFrozenProjection = value.frozen
+        }
+        for index in room.formerMembers.indices {
+            guard let value = authority[room.formerMembers[index].route] else { continue }
+            room.formerMembers[index].rawProjectionConnectionID = value.raw
+            room.formerMembers[index].isFrozenProjection = value.frozen
+        }
+    }
+
+    private static func hydratedMembers(_ projected: [RoomProjectionMember],
                                         preserving rich: [RoomMember],
                                         allowedGatewayIDs: Set<String>) -> [RoomMember]? {
         var richByRoute: [GatewayBotRoute: RoomMember] = [:]
@@ -203,18 +242,21 @@ enum RoomProjectionHydration {
             let profile = value.name.trimmingCharacters(in: .whitespacesAndNewlines)
             // Modern descriptors must prove their source. Bare v1/v2 member
             // names remain in the ledger but cannot become routable seats.
-            // Desktop connection ids are host-registry identities. They are
-            // routable on this device only after the caller proves an exact
-            // configured Talaria gateway id; labels are display data and must
-            // never be used as an identity fallback.
-            guard value.sourceScoped, allowedGatewayIDs.contains(gateway),
-                  !gateway.isEmpty, !profile.isEmpty,
+            // Desktop connection ids are host-registry identities. Preserve a
+            // syntactically safe unknown id as a frozen display seat; it becomes
+            // routable only when the caller proves that exact configured
+            // Talaria gateway id. Labels are never identity fallbacks.
+            guard value.sourceScoped, !gateway.isEmpty, !profile.isEmpty,
                   !gateway.contains(GatewayBotRoute.separator) else { continue }
             let route = GatewayBotRoute(gatewayID: gateway, profile: profile)
             guard GatewayBotRoute(qualifiedID: route.qualifiedID) == route,
                   routes.insert(route).inserted else { continue }
+            let frozen = !allowedGatewayIDs.contains(gateway)
             if let rich = richByRoute[route] {
-                result.append(rich)
+                var preserved = rich
+                preserved.rawProjectionConnectionID = gateway
+                preserved.isFrozenProjection = frozen
+                result.append(preserved)
                 continue
             }
             let proposedHandle = value.handle?
@@ -224,7 +266,9 @@ enum RoomProjectionHydration {
             let label = value.connectionLabel?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             result.append(RoomMember(route: route, handle: handle,
-                                     sourceLabel: label?.isEmpty == false ? label : nil))
+                                     sourceLabel: label?.isEmpty == false ? label : nil,
+                                     rawProjectionConnectionID: gateway,
+                                     isFrozenProjection: frozen))
         }
         guard result.count <= RoomEngine.maximumMembers else { return nil }
         return result

@@ -846,9 +846,11 @@ public actor RoomStore {
             updatedAt: updatedAt ?? previous.updatedAt)
         var intent = proposedIntent
         let affectedKeys = resolvedProjectionKeys(
-            intent.changedRooms + intent.deletedRooms, in: previous
+            intent.changedRooms + intent.deletedRooms + intent.clearedImages,
+            in: previous
         ).union(resolvedProjectionKeys(
-            intent.changedRooms + intent.deletedRooms, in: local))
+            intent.changedRooms + intent.deletedRooms + intent.clearedImages,
+            in: local))
         var observedRevision: UInt64 = 0
         for key in affectedKeys {
             observedRevision = max(
@@ -958,7 +960,11 @@ public actor RoomStore {
                                              handle: member.handle,
                                              sourceLabel: member.sourceLabel,
                                              friendlyName: member.friendlyName,
-                                             rawDisplayName: member.rawDisplayName)
+                                             rawDisplayName: member.rawDisplayName,
+                                             rawProjectionConnectionID:
+                                                member.rawProjectionConnectionID,
+                                             isFrozenProjection:
+                                                member.isFrozenProjection)
             changed = true
         }
         if let index = room.formerMembers.firstIndex(where: { $0.route == source }),
@@ -968,7 +974,11 @@ public actor RoomStore {
                                                    handle: member.handle,
                                                    sourceLabel: member.sourceLabel,
                                                    friendlyName: member.friendlyName,
-                                                   rawDisplayName: member.rawDisplayName)
+                                                   rawDisplayName: member.rawDisplayName,
+                                                   rawProjectionConnectionID:
+                                                    member.rawProjectionConnectionID,
+                                                   isFrozenProjection:
+                                                    member.isFrozenProjection)
             changed = true
         }
         // Destination collisions are deterministic: keep the authoritative

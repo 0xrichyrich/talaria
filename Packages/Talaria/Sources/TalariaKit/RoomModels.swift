@@ -50,11 +50,21 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
     public var rawDisplayName: String?
     public var handle: String
     public var sourceLabel: String?
+    /// Exact Desktop projection connection id. It is retained independently
+    /// from routing authority so a client-local source slug can round-trip
+    /// without being mistaken for a configured Talaria gateway.
+    public var rawProjectionConnectionID: String?
+    /// A projected seat whose source id is not an exact configured gateway on
+    /// this device. Frozen seats remain visible transcript identity but are
+    /// never eligible for responder scheduling or transport.
+    public var isFrozenProjection: Bool
     public var id: GatewayBotRoute { route }
 
     public init(route: GatewayBotRoute, title: String? = nil,
                 handle: String? = nil, sourceLabel: String? = nil,
-                friendlyName: String? = nil, rawDisplayName: String? = nil) {
+                friendlyName: String? = nil, rawDisplayName: String? = nil,
+                rawProjectionConnectionID: String? = nil,
+                isFrozenProjection: Bool = false) {
         self.route = route
         self.title = title?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.friendlyName = Self.normalizedFriendlyName(friendlyName)
@@ -64,6 +74,10 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
             ? (route.profile.lowercased() == "default" ? "hermes" : route.profile)
             : proposed
         self.sourceLabel = sourceLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawConnection = rawProjectionConnectionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.rawProjectionConnectionID = rawConnection?.isEmpty == false ? rawConnection : nil
+        self.isFrozenProjection = isFrozenProjection
     }
 
     /// The identity which produces room-friendly mention forms. New records
@@ -108,6 +122,7 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case route, title, friendlyName, rawDisplayName, handle, sourceLabel
+        case rawProjectionConnectionID, isFrozenProjection
     }
 
     /// `friendlyName` is additive. Decode all pre-existing identity fields
@@ -125,6 +140,13 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
             try? values.decodeIfPresent(String.self, forKey: .friendlyName))
         rawDisplayName = Self.normalizedFriendlyName(
             try? values.decodeIfPresent(String.self, forKey: .rawDisplayName))
+        let decodedRawConnection = try? values.decodeIfPresent(
+            String.self, forKey: .rawProjectionConnectionID)
+        let rawConnection = (decodedRawConnection ?? nil)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        rawProjectionConnectionID = rawConnection?.isEmpty == false ? rawConnection : nil
+        isFrozenProjection = (try? values.decodeIfPresent(
+            Bool.self, forKey: .isFrozenProjection)) ?? nil ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -135,6 +157,11 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
         try values.encodeIfPresent(rawDisplayName, forKey: .rawDisplayName)
         try values.encode(handle, forKey: .handle)
         try values.encodeIfPresent(sourceLabel, forKey: .sourceLabel)
+        try values.encodeIfPresent(rawProjectionConnectionID,
+                                   forKey: .rawProjectionConnectionID)
+        if isFrozenProjection {
+            try values.encode(true, forKey: .isFrozenProjection)
+        }
     }
 
     private static func normalizedFriendlyName(_ value: String?) -> String? {
@@ -651,12 +678,16 @@ public struct RoomProjectionMergeIntent: Equatable, Sendable {
     public var changedRooms: [String]
     public var deletedRooms: [String]
     public var writeRevision: UInt64
+    /// Local-only room keys whose image field must be emitted as the explicit
+    /// empty-string clear sentinel. Absence remains compaction/omission.
+    public var clearedImages: [String]
 
     public init(changedRooms: [String] = [], deletedRooms: [String] = [],
-                writeRevision: UInt64 = 0) {
+                writeRevision: UInt64 = 0, clearedImages: [String] = []) {
         self.changedRooms = Self.unique(changedRooms)
         self.deletedRooms = Self.unique(deletedRooms)
         self.writeRevision = writeRevision
+        self.clearedImages = Self.unique(clearedImages)
     }
 
     private static func unique(_ values: [String]) -> [String] {
@@ -875,7 +906,8 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
                 RoomProjectionMember(
                     name: member.route.profile,
                     handle: member.handle,
-                    connectionID: member.route.gatewayID,
+                    connectionID: member.rawProjectionConnectionID
+                        ?? member.route.gatewayID,
                     connectionLabel: member.sourceLabel,
                     sourceScoped: true
                 )
@@ -940,6 +972,11 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
         for label in intent.changedRooms {
             changed.formUnion(keys(for: label, in: local))
         }
+        var clearedImages = Set<String>()
+        for label in intent.clearedImages {
+            clearedImages.formUnion(keys(for: label, in: remote))
+            clearedImages.formUnion(keys(for: label, in: local))
+        }
 
         var deleted: [String: UInt64] = [:]
         for source in [remote, local] {
@@ -976,7 +1013,13 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
             let identity: RoomProjectionRoom
             let members: [RoomProjectionMember]
             let image: String?
-            if localRevision > remoteRevision {
+            if clearedImages.contains(key), localRevision >= remoteRevision {
+                identity = localRoom ?? remoteRoom!
+                members = localRevision > remoteRevision
+                    ? (localRoom?.members ?? [])
+                    : unionMembers(remoteRoom?.members ?? [], localRoom?.members ?? [])
+                image = ""
+            } else if localRevision > remoteRevision {
                 identity = localRoom ?? remoteRoom!
                 members = localRoom?.members ?? []
                 // Image is optional because envelope bounding may remove it.
