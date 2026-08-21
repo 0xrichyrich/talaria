@@ -338,10 +338,10 @@ final class RoutedEventGate {
 }
 
 /// The old routed subscription remains live while a staged exact-session open
-/// crosses its synchronous visible-adoption boundary.  Keeping this token on
-/// the MainActor makes the swap reversible: a failed begin restores the exact
-/// old pump/generation without needing to reconstruct any approval or runtime
-/// state that was deliberately left untouched during the swap.
+/// crosses its synchronous visible-adoption boundary. Keeping this token on
+/// the MainActor makes a same-client swap reversible; a different-client
+/// failure instead retires both generations without reconstructing stale
+/// approval or runtime state.
 @MainActor
 final class ExactRoutedEventsTransaction {
     let gatewayID: String
@@ -386,16 +386,38 @@ final class ExactRoutedEventsTransaction {
         }
         replacement.gate?.retire()
         replacement.pump.cancel()
-        if let previous {
+
+        // A same-client handoff is reversible: the old gate parked target
+        // frames and can replay them into the old pump without changing the
+        // source identity. A different client is not reversible. Its prior
+        // handler was retired at commit because that client is no longer the
+        // pool owner; restoring it here would reopen a stale source and let a
+        // queued frame from the old connection mutate the new world.
+        let canRestorePrevious = previous.map {
+            ObjectIdentifier($0.client) == ObjectIdentifier(replacement.client)
+        } == true
+        if canRestorePrevious, let previous {
             let replay = previous.gate?.restoreForRollback() ?? []
             for event in replay { previous.continuation?.yield(event) }
-        }
-        runtime.routedEvents[gatewayID] = previous
-        runtime.routedEventGenerations[gatewayID] = previousGeneration
-        if let previousApprovalSweepEpoch {
-            ApprovalBridges.shared.sweepEpochs[gatewayID] = previousApprovalSweepEpoch
+            runtime.routedEvents[gatewayID] = previous
+            runtime.routedEventGenerations[gatewayID] = previousGeneration
+            if let previousApprovalSweepEpoch {
+                ApprovalBridges.shared.sweepEpochs[gatewayID] = previousApprovalSweepEpoch
+            } else {
+                ApprovalBridges.shared.sweepEpochs[gatewayID] = nil
+            }
         } else {
-            ApprovalBridges.shared.sweepEpochs[gatewayID] = nil
+            // Keep the source unpublished until a fresh attach wins. The
+            // generation bump is deliberate: a late completion or stale
+            // cleanup from either client must not be able to claim this slot.
+            runtime.routedEvents[gatewayID] = nil
+            let currentGeneration = runtime.routedEventGenerations[gatewayID,
+                                                                   default: replacement.generation]
+            runtime.routedEventGenerations[gatewayID] = currentGeneration &+ 1
+            // Do not restore the prior sweep epoch. Approval.pending work
+            // issued against the retired client belongs to that source and
+            // must be fenced until a new subscription starts its own sweep.
+            ApprovalBridges.shared.resetSweepScope(gatewayID: gatewayID)
         }
         prepared.abandonCommitted()
         settled = true

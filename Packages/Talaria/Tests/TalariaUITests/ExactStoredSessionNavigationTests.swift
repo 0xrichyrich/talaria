@@ -1203,7 +1203,8 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         await pool.disconnect(gatewayID: gatewayID)
     }
 
-    func testRollbackRestoresOldGenerationAndRejectsQueuedOldClientEvents() async throws {
+    func testDifferentClientRollbackRetiresBothGenerationsAndRejectsQueuedOldClientEvents()
+        async throws {
         let model = AppModel()
         let gatewayID = "foreign-rollback-gate-\(UUID().uuidString)"
         let oldClient = GatewayClient(
@@ -1260,21 +1261,21 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
                       "retired old client/generation cannot deliver queued frames")
 
         transaction.rollback()
+        await transaction.cleanupSupersededPrevious()
         await transaction.prepared.discardAfterRollback()
-        XCTAssertEqual(runtime.routedEvents[gatewayID]?.handlerID, oldHandler)
-        XCTAssertEqual(runtime.routedEventGenerations[gatewayID], oldGeneration)
-        XCTAssertEqual(ApprovalBridges.shared.sweepEpochs[gatewayID], 19)
-        XCTAssertTrue(oldGate.isOpen, "rollback restores old gate authority")
+        XCTAssertNil(runtime.routedEvents[gatewayID],
+                     "a different-client rollback must not republish the retired source")
+        XCTAssertEqual(runtime.routedEventGenerations[gatewayID], oldGeneration + 2,
+                       "rollback leaves a monotonic fence after the replacement generation")
+        XCTAssertNotEqual(ApprovalBridges.shared.sweepEpochs[gatewayID], 19,
+                          "stale approval sweep state must not be restored")
+        XCTAssertFalse(oldGate.isOpen, "a different-client rollback keeps old gate retired")
         await oldClient.emitEventForTesting(GatewayEvent(
             type: "message.complete", sessionID: "old-runtime",
             payload: .object(["text": .string("restored")]), inboundSequence: 15))
-        for _ in 0..<20 {
-            if await probe.events.count > 0 { break }
-            await Task.yield()
-        }
         let restoredEvents = await probe.events
-        XCTAssertEqual(restoredEvents.map(\.inboundSequence), [15],
-                       "rollback returns delivery to the old pump exactly once")
+        XCTAssertEqual(restoredEvents.map(\.inboundSequence), [],
+                       "retired old-client frames must never replay after rollback")
     }
 
     func testExactOpenAuthorityFailuresPreserveVisibleChatTranscriptAndUnread() async throws {
