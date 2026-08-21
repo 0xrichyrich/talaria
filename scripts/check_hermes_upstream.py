@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate Talaria's pinned Hermes parity authority and detect upstream drift."""
+"""Validate Talaria's pinned Hermes authority and report upstream drift."""
 
 from __future__ import annotations
 
@@ -93,7 +93,14 @@ def verify_checkout(manifest: dict[str, Any], checkout: Path) -> None:
             )
 
 
-def verify_remote(manifest: dict[str, Any]) -> None:
+def verify_remote(manifest: dict[str, Any]) -> bool:
+    """Report whether the moving remote ref still equals the audited cutoff.
+
+    The exact commit plus authority hashes are the reproducible gate. A newer
+    remote HEAD is an input to a future explicit audit, not proof that the
+    audited snapshot became invalid, so drift is informational and returns
+    ``False`` without failing the command.
+    """
     output = git("ls-remote", "--exit-code", manifest["repository"], manifest["ref"])
     rows = [line.split() for line in output.splitlines() if line.strip()]
     if len(rows) != 1 or len(rows[0]) != 2 or not SHA_PATTERN.fullmatch(rows[0][0]):
@@ -101,25 +108,33 @@ def verify_remote(manifest: dict[str, Any]) -> None:
     actual_commit = rows[0][0]
     expected_commit = manifest["commit"]
     if actual_commit != expected_commit:
-        raise CheckError(
-            "Hermes upstream moved. Re-audit the changed authority files and update "
-            f"parity/hermes-upstream.json.\npinned {expected_commit}\nremote {actual_commit}"
+        print(
+            "Hermes upstream drift (informational): the audited pin remains "
+            "authoritative until a later explicit source/contract audit.\n"
+            f"pinned {expected_commit}\nremote {actual_commit}",
+            file=sys.stderr,
         )
+        return False
+    return True
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--checkout", type=Path, help="verify an exact local Hermes checkout")
-    parser.add_argument("--remote", action="store_true", help="compare the pin with the remote ref")
+    parser.add_argument(
+        "--remote", action="store_true",
+        help="report whether the moving remote ref differs from the audited pin",
+    )
     arguments = parser.parse_args()
 
     try:
         manifest = load_manifest(arguments.manifest)
         if arguments.checkout:
             verify_checkout(manifest, arguments.checkout.resolve())
+        remote_matches = None
         if arguments.remote:
-            verify_remote(manifest)
+            remote_matches = verify_remote(manifest)
     except CheckError as error:
         print(f"Hermes parity check failed: {error}", file=sys.stderr)
         return 1
@@ -128,7 +143,7 @@ def main() -> int:
     if arguments.checkout:
         checks.append("checkout")
     if arguments.remote:
-        checks.append("remote")
+        checks.append("remote" if remote_matches else "remote drift noted")
     print(f"Hermes parity check passed ({', '.join(checks)}): {manifest['commit']}")
     return 0
 

@@ -2,17 +2,17 @@
   "schemaVersion": 1,
   "repository": "https://github.com/nousresearch/hermes-agent.git",
   "ref": "HEAD",
-  "commit": "c1e25cadffe539b058816be5fdfc9127d7199fa4",
+  "commit": "40643cbaf9b767af146694131ffb8f8160f25e1c",
   "auditedAt": "2026-08-20",
-  "talariaBaseline": "9c9015644cb57883dda49c5d709779ec0f50414b",
+  "talariaBaseline": "04695b91e8fe7cc59a8638e266b5b151c58144ab",
   "authorityFiles": [
     {
       "path": "apps/desktop/src/plugins/hermes-bots/plugin.js",
-      "sha256": "400a731d5263ef47927bcb261560fb626d7e285299c8a532319b73c5a5f9df22"
+      "sha256": "738e108f12134bf651b9e43a795d87c6b24dd0bd3c2e0da1e533b1912fb2783e"
     },
     {
       "path": "website/docs/user-guide/bot-mode.md",
-      "sha256": "d13ab467217d464cb7403c2cde6258fa560bc8b6550c09c5b735511a48fa3848"
+      "sha256": "3b614687a88c6da3213fcaef6f6a0d1a801a2bfed4407c36c5666b6d588d4e97"
     },
     {
       "path": "website/docs/user-guide/desktop.md",

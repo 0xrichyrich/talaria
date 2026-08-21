@@ -7,23 +7,74 @@ are not current until they are regenerated against this baseline.
 ## Exact authority
 
 - Hermes repository: <https://github.com/nousresearch/hermes-agent>
-- Hermes commit: `c1e25cadffe539b058816be5fdfc9127d7199fa4`
-- Talaria baseline: `9c9015644cb57883dda49c5d709779ec0f50414b`
-- Audited: 2026-08-20
+- Hermes commit: `40643cbaf9b767af146694131ffb8f8160f25e1c`
+- Talaria baseline: `04695b91e8fe7cc59a8638e266b5b151c58144ab`
+- Audited cutoff: 2026-08-20 (America/Los_Angeles), exact `40643cba` snapshot
 - Machine-readable pin and authority-file hashes:
   [`parity/hermes-upstream.json`](../parity/hermes-upstream.json)
 - Audited contract delta and remaining certification:
-  [`docs/HERMES-9EF9-AUDIT.md`](HERMES-9EF9-AUDIT.md)
+  [`docs/HERMES-CURRENT-AUDIT.md`](HERMES-CURRENT-AUDIT.md)
 
-The `b5455fdd..c1e25cad` drift is material rather than mechanical. All five
-hashed authority files changed. The Bot Mode plugin added exact canonical-chat
-adoption rules, renamed-friendly mention forms, preferred/worker activity,
-roster hiding, and room-member clarification/approval mirroring. Hermes also
-made Projects profile-scoped, added remote repository scanning, and exposed a
-reattachable authenticated PTY contract. The final `9ef9b2d2..c1e25cad` step
-also made room member-session identity immutable across rename and same-name
-recreation, and tightened stranded-reply harvesting. Each change is audited as
-a behavioral dependency below; moving this pin does not by itself claim parity.
+The earlier `b5455fdd..c1e25cad` drift was material: it changed all five
+authority files and added canonical-chat adoption, renamed-friendly mentions,
+preferred/worker activity, roster hiding, room prompt mirroring, profile-scoped
+Projects, remote repository scanning, immutable room-session identity, and the
+reattachable authenticated PTY contract. Those corrections landed on Talaria
+`main` in PR #31, with live certification deliberately still open.
+
+The subsequent `c1e25cad..95057c2` drift is narrower. GitHub reports 13 commits
+ahead; only the Bot Mode plugin changed among the five hashed authority files.
+Desktop fixed union-roster cache reads, focused-bot identity, and duplicate
+mention completions. Talaria already uses one `unionRosterBots` source and the
+source-qualified speaking bot for both completion and routing. Outside the
+hashed authority set, Hermes refreshed OpenCode catalogs/routing (gateway-driven
+in Talaria), honored `auxiliary.goal_judge.timeout` (a remaining management
+surface), and made React/compiler and contributor-only changes. The exact
+per-commit dispositions are in the current audit. Moving the pin records that
+review; it does not certify gateway- or device-dependent behavior.
+
+The next `95057c2..18a15a46` move adds no authority-file hash changes. Its
+portable deltas are gateway prompt-delivery semantics and per-job cron
+reasoning. Approval/clarify sends now preserve registrations when connector
+delivery times out ambiguously, and prompt lifecycle acknowledgements no longer
+block the relay read loop or seal a live draft. Those are gateway fixes with no
+new Talaria wire shape, but they extend the live certification matrix. Cron raw
+jobs now expose an optional user-owned `reasoning_effort` override; Talaria does
+not yet decode or edit that field, so it remains a management gap. Formatting,
+React build, contributor, and Windows test-only commits do not create portable
+iOS behavior.
+
+The final audited `18a15a46..efb6b40f` window contains exactly 19 commits
+across two parents and their merge. All five authority files remain
+byte-for-byte unchanged, but three portable gateway behaviors moved outside
+that set. Environment-stamped connector deployments now default to
+relay-exclusive messaging, with an explicit allow-direct escape hatch,
+process-global routing stamps, profile-scoped credentials, and an accurate
+secondary-multiplex enroll warning. Built-in `MEMORY.md` and `USER.md` flags now
+drive one fresh per-turn tool schema and independently gate both direct and
+approved/staged writes. Custom OpenCode Go/Zen providers now get family-wide,
+case-insensitive model routing, per-model API mode and `/v1` healing, plus
+provider-wire aliases for reserved `web_search`/`search_files` names that map
+back before Hermes dispatch. Talaria needs no new decoder for these changes:
+relay deployment management remains an existing gap, while the memory toggles
+and custom-endpoint/model/tool surfaces exist but need the exact live cases in
+`TESTING.md`. The current audit records a disposition for every commit,
+including test, metadata, superseded-intermediate, and merge-only changes.
+
+The later authority-changing `efb6b40f..40643cba` audit is bounded by its
+exact net tree: 20 files, 3,134 additions, and 85 deletions. Bot Mode now
+projects a bounded version-3 room summary through every reachable gateway's
+default-profile `ui_meta["hermes-bots-groups"]`, with immutable room ids,
+stable message ids, explicit tombstones, reconnect fan-out, and conflict-safe
+merge. Gateway profiles add per-key `ui_meta_revisions` and optional
+`ui_meta_expected_revisions` compare-and-swap writes. Talaria's existing rooms
+remain full, durable local rooms; they do not yet decode, merge, or publish
+this shared projection and do not use the new CAS fields. Cross-client room
+projection is therefore a new explicit implementation gap, not covered by the
+checked local room rows below. The other net changes are host update receipts
+and fleet code identity, container first-boot key generation, Telegram final
+rendering, and Cloud MCP documentation; the current audit classifies their
+client impact file by file.
 
 Run the local check against an exact Hermes checkout:
 
@@ -37,8 +88,13 @@ Check whether upstream has moved:
 python3 scripts/check_hermes_upstream.py --remote
 ```
 
-The scheduled upstream-drift workflow runs the latter check. A failure is a
-request to review upstream, not permission to move the pin without an audit.
+The exact checkout plus manifest hashes are the authoritative, blocking gate.
+The scheduled upstream-drift workflow runs the latter command only as an
+informational signal: a newer moving `HEAD` does not make this audited snapshot
+non-reproducible and must not trigger an automatic repin. Review the later
+commit range explicitly. Only an audited authority-file change or material
+portable-contract delta is blocking; metadata, test-only, and non-portable
+drift can be recorded without moving this cutoff.
 
 ## What “parity” means
 
@@ -68,19 +124,21 @@ gateway controls on iOS.
 
 ## Current honest status
 
-The 2026-08-17 Desktop audit measured 30% covered portable behavior. Subsequent
-Talaria work improved several Bot Mode areas, but it was developed against an
-older Hermes snapshot and current upstream expanded materially. There is no
-defensible newer percentage until the granular ledgers are regenerated.
+The 2026-08-17 Desktop audit measured 30% covered portable behavior. Substantial
+Bot Mode and portable Desktop work has landed since then, including the current
+Hermes corrections in PR #31. There is no defensible newer percentage until
+the granular ledgers are regenerated against this exact pin.
 
 The current implementation is best described as a mobile Hermes client with
 substantial Bot Mode support, not yet a 1:1 client. Source-qualified A2A,
 standalone multi-member rooms, rich transcript interaction, and a guarded
 gateway-backed Command Center are implemented and automated-gate certified;
 they remain provisional until live-gateway and real-device certification. The
-largest remaining product gaps are the newly audited current Bot Mode contracts,
-room-member prompts, richer transcript media/tool presentation, profile-scoped
-Projects, and the portable gateway PTY:
+largest remaining product gaps are shared gateway room projection with
+profile-metadata CAS, richer transcript media/tool presentation,
+portable management depth (including auxiliary goal-judge controls and per-job
+cron reasoning), workspace and artifact completeness, and the authenticated
+gateway PTY:
 
 - Talaria retains authenticated clients for multiple gateways and routes chat,
   events, sessions, full approval recovery/prompts, and unread state by source.
@@ -98,6 +156,10 @@ Projects, and the portable gateway PTY:
   gateway; accepted/uncertain sends are durable and never blindly replayed.
   Membership convergence uses a source-qualified persistent outbox so an
   offline create/rename/disband can finish after reconnect.
+  This local durability does not yet implement exact Hermes' bounded
+  `hermes-bots-groups` projection, explicit shared tombstones, all-gateway
+  fan-out, or `ui_meta` compare-and-swap. Cross-client room convergence remains
+  open until the implementation and conflict/reconnect matrix land.
 - Current Hermes also exposes agent-guided `tour.request` prompts and whole-turn
   activity across transcript gaps. Talaria's room work includes the bounded
   current-run activity feed; tours and transcript activity remain queued with
@@ -126,9 +188,13 @@ notifications.
 
 Debug and TestFlight are separate APNs environments (`dev`/sandbox versus
 `prod`/production), and every Hermes process that can own an event needs its
-own inherited environment. A real-device Debug + TestFlight matrix, event
-negative cases, profile-filter check, and honest sidecar limitations are still
-required. Follow [TESTING.md §5](../TESTING.md#5-live-gateway-and-push-certification)
+own inherited environment. On 2026-08-20, real approval and final-response
+notifications were observed on the paired Debug device, but no retained
+repository/PR report yet records every field required by `TESTING.md` section
+5. Treat certification as pending. Mention/routine delivery, interrupted and
+profile-filter negative cases, exact-session cold-launch tap routing, honest
+sidecar limitations, and the full TestFlight production matrix remain open.
+Follow [TESTING.md §5](../TESTING.md#5-live-gateway-and-push-certification)
 and the [relay certification procedure](../relay/README.md#live-gatewaydevice-certification)
 before moving push rows from partial to complete.
 
@@ -136,33 +202,45 @@ before moving push rows from partial to complete.
 
 Reviewed follow-up work now includes transcript edit/rewind/regenerate,
 Gateway Operations maintenance, files/git/projects, live pet presentation,
-Bot Mode kickoff, response-ready APNs delivery, native motion, and the
-attachment-source redesign. The current-Hermes contract corrections, App Store release,
-and independent live-gateway/device certification remain outstanding.
+Bot Mode kickoff, response-ready APNs delivery, native motion, the
+attachment-source redesign, and the current-Hermes contract corrections merged
+in PR #31. Granular-ledger regeneration, remaining portable surfaces, App Store
+release, and independent live-gateway/device certification remain outstanding.
 
 Every item below ships as one or more independently reviewable PRs. A checked
-item means the behavior contract above is satisfied, not merely that code was
-written.
+implementation item means its reviewed code is on `main`; it does not override
+the completion rules above. Gateway- and device-dependent checked items remain
+partial until the unchecked certification gates are recorded.
 
 - [x] Pin the exact current Hermes authority and automate upstream drift detection.
 - [ ] Regenerate both granular ledgers from the pinned source and stabilize the
       crash-recovery work as reviewable, tested slices.
 - [x] Replace global gateway switching with a managed multi-connection pool and
       source-qualified state, events, sessions, and mutations.
-- [ ] Migrate group metadata to multiple memberships and standalone room identities.
-- [ ] Implement cross-machine room delivery, explicit failure semantics,
-      attachments, threads, and stranded-reply recovery.
-- [ ] Close current Bot Mode gaps: roster hiding, avatars, remote creation,
-      target capabilities, mentions, routines, canonical chats, and profile lifecycle.
-- [ ] Add rich transcripts and full session interaction controls.
+- [x] Migrate group metadata to multiple memberships and standalone room identities.
+      Local implementation merged; exact Hermes shared gateway projection and
+      metadata CAS remain a separate unchecked item.
+- [ ] Implement shared `hermes-bots-groups` projection consumption/publication,
+      durable tombstones, all-gateway fan-out, per-key profile CAS conflict
+      recovery, read-back confirmation, and legacy-gateway feature detection.
+- [x] Implement cross-machine room delivery, explicit failure semantics,
+      attachments, threads, and stranded-reply recovery. Implementation merged;
+      the room prompt/relaunch matrix remains open.
+- [x] Close the audited current Bot Mode implementation gaps: roster hiding,
+      avatars, remote creation, target capabilities, mentions, routines,
+      canonical chats, room prompts, and profile lifecycle. Live certification
+      remains open row by row.
+- [ ] Finish rich transcripts and full session interaction controls.
       Default working presentation is an animated agent avatar; tool activity
       and gateway-exposed reasoning summaries are opt-in advanced views. The
       mobile composer must give multiline drafts the full available width,
       keep accessory/send controls stable, and scroll internally after its
       height cap instead of squeezing text into a narrow center column.
-- [ ] Add mobile management for providers, models, profiles, tools, skills, MCP,
-      plugins, routines, messaging, memory, and agents.
-- [ ] Add gateway-backed files, artifacts, projects, git, terminal, and command-center UI.
+- [ ] Finish mobile management for providers, models, profiles, tools, skills,
+      MCP, plugins, routines (including per-job reasoning effort), messaging,
+      memory, auxiliary slots, and agents.
+- [ ] Finish gateway-backed files, artifacts, projects, git, authenticated PTY,
+      and command-center UI.
 - [ ] Finish push, background, offline, reconciliation, and capability/version reliability.
       Push specifically remains implemented-but-uncertified until the Debug /
       TestFlight, real-event, filter, and sidecar matrix in TESTING.md is

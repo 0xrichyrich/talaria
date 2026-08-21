@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   parity-pin:
-    name: Compare parity pin with Hermes HEAD
+    name: Report Hermes HEAD drift from audited pin
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

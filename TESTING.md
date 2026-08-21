@@ -200,6 +200,120 @@ observed on the intended APNs environment and the negative/filter/sidecar
 cases above are recorded. Full relay contract and payload details remain in
 [`relay/README.md`](relay/README.md).
 
+## 6. Exact `40643cba` gateway-delta checks
+
+The parity cutoff is a reproducible snapshot, not whatever Hermes `HEAD` is
+when this guide is read. Before recording any result, check out
+`40643cbaf9b767af146694131ffb8f8160f25e1c` and verify both its identity and
+the five authority-file hashes:
+
+```sh
+python3 scripts/check_hermes_upstream.py
+python3 scripts/check_hermes_upstream.py --checkout /path/to/hermes-agent
+```
+
+`python3 scripts/check_hermes_upstream.py --remote` is only a drift report. A
+newer remote `HEAD` does not invalidate the audited checkout and is not a
+reason to repin without reviewing the later commit range.
+
+Retain the exact gateway commit, Talaria commit/build, selected profile and
+gateway, redacted config, request/result log excerpts, and expected/actual
+result for each case below. Upstream unit tests establish the source contract;
+they do not certify Talaria's live behavior.
+
+### Relay-exclusive deployment
+
+Use a disposable connector-fronted gateway with at least one directly enabled
+messaging adapter. An environment `GATEWAY_RELAY_URL` should enable relay and
+disable direct messaging adapters, including an explicitly configured one,
+while local, API-server, and webhook surfaces remain available. Repeat with
+`GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS=true` and expect the direct adapter to
+remain enabled. A relay URL configured only in YAML remains additive.
+
+For a multiplex gateway, prove routing stamps come from the process/default
+root while relay secrets remain isolated per profile. A profile-only routing
+stamp must not half-enable config or registration. Finally, run gateway enroll
+from a secondary profile and retain the warning that its URL/wake stamps will
+not activate from that profile's isolated `.env`. These are deployment checks,
+not evidence that Talaria implements messaging/relay administration; that
+mobile management surface remains open.
+
+### Independent built-in memory stores
+
+From Talaria's gateway operator settings on a disposable profile, enable only
+`USER.md`, start a fresh turn, and verify the memory tool advertises/accepts
+only the `user` target while direct and approved/staged `memory` writes are
+rejected. Repeat with only `MEMORY.md` enabled and the inverse expectations.
+Then disable both and verify the built-in memory tool is unavailable; re-enable
+one store and start another turn to prove the old availability decision was
+not retained. Record the bounded invalid-target error and its recovery hint.
+
+### Custom OpenCode family routing and tools
+
+Using credentials authorized for the test, create and activate a custom
+OpenCode Go or Zen endpoint from Talaria's Name / Base URL / Model form. Use a
+lowercase family-suffixed name such as `opencode-go-bridge`; Hermes derives the
+endpoint id from that name and lowercases it. Exercise one Responses model
+(GPT/Grok), one Messages model (MiniMax/Qwen/Claude as appropriate), and one
+Chat Completions model (DeepSeek/GLM/Kimi as appropriate), switching between
+them so a stripped `/v1` must be restored. A transport explicitly configured
+on the gateway remains authoritative; Talaria's custom-endpoint editor does
+not expose that field.
+
+Talaria cannot create a mixed-case provider id: its form sends no independent
+id, and Hermes generates a lowercase slug. If the case-insensitive provider
+predicate needs live proof beyond the pinned upstream tests, hand-write a
+mixed-case family key such as `OpenCode-Go-Bridge` plus the matching
+`model.provider` in a disposable gateway config, restart that gateway, and run
+the relevant model there. Record this as gateway-config evidence, not as a
+Talaria-created endpoint case.
+
+On a Responses model, trigger both `web_search` and `search_files`. The request
+must avoid the provider's reserved-name HTTP 400, while Talaria's tool cards
+and Hermes dispatch retain the canonical names; a visible `hermes_web_search`
+or `hermes_search_files` name is a failure. Do not call this path certified
+until the retained report covers endpoint save/activate, model switches, one
+completed answer per API family, and both tool calls.
+
+### Shared room projection and profile-metadata CAS (implementation gate)
+
+This is an expected gap at the current Talaria baseline, not a passing live
+certification case. Exact Hermes publishes bounded version-3 room projections
+in default-profile `ui_meta["hermes-bots-groups"]` and exposes per-key
+`ui_meta_revisions`. Talaria currently does neither. Do not claim Desktop/mobile
+shared-room convergence from the existing local room tests.
+
+First pin the gateway protocol directly: two clients must read the same
+revision, then submit different `profiles.configure` writes with that expected
+revision. Exactly one succeeds and increments it; the loser receives
+`applied.ui_meta=false`, an exact `ui_meta_conflicts` expected/actual pair, and
+the current revision. Delete the key and prove its revision survives deletion
+so the stale client cannot recreate it. Also prove that omission of
+`ui_meta_expected_revisions` retains the documented legacy best-effort path.
+
+After Talaria support lands, retain a two-Desktop/one-phone report covering:
+
+1. Hydration of name, picture, source-qualified members, and bounded recent
+   transcript from each attached gateway without replacing Talaria's full
+   protected local transcript.
+2. A concurrent Desktop/phone write conflict followed by reread, stable-id
+   merge, CAS retry, exact revision increment, and read-back confirmation.
+3. Rename with the same immutable room id; disband with a final `id:`
+   tombstone; and same-name recreation with a fresh id and fresh sessions.
+4. A truncated or missing remote projection that does **not** delete local
+   rooms/messages, plus explicit tombstone propagation that does.
+5. One gateway offline during create/rename/disband, later reconnect and
+   reseed, and fan-out to every other reachable default-profile gateway.
+6. Feature detection against an older gateway with no `ui_meta_revisions`,
+   exercising only the bounded legacy fallback without presenting it as
+   conflict-safe.
+
+The projection limit is 48,000 bytes with at most 16 recent messages per room,
+1,200 text characters per projected message, and a 24,000-character image.
+Exceed each bound in the fixture and verify graceful trimming, never implicit
+deletion. Until all six cases are retained, cross-client shared rooms remain
+uncertified even if standalone room routing passes.
+
 ---
 
 ## What to expect
@@ -208,20 +322,23 @@ Talaria is **Bot Mode on a phone** — a roster of your Hermes profiles, each
 with one forever-chat — not a session manager. If it starts feeling like a
 list of sessions, that is a bug.
 
-Roughly a third of Hermes Desktop's Bot Mode surface is implemented, tracked
-row by row in [docs/BOT-MODE-PARITY.md](docs/BOT-MODE-PARITY.md) with the plan
-in [docs/BOT-PARITY-PLAN.md](docs/BOT-PARITY-PLAN.md). Broad desktop parity
-lives in [PARITY.md](PARITY.md).
+The older row-by-row ledgers remain useful historical evidence, but their
+percentages have not yet been regenerated against the current Hermes pin. The
+authoritative status and remaining certification are in
+[docs/PARITY-BASELINE.md](docs/PARITY-BASELINE.md); broad Desktop coverage is
+still catalogued in [PARITY.md](PARITY.md).
 
 **Works today:** the roster, chat with streaming, reasoning ("Thought") blocks,
 tool chips, block markdown, approvals with the full choice set, model picker
 grouped by provider, sessions, cron, capabilities (skills/MCP/toolsets), voice,
 attachments, slash commands, pets, three themes, Live Activity.
 
-**Known rough edges:** group rooms are unbuilt; a phone that sleeps mid-turn
-can briefly show a bot as still working; several surfaces are implemented but
-have never met a live gateway, so please report anything that looks
-confidently wrong.
+**Known rough edges:** standalone multi-bot rooms, source-qualified commands,
+and profile-scoped Projects are implemented, but their real multi-gateway,
+prompt/relaunch, and device certification remains open. A phone that sleeps
+mid-turn can briefly show a bot as still working, and several other surfaces
+have not completed their live-gateway matrix, so please report anything that
+looks confidently wrong.
 
 ## Reporting a bug
 
