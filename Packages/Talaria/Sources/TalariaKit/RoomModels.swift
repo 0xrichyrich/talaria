@@ -714,8 +714,23 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
 
     /// The complete top-level patch accepted by profiles.configure.
     public var uiMetaPatch: JSONValue {
-        guard let raw = try? JSONValue.from(self) else { return .object([:]) }
+        // Public value fields make fixture construction and pure merges
+        // ergonomic, but outbound gateway data must always cross the bounds
+        // fence again after any caller mutation.
+        guard let raw = try? JSONValue.from(bounded()) else { return .object([:]) }
         return .object([Self.metadataKey: raw])
+    }
+
+    /// RoomStore persists only the canonical v3 shape emitted by this build.
+    /// Gateway input deliberately normalizes malformed rows leniently, while
+    /// a present malformed on-disk ledger is corruption and must fail closed
+    /// rather than silently erasing rooms or tombstones on the next write.
+    static func strictlyDecodedPersisted(_ raw: JSONValue) -> Self? {
+        guard raw.objectValue != nil else { return nil }
+        let normalized = Self.normalized(raw)
+        guard let canonical = try? JSONValue.from(normalized),
+              canonical == raw else { return nil }
+        return normalized
     }
 
     /// Lift v1 wall-clock and v2 name-keyed snapshots into the v3 identity

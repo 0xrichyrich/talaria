@@ -742,6 +742,19 @@ final class RoomStoreTests: XCTestCase {
                 && ($0.image?.count ?? 0) <= RoomProjectionEnvelope.maximumImageCharacters
         })
         XCTAssertEqual(envelope.deleted.values.max(), 99)
+
+        var mutated = RoomProjectionEnvelope()
+        mutated.rooms = rooms
+        mutated.deleted = deleted
+        let outbound = RoomProjectionEnvelope(uiMeta: mutated.uiMetaPatch)
+        XCTAssertNotNil(outbound)
+        XCTAssertLessThanOrEqual(outbound?.gatewayJSONSize ?? .max,
+                                 RoomProjectionEnvelope.maximumGatewayJSONBytes)
+        XCTAssertLessThanOrEqual(outbound?.deleted.count ?? .max,
+                                 RoomProjectionEnvelope.maximumTombstones)
+        XCTAssertTrue(outbound?.rooms.values.allSatisfy {
+            $0.log.count <= RoomProjectionEnvelope.maximumMessagesPerRoom
+        } == true)
     }
 
     func testRoomProjectionAppliesUnionedTombstonesBeforeRetentionBound() {
@@ -914,6 +927,35 @@ final class RoomStoreTests: XCTestCase {
         try await reader.deleteAll()
         let emptyProjection = try await reader.roomProjection()
         XCTAssertEqual(emptyProjection, RoomProjectionEnvelope())
+    }
+
+    func testMalformedPersistedProjectionFailsClosedInsteadOfErasingLedger() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = RoomStore(baseDirectory: base)
+        _ = try await store.loadAll()
+        _ = try await store.mergeRoomProjection(RoomProjectionEnvelope(rooms: [
+            "id:kept": RoomProjectionRoom(name: "Kept", roomID: "kept", log: []),
+        ]))
+
+        let indexURL = base.appendingPathComponent("Rooms/rooms-v1.json")
+        let data = try Data(contentsOf: indexURL)
+        var root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        root["roomProjection"] = [
+            "version": 3,
+            "updatedAt": 0,
+            "rooms": "truncated",
+        ]
+        try JSONSerialization.data(withJSONObject: root).write(to: indexURL, options: .atomic)
+
+        do {
+            _ = try await RoomStore(baseDirectory: base).loadAll()
+            XCTFail("a present malformed durable projection must fail closed")
+        } catch {
+            XCTAssertEqual(error as? RoomStoreError, .corruptIndex)
+        }
     }
 }
 #endif

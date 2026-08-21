@@ -91,9 +91,19 @@ public actor RoomStore {
                                                                      forKey: .ignoredMetadataMutationIDs) ?? []
             pendingLifecycleRoutes = try values.decodeIfPresent([GatewayBotRoute].self,
                                                                forKey: .pendingLifecycleRoutes) ?? []
-            roomProjection = try values.decodeIfPresent(
-                RoomProjectionEnvelope.self, forKey: .roomProjection
-            )?.bounded() ?? RoomProjectionEnvelope()
+            if values.contains(.roomProjection) {
+                let raw = try values.decode(JSONValue.self, forKey: .roomProjection)
+                guard let projection = RoomProjectionEnvelope.strictlyDecodedPersisted(raw) else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .roomProjection,
+                        in: values,
+                        debugDescription: "Persisted room projection was not canonical"
+                    )
+                }
+                roomProjection = projection
+            } else {
+                roomProjection = RoomProjectionEnvelope()
+            }
         }
     }
 
