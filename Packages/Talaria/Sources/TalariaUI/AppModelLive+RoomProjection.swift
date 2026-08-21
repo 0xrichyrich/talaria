@@ -674,6 +674,9 @@ final class RoomProjectionRuntime {
         runtime.avatarData = runtime.avatarData.filter {
             retainedAvatarIDs.contains($0.key)
         }
+        for roomID in result.clearedImageRoomIDs {
+            runtime.avatarData[roomID] = nil
+        }
         for (roomID, data) in result.projectedImages {
             runtime.avatarData[roomID] = data
         }

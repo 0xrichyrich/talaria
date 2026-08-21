@@ -156,6 +156,12 @@ while the normal update path persists it and the guide/tests require durable
 identity. Talaria must retain `roomId`; it must not copy that helper omission
 as a client contract.
 
+Talaria uses an empty-string `image` field as a compatible property-presence
+extension for an explicit mobile avatar removal. The pinned Desktop receiver
+already treats a present empty image as clear, while an absent image remains
+ambiguous because size bounding can omit it. A Desktop-origin omission is
+therefore never inferred as removal.
+
 ## Current-source corrections
 
 | Contract | Talaria disposition | Automated evidence | Remaining certification |

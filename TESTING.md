@@ -310,7 +310,9 @@ Retain a two-Desktop/one-phone report covering:
 3. Rename with the same immutable room id; disband with a final `id:`
    tombstone; and same-name recreation with a fresh id and fresh sessions.
 4. A truncated or missing remote projection that does **not** delete local
-   rooms/messages, plus explicit tombstone propagation that does.
+   rooms/messages, plus explicit tombstone propagation that does. Verify an
+   absent bounded image preserves the prior avatar while Talaria's present
+   empty-string clear removes it on a peer and does not resurrect after restart.
 5. One gateway offline during create/rename/disband, later reconnect and
    reseed, and fan-out to every other reachable default-profile gateway.
 6. Feature detection against an older gateway with no `ui_meta_revisions`,

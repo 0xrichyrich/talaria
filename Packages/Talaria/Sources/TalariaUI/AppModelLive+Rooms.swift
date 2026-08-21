@@ -1013,6 +1013,9 @@ public extension AppModel {
                 let reconciled = try await runtime.store.reconcileRoomProjection(
                     cachedProjection)
                 loaded = reconciled.rooms
+                for roomID in reconciled.clearedImageRoomIDs {
+                    runtime.avatarData[roomID] = nil
+                }
                 for (roomID, data) in reconciled.projectedImages {
                     runtime.avatarData[roomID] = data
                 }
@@ -1136,14 +1139,18 @@ public extension AppModel {
             let beforeRoutes = Set(before.members.map(\.route))
             let afterRoutes = Set(members.map(\.route))
             var metadata: [RoomMetadataMutation] = before.members
-                .filter { !afterRoutes.contains($0.route) }
+                .filter { !$0.isFrozenProjection && !afterRoutes.contains($0.route) }
                 .map { RoomMetadataMutation(route: $0.route, kind: .remove,
                                             oldName: before.name) }
-            metadata += members.filter { !beforeRoutes.contains($0.route) }.map {
+            metadata += members.filter {
+                !$0.isFrozenProjection && !beforeRoutes.contains($0.route)
+            }.map {
                 RoomMetadataMutation(route: $0.route, kind: .add, newName: normalized)
             }
             if before.name != normalized {
-                metadata += members.filter { beforeRoutes.contains($0.route) }.map {
+                metadata += members.filter {
+                    !$0.isFrozenProjection && beforeRoutes.contains($0.route)
+                }.map {
                     RoomMetadataMutation(route: $0.route, kind: .rename,
                                          oldName: before.name, newName: normalized)
                 }
@@ -1220,7 +1227,7 @@ public extension AppModel {
             .filter { $0.id != roomID }.map { $0.name.lowercased() }
         guard !otherNames.contains(normalized.lowercased()) else { throw RoomNameError.taken }
         await RoomRuntime.shared.roomNameCommitBarrier?()
-        let metadata = room.members.map {
+        let metadata = room.members.filter { !$0.isFrozenProjection }.map {
             RoomMetadataMutation(route: $0.route, kind: .rename,
                                  oldName: oldName, newName: normalized)
         }
@@ -1295,7 +1302,7 @@ public extension AppModel {
                                                    sessionID: attempt.runtimeSessionID)
             }
         }
-        let metadata = room.members.map {
+        let metadata = room.members.filter { !$0.isFrozenProjection }.map {
             RoomMetadataMutation(route: $0.route, kind: .remove, oldName: room.name)
         }
         let projectionKey = roomProjectionKey(room)

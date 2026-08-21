@@ -63,15 +63,25 @@ public struct RoomView: View {
                 unresolvedPanel(room)
                 activityPanel(room)
                 timeline(room)
-                RoomComposer(theme: theme,
-                             members: room.members.filter { !$0.isFrozenProjection },
-                             placeholder: "New thread in \(room.name)…",
-                             submitLabel: "New Thread") { text, attachments in
-                    _ = try await model.sendRoomMessage(roomID: roomID, text: text,
-                                                        attachments: attachments)
+                let liveMembers = room.members.filter { !$0.isFrozenProjection }
+                if liveMembers.isEmpty {
+                    frozenRoomNotice
+                        .padding(10).background(theme.bg)
+                        .overlay(alignment: .top) {
+                            Rectangle().fill(theme.line).frame(height: 1)
+                        }
+                } else {
+                    RoomComposer(theme: theme, members: liveMembers,
+                                 placeholder: "New thread in \(room.name)…",
+                                 submitLabel: "New Thread") { text, attachments in
+                        _ = try await model.sendRoomMessage(roomID: roomID, text: text,
+                                                            attachments: attachments)
+                    }
+                    .padding(10).background(theme.bg)
+                    .overlay(alignment: .top) {
+                        Rectangle().fill(theme.line).frame(height: 1)
+                    }
                 }
-                .padding(10).background(theme.bg)
-                .overlay(alignment: .top) { Rectangle().fill(theme.line).frame(height: 1) }
             } else {
                 ContentUnavailableView("Room unavailable", systemImage: "person.3",
                                        description: Text("It may have been disbanded on this device."))
@@ -247,6 +257,14 @@ public struct RoomView: View {
         room.threads.sorted { $0.lastActivityAt < $1.lastActivityAt }
     }
 
+    private var frozenRoomNotice: some View {
+        Label("View only — connect an exact source gateway to reply",
+              systemImage: "lock")
+            .font(theme.body(11, weight: .semibold))
+            .foregroundStyle(theme.faint)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+    }
+
     @ViewBuilder private func threadBlock(_ thread: RoomThread, room: RoomRecord) -> some View {
         let entries = room.entries.filter { $0.threadID == thread.id }
         let isExpanded = !collapsed.contains(thread.id)
@@ -260,14 +278,18 @@ public struct RoomView: View {
                         .font(theme.body(10)).foregroundStyle(theme.faint)
                 }.buttonStyle(.plain)
                 ForEach(entries) { entry in entryRow(entry, room: room) }
-                RoomComposer(theme: theme,
-                             members: room.members.filter { !$0.isFrozenProjection },
-                             placeholder: "Reply in thread…", submitLabel: "Reply") { text, attachments in
-                    _ = try await model.sendRoomMessage(roomID: roomID, text: text,
-                                                        threadID: thread.id,
-                                                        attachments: attachments)
+                let liveMembers = room.members.filter { !$0.isFrozenProjection }
+                if liveMembers.isEmpty {
+                    frozenRoomNotice.padding(.top, 3)
+                } else {
+                    RoomComposer(theme: theme, members: liveMembers,
+                                 placeholder: "Reply in thread…", submitLabel: "Reply") { text, attachments in
+                        _ = try await model.sendRoomMessage(roomID: roomID, text: text,
+                                                            threadID: thread.id,
+                                                            attachments: attachments)
+                    }
+                    .padding(.top, 3)
                 }
-                .padding(.top, 3)
             }
             .padding(9).background(theme.ink.opacity(0.025), in: RoundedRectangle(cornerRadius: 12))
             .overlay(alignment: .leading) { Rectangle().fill(theme.accent.opacity(0.4)).frame(width: 2) }
