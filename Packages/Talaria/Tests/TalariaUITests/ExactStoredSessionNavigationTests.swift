@@ -776,6 +776,8 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         runtime.routedEvents[gatewayID] = .init(
             client: oldClient, handlerID: oldHandler, pump: oldPump,
             continuation: oldContinuation, gate: oldGate, generation: 41)
+        let oldApprovalEpoch = ApprovalBridges.shared.sweepEpochs[gatewayID]
+        ApprovalBridges.shared.sweepEpochs[gatewayID] = 17
         let oldGatewayID = LiveRuntime.shared.gatewayID
         LiveRuntime.shared.gatewayID = "primary-prepare-same-client-flip"
         defer {
@@ -785,6 +787,7 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
             Task { await oldClient.removeEventHandler(oldHandler) }
             runtime.routedEvents[gatewayID] = nil
             runtime.routedEventGenerations[gatewayID] = nil
+            ApprovalBridges.shared.sweepEpochs[gatewayID] = oldApprovalEpoch
             LiveRuntime.shared.gatewayID = oldGatewayID
             Task { await pool.disconnect(gatewayID: gatewayID) }
         }
@@ -805,6 +808,8 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
                        "a stale same-client gate must not be restored after the pool flip")
         XCTAssertNil(runtime.routedEvents[gatewayID])
         XCTAssertEqual(runtime.routedEventGenerations[gatewayID], 42)
+        XCTAssertEqual(ApprovalBridges.shared.sweepEpochs[gatewayID], 18,
+                       "clearing the captured runtime must fence its old approval sweep")
 
         for _ in 0..<20 { await Task.yield() }
         let observed = await oldProbe.events
@@ -929,6 +934,8 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         runtime.routedEvents[gatewayID] = .init(
             client: oldClient, handlerID: oldHandler, pump: oldPump,
             continuation: oldContinuation, gate: oldGate, generation: 61)
+        let oldApprovalEpoch = ApprovalBridges.shared.sweepEpochs[gatewayID]
+        ApprovalBridges.shared.sweepEpochs[gatewayID] = 61
         let oldGatewayID = LiveRuntime.shared.gatewayID
         LiveRuntime.shared.gatewayID = "primary-prepare-newer-runtime-wins"
         MultiGatewayRuntime.shared.prepareAfterHandlerInstallationForTesting = {
@@ -939,6 +946,7 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
             runtime.routedEvents[gatewayID] = .init(
                 client: newerClient, handlerID: newerHandler, pump: newerPump,
                 continuation: newContinuation, gate: newerGate, generation: 77)
+            ApprovalBridges.shared.sweepEpochs[gatewayID] = 91
             await pool.adopt(newerClient, for: gatewayID)
             await oldClient.emitEventForTesting(GatewayEvent(
                 type: "message.complete", sessionID: "queued-old-after-newer",
@@ -957,6 +965,7 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
             Task { await newerClient.removeEventHandler(newerHandler) }
             runtime.routedEvents[gatewayID] = nil
             runtime.routedEventGenerations[gatewayID] = nil
+            ApprovalBridges.shared.sweepEpochs[gatewayID] = oldApprovalEpoch
             LiveRuntime.shared.gatewayID = oldGatewayID
             Task { await pool.disconnect(gatewayID: gatewayID) }
         }
@@ -971,6 +980,8 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
             ObjectIdentifier($0.client) == ObjectIdentifier(newerClient)
         }, true)
         XCTAssertEqual(runtime.routedEventGenerations[gatewayID], 77)
+        XCTAssertEqual(ApprovalBridges.shared.sweepEpochs[gatewayID], 91,
+                       "stale cleanup must not reset the newer owner's approval scope")
 
         await newerClient.emitEventForTesting(GatewayEvent(
             type: "message.complete", sessionID: "newer-runtime",

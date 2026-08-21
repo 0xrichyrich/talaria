@@ -702,6 +702,7 @@ public extension AppModel {
                     MultiGatewayRuntime.shared.routedEvents[gatewayID] = nil
                     MultiGatewayRuntime.shared.routedEventGenerations[gatewayID,
                                                                         default: 0] &+= 1
+                    ApprovalBridges.shared.resetSweepScope(gatewayID: gatewayID)
                 }
                 await existing.client.removeEventHandler(existing.handlerID)
             }
