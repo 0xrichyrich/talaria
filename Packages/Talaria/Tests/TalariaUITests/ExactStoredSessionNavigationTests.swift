@@ -624,12 +624,28 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
 
     func testExactOpenAuthorityFailuresPreserveVisibleChatTranscriptAndUnread() async throws {
         let model = AppModel()
-        let gatewayID = "exact-transaction"
-        let target = "researcher"
-        let route = GatewayBotRoute(gatewayID: gatewayID, profile: target)
+        let gatewayID = "foreign-exact-transaction-\(UUID().uuidString)"
+        let profile = "researcher"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: profile)
+        let target = route.qualifiedID
         let client = GatewayClient(
             baseURL: try XCTUnwrap(URL(string: "https://exact-transaction.example")),
             credential: .sessionToken("unused-test-token"))
+        let sentinelClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://sentinel-events.example")),
+            credential: .sessionToken("unused-sentinel-token"))
+        let sentinelHandler = await sentinelClient.addEventHandler { _ in }
+        let sentinelPump = Task<Void, Never> {}
+        let eventRuntime = MultiGatewayRuntime.shared
+        eventRuntime.routedEventGenerations[gatewayID] = 41
+        eventRuntime.routedEvents[gatewayID] = .init(
+            client: sentinelClient, handlerID: sentinelHandler, pump: sentinelPump)
+        eventRuntime.routedUnread[route] = 7
+        let approvalID = "approval-exact-transaction"
+        LiveRuntime.shared.approvalTargets[approvalID] = ApprovalResponseTarget(
+            bot: route,
+            session: GatewaySessionRoute(gatewayID: gatewayID, sessionID: "approval-runtime"),
+            requestID: "approval-wire")
         let previous = ChatState(messages: [
             ChatMessage(author: .bot, text: "keep the visible transcript"),
         ])
@@ -647,11 +663,18 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         model.bots = [Bot(
             id: target, job: "", shape: .circle, hue: .violet, unread: 7)]
         let oldGatewayID = LiveRuntime.shared.gatewayID
-        LiveRuntime.shared.gatewayID = gatewayID
+        LiveRuntime.shared.gatewayID = "primary-exact-transaction"
         defer {
+            sentinelPump.cancel()
+            eventRuntime.routedEvents[gatewayID] = nil
+            eventRuntime.routedEventGenerations[gatewayID] = nil
+            eventRuntime.routedUnread[route] = nil
+            LiveRuntime.shared.approvalTargets[approvalID] = nil
             LiveRuntime.shared.gatewayID = oldGatewayID
-            LiveRuntime.shared.sessionToBot.removeValue(forKey: "wrong-runtime")
-            LiveRuntime.shared.sessionToBot.removeValue(forKey: "right-runtime")
+            LiveRuntime.shared.routedSessionToBot.removeValue(forKey: GatewaySessionRoute(
+                gatewayID: gatewayID, sessionID: "wrong-runtime"))
+            LiveRuntime.shared.routedSessionToBot.removeValue(forKey: GatewaySessionRoute(
+                gatewayID: gatewayID, sessionID: "right-runtime"))
         }
 
         do {
@@ -679,7 +702,12 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         XCTAssertEqual(targetChat.messages.map(\.text), ["keep the target transcript too"])
         XCTAssertEqual(targetChat.sessionID, "target-old-runtime")
         XCTAssertEqual(targetChat.storedSessionID, "target-old-stored")
-        XCTAssertEqual(model.bots.first(where: { $0.id == target })?.unread, 7)
+        XCTAssertEqual(eventRuntime.routedUnread[route], 7)
+        XCTAssertTrue(eventRuntime.routedEvents[gatewayID].map {
+            ObjectIdentifier($0.client) == ObjectIdentifier(sentinelClient)
+        } == true)
+        XCTAssertEqual(eventRuntime.routedEventGenerations[gatewayID], 41)
+        XCTAssertNotNil(LiveRuntime.shared.approvalTargets[approvalID])
 
         do {
             _ = try await model.openStoredSessionAwaiting(
@@ -687,14 +715,14 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
                 validateBeforeBinding: {
                     throw ExactStoredSessionRouteAuthorityError.missingProfile(
                         try XCTUnwrap(ExactStoredSessionRoute(
-                            gatewayID: gatewayID, profile: target,
+                            gatewayID: gatewayID, profile: profile,
                             storedSessionID: "wanted-stored")))
                 },
                 resumeForTesting: {
                     LiveSession(.object([
                         "session_id": .string("right-runtime"),
                         "stored_session_id": .string("wanted-stored"),
-                        "info": .object(["profile_name": .string(target)]),
+                        "info": .object(["profile_name": .string(profile)]),
                     ]))
                 })
             XCTFail("post-resume profile deletion must be rejected")
@@ -709,14 +737,50 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         XCTAssertEqual(targetChat.messages.map(\.text), ["keep the target transcript too"])
         XCTAssertEqual(targetChat.sessionID, "target-old-runtime")
         XCTAssertEqual(targetChat.storedSessionID, "target-old-stored")
-        XCTAssertEqual(model.bots.first(where: { $0.id == target })?.unread, 7)
+        XCTAssertEqual(eventRuntime.routedUnread[route], 7)
+        XCTAssertTrue(eventRuntime.routedEvents[gatewayID].map {
+            ObjectIdentifier($0.client) == ObjectIdentifier(sentinelClient)
+        } == true)
+        XCTAssertEqual(eventRuntime.routedEventGenerations[gatewayID], 41)
+        XCTAssertNotNil(LiveRuntime.shared.approvalTargets[approvalID])
+
+        await sentinelClient.removeEventHandler(sentinelHandler)
+    }
+
+    func testExactOpenRejectsMissingDurableAckWithoutBackfill() async throws {
+        let model = AppModel()
+        let route = GatewayBotRoute(gatewayID: "missing-durable", profile: "researcher")
+        let client = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://missing-durable.example")),
+            credential: .sessionToken("unused-test-token"))
+        var postAuthorityCalled = false
+
+        do {
+            _ = try await model.openStoredSessionAwaiting(
+                "requested-stored", botID: route.qualifiedID,
+                route: route, client: client,
+                validateBeforeBinding: { postAuthorityCalled = true },
+                resumeForTesting: {
+                    LiveSession(.object([
+                        "session_id": .string("runtime-without-durable-ack"),
+                        "info": .object(["profile_name": .string("researcher")]),
+                    ]))
+                })
+            XCTFail("an omitted durable ACK must never be backfilled from the request")
+        } catch let error as AckValidationError {
+            XCTAssertTrue(error.localizedDescription.contains("durable session identity"))
+        }
+        XCTAssertFalse(postAuthorityCalled)
+        XCTAssertNil(model.openBotID)
+        XCTAssertTrue(model.chats.isEmpty)
     }
 
     func testExactOpenPublishesOnlyAfterResumeAndFreshProfileAuthority() async throws {
         let model = AppModel()
-        let gatewayID = "exact-positive"
-        let target = "researcher"
-        let route = GatewayBotRoute(gatewayID: gatewayID, profile: target)
+        let gatewayID = "foreign-exact-positive-\(UUID().uuidString)"
+        let profile = "researcher"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: profile)
+        let target = route.qualifiedID
         let client = GatewayClient(
             baseURL: try XCTUnwrap(URL(string: "https://exact-positive.example")),
             credential: .sessionToken("unused-test-token"))
@@ -729,43 +793,50 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         targetChat.sessionID = "old-runtime"
         targetChat.storedSessionID = "old-stored"
         model.mode = .live
-        model.client = client
         model.openBotID = "visible"
         model.chats["visible"] = previous
         model.chats[target] = targetChat
         model.bots = [Bot(
             id: target, job: "", shape: .circle, hue: .violet, unread: 5)]
         let oldGatewayID = LiveRuntime.shared.gatewayID
-        LiveRuntime.shared.gatewayID = gatewayID
+        LiveRuntime.shared.gatewayID = "primary-exact-positive"
+        let pool = ConnectionRegistry.shared.clientPool
+        await pool.adopt(client, for: gatewayID)
+        let initialEventGeneration = MultiGatewayRuntime.shared
+            .routedEventGenerations[gatewayID, default: 0]
+        MultiGatewayRuntime.shared.routedUnread[route] = 5
         var observedBeforeResume = false
         var observedBeforeAuthority = false
-        defer {
-            model.client = nil
+        let opened: Bool
+        do {
+            opened = try await model.openStoredSessionAwaiting(
+                "wanted-stored", botID: target, route: route, client: client,
+                validateBeforeBinding: {
+                    observedBeforeAuthority = model.openBotID == "visible"
+                        && targetChat.messages.map(\.text) == ["old target transcript"]
+                        && MultiGatewayRuntime.shared.routedUnread[route] == 5
+                },
+                resumeForTesting: {
+                    observedBeforeResume = model.openBotID == "visible"
+                        && targetChat.messages.map(\.text) == ["old target transcript"]
+                        && MultiGatewayRuntime.shared.routedUnread[route] == 5
+                    return LiveSession(.object([
+                        "session_id": .string("new-runtime"),
+                        "stored_session_id": .string("wanted-stored"),
+                        "messages": .array([
+                            .object(["role": .string("assistant"),
+                                     "text": .string("authoritative response")]),
+                        ]),
+                        "info": .object(["profile_name": .string(profile)]),
+                    ]))
+                })
+        } catch {
+            await model.removeRoutedEventSubscription(gatewayID: gatewayID)
+            await pool.disconnect(gatewayID: gatewayID)
+            MultiGatewayRuntime.shared.routedUnread[route] = nil
             LiveRuntime.shared.gatewayID = oldGatewayID
-            LiveRuntime.shared.sessionToBot.removeValue(forKey: "new-runtime")
+            throw error
         }
-
-        let opened = try await model.openStoredSessionAwaiting(
-            "wanted-stored", botID: target, route: route, client: client,
-            validateBeforeBinding: {
-                observedBeforeAuthority = model.openBotID == "visible"
-                    && targetChat.messages.map(\.text) == ["old target transcript"]
-                    && model.bots.first(where: { $0.id == target })?.unread == 5
-            },
-            resumeForTesting: {
-                observedBeforeResume = model.openBotID == "visible"
-                    && targetChat.messages.map(\.text) == ["old target transcript"]
-                    && model.bots.first(where: { $0.id == target })?.unread == 5
-                return LiveSession(.object([
-                    "session_id": .string("new-runtime"),
-                    "stored_session_id": .string("wanted-stored"),
-                    "messages": .array([
-                        .object(["role": .string("assistant"),
-                                 "text": .string("authoritative response")]),
-                    ]),
-                    "info": .object(["profile_name": .string(target)]),
-                ]))
-            })
 
         XCTAssertTrue(opened)
         XCTAssertTrue(observedBeforeResume)
@@ -775,8 +846,25 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         XCTAssertEqual(targetChat.sessionID, "new-runtime")
         XCTAssertEqual(targetChat.storedSessionID, "wanted-stored")
         XCTAssertEqual(targetChat.messages.map(\.text), ["authoritative response"])
-        XCTAssertEqual(model.bots.first(where: { $0.id == target })?.unread, 0)
+        XCTAssertNil(MultiGatewayRuntime.shared.routedUnread[route])
         XCTAssertEqual(previous.messages.map(\.text), ["old visible transcript"])
+        XCTAssertEqual(
+            MultiGatewayRuntime.shared.routedEventGenerations[gatewayID],
+            initialEventGeneration + 2,
+            "one attach advances the empty-slot removal and install generations once each")
+        XCTAssertTrue(MultiGatewayRuntime.shared.routedEvents[gatewayID].map {
+            ObjectIdentifier($0.client) == ObjectIdentifier(client)
+        } == true)
+        XCTAssertEqual(
+            LiveRuntime.shared.routedSessionToBot[GatewaySessionRoute(
+                gatewayID: gatewayID, sessionID: "new-runtime")], target)
+
+        await model.removeRoutedEventSubscription(gatewayID: gatewayID)
+        await pool.disconnect(gatewayID: gatewayID)
+        MultiGatewayRuntime.shared.routedUnread[route] = nil
+        LiveRuntime.shared.routedSessionToBot.removeValue(forKey: GatewaySessionRoute(
+            gatewayID: gatewayID, sessionID: "new-runtime"))
+        LiveRuntime.shared.gatewayID = oldGatewayID
     }
 
     func testDeepLinkParserRetainsUnknownSourceForVisibleAuthorityFailure() throws {

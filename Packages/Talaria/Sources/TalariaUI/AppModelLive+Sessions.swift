@@ -260,7 +260,6 @@ extension AppModel {
         if let resumeForTesting {
             live = try await resumeForTesting()
         } else {
-            await attachRoutedEventsIfNeeded(client: client, gatewayID: route.gatewayID)
             live = try await client.resumeSession(id, profile: route.profile,
                                                   deferHistory: false)
         }
@@ -268,12 +267,16 @@ extension AppModel {
         guard !live.sessionID.isEmpty else {
             throw GatewayError(code: -8, message: "session.resume returned no id")
         }
-        let stored = live.storedSessionID.isEmpty ? id : live.storedSessionID
+        guard !live.storedSessionID.isEmpty else {
+            throw AckValidationError(
+                operation: "Resume session",
+                detail: "Hermes returned no durable session identity.")
+        }
         do {
             try ExactStoredSessionResumeAckAuthority.requireExact(
                 route: route,
                 requestedStoredSessionID: id,
-                returnedStoredSessionID: stored,
+                returnedStoredSessionID: live.storedSessionID,
                 returnedProfile: live.info.profileName)
         } catch ExactStoredSessionResumeAckAuthorityError.durableSessionMismatch {
             throw AckValidationError(
@@ -285,6 +288,12 @@ extension AppModel {
                 detail: "Hermes returned a different profile identity.")
         }
         try await validateBeforeBinding()
+        try Task.checkCancellation()
+        // Event attachment tears down any prior subscription and its routed
+        // approval/session scope. It is therefore a publication step, not a
+        // harmless prerequisite: perform it only after every exact ACK and
+        // post-resume authority proof has succeeded.
+        await attachRoutedEventsIfNeeded(client: client, gatewayID: route.gatewayID)
         try Task.checkCancellation()
 
         let attempt = try beginStoredSessionOpen(
@@ -456,7 +465,17 @@ extension AppModel {
             guard !live.sessionID.isEmpty else {
                 throw GatewayError(code: -8, message: "session.resume returned no id")
             }
-            let stored = live.storedSessionID.isEmpty ? id : live.storedSessionID
+            let stored: String
+            if exactSource != nil {
+                guard !live.storedSessionID.isEmpty else {
+                    throw AckValidationError(
+                        operation: "Resume session",
+                        detail: "Hermes returned no durable session identity.")
+                }
+                stored = live.storedSessionID
+            } else {
+                stored = live.storedSessionID.isEmpty ? id : live.storedSessionID
+            }
             chat.storedSessionID = stored
             // Clear state from the session we left, then derive the selected
             // session's turn state before yielding to REST hydration. Events
