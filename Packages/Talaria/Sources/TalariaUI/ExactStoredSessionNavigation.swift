@@ -484,7 +484,8 @@ extension AppModel {
                         route, profileNames: current.map(\.name))
                     try await self.requireExactStoredSessionSourceCurrent(
                         route, snapshot: snapshot, wasPrimary: wasPrimary)
-                })
+                },
+                sourceSnapshot: snapshot)
             guard opened,
                   openBotID == botID,
                   stateRoute(for: botID) == route.botRoute,

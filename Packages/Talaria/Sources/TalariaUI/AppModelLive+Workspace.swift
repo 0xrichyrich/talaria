@@ -1547,7 +1547,8 @@ public extension AppModel {
                     try await self.refreshWorkspaceProjectAuthority(
                         authority, generation: generation
                     )
-                }
+                },
+                sourceSnapshot: authority.connection
             )
         }
     }

@@ -826,18 +826,26 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         let targetChat = ChatState(messages: [
             ChatMessage(author: .bot, text: "old target transcript"),
         ])
+        let otherRoute = GatewayBotRoute(gatewayID: gatewayID, profile: "other")
+        let otherTarget = otherRoute.qualifiedID
+        let otherChat = ChatState(messages: [])
         targetChat.sessionID = "old-runtime"
         targetChat.storedSessionID = "old-stored"
         model.mode = .live
         model.openBotID = "visible"
         model.chats["visible"] = previous
         model.chats[target] = targetChat
-        model.bots = [Bot(
-            id: target, job: "", shape: .circle, hue: .violet, unread: 5)]
+        model.bots = [
+            Bot(id: target, job: "", shape: .circle, hue: .violet, unread: 5),
+            Bot(id: otherTarget, job: "", shape: .circle, hue: .blue),
+        ]
+        model.chats[otherTarget] = otherChat
         let oldGatewayID = LiveRuntime.shared.gatewayID
         LiveRuntime.shared.gatewayID = "primary-exact-positive"
         let pool = ConnectionRegistry.shared.clientPool
         await pool.adopt(client, for: gatewayID)
+        LiveRuntime.shared.routedSessionToBot[GatewaySessionRoute(
+            gatewayID: gatewayID, sessionID: "other-runtime")] = otherTarget
         let initialEventGeneration = MultiGatewayRuntime.shared
             .routedEventGenerations[gatewayID, default: 0]
         MultiGatewayRuntime.shared.routedUnread[route] = 5
@@ -853,7 +861,7 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
                     observedBeforeAuthority = model.openBotID == "visible"
                         && targetChat.messages.map(\.text) == ["old target transcript"]
                         && MultiGatewayRuntime.shared.routedUnread[route] == 5
-                    if validationCount == 2 {
+                    if validationCount == 1 {
                         await client.emitEventForTesting(GatewayEvent(
                             type: "message.complete", sessionID: "new-runtime",
                             payload: .object([
@@ -862,21 +870,16 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
                             ]), inboundSequence: 11))
                     }
                 },
-                resumeForTesting: {
+                catchUpResumeForTesting: {
                     observedBeforeResume = model.openBotID == "visible"
                         && targetChat.messages.map(\.text) == ["old target transcript"]
                         && MultiGatewayRuntime.shared.routedUnread[route] == 5
-                    return LiveSession(.object([
-                        "session_id": .string("new-runtime"),
-                        "stored_session_id": .string("wanted-stored"),
-                        "messages": .array([
-                            .object(["role": .string("assistant"),
-                                     "text": .string("snapshot response")]),
-                        ]),
-                        "info": .object(["profile_name": .string(profile)]),
-                    ]))
-                },
-                catchUpResumeForTesting: {
+                    await client.emitEventForTesting(GatewayEvent(
+                        type: "message.complete", sessionID: "other-runtime",
+                        payload: .object([
+                            "text": .string("other before snapshot"),
+                            "status": .string("complete"),
+                        ]), inboundSequence: 4))
                     // This frame precedes the response boundary and is already
                     // represented by the returned snapshot, so replaying it
                     // would duplicate the completed message.
@@ -900,6 +903,8 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
             await model.removeRoutedEventSubscription(gatewayID: gatewayID)
             await pool.disconnect(gatewayID: gatewayID)
             MultiGatewayRuntime.shared.routedUnread[route] = nil
+            LiveRuntime.shared.routedSessionToBot.removeValue(forKey: GatewaySessionRoute(
+                gatewayID: gatewayID, sessionID: "other-runtime"))
             LiveRuntime.shared.gatewayID = oldGatewayID
             throw error
         }
@@ -914,12 +919,14 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         for _ in 0..<20 where targetChat.messages.count < 2 { await Task.yield() }
         XCTAssertEqual(targetChat.messages.map(\.text),
                        ["snapshot response", "post-snapshot response"])
+        XCTAssertEqual(otherChat.messages.map(\.text), ["other before snapshot"],
+                       "a pre-resume event for another session must not be dropped")
         XCTAssertNil(MultiGatewayRuntime.shared.routedUnread[route])
         XCTAssertEqual(previous.messages.map(\.text), ["old visible transcript"])
         XCTAssertEqual(
             MultiGatewayRuntime.shared.routedEventGenerations[gatewayID],
-            initialEventGeneration + 2,
-            "one attach advances the empty-slot removal and install generations once each")
+            initialEventGeneration + 1,
+            "one staged swap owns one new routed-event generation")
         XCTAssertTrue(MultiGatewayRuntime.shared.routedEvents[gatewayID].map {
             ObjectIdentifier($0.client) == ObjectIdentifier(client)
         } == true)
@@ -930,6 +937,8 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         await model.removeRoutedEventSubscription(gatewayID: gatewayID)
         await pool.disconnect(gatewayID: gatewayID)
         MultiGatewayRuntime.shared.routedUnread[route] = nil
+        LiveRuntime.shared.routedSessionToBot.removeValue(forKey: GatewaySessionRoute(
+            gatewayID: gatewayID, sessionID: "other-runtime"))
         LiveRuntime.shared.routedSessionToBot.removeValue(forKey: GatewaySessionRoute(
             gatewayID: gatewayID, sessionID: "new-runtime"))
         LiveRuntime.shared.gatewayID = oldGatewayID

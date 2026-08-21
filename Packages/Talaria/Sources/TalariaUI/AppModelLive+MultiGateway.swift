@@ -42,6 +42,80 @@ final class MultiGatewayRuntime {
     var routedUnread: [GatewayBotRoute: Int] = [:]
 }
 
+/// The old routed subscription remains live while a staged exact-session open
+/// crosses its synchronous visible-adoption boundary.  Keeping this token on
+/// the MainActor makes the swap reversible: a failed begin restores the exact
+/// old pump/generation without needing to reconstruct any approval or runtime
+/// state that was deliberately left untouched during the swap.
+@MainActor
+final class ExactRoutedEventsTransaction {
+    let gatewayID: String
+    let replacement: MultiGatewayRuntime.RoutedEvents
+    let prepared: PreparedExactRoutedEvents
+    private let previous: MultiGatewayRuntime.RoutedEvents?
+    private let previousGeneration: UInt64
+    private let previousApprovalSweepEpoch: Int?
+    private var settled = false
+
+    init(gatewayID: String,
+         replacement: MultiGatewayRuntime.RoutedEvents,
+         previous: MultiGatewayRuntime.RoutedEvents?,
+         previousGeneration: UInt64,
+         previousApprovalSweepEpoch: Int?,
+         prepared: PreparedExactRoutedEvents) {
+        self.gatewayID = gatewayID
+        self.replacement = replacement
+        self.previous = previous
+        self.previousGeneration = previousGeneration
+        self.previousApprovalSweepEpoch = previousApprovalSweepEpoch
+        self.prepared = prepared
+    }
+
+    /// Undo only the synchronous swap.  No await occurs here, so a caller can
+    /// decide visible adoption and restore the old source as one MainActor
+    /// transaction.
+    func rollback() {
+        guard !settled else { return }
+        let runtime = MultiGatewayRuntime.shared
+        guard let current = runtime.routedEvents[gatewayID],
+              current.handlerID == replacement.handlerID,
+              ObjectIdentifier(current.client) == ObjectIdentifier(replacement.client) else {
+            // A source teardown/replacement already won.  Do not resurrect an
+            // older subscription over that newer authority.
+            settled = true
+            prepared.abandonCommitted()
+            return
+        }
+        replacement.pump.cancel()
+        runtime.routedEvents[gatewayID] = previous
+        runtime.routedEventGenerations[gatewayID] = previousGeneration
+        if let previousApprovalSweepEpoch {
+            ApprovalBridges.shared.sweepEpochs[gatewayID] = previousApprovalSweepEpoch
+        } else {
+            ApprovalBridges.shared.sweepEpochs[gatewayID] = nil
+        }
+        prepared.abandonCommitted()
+        settled = true
+    }
+
+    /// Remove the old handler only after visible adoption has succeeded.  The
+    /// replacement remains installed throughout; broad routed-state teardown
+    /// would erase the newly bound session and approvals, so finalization only
+    /// retires the old subscription and starts a fresh approval sweep epoch.
+    func finalize(model: AppModel) async {
+        guard !settled else { return }
+        if let previous,
+           previous.handlerID != replacement.handlerID
+            || ObjectIdentifier(previous.client) != ObjectIdentifier(replacement.client) {
+            previous.pump.cancel()
+            await previous.client.removeEventHandler(previous.handlerID)
+        }
+        ApprovalBridges.shared.resetSweepScope(gatewayID: gatewayID)
+        Task { @MainActor [weak model] in await model?.replayPendingApprovals() }
+        settled = true
+    }
+}
+
 /// A secondary-source event intake that is invisible until exact session
 /// authority succeeds. The handler starts buffering immediately; publication
 /// installs its gated pump only after the authoritative snapshot is ready.
@@ -70,6 +144,16 @@ final class PreparedExactRoutedEvents {
         self.activation = activation
     }
 
+    /// Mark a published intake as abandoned during a synchronous transaction
+    /// rollback.  The pump is cancelled by the transaction; closing both
+    /// streams prevents a later activation from reviving it.
+    func abandonCommitted() {
+        committed = false
+        activation?.finish()
+        activation = nil
+        continuation.finish()
+    }
+
     func activate() {
         activation?.yield(())
         activation?.finish()
@@ -81,6 +165,11 @@ final class PreparedExactRoutedEvents {
     func discard() async {
         guard !committed else { return }
         continuation.finish()
+        await client.removeEventHandler(handlerID)
+    }
+
+    func discardAfterRollback() async {
+        abandonCommitted()
         await client.removeEventHandler(handlerID)
     }
 
@@ -124,27 +213,21 @@ public extension AppModel {
             stream: stream, continuation: continuation)
     }
 
-    /// Publish a prepared intake without starting delivery. The caller binds
-    /// the post-subscription snapshot first, then calls `activate()` so buffered
-    /// post-snapshot events replay against the correct runtime session.
+    /// Synchronously swap a prepared intake into the routed runtime without
+    /// starting delivery.  The old subscription is intentionally left attached
+    /// until the caller's visible begin succeeds; the returned transaction can
+    /// restore it synchronously or finalize it after hydration.
     internal func commitExactRoutedEvents(_ prepared: PreparedExactRoutedEvents,
                                           snapshotSequence: UInt64,
-                                          snapshotSessionID: String) async throws {
+                                          snapshotSessionID: String) throws
+        -> ExactRoutedEventsTransaction {
         let gatewayID = prepared.gatewayID
-        guard gatewayID != activeGatewayID,
-              await ConnectionRegistry.shared.clientPool.client(for: gatewayID)
-                .map(ObjectIdentifier.init) == ObjectIdentifier(prepared.client) else {
-            await prepared.discard()
-            throw CancellationError()
-        }
-        if MultiGatewayRuntime.shared.routedEvents[gatewayID] != nil {
-            await detachRoutedEvents(gatewayID: gatewayID)
-        } else {
-            await removeRoutedEventSubscription(gatewayID: gatewayID)
-        }
-        MultiGatewayRuntime.shared.routedEventGenerations[gatewayID, default: 0] &+= 1
-        let generation = MultiGatewayRuntime.shared
-            .routedEventGenerations[gatewayID, default: 0]
+        guard gatewayID != activeGatewayID else { throw CancellationError() }
+        let runtime = MultiGatewayRuntime.shared
+        let previous = runtime.routedEvents[gatewayID]
+        let previousGeneration = runtime.routedEventGenerations[gatewayID, default: 0]
+        let previousApprovalSweepEpoch = ApprovalBridges.shared.sweepEpochs[gatewayID]
+        let generation = previousGeneration &+ 1
         let (activationStream, activation) = AsyncStream.makeStream(of: Void.self)
         let pump = Task { @MainActor [weak self] in
             for await _ in activationStream { break }
@@ -162,17 +245,16 @@ public extension AppModel {
                     event, gatewayID: gatewayID, client: prepared.client)
             }
         }
-        MultiGatewayRuntime.shared.routedEvents[gatewayID] = .init(
+        let replacement = MultiGatewayRuntime.RoutedEvents(
             client: prepared.client, handlerID: prepared.handlerID, pump: pump)
+        runtime.routedEventGenerations[gatewayID] = generation
+        runtime.routedEvents[gatewayID] = replacement
         prepared.markCommitted(activation)
-        // `remove` + install owns the current generation. A replacement racing
-        // this commit must not be mistaken for the prepared subscription.
-        guard MultiGatewayRuntime.shared.routedEventGenerations[gatewayID] == generation else {
-            pump.cancel()
-            throw CancellationError()
-        }
-        ApprovalBridges.shared.resetSweepScope(gatewayID: gatewayID)
-        Task { @MainActor [weak self] in await self?.replayPendingApprovals() }
+        return ExactRoutedEventsTransaction(
+            gatewayID: gatewayID, replacement: replacement, previous: previous,
+            previousGeneration: previousGeneration,
+            previousApprovalSweepEpoch: previousApprovalSweepEpoch,
+            prepared: prepared)
     }
 
     enum GatewayRouteError: LocalizedError {

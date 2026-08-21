@@ -45,6 +45,10 @@ final class SessionsRuntime {
     var routerTask: Task<Void, Never>?
     /// Debounce for the `sessions.changed` broadcast.
     var refreshTask: Task<Void, Never>?
+    /// Focused transaction seam: force the synchronous visible-adoption
+    /// boundary to fail after a staged routed swap, without touching ordinary
+    /// manual/session paths.
+    var beginFailureForTesting: Error?
 
     static func key(botID: String, sessionID: String) -> String {
         botID + "\u{0}" + sessionID
@@ -86,6 +90,16 @@ private struct StoredSessionOpenSource {
     /// link opens obtain this before visible navigation or transcript state is
     /// changed.
     var resumed: LiveSession
+}
+
+private struct ExactStoredSessionSourceFence {
+    var route: GatewayBotRoute
+    var botID: String
+    var client: GatewayClient
+    var lifecycle: ProfileLifecycleGenerationToken
+    var connectionGeneration: Int
+    var savedURLString: String?
+    var snapshot: GatewayClientPool.ConnectionSnapshot?
 }
 
 private struct StoredSessionOpenAttempt {
@@ -249,81 +263,116 @@ extension AppModel {
         validateBeforeBinding: @escaping @MainActor () async throws -> Void,
         resumeForTesting: (@MainActor () async throws -> LiveSession)? = nil,
         catchUpResumeForTesting:
-            (@MainActor () async throws -> (LiveSession, UInt64))? = nil
+            (@MainActor () async throws -> (LiveSession, UInt64))? = nil,
+        sourceSnapshot: GatewayClientPool.ConnectionSnapshot? = nil
     ) async throws -> Bool {
         guard !id.isEmpty else {
             throw GatewayError(code: 400, message: "A stored session identity is required.")
         }
+        guard let lifecycle = profileLifecycleGenerationToken(for: botID),
+              lifecycle.route == route else {
+            throw CancellationError()
+        }
+        let sourceFence = ExactStoredSessionSourceFence(
+            route: route, botID: botID, client: client, lifecycle: lifecycle,
+            connectionGeneration: LiveRuntime.shared.generation,
+            savedURLString: ConnectionRegistry.shared.saved.first {
+                $0.id == route.gatewayID
+            }?.urlString,
+            snapshot: sourceSnapshot)
         // Exact out-of-process navigation is transactional at the visible-state
         // boundary. Resume and validate both durable/profile identity and the
         // caller's fresh source authority before `beginStoredSessionOpen`
         // clears the current chat, unread mark, or navigation selection.
-        let live: LiveSession
-        if let resumeForTesting {
-            live = try await resumeForTesting()
-        } else {
-            live = try await client.resumeSession(id, profile: route.profile,
-                                                  deferHistory: false)
-        }
-        func requireExactResume(_ resumed: LiveSession) throws {
-            guard !resumed.sessionID.isEmpty else {
-                throw GatewayError(code: -8, message: "session.resume returned no id")
-            }
-            guard !resumed.storedSessionID.isEmpty else {
-                throw AckValidationError(
-                    operation: "Resume session",
-                    detail: "Hermes returned no durable session identity.")
-            }
-            do {
-                try ExactStoredSessionResumeAckAuthority.requireExact(
-                    route: route,
-                    requestedStoredSessionID: id,
-                    returnedStoredSessionID: resumed.storedSessionID,
-                    returnedProfile: resumed.info.profileName)
-            } catch ExactStoredSessionResumeAckAuthorityError.durableSessionMismatch {
-                throw AckValidationError(
-                    operation: "Resume session",
-                    detail: "Hermes returned a different durable session identity.")
-            } catch {
-                throw AckValidationError(
-                    operation: "Resume session",
-                    detail: "Hermes returned a different profile identity.")
-            }
-        }
-        try Task.checkCancellation()
-        try requireExactResume(live)
-        try await validateBeforeBinding()
-        try Task.checkCancellation()
-
-        // A brand-new/replacement secondary source needs a lossless hand-off:
-        // stage an invisible handler, take a second snapshot with an exact wire
-        // sequence boundary, and re-prove authority before publishing either.
         let prepared = await prepareExactRoutedEvents(
             client: client, gatewayID: route.gatewayID)
-        var authoritative = live
-        var snapshotSequence: UInt64 = 0
-        if let prepared {
-            do {
-                let catchUp: (LiveSession, UInt64)
+        let resumed: (session: LiveSession, inboundSequence: UInt64)
+        do {
+            if prepared != nil {
+                // A new/replacement secondary must stage before this ONE
+                // authoritative sequenced resume. Every event from the first
+                // response request onward is therefore buffered for the later
+                // snapshot-boundary replay.
                 if let catchUpResumeForTesting {
-                    catchUp = try await catchUpResumeForTesting()
+                    resumed = try await catchUpResumeForTesting()
                 } else if let resumeForTesting {
-                    catchUp = (try await resumeForTesting(), 0)
+                    resumed = (try await resumeForTesting(), 0)
                 } else {
                     let result = try await client.resumeSessionSequenced(
                         id, profile: route.profile, deferHistory: false)
-                    catchUp = (result.session, result.inboundSequence)
+                    resumed = (result.session, result.inboundSequence)
                 }
-                try Task.checkCancellation()
-                try requireExactResume(catchUp.0)
-                try await validateBeforeBinding()
-                try Task.checkCancellation()
-                authoritative = catchUp.0
-                snapshotSequence = catchUp.1
+            } else if let resumeForTesting {
+                resumed = (try await resumeForTesting(), 0)
+            } else {
+                resumed = (try await client.resumeSession(
+                    id, profile: route.profile, deferHistory: false), 0)
+            }
+            let live = resumed.session
+            func requireExactResume(_ resumed: LiveSession) throws {
+                guard !resumed.sessionID.isEmpty else {
+                    throw GatewayError(code: -8, message: "session.resume returned no id")
+                }
+                guard !resumed.storedSessionID.isEmpty else {
+                    throw AckValidationError(
+                        operation: "Resume session",
+                        detail: "Hermes returned no durable session identity.")
+                }
+                do {
+                    try ExactStoredSessionResumeAckAuthority.requireExact(
+                        route: route,
+                        requestedStoredSessionID: id,
+                        returnedStoredSessionID: resumed.storedSessionID,
+                        returnedProfile: resumed.info.profileName)
+                } catch ExactStoredSessionResumeAckAuthorityError.durableSessionMismatch {
+                    throw AckValidationError(
+                        operation: "Resume session",
+                        detail: "Hermes returned a different durable session identity.")
+                } catch {
+                    throw AckValidationError(
+                        operation: "Resume session",
+                        detail: "Hermes returned a different profile identity.")
+                }
+            }
+            try Task.checkCancellation()
+            try requireExactResume(live)
+            try await validateBeforeBinding()
+            try Task.checkCancellation()
+            try await requireExactStoredSessionSourceCurrent(sourceFence)
+            // The final cancellation/source fence is immediately followed by
+            // the synchronous swap and visible begin. There is intentionally
+            // no await between those operations, so a superseding route or
+            // source teardown cannot publish this attempt after it has lost
+            // authority.
+            try Task.checkCancellation()
+        } catch {
+            // Staging installs a handler before the first resume. Any failure
+            // before the synchronous commit must close that intake, including
+            // cancellation or source removal while the resume/authority await
+            // is suspended; otherwise a dead invisible handler leaks forever.
+            if let prepared { await prepared.discard() }
+            throw error
+        }
+        let live = resumed.session
+        let authoritative = live
+        let snapshotSequence = resumed.inboundSequence
+        let transaction: ExactRoutedEventsTransaction?
+        if let prepared {
+            do {
+                transaction = try commitExactRoutedEvents(
+                    prepared, snapshotSequence: snapshotSequence,
+                    snapshotSessionID: authoritative.sessionID)
             } catch {
                 await prepared.discard()
                 throw error
             }
+        } else {
+            // Primary and already-subscribed secondary sources already have a
+            // continuous pump, so no staged publication is necessary.
+            await attachRoutedEventsIfNeeded(client: client, gatewayID: route.gatewayID)
+            try Task.checkCancellation()
+            try await requireExactStoredSessionSourceCurrent(sourceFence)
+            transaction = nil
         }
 
         let attempt: StoredSessionOpenAttempt
@@ -335,23 +384,11 @@ extension AppModel {
                 )
             )
         } catch {
-            if let prepared { await prepared.discard() }
-            throw error
-        }
-        if let prepared {
-            do {
-                try await commitExactRoutedEvents(
-                    prepared, snapshotSequence: snapshotSequence,
-                    snapshotSessionID: authoritative.sessionID)
-            } catch {
-                attempt.task.cancel()
-                await prepared.discard()
-                throw error
+            if let transaction {
+                transaction.rollback()
+                await transaction.prepared.discardAfterRollback()
             }
-        } else {
-            // Primary and already-subscribed secondary sources already have a
-            // continuous pump, so no staged publication is necessary.
-            await attachRoutedEventsIfNeeded(client: client, gatewayID: route.gatewayID)
+            throw error
         }
         // Cancelling the outer navigation task must also cancel the unstructured
         // resume/hydration task created by beginStoredSessionOpen. Without this
@@ -361,14 +398,58 @@ extension AppModel {
             do {
                 let opened = try await finishStoredSessionOpen(
                     attempt, presentsFailure: false)
-                prepared?.activate()
+                if let transaction {
+                    await transaction.finalize(model: self)
+                    transaction.prepared.activate()
+                }
                 return opened
             } catch {
-                prepared?.activate()
+                if let transaction {
+                    await transaction.finalize(model: self)
+                    transaction.prepared.activate()
+                }
                 throw error
             }
         } onCancel: {
             attempt.task.cancel()
+        }
+    }
+
+    private func requireExactStoredSessionSourceCurrent(
+        _ fence: ExactStoredSessionSourceFence
+    ) async throws {
+        try Task.checkCancellation()
+        guard mode == .live,
+              stateRoute(for: fence.botID) == fence.route,
+              profileLifecycleAccepts(fence.lifecycle) else {
+            throw CancellationError()
+        }
+        if let expectedURL = fence.savedURLString {
+            guard ConnectionRegistry.shared.saved.contains(where: {
+                $0.id == fence.route.gatewayID && $0.urlString == expectedURL
+            }) else { throw CancellationError() }
+        }
+        if let snapshot = fence.snapshot {
+            guard await ConnectionRegistry.shared.clientPool.isCurrent(
+                snapshot, for: fence.route.gatewayID) else {
+                throw CancellationError()
+            }
+        } else if let current = await ConnectionRegistry.shared.clientPool.client(
+            for: fence.route.gatewayID) {
+            guard ObjectIdentifier(current) == ObjectIdentifier(fence.client) else {
+                throw CancellationError()
+            }
+        }
+        if fence.route.gatewayID == activeGatewayID {
+            guard LiveRuntime.shared.generation == fence.connectionGeneration,
+                  self.client.map(ObjectIdentifier.init)
+                    == ObjectIdentifier(fence.client) else {
+                throw CancellationError()
+            }
+        } else {
+            guard fence.route.gatewayID != activeGatewayID else {
+                throw CancellationError()
+            }
         }
     }
 
@@ -379,7 +460,18 @@ extension AppModel {
             throw GatewayError(code: 400, message: "A stored session identity is required.")
         }
         let lifecycle = mode == .live ? profileLifecycleGenerationToken(for: botID) : nil
-        if mode == .live, lifecycle == nil { throw CancellationError() }
+        if let exactSource {
+            guard mode == .live, let lifecycle,
+                  lifecycle.route == exactSource.route,
+                  stateRoute(for: botID) == exactSource.route else {
+                throw CancellationError()
+            }
+            if let forced = SessionsRuntime.shared.beginFailureForTesting {
+                throw forced
+            }
+        } else if mode == .live, lifecycle == nil {
+            throw CancellationError()
+        }
         openBotID = botID
         selectedTab = .home
         clearUnread(for: botID)
@@ -390,12 +482,6 @@ extension AppModel {
         let chat = chat(for: botID)
         let runtime = LiveRuntime.shared
         guard mode == .live, let lifecycle else { throw CancellationError() }
-        if let exactSource {
-            guard lifecycle.route == exactSource.route,
-                  stateRoute(for: botID) == exactSource.route else {
-                throw CancellationError()
-            }
-        }
 
         let sessionsRuntime = SessionsRuntime.shared
         let openGeneration = sessionsRuntime.beginOpen(botID: botID)
