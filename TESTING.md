@@ -277,11 +277,13 @@ completed answer per API family, and both tool calls.
 
 ### Shared room projection and profile-metadata CAS (implementation gate)
 
-This is an expected gap at the current Talaria baseline, not a passing live
-certification case. Exact Hermes publishes bounded version-3 room projections
-in default-profile `ui_meta["hermes-bots-groups"]` and exposes per-key
-`ui_meta_revisions`. Talaria currently does neither. Do not claim Desktop/mobile
-shared-room convergence from the existing local room tests.
+This is not yet a passing live certification case. Exact Hermes publishes
+bounded version-3 room projections in default-profile
+`ui_meta["hermes-bots-groups"]` and exposes per-key `ui_meta_revisions`.
+Talaria now has the bounded projection/ledger foundation and strict typed CAS
+wire support, but not AppModel hydration, all-gateway fan-out, conflict retry,
+read-back confirmation, or reconnect reseeding. Do not claim Desktop/mobile
+shared-room convergence from the foundation tests.
 
 First pin the gateway protocol directly: two clients must read the same
 revision, then submit different `profiles.configure` writes with that expected

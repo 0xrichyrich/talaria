@@ -69,11 +69,13 @@ projects a bounded version-3 room summary through every reachable gateway's
 default-profile `ui_meta["hermes-bots-groups"]`, with immutable room ids,
 stable message ids, explicit tombstones, reconnect fan-out, and conflict-safe
 merge. Gateway profiles add per-key `ui_meta_revisions` and optional
-`ui_meta_expected_revisions` compare-and-swap writes. Talaria's existing rooms
-remain full, durable local rooms; they do not yet decode, merge, or publish
-this shared projection and do not use the new CAS fields. Cross-client room
-projection is therefore a new explicit implementation gap, not covered by the
-checked local room rows below. The other net changes are host update receipts
+`ui_meta_expected_revisions` compare-and-swap writes. Talaria now has the
+typed CAS wire contract plus a bounded version-3 decoder, merger, tombstone
+model, and separately persisted projection ledger. Its existing rooms remain
+full, durable local rooms. AppModel hydration, all-gateway publication,
+conflict retry/read-back, and reconnect reseeding remain open, so cross-client
+room convergence is still an explicit implementation gap and is not covered
+by the checked local room rows below. The other net changes are host update receipts
 and fleet code identity, container first-boot key generation, Telegram final
 rendering, and Cloud MCP documentation; the current audit classifies their
 client impact file by file.

@@ -657,5 +657,233 @@ final class RoomStoreTests: XCTestCase {
             XCTAssertEqual(error as? RoomStoreError, .corruptIndex)
         }
     }
+
+    func testRoomProjectionNormalizesLegacyVersionsAndRestoresDurableRoomID() throws {
+        let v1: JSONValue = [
+            "version": 1,
+            "updatedAt": 55,
+            "rooms": [
+                "Legacy": [
+                    "log": [[
+                        "from": ["kind": "user", "name": "You"],
+                        "text": "old", "at": 10,
+                    ]],
+                    "members": [["name": "research"]],
+                ],
+            ],
+            "deleted": ["Gone": 999_999_999],
+        ]
+        let normalizedV1 = RoomProjectionEnvelope.normalized(v1)
+        XCTAssertEqual(normalizedV1.version, 3)
+        XCTAssertEqual(normalizedV1.rooms["name:Legacy"]?.name, "Legacy")
+        XCTAssertEqual(normalizedV1.deleted["name:Gone"], 0,
+                       "v1 wall-clock tombstones must not become revisions")
+
+        let v2: JSONValue = [
+            "version": 2,
+            "rooms": [
+                "Legacy": ["revision": 7, "log": []],
+            ],
+            "deleted": ["Gone": 8],
+        ]
+        let normalizedV2 = RoomProjectionEnvelope.normalized(v2)
+        XCTAssertEqual(normalizedV2.rooms["name:Legacy"]?.revision, 7)
+        XCTAssertEqual(normalizedV2.deleted["name:Gone"], 8)
+
+        // Exact upstream durableGroupChatRooms omitted roomId. The durable
+        // id-key is nevertheless sufficient and must repair the stored value.
+        let omittedID: JSONValue = [
+            "version": 3,
+            "rooms": [
+                "id:r-keep": ["name": "Renamed", "revision": 4, "log": []],
+            ],
+        ]
+        let repaired = RoomProjectionEnvelope.normalized(omittedID)
+        XCTAssertEqual(repaired.rooms["id:r-keep"]?.roomID, "r-keep")
+        let roundTrip = try JSONDecoder().decode(
+            RoomProjectionEnvelope.self,
+            from: JSONEncoder().encode(repaired)
+        )
+        XCTAssertEqual(roundTrip.rooms["id:r-keep"]?.roomID, "r-keep")
+    }
+
+    func testRoomProjectionBoundsMessagesTextImageEnvelopeAndTombstones() {
+        let author = RoomProjectionAuthor(kind: .member, name: "research")
+        let log = (0..<40).map { index in
+            RoomProjectionEntry(id: "m-\(index)", from: author,
+                                text: "\(index):" + String(repeating: "🧠", count: 2_000),
+                                at: Int64(index))
+        }
+        var rooms: [String: RoomProjectionRoom] = [:]
+        for index in 0..<12 {
+            rooms["id:r-\(index)"] = RoomProjectionRoom(
+                name: "Room \(index)", roomID: "r-\(index)", log: log,
+                members: (0..<10).map {
+                    RoomProjectionMember(name: "member-\($0)", connectionID: "gateway-\($0)")
+                },
+                image: index == 11 ? String(repeating: "x", count: 24_001) : nil
+            )
+        }
+        let deleted = Dictionary(uniqueKeysWithValues: (0..<100).map {
+            ("id:dead-\($0)", UInt64($0))
+        })
+        let envelope = RoomProjectionEnvelope(updatedAt: 42, rooms: rooms, deleted: deleted)
+
+        XCTAssertLessThanOrEqual(envelope.gatewayJSONSize,
+                                 RoomProjectionEnvelope.maximumGatewayJSONBytes)
+        XCTAssertLessThanOrEqual(envelope.deleted.count,
+                                 RoomProjectionEnvelope.maximumTombstones)
+        XCTAssertTrue(envelope.rooms.values.allSatisfy {
+            $0.log.count <= RoomProjectionEnvelope.maximumMessagesPerRoom
+                && $0.log.allSatisfy {
+                    $0.text.count <= RoomProjectionEnvelope.maximumTextCharacters
+                }
+                && $0.members.count <= RoomProjectionEnvelope.maximumMembersPerRoom
+                && ($0.image?.count ?? 0) <= RoomProjectionEnvelope.maximumImageCharacters
+        })
+        XCTAssertEqual(envelope.deleted.values.max(), 99)
+    }
+
+    func testRoomProjectionMergeUnionsOmissionsAndAppliesTombstoneClasses() {
+        let user = RoomProjectionAuthor(kind: .user, name: "You")
+        let remote = RoomProjectionEnvelope(rooms: [
+            "id:shared": RoomProjectionRoom(
+                name: "Old", roomID: "shared",
+                log: [RoomProjectionEntry(id: "remote", from: user,
+                                          text: "remote", at: 20)],
+                revision: 4,
+                members: [RoomProjectionMember(name: "remote")]
+            ),
+            "id:zombie": RoomProjectionRoom(
+                name: "Zombie", roomID: "zombie",
+                log: [RoomProjectionEntry(id: "stale", from: user,
+                                          text: "stale", at: 1)],
+                revision: 40
+            ),
+            "name:Legacy": RoomProjectionRoom(
+                name: "Legacy",
+                log: [RoomProjectionEntry(id: "legacy", from: user,
+                                          text: "old", at: 1)],
+                revision: 8
+            ),
+            "id:remote-only": RoomProjectionRoom(name: "Remote only", roomID: "remote-only",
+                                                   log: [], revision: 1),
+        ])
+        let local = RoomProjectionEnvelope(rooms: [
+            "id:shared": RoomProjectionRoom(
+                name: "New", roomID: "shared",
+                log: [RoomProjectionEntry(id: "local", from: user,
+                                          text: "local", at: 10)],
+                revision: 4,
+                members: [RoomProjectionMember(name: "local")]
+            ),
+        ], deleted: ["id:zombie": 3, "name:Legacy": 7])
+
+        let merged = RoomProjectionEnvelope.merging(
+            remote: remote, local: local,
+            intent: RoomProjectionMergeIntent(changedRooms: ["id:shared"],
+                                              writeRevision: 5),
+            updatedAt: 99
+        )
+        XCTAssertEqual(merged.rooms["id:shared"]?.name, "New")
+        XCTAssertEqual(merged.rooms["id:shared"]?.revision, 5)
+        XCTAssertEqual(merged.rooms["id:shared"]?.log.map(\.id), ["local", "remote"])
+        XCTAssertNotNil(merged.rooms["id:remote-only"],
+                        "missing local projection rows are not deletions")
+        XCTAssertNil(merged.rooms["id:zombie"], "id tombstones are final")
+        XCTAssertEqual(merged.deleted["id:zombie"], 3)
+        XCTAssertNotNil(merged.rooms["name:Legacy"],
+                        "older legacy tombstone cannot delete a newer room revision")
+        XCTAssertNil(merged.deleted["name:Legacy"])
+
+        let disbanded = RoomProjectionEnvelope.merging(
+            remote: merged,
+            local: RoomProjectionEnvelope(),
+            intent: RoomProjectionMergeIntent(deletedRooms: ["id:shared"],
+                                              writeRevision: 6)
+        )
+        XCTAssertNil(disbanded.rooms["id:shared"])
+        XCTAssertEqual(disbanded.deleted["id:shared"], 6)
+    }
+
+    func testRoomProjectionRenameJobPreservesDurableIDAndRetiresLegacyName() {
+        let user = RoomProjectionAuthor(kind: .user, name: "You")
+        let history = [RoomProjectionEntry(id: "h1", from: user,
+                                           text: "history", at: 5)]
+        let remote = RoomProjectionEnvelope(rooms: [
+            "id:room-3": RoomProjectionRoom(
+                name: "Old", roomID: "room-3", log: history, revision: 2
+            ),
+        ])
+        let local = RoomProjectionEnvelope(rooms: [
+            "id:room-3": RoomProjectionRoom(
+                name: "New", roomID: "room-3", log: history, revision: 2
+            ),
+        ])
+
+        // This is the exact Desktop rename job shape. The old and new display
+        // labels resolve to the same immutable id key, which must never be
+        // tombstoned. A legacy name-key tombstone still retires v1/v2 copies.
+        let renamed = RoomProjectionEnvelope.merging(
+            remote: remote,
+            local: local,
+            intent: RoomProjectionMergeIntent(
+                changedRooms: ["New"], deletedRooms: ["Old"], writeRevision: 3
+            )
+        )
+
+        XCTAssertEqual(renamed.rooms["id:room-3"]?.name, "New")
+        XCTAssertEqual(renamed.rooms["id:room-3"]?.revision, 3)
+        XCTAssertNil(renamed.deleted["id:room-3"])
+        XCTAssertEqual(renamed.deleted["name:Old"], 3)
+    }
+
+    func testRoomStorePersistsProjectionLedgerWithoutPruningRichRooms() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = RoomStore(baseDirectory: base)
+        let thread = RoomThread()
+        let localRoom = RoomRecord(name: "Protected", members: members(),
+                                   threads: [thread], entries: [
+            RoomEntry(threadID: thread.id, speaker: .user, speakerName: "You",
+                      text: "full protected transcript")
+        ])
+        try await store.upsert(localRoom)
+
+        let projected = RoomProjectionEnvelope(rooms: [
+            "id:desktop-room": RoomProjectionRoom(
+                name: "Desktop", roomID: "desktop-room",
+                log: [RoomProjectionEntry(
+                    id: "desktop-message",
+                    from: RoomProjectionAuthor(kind: .member, name: "research"),
+                    text: "bounded remote", at: 1
+                )],
+                revision: 2,
+                members: [RoomProjectionMember(name: "research", connectionID: "mini",
+                                                sourceScoped: true)]
+            ),
+        ])
+        _ = try await store.mergeRoomProjection(projected)
+        // A truncated/empty later projection cannot imply deletion.
+        _ = try await store.mergeRoomProjection(RoomProjectionEnvelope(updatedAt: 3))
+
+        let reader = RoomStore(baseDirectory: base)
+        let restoredProjection = try await reader.roomProjection()
+        XCTAssertEqual(restoredProjection.rooms, projected.rooms)
+        XCTAssertEqual(restoredProjection.updatedAt, 3)
+        let restoredRooms = try await reader.loadAll()
+        XCTAssertEqual(restoredRooms.first?.entries.first?.text, "full protected transcript")
+
+        let tombstone = RoomProjectionEnvelope(deleted: ["id:desktop-room": 3])
+        let deleted = try await reader.mergeRoomProjection(tombstone)
+        XCTAssertNil(deleted.rooms["id:desktop-room"])
+        XCTAssertEqual(deleted.deleted["id:desktop-room"], 3)
+        let protectedRoom = try await reader.room(id: localRoom.id)
+        XCTAssertEqual(protectedRoom?.entries.count, 1)
+
+        try await reader.deleteAll()
+        let emptyProjection = try await reader.roomProjection()
+        XCTAssertEqual(emptyProjection, RoomProjectionEnvelope())
+    }
 }
 #endif
