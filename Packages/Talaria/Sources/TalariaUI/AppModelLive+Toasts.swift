@@ -376,18 +376,35 @@ public extension AppModel {
     /// may have already flicked away.
     @discardableResult
     func deleteRoutineWithFeedback(_ routine: Routine) async -> String? {
-        let key = "routine-delete:\(routine.id)"
+        let fence = cronRoutineMutationFence(routine.id)
+        let key = fence.map { "routine-delete:\($0.activityIdentity)" }
+            ?? "routine-delete:\(routine.id)"
         toast(kind: .info, title: theme.copy.toastDeleting(theme.themeID),
               message: routine.name, botID: routine.botID, key: key)
         do {
+            guard let fence,
+                  let sourceClient = cronSourceClient(gatewayID: fence.source.gatewayID),
+                  cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+                throw cronSourceChangedError()
+            }
             try await deleteRoutine(routine)
+            guard cronMutationFenceAccepts(fence.source, expectedClient: sourceClient) else {
+                throw cronSourceChangedError()
+            }
             toast(kind: .success, title: theme.copy.toastRoutineDeleted(theme.themeID),
                   message: routine.name, botID: routine.botID, key: key)
             return nil
         } catch {
             let reason = Self.reason(error)
-            toast(kind: .failure, title: theme.copy.toastDeleteFailed(theme.themeID),
-                  message: reason, botID: routine.botID, key: key)
+            if (error as? GatewayError)?.code == CronMutationFenceError.sourceChanged {
+                // There was no authoritative result for this source. Remove
+                // the optimistic card/ledger pending state instead of claiming
+                // that the replacement gateway failed the delete.
+                retractToast(key: key)
+            } else {
+                toast(kind: .failure, title: theme.copy.toastDeleteFailed(theme.themeID),
+                      message: reason, botID: routine.botID, key: key)
+            }
             return reason
         }
     }
@@ -403,34 +420,60 @@ public extension AppModel {
     /// the delete is confirmed by the row vanishing, and the create by a screen
     /// that pops back to a list the new row may not have reached yet.
     ///
-    /// Rethrows, deliberately: the editor keeps the gateway's sentence on its
-    /// own error line for the failure the user is looking straight at, and it
-    /// stays on screen with the typing intact.
+    /// A socket add is irreversible. Once it returns an id, a failed or stale
+    /// REST follow-up is returned as a typed partial result and the create
+    /// editor dismisses with a warning; it must not invite a duplicate create.
     func scheduleRoutineWithFeedback(botID: String, title: String, schedule: String,
                                      instruction: String, repeatForever: Bool = true,
                                      continuity: Bool = false, deliver: [String] = [],
-                                     model: String? = nil, provider: String? = nil) async throws {
+                                     model: String? = nil, provider: String? = nil,
+                                     reasoningEffort: String? = nil) async throws -> CronCreateOutcome {
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let key = "routine-add:\(botID):\(clean)"
+        let sourceFence = mode == .live
+            ? routineGatewayID(botID: botID).flatMap { gatewayID in
+                return cronSourceMutationFence(
+                    gatewayID: gatewayID, profile: nil)
+            }
+            : nil
+        let key = sourceFence.map {
+            "routine-add:\($0.gatewayID):\($0.generation.activityIdentity):"
+                + "\($0.lifecycleProfile ?? ""):\($0.profileGeneration.map(String.init) ?? ""):"
+                + "\(botID):\(clean)"
+        } ?? "routine-add:\(botID):\(clean)"
         toast(kind: .info, title: theme.copy.toastSchedulingRoutine(clean, theme.themeID),
               botID: botID, key: key)
         do {
-            try await scheduleRoutine(botID: botID, title: clean, schedule: schedule,
-                                      instruction: instruction, repeatForever: repeatForever,
-                                      continuity: continuity, deliver: deliver,
-                                      model: model, provider: provider)
-            toast(kind: .success, title: theme.copy.toastRoutineScheduled(clean, theme.themeID),
-                  botID: botID, key: key)
+            let outcome = try await scheduleRoutine(
+                botID: botID, title: clean, schedule: schedule,
+                instruction: instruction, repeatForever: repeatForever,
+                continuity: continuity, deliver: deliver,
+                model: model, provider: provider,
+                reasoningEffort: reasoningEffort)
+            if let partial = outcome.acceptedPartial {
+                let title: String
+                let message: String
+                switch partial.reason {
+                case .addOutcomeUnknown, .sourceChangedBeforeACK:
+                    title = theme.copy.toastRoutineOutcomeUnknown(clean, theme.themeID)
+                    message = theme.copy.routineAddOutcomeUnknown(theme.themeID)
+                case .sourceChanged:
+                    title = theme.copy.toastRoutineScheduled(clean, theme.themeID)
+                    message = theme.copy.routineMadeSourceChanged(theme.themeID)
+                case .followUpUnavailable, .followUpAmbiguous:
+                    title = theme.copy.toastRoutineScheduled(clean, theme.themeID)
+                    message = theme.copy.routineMadeFollowUpAmbiguous(theme.themeID)
+                }
+                toast(kind: .warning,
+                      title: title,
+                      message: message, botID: botID, key: key)
+            } else {
+                toast(kind: .success, title: theme.copy.toastRoutineScheduled(clean, theme.themeID),
+                      botID: botID, key: key)
+            }
+            return outcome
         } catch {
-            // `scheduleRoutine` raises -4 for the one half-landed case: the job
-            // EXISTS and will fire, only its delivery route or model pin did
-            // not take. Reporting that as a failure would tell the user to
-            // schedule it again and give them two.
             let reason = Self.reason(error)
-            let partial = (error as? GatewayError)?.code == -4
-            toast(kind: partial ? .warning : .failure,
-                  title: partial ? theme.copy.toastRoutineScheduled(clean, theme.themeID)
-                                 : theme.copy.toastRoutineScheduleFailed(theme.themeID),
+            toast(kind: .failure, title: theme.copy.toastRoutineScheduleFailed(theme.themeID),
                   message: reason, botID: botID, key: key)
             throw error
         }
@@ -443,21 +486,37 @@ public extension AppModel {
                                  botID: String, title: String,
                                  schedule: String, instruction: String, deliver: [String]?,
                                  model: String?, provider: String?,
+                                 reasoningEffort: String? = nil,
                                  continuity: Bool?) async throws {
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let key = "routine-save:\(routineID)"
+        let fence = cronRoutineMutationFence(routineID)
+        let key = fence.map { "routine-save:\($0.activityIdentity)" }
+            ?? "routine-save:\(routineID)"
         toast(kind: .info, title: theme.copy.toastSavingRoutine(clean, theme.themeID),
               botID: botID, key: key)
         do {
+            guard let fence,
+                  let sourceClient = cronSourceClient(gatewayID: fence.source.gatewayID),
+                  cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+                throw cronSourceChangedError()
+            }
             try await saveRoutine(job, routineID: routineID, botID: botID,
                                   title: clean, schedule: schedule,
                                   instruction: instruction, deliver: deliver, model: model,
-                                  provider: provider, continuity: continuity)
+                                  provider: provider, reasoningEffort: reasoningEffort,
+                                  continuity: continuity)
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+                throw cronSourceChangedError()
+            }
             toast(kind: .success, title: theme.copy.toastRoutineSaved(clean, theme.themeID),
                   botID: botID, key: key)
         } catch {
-            toast(kind: .failure, title: theme.copy.toastRoutineUpdateFailed(theme.themeID),
-                  message: Self.reason(error), botID: botID, key: key)
+            if (error as? GatewayError)?.code == CronMutationFenceError.sourceChanged {
+                retractToast(key: key)
+            } else {
+                toast(kind: .failure, title: theme.copy.toastRoutineUpdateFailed(theme.themeID),
+                      message: Self.reason(error), botID: botID, key: key)
+            }
             throw error
         }
     }

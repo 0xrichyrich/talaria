@@ -44,6 +44,9 @@ public final class CronDetailRuntime {
     /// Gateway id → whether its REST cron router exists. Missing means
     /// unknown; false hides only that source's REST-backed controls.
     public var restSupported: [String: Bool] = [:]
+    /// Generation that produced each REST capability verdict. A replacement
+    /// client must probe again even when it reuses the gateway id.
+    @ObservationIgnored var restSupportGeneration: [String: CronSourceMutationFence] = [:]
 
     public var loadingDetail: Set<String> = []
     public var loadingRuns: Set<String> = []
@@ -66,16 +69,627 @@ public final class CronDetailRuntime {
     /// goes nil when the old client dies, which is exactly the answer wanted.
     @ObservationIgnored weak var routedClient: GatewayClient?
     @ObservationIgnored var deliveryLoaded: Set<String> = []
-    /// Legacy delegated jobs already force-paused on this link, so the
-    /// migration runs once per job instead of on every list refresh.
+    /// Generation that produced each gateway's delivery-target cache. A pool
+    /// replacement reuses the gateway id but not this authority.
+    @ObservationIgnored var deliveryGeneration: [String: CronSourceMutationFence] = [:]
+    /// Source authority for the per-routine caches. A stale task may finish
+    /// after a replacement row reuses the same UI id; it must not clear or
+    /// overwrite that newer row's detail/history.
+    @ObservationIgnored var detailAuthority: [String: CronRoutineMutationFence] = [:]
+    @ObservationIgnored var runsAuthority: [String: CronRoutineMutationFence] = [:]
+    @ObservationIgnored var detailLoadingAuthority: [String: CronRoutineMutationFence] = [:]
+    @ObservationIgnored var runsLoadingAuthority: [String: CronRoutineMutationFence] = [:]
+    /// Full routine-fence identities already force-paused on this link, so the
+    /// migration runs once per source/profile generation instead of on every
+    /// list refresh. Raw job ids are deliberately not enough here.
     @ObservationIgnored var quarantined: Set<String> = []
 
     /// Everything derived from one gateway; dropped when the link changes.
     func reset() {
         detail.removeAll(); runs.removeAll(); deliveryTargets.removeAll()
         detailError.removeAll(); loadingDetail.removeAll(); loadingRuns.removeAll()
-        deliveryLoaded.removeAll(); restSupported.removeAll(); quarantined.removeAll()
+        deliveryLoaded.removeAll(); deliveryGeneration.removeAll()
+        detailAuthority.removeAll(); runsAuthority.removeAll()
+        detailLoadingAuthority.removeAll(); runsLoadingAuthority.removeAll()
+        restSupported.removeAll(); restSupportGeneration.removeAll(); quarantined.removeAll()
     }
+}
+
+// MARK: - Mutation authority
+
+/// Connection-role generation captured with a cron mutation. Gateway ids are
+/// durable registry identities; generations prove that the client currently
+/// occupying that identity is still the one the user acted on.
+enum CronGatewayGeneration: Sendable, Equatable {
+    case primary(Int)
+    case retained(UInt64)
+
+    var activityIdentity: String {
+        switch self {
+        case .primary(let generation): "primary-\(generation)"
+        case .retained(let generation): "retained-\(generation)"
+        }
+    }
+}
+
+/// Existing-job operations use a distinct outcome from the accepted-add
+/// partial result. A stale completion must never look like a successful write
+/// or invite a retry against the replacement source.
+enum CronMutationFenceError {
+    /// GatewayTransport reserves -5 for an ordinary request timeout. A stale
+    /// completion is a different state: the request may have landed on the
+    /// old source, but its result is not authoritative for the current one.
+    static let sourceChanged = -10
+}
+
+/// Common post-await decision for cron reads and writes. Keeping stale as an
+/// explicit outcome makes it impossible for a caller to accidentally treat a
+/// rejected fence as a successful no-op.
+enum CronAsyncFencePolicy: Sendable, Equatable {
+    case accepted
+    case sourceChanged
+
+    init(sourceAccepted: Bool) {
+        self = sourceAccepted ? .accepted : .sourceChanged
+    }
+
+    var mayPublish: Bool { self == .accepted }
+    var shouldRollbackOptimisticState: Bool { self == .sourceChanged }
+}
+
+enum CronQuarantinePolicy {
+    /// A failed pause never owns a durable local dedupe marker. Keeping it
+    /// would suppress the next safety sweep indefinitely.
+    static let retainMarkerAfterPauseFailure = false
+
+    /// Activity keys carry either the full routine-fence identity or a legacy
+    /// raw id. Both forms belong to the removed routine; a sibling whose id
+    /// merely shares the same prefix must survive.
+    static func ownsActivityKey(_ key: String, routineID: String) -> Bool {
+        let identity: String
+        if key.hasPrefix("cron-quarantine:") {
+            identity = String(key.dropFirst("cron-quarantine:".count))
+        } else if key.hasPrefix("cron-run:") {
+            identity = String(key.dropFirst("cron-run:".count))
+        } else {
+            return false
+        }
+        return identity == routineID
+            || identity.hasPrefix("\(routineID)|")
+            || identity.hasPrefix("\(routineID):")
+    }
+}
+
+/// Exact source + profile store authority for one cron write.
+struct CronSourceMutationFence: Sendable, Equatable {
+    var gatewayID: String
+    var profile: String?
+    var generation: CronGatewayGeneration
+    var profileGeneration: UInt64? = nil
+    /// The profile store whose lifecycle owns an otherwise unscoped request.
+    /// `profile == nil` is still meaningful for launch-store REST/WS calls, so
+    /// keep its lifecycle route separate from the wire's optional profile.
+    var lifecycleProfile: String? = nil
+
+    static func accepts(_ fence: Self, primaryGatewayID: String?,
+                        primaryGeneration: Int,
+                        retainedGenerations: [String: UInt64]) -> Bool {
+        switch fence.generation {
+        case .primary(let generation):
+            return fence.gatewayID == primaryGatewayID && generation == primaryGeneration
+        case .retained(let generation):
+            return fence.gatewayID != primaryGatewayID
+                && retainedGenerations[fence.gatewayID] == generation
+        }
+    }
+}
+
+/// The socket create is the irreversible half of a new routine.  Once it has
+/// returned a job id, the caller must distinguish an accepted add from the
+/// optional REST completion instead of treating a lost source as permission to
+/// retry or remove the job.
+enum CronCreatePostAddDecision: Sendable, Equatable {
+    /// The source changed while `cronAdd` was in flight.  No activity, cache
+    /// publication, or REST patch may be attributed to the old source.
+    case acceptedButStale
+    /// The socket add is complete and there are no REST-only fields to apply.
+    case accepted
+    /// The captured source is still authoritative and the REST patch is safe.
+    case readyForREST
+    /// The add is complete, but requested REST-only fields could not be
+    /// attempted from the captured authority.  The caller must surface the
+    /// recoverable partial result.
+    case acceptedWithoutREST
+
+    var shouldIssueRESTPatch: Bool { self == .readyForREST }
+    var preservesAcceptedAdd: Bool { true }
+    var requiresRecoveryNotice: Bool {
+        self == .acceptedButStale || self == .acceptedWithoutREST
+    }
+}
+
+enum CronCreatePostAddPolicy {
+    static func decision(
+        sourceFence: CronSourceMutationFence,
+        primaryGatewayID: String?,
+        primaryGeneration: Int,
+        retainedGenerations: [String: UInt64],
+        hasRESTOnlyFields: Bool,
+        hasJobID: Bool,
+        hasRESTAuthority: Bool,
+        restSupported: Bool
+    ) -> CronCreatePostAddDecision {
+        guard CronSourceMutationFence.accepts(
+            sourceFence,
+            primaryGatewayID: primaryGatewayID,
+            primaryGeneration: primaryGeneration,
+            retainedGenerations: retainedGenerations
+        ) else {
+            return .acceptedButStale
+        }
+        guard hasRESTOnlyFields else { return .accepted }
+        guard hasJobID, hasRESTAuthority, restSupported else {
+            return .acceptedWithoutREST
+        }
+        return .readyForREST
+    }
+}
+
+/// `cron.manage add` is irreversible once the frame is sent. These are the
+/// same transport outcomes the mutation surfaces treat as ambiguous-after-
+/// send; a timeout or lost socket response must become a terminal partial
+/// result rather than a retryable validation error. Tool/auth/route refusals
+/// remain definite failures and are still thrown to the editor.
+enum CronCreateAddFailurePolicy {
+    static func isAmbiguousAfterSend(_ error: Error) -> Bool {
+        if let gateway = error as? GatewayError {
+            // GatewayTransport: timeout, cancellation-after-send, socket loss.
+            return [-5, -6, -7].contains(gateway.code)
+        }
+        if let url = error as? URLError {
+            return [.cancelled, .timedOut, .networkConnectionLost].contains(url.code)
+        }
+        // A response that reached the client but could not be decoded cannot
+        // prove that the gateway rejected the irreversible add.
+        return error is DecodingError
+    }
+
+    /// Only an ambiguous transport result can become a terminal partial. A
+    /// definite refusal must remain a thrown, retryable error even when the
+    /// source fence changed while the request was in flight.
+    static func ambiguousPartialReason(
+        for error: Error, sourceFenceStillCurrent: Bool
+    ) -> CronAcceptedPartialReason? {
+        guard isAmbiguousAfterSend(error) else { return nil }
+        return sourceFenceStillCurrent ? .addOutcomeUnknown : .sourceChangedBeforeACK
+    }
+
+    static func unresolvedAddReason(sourceFenceStillCurrent: Bool)
+        -> CronAcceptedPartialReason {
+        sourceFenceStillCurrent ? .addOutcomeUnknown : .sourceChangedBeforeACK
+    }
+
+    static func unresolvedPartial(reason: CronAcceptedPartialReason)
+        -> CronAcceptedPartialOutcome {
+        CronAcceptedPartialOutcome(
+            jobID: "", gatewayID: nil, profile: nil, reason: reason)
+    }
+}
+
+/// A socket add is irreversible. If its REST completion is not authoritative,
+/// callers must carry the accepted job forward as a typed partial result so a
+/// UI cannot turn an ambiguous follow-up into a duplicate create retry.
+public enum CronAcceptedPartialReason: Sendable, Equatable {
+    /// The add returned no authoritative acknowledgement. The job may exist,
+    /// but there is no id to claim or safely reconcile.
+    case addOutcomeUnknown
+    /// The source changed while the add was throwing, before an id was known.
+    case sourceChangedBeforeACK
+    /// A job id was known before a later source replacement.
+    case sourceChanged
+    case followUpUnavailable
+    case followUpAmbiguous
+}
+
+public struct CronAcceptedPartialOutcome: Sendable, Equatable {
+    public var jobID: String
+    public var gatewayID: String?
+    public var profile: String?
+    public var reason: CronAcceptedPartialReason
+
+    public init(jobID: String, gatewayID: String?, profile: String?,
+                reason: CronAcceptedPartialReason) {
+        self.jobID = jobID; self.gatewayID = gatewayID; self.profile = profile
+        self.reason = reason
+    }
+}
+
+public enum CronCreateOutcome: Sendable, Equatable {
+    case completed
+    case acceptedPartial(CronAcceptedPartialOutcome)
+
+    public var acceptedPartial: CronAcceptedPartialOutcome? {
+        guard case .acceptedPartial(let outcome) = self else { return nil }
+        return outcome
+    }
+
+    /// Both a completed add and an accepted/ambiguous add must leave the
+    /// create form. Keeping it open after an irreversible socket attempt
+    /// would turn the primary button into a duplicate-create invitation.
+    var shouldDismissCreateEditor: Bool { true }
+
+    /// Partial outcomes are terminal warnings, not ordinary retryable errors.
+    var needsWarningFeedback: Bool { acceptedPartial != nil }
+}
+
+/// The only REST cron acknowledgement accepted for publication. The job id is
+/// not enough: an unscoped response can come from any profile store on the
+/// gateway, so every response must echo a non-empty exact profile as well.
+enum CronJobAcknowledgementPolicy {
+    static func returnedProfile(_ detail: CronJobDetail, jobID: String,
+                                expectedProfile: String) -> String? {
+        guard !jobID.isEmpty, detail.id == jobID,
+              let returned = detail.profile,
+              !returned.isEmpty,
+              returned == returned.trimmingCharacters(in: .whitespacesAndNewlines),
+              !expectedProfile.isEmpty, expectedProfile == returned else { return nil }
+        return returned
+    }
+
+    static func accepts(_ detail: CronJobDetail, jobID: String,
+                        profile: String?) -> Bool {
+        guard let profile else { return false }
+        return returnedProfile(detail, jobID: jobID, expectedProfile: profile) != nil
+    }
+}
+
+/// REST detail/history/update routes search by job id when no profile query is
+/// supplied. That lookup is unsafe for colliding ids, so only a profile already
+/// established by a scoped socket listing may authorize those calls.
+enum CronDetailAuthorityPolicy {
+    static func allowsProfileScopedREST(profile: String?) -> Bool {
+        guard let profile else { return false }
+        return !profile.isEmpty
+    }
+}
+
+/// Kept as a source-compatible spelling for the original create tests. All
+/// production call sites use `CronJobAcknowledgementPolicy` directly so
+/// detail/save/pin/create share one identity check.
+enum CronCreateAcknowledgementPolicy {
+    static func accepts(_ detail: CronJobDetail, jobID: String,
+                        profile: String?) -> Bool {
+        guard let profile else { return false }
+        return CronJobAcknowledgementPolicy.accepts(detail, jobID: jobID,
+                                                    profile: profile)
+    }
+}
+
+enum CronDeletePostRefreshPolicy {
+    /// A successful remove may be followed by a refresh that installs a newer
+    /// same-id row. Clearing is safe only when that id is now absent (the
+    /// accepted delete is reflected) or still points at the exact captured
+    /// target. A different target owns the caches and must be left alone.
+    static func mayClear(capturedTarget: RoutineTarget,
+                        currentTarget: RoutineTarget?) -> Bool {
+        currentTarget == nil || currentTarget == capturedTarget
+    }
+}
+
+/// Existing-job authority adds the UI row identity to the source fence. The
+/// profile is part of `RoutineTarget`, so a refresh that moves the same raw job
+/// id to another profile store invalidates this fence even if the source
+/// connection did not change.
+struct CronRoutineMutationFence: Sendable, Equatable {
+    var routineID: String
+    var target: RoutineTarget
+    var source: CronSourceMutationFence
+    var profileGeneration: UInt64? = nil
+
+    static func accepts(_ fence: Self, currentTarget: RoutineTarget?,
+                        primaryGatewayID: String?, primaryGeneration: Int,
+                        retainedGenerations: [String: UInt64]) -> Bool {
+        currentTarget == fence.target
+            && sourceMatchesTarget(fence)
+            && CronSourceMutationFence.accepts(
+                fence.source, primaryGatewayID: primaryGatewayID,
+                primaryGeneration: primaryGeneration,
+                retainedGenerations: retainedGenerations)
+    }
+
+    private static func sourceMatchesTarget(_ fence: Self) -> Bool {
+        fence.source.gatewayID == fence.target.route.gatewayID
+            && fence.source.profile == fence.target.profile
+    }
+
+    /// Stable identity for optimistic cards and ledger rows. Include the
+    /// generation so a replacement source cannot settle a new source's toast
+    /// merely because a raw job id was reused.
+    var activityIdentity: String {
+        [routineID, target.route.gatewayID, target.route.jobID,
+         target.profile ?? "", source.generation.activityIdentity,
+         profileGeneration.map(String.init) ?? ""]
+            .joined(separator: "|")
+    }
+}
+
+enum CronReadCachePolicy {
+    /// A current-source read may replace an older cache. A stale completion
+    /// may clear only the cache it owned (or an unowned legacy cache), never a
+    /// replacement source's authoritative row.
+    static func shouldClearBeforeRead(sourceAccepted: Bool,
+                                      cacheFence: CronRoutineMutationFence?,
+                                      operationFence: CronRoutineMutationFence) -> Bool {
+        sourceAccepted || cacheFence == nil || cacheFence == operationFence
+    }
+}
+
+/// A secondary sweep is all-or-nothing for one gateway. A missing profile
+/// token or a lifecycle change after any awaited RPC means the accumulated
+/// dictionary is not a snapshot and must never prune the previous one.
+enum CronProfileRefreshPolicy {
+    static func mayPublishSnapshot(sourceAccepted: Bool,
+                                   lifecycleAuthorityAccepted: Bool) -> Bool {
+        sourceAccepted && lifecycleAuthorityAccepted
+    }
+
+    /// A profile list is a set of expected stores. Capture one lifecycle token
+    /// for every expected name before the first cron read; a token missing from
+    /// the map makes the whole snapshot incomplete rather than authorizing a
+    /// partial prune.
+    static func hasAllExpectedProfileTokens(
+        expectedProfiles: [String],
+        tokens: [String: ProfileLifecycleGenerationToken]
+    ) -> Bool {
+        guard Set(expectedProfiles).count == expectedProfiles.count,
+              tokens.count == expectedProfiles.count else { return false }
+        return expectedProfiles.allSatisfy { profile in
+            tokens[profile]?.route.profile == profile
+        }
+    }
+
+    /// Re-check every captured token, not just the profile whose RPC just
+    /// completed. This closes the A-changes-during-B-read race.
+    static func capturedProfilesRemainCurrent(
+        expectedProfiles: [String],
+        tokens: [String: ProfileLifecycleGenerationToken],
+        isCurrent: (ProfileLifecycleGenerationToken) -> Bool
+    ) -> Bool {
+        hasAllExpectedProfileTokens(expectedProfiles: expectedProfiles, tokens: tokens)
+            && expectedProfiles.allSatisfy { profile in
+                guard let token = tokens[profile] else { return false }
+                return isCurrent(token)
+            }
+    }
+}
+
+/// Only the request's explicit profile plus Hermes' exact `scoped` echo can
+/// identify a profile store. Per-row `profile` fields and an unscoped listing's
+/// top-level profile are merely payload data and cannot retarget a row.
+enum CronListingScopePolicy {
+    static let incompleteScopeMessage =
+        "Profile-scoped routine response did not echo its requested profile."
+
+    static func scope(for listing: CronListing, requestedProfile: String?) -> String? {
+        guard let requestedProfile, !requestedProfile.isEmpty,
+              listing.scopedProfile == requestedProfile else { return nil }
+        return requestedProfile
+    }
+
+    static func acceptsExactScopeEcho(_ listing: CronListing,
+                                      requestedProfile: String?) -> Bool {
+        scope(for: listing, requestedProfile: requestedProfile) != nil
+    }
+}
+
+/// Display attribution is deliberately separate from store authority. The
+/// parser validates the namespaced `[bot:…]` shape; the result may identify the
+/// row's UI bot and socket-management destination, but it never becomes a
+/// `RoutineTarget.profile` or a REST profile argument.
+enum CronListingAttributionPolicy {
+    static func displayBotID(for job: CronJobRecord, scopedProfile: String? = nil) -> String {
+        job.taggedBotID ?? scopedProfile ?? ""
+    }
+}
+
+/// The old flat refresh has no source-qualified target fold and is therefore
+/// safe only for the canned demo world. Every live caller uses
+/// `refreshRoutinesLive`, which updates rows and targets under one fence.
+enum CronRoutineRefreshAuthorityPolicy {
+    static func allowsLegacyRefresh(mode: AppMode) -> Bool {
+        mode == .demo
+    }
+}
+
+/// Create's socket step is authoritative but unscoped. Until Hermes exposes
+/// the process launch profile, no REST-only field may be serialized or shown as
+/// available; otherwise the follow-up would be an ambiguous cross-store write.
+enum CronCreateRESTPolicy {
+    static func allowsExtras(launchProfile: String?) -> Bool {
+        guard let launchProfile else { return false }
+        return !launchProfile.isEmpty
+    }
+
+    static func extras(launchProfile: String?, deliver: [String], model: String?,
+                       provider: String?, reasoningEffort: String?) -> [String: JSONValue] {
+        guard allowsExtras(launchProfile: launchProfile) else { return [:] }
+        var values: [String: JSONValue] = [:]
+        if !deliver.isEmpty { values["deliver"] = .string(deliver.joined(separator: ",")) }
+        if let model, !model.isEmpty { values["model"] = .string(model) }
+        if let provider, !provider.isEmpty { values["provider"] = .string(provider) }
+        if let reasoningEffort { values["reasoning_effort"] = .string(reasoningEffort) }
+        return values
+    }
+}
+
+extension AppModel {
+    func cronSourceMutationFence(gatewayID: String,
+                                 profile: String?,
+                                 lifecycleProfile: String? = nil) -> CronSourceMutationFence? {
+        let authorityProfile = lifecycleProfile ?? profile
+        let profileGeneration: UInt64?
+        if let authorityProfile, !authorityProfile.isEmpty {
+            let rosterID = gatewayID == LiveRuntime.shared.gatewayID
+                ? authorityProfile
+                : GatewayBotRoute(gatewayID: gatewayID, profile: authorityProfile).qualifiedID
+            guard let token = profileLifecycleGenerationToken(for: rosterID) else { return nil }
+            profileGeneration = token.generation
+        } else {
+            profileGeneration = nil
+        }
+        if gatewayID == LiveRuntime.shared.gatewayID {
+            return CronSourceMutationFence(
+                gatewayID: gatewayID, profile: profile,
+                generation: .primary(LiveRuntime.shared.generation),
+                profileGeneration: profileGeneration,
+                lifecycleProfile: authorityProfile)
+        }
+        let routed = MultiGatewayRuntime.shared
+        guard routed.routedEvents[gatewayID] != nil,
+              let generation = routed.routedEventGenerations[gatewayID] else { return nil }
+        return CronSourceMutationFence(
+            gatewayID: gatewayID, profile: profile,
+            generation: .retained(generation), profileGeneration: profileGeneration,
+            lifecycleProfile: authorityProfile)
+    }
+
+    func cronRoutineMutationFence(_ routineID: String) -> CronRoutineMutationFence? {
+        guard let target = routineTarget(routineID),
+              let source = cronSourceMutationFence(
+                gatewayID: target.route.gatewayID, profile: target.profile) else { return nil }
+        // An unscoped cron row belongs to the process launch store, whose
+        // profile name is intentionally unknown here. Never turn a roster
+        // default or a display bot into profile authority; only an exact
+        // profile echoed by Hermes may carry lifecycle generation.
+        let profileGeneration: UInt64?
+        if let profile = target.profile, !profile.isEmpty {
+            let profileID = target.route.gatewayID == LiveRuntime.shared.gatewayID
+                ? profile
+                : GatewayBotRoute(gatewayID: target.route.gatewayID,
+                                  profile: profile).qualifiedID
+            guard let profileToken = profileLifecycleGenerationToken(for: profileID) else {
+                return nil
+            }
+            profileGeneration = profileToken.generation
+        } else {
+            profileGeneration = nil
+        }
+        return CronRoutineMutationFence(routineID: routineID, target: target, source: source,
+                                        profileGeneration: profileGeneration)
+    }
+
+    /// Return the exact client currently occupying a source slot. A generation
+    /// normally implies this identity, but keeping the identity check explicit
+    /// closes the small handoff window where a pool swaps clients before its
+    /// routed-event generation is published.
+    func cronSourceClient(gatewayID: String) -> GatewayClient? {
+        if gatewayID == LiveRuntime.shared.gatewayID {
+            return client
+        }
+        return MultiGatewayRuntime.shared.routedEvents[gatewayID]?.client
+    }
+
+    func cronMutationFenceAccepts(_ fence: CronSourceMutationFence,
+                                  expectedClient: GatewayClient? = nil) -> Bool {
+        if let expectedClient {
+            guard let currentClient = cronSourceClient(gatewayID: fence.gatewayID),
+                  currentClient === expectedClient else { return false }
+        }
+        return profileLifecycleAllowsGatewayTraffic(fence.gatewayID)
+            && cronSourceProfileLifecycleAccepts(fence)
+            && CronSourceMutationFence.accepts(
+                fence, primaryGatewayID: LiveRuntime.shared.gatewayID,
+                primaryGeneration: LiveRuntime.shared.generation,
+                retainedGenerations: MultiGatewayRuntime.shared.routedEventGenerations)
+    }
+
+    func cronMutationFenceAccepts(_ fence: CronRoutineMutationFence,
+                                  expectedClient: GatewayClient? = nil) -> Bool {
+        if let expectedClient {
+            guard let currentClient = cronSourceClient(gatewayID: fence.source.gatewayID),
+                  currentClient === expectedClient else { return false }
+        }
+        return profileLifecycleAllowsGatewayTraffic(fence.source.gatewayID)
+            && cronSourceProfileLifecycleAccepts(fence.source)
+            && cronRoutineProfileLifecycleAccepts(fence)
+            && CronRoutineMutationFence.accepts(
+                fence, currentTarget: routineTarget(fence.routineID),
+                primaryGatewayID: LiveRuntime.shared.gatewayID,
+                primaryGeneration: LiveRuntime.shared.generation,
+                retainedGenerations: MultiGatewayRuntime.shared.routedEventGenerations)
+    }
+
+    /// Detail screens use this before enabling edits or retrying a write. It
+    /// intentionally requires the same live client that produced the fence;
+    /// a matching row/generation alone is not authority during client handoff.
+    func cronRoutineAuthorityIsCurrent(_ fence: CronRoutineMutationFence) -> Bool {
+        guard let sourceClient = cronSourceClient(gatewayID: fence.source.gatewayID) else {
+            return false
+        }
+        return cronMutationFenceAccepts(fence, expectedClient: sourceClient)
+    }
+
+    /// A gateway/pool generation is not enough when the same connection keeps
+    /// serving a profile that is being retired, renamed, or recreated. Reads
+    /// and writes that carry a profile capture its lifecycle generation too.
+    private func cronSourceProfileLifecycleAccepts(_ fence: CronSourceMutationFence) -> Bool {
+        guard let profile = fence.lifecycleProfile ?? fence.profile, !profile.isEmpty else {
+            return true
+        }
+        return cronProfileLifecycleAccepts(gatewayID: fence.gatewayID, profile: profile,
+                                           generation: fence.profileGeneration)
+    }
+
+    private func cronRoutineProfileLifecycleAccepts(_ fence: CronRoutineMutationFence) -> Bool {
+        guard let profile = fence.target.profile, !profile.isEmpty else {
+            return fence.profileGeneration == nil
+        }
+        return cronProfileLifecycleAccepts(gatewayID: fence.source.gatewayID, profile: profile,
+                                           generation: fence.profileGeneration)
+    }
+
+    private func cronProfileLifecycleAccepts(gatewayID: String, profile: String,
+                                             generation: UInt64? = nil) -> Bool {
+        guard !profile.isEmpty else { return false }
+        let rosterID = gatewayID == LiveRuntime.shared.gatewayID
+            ? profile : GatewayBotRoute(gatewayID: gatewayID, profile: profile).qualifiedID
+        guard let token = profileLifecycleGenerationToken(for: rosterID),
+              token.route == GatewayBotRoute(gatewayID: gatewayID, profile: profile)
+        else { return false }
+        return profileLifecycleAccepts(token)
+            && (generation == nil || token.generation == generation)
+    }
+
+    func cronSourceChangedError() -> GatewayError {
+        GatewayError(code: CronMutationFenceError.sourceChanged,
+                     message: theme.copy.routineSourceChanged(theme.themeID))
+    }
+
+    /// A negative REST probe is source authority, not a gateway-id property.
+    /// The nil fallback keeps hand-seeded test/runtime state readable until the
+    /// first probe records its generation; all production writes use the
+    /// generation-aware setter below.
+    func cronRESTSupported(gatewayID: String,
+                           sourceFence: CronSourceMutationFence) -> Bool? {
+        guard let knownFence = CronDetailRuntime.shared.restSupportGeneration[gatewayID]
+        else { return CronDetailRuntime.shared.restSupported[gatewayID] }
+        // REST capability is gateway-wide, while a routine fence may carry a
+        // profile store. Compare the exact gateway generation (the client
+        // identity is checked by each caller), not that unrelated profile
+        // qualifier.
+        guard knownFence.gatewayID == sourceFence.gatewayID,
+              knownFence.generation == sourceFence.generation else { return nil }
+        return CronDetailRuntime.shared.restSupported[gatewayID]
+    }
+
+    func setCronRESTSupported(_ supported: Bool,
+                              gatewayID: String,
+                              sourceFence: CronSourceMutationFence) {
+        CronDetailRuntime.shared.restSupported[gatewayID] = supported
+        CronDetailRuntime.shared.restSupportGeneration[gatewayID] =
+            cronSourceMutationFence(gatewayID: gatewayID, profile: nil) ?? sourceFence
+    }
+
 }
 
 // MARK: - Legacy delegation quarantine
@@ -121,28 +735,43 @@ public extension AppModel {
         let runtime = CronDetailRuntime.shared
         let feeds = FeedsRuntime.shared
         let victims = feeds.cronJobs.filter { id, job in
-            Self.isLegacyDelegated(job) && job.isActive && !runtime.quarantined.contains(id)
+            guard let fence = cronRoutineMutationFence(id) else { return false }
+            return Self.isLegacyDelegated(job) && job.isActive
+                && !runtime.quarantined.contains(fence.activityIdentity)
         }
         guard !victims.isEmpty else { return }
         var paused = false
         for (id, job) in victims {
-            guard let target = feeds.routineTargets[id],
+            guard let fence = cronRoutineMutationFence(id),
+                  let target = feeds.routineTargets[id], target == fence.target,
                   let client = try? await routedClient(gatewayID: target.route.gatewayID)
             else { continue }
-            runtime.quarantined.insert(id)
+            guard cronMutationFenceAccepts(fence, expectedClient: client) else { continue }
+            let quarantineKey = fence.activityIdentity
+            runtime.quarantined.insert(quarantineKey)
             do {
                 try await client.cronSetPaused(jobID: target.route.jobID, paused: true,
                                                profile: target.profile)
+                guard cronMutationFenceAccepts(fence, expectedClient: client) else {
+                    runtime.quarantined.remove(quarantineKey)
+                    continue
+                }
                 paused = true
                 let botID = target.route.gatewayID == LiveRuntime.shared.gatewayID
                     ? target.bot.profile : target.bot.qualifiedID
                 recordActivity(kind: .routine, botID: botID,
                                text: theme.copy.routineQuarantined(theme.themeID) + " — " + job.displayTitle,
                                subtext: theme.copy.routineQuarantineWhy(theme.themeID),
-                               key: "cron-quarantine:\(id)")
+                               key: "cron-quarantine:\(fence.activityIdentity)")
             } catch {
                 // Retried on the next list; never surfaced as a list failure.
-                runtime.quarantined.remove(id)
+                // The marker is only a same-source dedupe lease. If the pause
+                // failed or the source was replaced while it was in flight,
+                // retaining it would permanently hide the victim from the
+                // next quarantine sweep and could leave an unsafe job armed.
+                if !CronQuarantinePolicy.retainMarkerAfterPauseFailure {
+                    runtime.quarantined.remove(quarantineKey)
+                }
             }
         }
         if paused { await refreshRoutinesLive(force: true) }
@@ -218,17 +847,48 @@ public extension AppModel {
     /// Everything past list/toggle/delete depends on it, so the surfaces that
     /// need it check this before rendering rather than after failing.
     func cronRESTReady(routineID: String? = nil, botID: String? = nil) -> Bool {
-        guard mode == .live,
+        // Create has no authoritative process-launch profile. Do not expose
+        // gateway-wide REST capability as if it authorized a future
+        // unscoped add/follow-up; the create form must stay socket-only.
+        guard mode == .live, let routineID,
               let gatewayID = routineGatewayID(routineID: routineID, botID: botID)
         else { return false }
-        return CronDetailRuntime.shared.restSupported[gatewayID] != false
+        guard let fence = cronRoutineMutationFence(routineID),
+              CronDetailAuthorityPolicy.allowsProfileScopedREST(profile: fence.target.profile),
+              cronRoutineAuthorityIsCurrent(fence) else { return false }
+        let sourceFence = fence.source
+        return cronRESTSupported(gatewayID: gatewayID, sourceFence: sourceFence) != false
             && gatewayRESTContext(gatewayID: gatewayID) != nil
     }
 
     func cronDeliveryTargets(routineID: String? = nil, botID: String? = nil)
         -> [CronDeliveryTarget] {
-        guard let gatewayID = routineGatewayID(routineID: routineID, botID: botID) else { return [] }
+        guard let (gatewayID, sourceFence) = cronDeliverySourceFence(
+            routineID: routineID, botID: botID),
+              let sourceClient = cronSourceClient(gatewayID: gatewayID),
+              cronMutationFenceAccepts(sourceFence, expectedClient: sourceClient),
+              CronDetailRuntime.shared.deliveryGeneration[gatewayID] == sourceFence else { return [] }
         return CronDetailRuntime.shared.deliveryTargets[gatewayID] ?? []
+    }
+
+    internal func cronDeliverySourceFence(routineID: String? = nil, botID: String? = nil)
+        -> (gatewayID: String, fence: CronSourceMutationFence)? {
+        let selectedTarget = routineID.flatMap(routineTarget)
+        let selectedBotRoute = botID.flatMap(GatewayBotRoute.init(qualifiedID:))
+        guard routineID == nil || selectedTarget != nil else { return nil }
+        // A routine target with nil profile is the process launch store. Keep
+        // that identity unscoped; never fall back to the editor's selected bot
+        // route for an existing row, because that display identity is not
+        // launch-store authority. The selected bot is only meaningful for the
+        // create-editor path, where there is no routine target yet.
+        let selectedProfile = selectedTarget != nil
+            ? selectedTarget?.profile
+            : selectedBotRoute?.profile
+        guard let gatewayID = selectedTarget?.route.gatewayID ?? selectedBotRoute?.gatewayID
+                ?? routineGatewayID(routineID: routineID, botID: botID),
+              let sourceFence = cronSourceMutationFence(
+                gatewayID: gatewayID, profile: selectedProfile) else { return nil }
+        return (gatewayID, sourceFence)
     }
 
     /// Load the raw job record. Returns nil when the gateway has no cron REST
@@ -236,67 +896,188 @@ public extension AppModel {
     @discardableResult
     func loadRoutineDetail(_ routineID: String) async -> CronJobDetail? {
         let runtime = CronDetailRuntime.shared
-        guard mode == .live, let target = routineTarget(routineID),
-              runtime.restSupported[target.route.gatewayID] != false,
+        guard mode == .live, let fence = cronRoutineMutationFence(routineID),
+              let target = routineTarget(routineID), target == fence.target,
+              // Hermes' unscoped REST lookup searches every profile store.
+              // Keep launch-store rows read-only until a scoped socket list
+              // establishes the exact profile; never retarget from a REST
+              // response that may belong to a colliding row.
+              CronDetailAuthorityPolicy.allowsProfileScopedREST(profile: target.profile),
+              cronRESTSupported(gatewayID: target.route.gatewayID,
+                                sourceFence: fence.source) != false,
+              let sourceClient = cronSourceClient(gatewayID: target.route.gatewayID),
               let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID),
               !target.route.jobID.isEmpty
-        else { return nil }
-        guard !runtime.loadingDetail.contains(routineID) else { return runtime.detail[routineID] }
+        else {
+            // A missing client/REST authority is not permission to keep an
+            // old raw record looking current. The socket listing remains the
+            // read-only fallback, while this cache must await a fresh detail.
+            clearCronRoutineCaches(routineID)
+            return nil
+        }
+        if runtime.loadingDetail.contains(routineID) {
+            if runtime.detailLoadingAuthority[routineID] != fence {
+                runtime.loadingDetail.remove(routineID)
+                runtime.detailLoadingAuthority.removeValue(forKey: routineID)
+            } else {
+                return nil
+            }
+        }
+        guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+            if CronReadCachePolicy.shouldClearBeforeRead(
+                sourceAccepted: false, cacheFence: runtime.detailAuthority[routineID],
+                operationFence: fence) {
+                runtime.detail.removeValue(forKey: routineID)
+                runtime.detailAuthority.removeValue(forKey: routineID)
+                runtime.detailError.removeValue(forKey: routineID)
+            }
+            return nil
+        }
+        // The old record is a display snapshot at best. It is not authority
+        // while this exact source is being read again, so the editor must lock
+        // until a fresh response arrives.
+        if CronReadCachePolicy.shouldClearBeforeRead(
+            sourceAccepted: true, cacheFence: runtime.detailAuthority[routineID],
+            operationFence: fence) {
+            runtime.detail.removeValue(forKey: routineID)
+            runtime.detailError.removeValue(forKey: routineID)
+            runtime.detailAuthority.removeValue(forKey: routineID)
+        }
         runtime.loadingDetail.insert(routineID)
-        defer { runtime.loadingDetail.remove(routineID) }
+        runtime.detailLoadingAuthority[routineID] = fence
+        defer {
+            if runtime.detailLoadingAuthority[routineID] == fence {
+                runtime.loadingDetail.remove(routineID)
+                runtime.detailLoadingAuthority.removeValue(forKey: routineID)
+            }
+        }
         do {
             let job = try await GatewayREST.cronJob(baseURL: base, credential: credential,
                                                     jobID: target.route.jobID,
                                                     profile: target.profile)
-            guard routineTarget(routineID) == target else { return nil }
-            runtime.restSupported[target.route.gatewayID] = true
+            guard CronJobAcknowledgementPolicy.accepts(
+                job, jobID: target.route.jobID, profile: target.profile) else {
+                throw AckValidationError(
+                    operation: "Load routine detail",
+                    detail: "Hermes did not echo the exact cron job id and profile.")
+            }
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else { return nil }
+            setCronRESTSupported(true, gatewayID: target.route.gatewayID,
+                                 sourceFence: fence.source)
             runtime.detail[routineID] = job
+            runtime.detailAuthority[routineID] = fence
             runtime.detailError[routineID] = nil
             return job
         } catch let error as GatewayError where error.code == GatewayREST.cronRESTUnavailable {
-            guard routineTarget(routineID) == target else { return nil }
-            runtime.restSupported[target.route.gatewayID] = false
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else { return nil }
+            setCronRESTSupported(false, gatewayID: target.route.gatewayID,
+                                 sourceFence: fence.source)
+            if runtime.detailAuthority[routineID].map({ $0 == fence }) ?? true {
+                runtime.detail.removeValue(forKey: routineID)
+                runtime.detailAuthority.removeValue(forKey: routineID)
+                runtime.detailError.removeValue(forKey: routineID)
+            }
             return nil
         } catch let error as GatewayError where error.code == 404 {
-            guard routineTarget(routineID) == target else { return nil }
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else { return nil }
             // The job is gone (a finite one-shot deletes itself after its last
             // run). Drop the stale cache rather than reporting a failure.
-            runtime.detail[routineID] = nil
-            runtime.detailError[routineID] = nil
+            if runtime.detailAuthority[routineID].map({ $0 == fence }) ?? true {
+                runtime.detail.removeValue(forKey: routineID)
+                runtime.detailAuthority.removeValue(forKey: routineID)
+                runtime.detailError[routineID] = nil
+            }
             return nil
         } catch {
-            guard routineTarget(routineID) == target else { return nil }
-            runtime.detailError[routineID] = Self.reason(error)
-            return runtime.detail[routineID]
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else { return nil }
+            if runtime.detailAuthority[routineID].map({ $0 == fence }) ?? true {
+                runtime.detail.removeValue(forKey: routineID)
+                runtime.detailAuthority.removeValue(forKey: routineID)
+                runtime.detailError[routineID] = Self.reason(error)
+            }
+            return nil
         }
     }
 
     /// Load this job's run sessions, newest first.
     func loadRoutineRuns(_ routineID: String, limit: Int = 20) async {
         let runtime = CronDetailRuntime.shared
-        guard mode == .live, let target = routineTarget(routineID),
-              runtime.restSupported[target.route.gatewayID] != false,
+        guard mode == .live, let fence = cronRoutineMutationFence(routineID),
+              let target = routineTarget(routineID), target == fence.target,
+              CronDetailAuthorityPolicy.allowsProfileScopedREST(profile: target.profile),
+              cronRESTSupported(gatewayID: target.route.gatewayID,
+                                sourceFence: fence.source) != false,
+              let sourceClient = cronSourceClient(gatewayID: target.route.gatewayID),
               let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID),
               !target.route.jobID.isEmpty
-        else { return }
-        guard !runtime.loadingRuns.contains(routineID) else { return }
+        else {
+            if routineTarget(routineID) == nil {
+                clearCronRoutineCaches(routineID)
+            } else {
+                runtime.runs.removeValue(forKey: routineID)
+                runtime.runsAuthority.removeValue(forKey: routineID)
+                runtime.runsLoadingAuthority.removeValue(forKey: routineID)
+                runtime.loadingRuns.remove(routineID)
+            }
+            return
+        }
+        if runtime.loadingRuns.contains(routineID) {
+            if runtime.runsLoadingAuthority[routineID] != fence {
+                runtime.loadingRuns.remove(routineID)
+                runtime.runsLoadingAuthority.removeValue(forKey: routineID)
+            } else {
+                return
+            }
+        }
+        guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+            if CronReadCachePolicy.shouldClearBeforeRead(
+                sourceAccepted: false, cacheFence: runtime.runsAuthority[routineID],
+                operationFence: fence) {
+                runtime.runs.removeValue(forKey: routineID)
+                runtime.runsAuthority.removeValue(forKey: routineID)
+            }
+            return
+        }
+        if CronReadCachePolicy.shouldClearBeforeRead(
+            sourceAccepted: true, cacheFence: runtime.runsAuthority[routineID],
+            operationFence: fence) {
+            runtime.runs.removeValue(forKey: routineID)
+            runtime.runsAuthority.removeValue(forKey: routineID)
+        }
         runtime.loadingRuns.insert(routineID)
-        defer { runtime.loadingRuns.remove(routineID) }
+        runtime.runsLoadingAuthority[routineID] = fence
+        defer {
+            if runtime.runsLoadingAuthority[routineID] == fence {
+                runtime.loadingRuns.remove(routineID)
+                runtime.runsLoadingAuthority.removeValue(forKey: routineID)
+            }
+        }
         do {
             let rows = try await GatewayREST.cronJobRuns(baseURL: base, credential: credential,
                                                          jobID: target.route.jobID,
                                                          profile: target.profile,
                                                          limit: limit)
-            guard routineTarget(routineID) == target else { return }
-            runtime.restSupported[target.route.gatewayID] = true
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else { return }
+            setCronRESTSupported(true, gatewayID: target.route.gatewayID,
+                                 sourceFence: fence.source)
             runtime.runs[routineID] = rows
+            runtime.runsAuthority[routineID] = fence
         } catch let error as GatewayError where error.code == GatewayREST.cronRESTUnavailable {
-            guard routineTarget(routineID) == target else { return }
-            runtime.restSupported[target.route.gatewayID] = false
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else { return }
+            setCronRESTSupported(false, gatewayID: target.route.gatewayID,
+                                 sourceFence: fence.source)
+            if runtime.runsAuthority[routineID].map({ $0 == fence }) ?? true {
+                runtime.runs.removeValue(forKey: routineID)
+                runtime.runsAuthority.removeValue(forKey: routineID)
+            }
         } catch {
-            // Deliberately leaves the cache untouched. "It hasn't run yet" is a
-            // CLAIM, and a read that failed cannot make it — the section stays
-            // in its unknown state instead of asserting an empty history.
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else { return }
+            // A failed read cannot make an old history authoritative. Clear it
+            // so the screen remains in its honest loading/unknown state.
+            if runtime.runsAuthority[routineID].map({ $0 == fence }) ?? true {
+                runtime.runs.removeValue(forKey: routineID)
+                runtime.runsAuthority.removeValue(forKey: routineID)
+            }
         }
     }
 
@@ -304,21 +1085,64 @@ public extension AppModel {
     /// derived from configured platforms, which do not change mid-session.
     func loadCronDeliveryTargets(routineID: String? = nil, botID: String? = nil) async {
         let runtime = CronDetailRuntime.shared
+        guard let (gatewayID, sourceFence) = cronDeliverySourceFence(
+            routineID: routineID, botID: botID) else { return }
+        if let loadedFence = runtime.deliveryGeneration[gatewayID],
+           loadedFence != sourceFence {
+            runtime.deliveryTargets.removeValue(forKey: gatewayID)
+            runtime.deliveryLoaded.remove(gatewayID)
+        }
         guard mode == .live,
-              let gatewayID = routineGatewayID(routineID: routineID, botID: botID),
-              !runtime.deliveryLoaded.contains(gatewayID),
-              runtime.restSupported[gatewayID] != false,
+              cronRESTSupported(gatewayID: gatewayID, sourceFence: sourceFence) != false,
+              let sourceClient = cronSourceClient(gatewayID: gatewayID),
               let (base, credential) = gatewayRESTContext(gatewayID: gatewayID) else { return }
+        guard !runtime.deliveryLoaded.contains(gatewayID) else { return }
+        guard cronMutationFenceAccepts(sourceFence, expectedClient: sourceClient) else {
+            runtime.deliveryTargets.removeValue(forKey: gatewayID)
+            runtime.deliveryLoaded.remove(gatewayID)
+            runtime.deliveryGeneration.removeValue(forKey: gatewayID)
+            return
+        }
         runtime.deliveryLoaded.insert(gatewayID)
+        runtime.deliveryGeneration[gatewayID] = sourceFence
         do {
             let targets = try await GatewayREST.cronDeliveryTargets(
                 baseURL: base, credential: credential)
-            guard gatewayRESTContext(gatewayID: gatewayID) != nil else { return }
+            guard cronMutationFenceAccepts(sourceFence, expectedClient: sourceClient) else {
+                if runtime.deliveryGeneration[gatewayID] == sourceFence {
+                    runtime.deliveryTargets.removeValue(forKey: gatewayID)
+                    runtime.deliveryLoaded.remove(gatewayID)
+                    runtime.deliveryGeneration.removeValue(forKey: gatewayID)
+                }
+                return
+            }
             runtime.deliveryTargets[gatewayID] = targets
+        } catch let error as GatewayError where error.code == GatewayREST.cronRESTUnavailable {
+            // Delivery-target discovery and job update are routes on the same
+            // Hermes cron router. This probe is what lets a legacy gateway
+            // become inspect-only before the form offers a REST-only effort
+            // picker that could never save.
+            guard cronMutationFenceAccepts(sourceFence, expectedClient: sourceClient) else {
+                if runtime.deliveryGeneration[gatewayID] == sourceFence {
+                    runtime.deliveryTargets.removeValue(forKey: gatewayID)
+                    runtime.deliveryLoaded.remove(gatewayID)
+                    runtime.deliveryGeneration.removeValue(forKey: gatewayID)
+                }
+                return
+            }
+            setCronRESTSupported(false, gatewayID: gatewayID, sourceFence: sourceFence)
+            runtime.deliveryLoaded.remove(gatewayID)
+            runtime.deliveryGeneration.removeValue(forKey: gatewayID)
         } catch {
             // No targets discovered = the picker stays hidden and every job
             // keeps whatever route it already has.
-            runtime.deliveryLoaded.remove(gatewayID)
+            if runtime.deliveryGeneration[gatewayID] == sourceFence {
+                runtime.deliveryLoaded.remove(gatewayID)
+                runtime.deliveryGeneration.removeValue(forKey: gatewayID)
+                if cronMutationFenceAccepts(sourceFence, expectedClient: sourceClient) {
+                    runtime.deliveryTargets.removeValue(forKey: gatewayID)
+                }
+            }
         }
     }
 
@@ -336,11 +1160,12 @@ public extension AppModel {
     internal func routineRunBotID(_ run: CronRun, routineID: String,
                                   fallbackBotID: String) -> String? {
         // Precedence: the profile the server stamped on the row, then the scope
-        // the job's own RPCs use, then the launch profile. `run.id` is a
-        // SESSION id, never a job id, so it must not be used as a scope key.
-        let owner = run.profile ?? cronScope(routineID)
-            ?? LiveRuntime.shared.defaultBotID ?? fallbackBotID
-        guard let target = routineTarget(routineID) else { return nil }
+        // the job's own RPCs use, then the row's exact bot tag. An unscoped row
+        // with no server profile remains unresolved. `run.id` is a SESSION id,
+        // never a job id, so it must not be used as a scope key.
+        guard let target = routineTarget(routineID),
+              let owner = run.profile ?? cronScope(routineID) ?? target.profile,
+              !owner.isEmpty else { return nil }
         return target.route.gatewayID == LiveRuntime.shared.gatewayID
             ? owner
             : GatewayBotRoute(gatewayID: target.route.gatewayID, profile: owner).qualifiedID
@@ -367,7 +1192,8 @@ public extension AppModel {
     func scheduleRoutine(botID: String, title: String, schedule: String, instruction: String,
                          repeatForever: Bool = true, continuity: Bool = false,
                          deliver: [String] = [], model: String? = nil,
-                         provider: String? = nil) async throws {
+                         provider: String? = nil,
+                         reasoningEffort: String? = nil) async throws -> CronCreateOutcome {
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanInstruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTitle.isEmpty, !cleanInstruction.isEmpty else {
@@ -385,50 +1211,215 @@ public extension AppModel {
               let gatewayID = routineGatewayID(botID: botID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
         }
-        let botProfile = GatewayBotRoute(qualifiedID: botID)?.profile ?? botID
-        let client = try await routedClient(gatewayID: gatewayID)
-
-        let jobID = try await client.cronAdd(
-            name: Self.namespacedTitle(botID: botProfile, title: cleanTitle),
-            schedule: normalized,
-            prompt: Self.delegatedPrompt(botID: botProfile, title: cleanTitle,
-                                         instruction: cleanInstruction),
-            repeatCount: repeatForever ? nil : 1,
-            continuity: continuity)
-
-        recordActivity(kind: .routine, botID: botID,
-                       text: theme.copy.feedRoutineAdded(theme.themeID) + " — " + cleanTitle,
-                       subtext: normalized)
-
-        var extras: [String: JSONValue] = [:]
-        if !deliver.isEmpty { extras["deliver"] = .string(deliver.joined(separator: ",")) }
-        if let model, !model.isEmpty { extras["model"] = .string(model) }
-        if let provider, !provider.isEmpty { extras["provider"] = .string(provider) }
-
-        guard !extras.isEmpty, !jobID.isEmpty,
-              let (base, credential) = gatewayRESTContext(gatewayID: gatewayID),
-              CronDetailRuntime.shared.restSupported[gatewayID] != false else {
-            await refreshRoutinesLive(force: true)
-            return
+        // Hermes' unscoped cron.manage call addresses the process launch
+        // HERMES_HOME, but this client has no authoritative process-profile
+        // response. Keep the wire unscoped; never substitute a roster default.
+        let launchProfile: String? = nil
+        guard let sourceFence = cronSourceMutationFence(
+            gatewayID: gatewayID, profile: nil) else {
+            throw GatewayRouteError.noRoute
         }
+        let client = try await routedClient(gatewayID: gatewayID)
+        guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
+            throw CancellationError()
+        }
+        // Capture the REST authority before the first suspension. If the
+        // socket add commits, finishing its PUT is one transaction and must
+        // keep using this exact source/profile even if navigation changes.
+        let restAuthority = gatewayRESTContext(gatewayID: gatewayID)
+        let botProfile = GatewayBotRoute(qualifiedID: botID)?.profile ?? botID
+
+        // Validate every authored value before the socket creates anything.
+        // Create is necessarily a two-step transaction (cron.manage add, then
+        // REST PUT for fields the socket cannot carry); rejecting bad effort
+        // after step one would leave a live, partially configured routine.
+        let canonicalEffort: String?
+        if let reasoningEffort {
+            canonicalEffort = try CronReasoningEffort.canonicalMutation(reasoningEffort)
+        } else {
+            canonicalEffort = nil
+        }
+
+        // No launch profile means no REST-only create fields. In particular,
+        // the editor's default `local` delivery is a UI floor, not a wire
+        // update; serializing it here would turn an ordinary socket create
+        // into an ambiguous cross-profile follow-up.
+        let extras = CronCreateRESTPolicy.extras(
+            launchProfile: launchProfile, deliver: deliver, model: model,
+            provider: provider, reasoningEffort: canonicalEffort)
+
+        let jobID: String
+        do {
+            jobID = try await client.cronAdd(
+                name: Self.namespacedTitle(botID: botProfile, title: cleanTitle),
+                schedule: normalized,
+                prompt: Self.delegatedPrompt(botID: botProfile, title: cleanTitle,
+                                             instruction: cleanInstruction,
+                                             launchProfile: launchProfile),
+                profile: launchProfile,
+                repeatCount: repeatForever ? nil : 1,
+                continuity: continuity)
+        } catch {
+            // A timeout/socket loss can happen after Hermes accepted the add.
+            // There is no job id to safely reconcile, so dismiss the editor
+            // with a warning-shaped terminal outcome instead of inviting a
+            // duplicate retry. Classify the error before consulting the
+            // source fence: validation/tool refusals remain thrown even if a
+            // source replacement raced this call. Only ambiguous transport
+            // failures become unresolved partials.
+            guard CronCreateAddFailurePolicy.isAmbiguousAfterSend(error) else {
+                throw error
+            }
+            let reason = CronCreateAddFailurePolicy.ambiguousPartialReason(
+                for: error,
+                sourceFenceStillCurrent: cronMutationFenceAccepts(
+                    sourceFence, expectedClient: client)) ?? .addOutcomeUnknown
+            return .acceptedPartial(CronCreateAddFailurePolicy.unresolvedPartial(
+                reason: reason))
+        }
+
+        // An empty acknowledgement is not a known accepted job. Check it
+        // before the known-job source fence: if a source replacement raced
+        // this response, the outcome is still unresolved pre-ACK identity,
+        // never a known-job `.sourceChanged` partial.
+        if jobID.isEmpty {
+            let reason = CronCreateAddFailurePolicy.unresolvedAddReason(
+                sourceFenceStillCurrent: cronMutationFenceAccepts(
+                    sourceFence, expectedClient: client))
+            return .acceptedPartial(CronCreateAddFailurePolicy.unresolvedPartial(
+                reason: reason))
+        }
+
+        // `cronAdd` has committed an irreversible job.  Re-check the exact
+        // source before publishing activity, refreshing the list, or issuing
+        // the REST half.  A retained pool client can be replaced while the
+        // socket call is suspended; in that case preserve the accepted add as
+        // a recoverable partial result and never retry it against a new source.
+        guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
+            return .acceptedPartial(CronAcceptedPartialOutcome(
+                jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                reason: .sourceChanged))
+        }
+        let postAddDecision = CronCreatePostAddPolicy.decision(
+            sourceFence: sourceFence,
+            primaryGatewayID: LiveRuntime.shared.gatewayID,
+            primaryGeneration: LiveRuntime.shared.generation,
+            retainedGenerations: MultiGatewayRuntime.shared.routedEventGenerations,
+            hasRESTOnlyFields: !extras.isEmpty,
+            hasJobID: !jobID.isEmpty,
+            hasRESTAuthority: restAuthority != nil && launchProfile != nil,
+            restSupported: launchProfile != nil
+                && cronRESTSupported(gatewayID: gatewayID,
+                                     sourceFence: sourceFence) != false)
+        guard postAddDecision != .acceptedButStale else {
+            return .acceptedPartial(CronAcceptedPartialOutcome(
+                jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                reason: .sourceChanged))
+        }
+
+        guard postAddDecision != .acceptedWithoutREST else {
+            guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
+                return .acceptedPartial(CronAcceptedPartialOutcome(
+                    jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                    reason: .sourceChanged))
+            }
+            await refreshRoutinesLive(force: true)
+            guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
+                return .acceptedPartial(CronAcceptedPartialOutcome(
+                    jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                    reason: .sourceChanged))
+            }
+            recordActivity(kind: .routine, botID: botID,
+                           text: theme.copy.feedRoutineAdded(theme.themeID) + " — " + cleanTitle,
+                           subtext: normalized)
+            return .acceptedPartial(CronAcceptedPartialOutcome(
+                jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                reason: .followUpUnavailable))
+        }
+        guard postAddDecision.shouldIssueRESTPatch,
+              let (base, credential) = restAuthority else {
+            await refreshRoutinesLive(force: true)
+            guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
+                return .acceptedPartial(CronAcceptedPartialOutcome(
+                    jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                    reason: .sourceChanged))
+            }
+            recordActivity(kind: .routine, botID: botID,
+                           text: theme.copy.feedRoutineAdded(theme.themeID) + " — " + cleanTitle,
+                           subtext: normalized)
+            return .completed
+        }
+        var sourceChangedAfterREST = false
         do {
             let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
-                                                            jobID: jobID, profile: nil,
+                                                            jobID: jobID, profile: launchProfile,
                                                             updates: extras)
-            let routineID = gatewayID == LiveRuntime.shared.gatewayID
-                ? jobID
-                : GatewayRoutineRoute(gatewayID: gatewayID, jobID: jobID).qualifiedID
-            CronDetailRuntime.shared.detail[routineID] = saved
+            guard CronJobAcknowledgementPolicy.accepts(
+                saved, jobID: jobID, profile: launchProfile) else {
+                throw AckValidationError(
+                    operation: "Create routine",
+                    detail: "Hermes did not echo the exact cron job id and profile.")
+            }
+            guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
+                sourceChangedAfterREST = true
+                throw cronSourceChangedError()
+            }
+            let routineID: String
+            if case .primary = sourceFence.generation {
+                routineID = jobID
+            } else {
+                routineID = GatewayRoutineRoute(
+                    gatewayID: gatewayID, jobID: jobID).qualifiedID
+            }
             await refreshRoutinesLive(force: true)
+            guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
+                sourceChangedAfterREST = true
+                throw cronSourceChangedError()
+            }
+            guard let detailFence = cronRoutineMutationFence(routineID),
+                  detailFence.target.route.gatewayID == gatewayID,
+                  detailFence.target.route.jobID == jobID,
+                  detailFence.target.profile == launchProfile,
+                  detailFence.source.profile == launchProfile,
+                  cronMutationFenceAccepts(detailFence, expectedClient: client) else {
+                throw GatewayError(code: -4,
+                                   message: "cron list did not confirm the created job's profile")
+            }
+            CronDetailRuntime.shared.detail[routineID] = saved
+            CronDetailRuntime.shared.detailAuthority[routineID] = detailFence
+            recordActivity(kind: .routine, botID: botID,
+                           text: theme.copy.feedRoutineAdded(theme.themeID) + " — " + cleanTitle,
+                           subtext: normalized)
+            return .completed
         } catch {
-            if let gateway = error as? GatewayError, gateway.code == GatewayREST.cronRESTUnavailable {
-                CronDetailRuntime.shared.restSupported[gatewayID] = false
+            // A transport error after the request began is ambiguous: the
+            // gateway may have accepted the PUT even though no response made
+            // it back. Re-check the exact source in the catch, not only after
+            // a successful response, so a replacement source never turns this
+            // into an ordinary retryable "not routed" result.
+            sourceChangedAfterREST = !cronMutationFenceAccepts(
+                sourceFence, expectedClient: client)
+            if !sourceChangedAfterREST,
+               let gateway = error as? GatewayError,
+               gateway.code == GatewayREST.cronRESTUnavailable {
+                setCronRESTSupported(false, gatewayID: gatewayID, sourceFence: sourceFence)
             }
             // The routine exists and WILL fire; only the route/pin did not
             // land. Say exactly that — the alternative, deleting a job the
             // gateway already scheduled, is worse than an unrouted one.
-            await refreshRoutinesLive(force: true)
-            throw GatewayError(code: -4, message: theme.copy.routineMadeNotRouted(theme.themeID))
+            if !sourceChangedAfterREST {
+                await refreshRoutinesLive(force: true)
+                sourceChangedAfterREST = !cronMutationFenceAccepts(
+                    sourceFence, expectedClient: client)
+            }
+            if sourceChangedAfterREST {
+                return .acceptedPartial(CronAcceptedPartialOutcome(
+                    jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                    reason: .sourceChanged))
+            }
+            return .acceptedPartial(CronAcceptedPartialOutcome(
+                jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                reason: .followUpAmbiguous))
         }
     }
 
@@ -437,13 +1428,25 @@ public extension AppModel {
     /// field cannot be cleared by a partial write.
     ///
     /// - Parameter model/provider: `.some("")` clears a pin, `nil` leaves it.
+    /// - Parameter reasoningEffort: nil leaves the raw stored value untouched;
+    ///   an empty string clears it; a level sets a canonical per-job pin.
     func saveRoutine(_ job: CronJobDetail, routineID: String, botID: String,
                      title: String, schedule: String,
                      instruction: String, deliver: [String]?, model: String?,
-                     provider: String?, continuity: Bool?) async throws {
-        guard mode == .live, let target = routineTarget(routineID),
+                     provider: String?, reasoningEffort: String? = nil,
+                     continuity: Bool?) async throws {
+        guard mode == .live, let fence = cronRoutineMutationFence(routineID),
+              let target = routineTarget(routineID), target == fence.target,
+              target.profile != nil,
+              let sourceClient = cronSourceClient(gatewayID: target.route.gatewayID),
               let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
+        }
+        guard CronJobAcknowledgementPolicy.accepts(
+            job, jobID: target.route.jobID, profile: target.profile) else {
+            throw AckValidationError(
+                operation: "Save routine",
+                detail: "The editor does not hold an exact cron job/profile record.")
         }
         var updates: [String: JSONValue] = [:]
 
@@ -474,7 +1477,8 @@ public extension AppModel {
                 throw GatewayError(code: -1, message: theme.copy.routineNeedsBoth(theme.themeID))
             }
             let rewritten = Self.delegatedPrompt(botID: target.bot.profile, title: cleanTitle,
-                                                 instruction: cleanInstruction)
+                                                 instruction: cleanInstruction,
+                                                 launchProfile: target.profile)
             if rewritten != job.prompt { updates["prompt"] = .string(rewritten) }
         }
 
@@ -494,6 +1498,13 @@ public extension AppModel {
             if p != (job.provider ?? "") { updates["provider"] = p.isEmpty ? .null : .string(p) }
         }
 
+        // Unlike model/provider, this pin is one independent axis. Omission
+        // must mean "do not touch": that is what preserves a future or
+        // hand-edited value during an unrelated title/schedule save.
+        if !job.isScriptOnly, let reasoningEffort {
+            updates["reasoning_effort"] = try CronReasoningEffort.wireMutation(reasoningEffort)
+        }
+
         if let continuity, continuity != job.continuity {
             // Preserve any real cross-job dependency; only the reserved "self"
             // entry is the continuity toggle (cronjob_tools.py:665).
@@ -503,21 +1514,47 @@ public extension AppModel {
         }
 
         guard !updates.isEmpty else { return }
+        guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+            throw cronSourceChangedError()
+        }
+        var savedDetail: CronJobDetail?
         do {
-            let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
-                                                            jobID: target.route.jobID,
-                                                            profile: target.profile,
-                                                            updates: updates)
-            guard routineTarget(routineID) == target else { return }
-            CronDetailRuntime.shared.detail[routineID] = saved
-            CronDetailRuntime.shared.detailError[routineID] = nil
+            let response = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
+                                                               jobID: target.route.jobID,
+                                                               profile: target.profile,
+                                                               updates: updates)
+            guard CronJobAcknowledgementPolicy.accepts(
+                response, jobID: target.route.jobID, profile: target.profile) else {
+                throw AckValidationError(
+                    operation: "Save routine",
+                    detail: "Hermes did not echo the exact cron job id and profile.")
+            }
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+                throw cronSourceChangedError()
+            }
+            savedDetail = response
         } catch let error as GatewayError where error.code == GatewayREST.cronRESTUnavailable {
-            if routineTarget(routineID) == target {
-                CronDetailRuntime.shared.restSupported[target.route.gatewayID] = false
+            if cronMutationFenceAccepts(fence, expectedClient: sourceClient) {
+                setCronRESTSupported(false, gatewayID: target.route.gatewayID,
+                                     sourceFence: fence.source)
+                throw error
+            }
+            throw cronSourceChangedError()
+        } catch {
+            if !cronMutationFenceAccepts(fence, expectedClient: sourceClient) {
+                throw cronSourceChangedError()
             }
             throw error
         }
         await refreshRoutinesLive(force: true)
+        guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+            throw cronSourceChangedError()
+        }
+        if let savedDetail {
+            CronDetailRuntime.shared.detail[routineID] = savedDetail
+            CronDetailRuntime.shared.detailAuthority[routineID] = fence
+            CronDetailRuntime.shared.detailError[routineID] = nil
+        }
     }
 
     /// Pin the inference axes the drift guard recorded at creation.
@@ -528,9 +1565,18 @@ public extension AppModel {
     /// gateway's current default — restores the behaviour the routine was
     /// created with, which is what "keep the original values" means there.
     func pinRoutineInference(_ job: CronJobDetail, routineID: String) async throws {
-        guard mode == .live, let target = routineTarget(routineID),
+        guard mode == .live, let fence = cronRoutineMutationFence(routineID),
+              let target = routineTarget(routineID), target == fence.target,
+              target.profile != nil,
+              let sourceClient = cronSourceClient(gatewayID: target.route.gatewayID),
               let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
+        }
+        guard CronJobAcknowledgementPolicy.accepts(
+            job, jobID: target.route.jobID, profile: target.profile) else {
+            throw AckValidationError(
+                operation: "Pin routine inference",
+                detail: "The editor does not hold an exact cron job/profile record.")
         }
         var updates: [String: JSONValue] = [:]
         if job.provider == nil, let snapshot = job.providerSnapshot {
@@ -540,14 +1586,47 @@ public extension AppModel {
             updates["model"] = .string(snapshot)
         }
         guard !updates.isEmpty else { return }
-        let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
-                                                        jobID: target.route.jobID,
-                                                        profile: target.profile,
-                                                        updates: updates)
-        guard routineTarget(routineID) == target else { return }
-        CronDetailRuntime.shared.detail[routineID] = saved
-        CronDetailRuntime.shared.detailError[routineID] = nil
+        guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+            throw cronSourceChangedError()
+        }
+        var savedDetail: CronJobDetail?
+        do {
+            let response = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
+                                                               jobID: target.route.jobID,
+                                                               profile: target.profile,
+                                                               updates: updates)
+            guard CronJobAcknowledgementPolicy.accepts(
+                response, jobID: target.route.jobID, profile: target.profile) else {
+                throw AckValidationError(
+                    operation: "Pin routine inference",
+                    detail: "Hermes did not echo the exact cron job id and profile.")
+            }
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+                throw cronSourceChangedError()
+            }
+            savedDetail = response
+        } catch let error as GatewayError where error.code == GatewayREST.cronRESTUnavailable {
+            if cronMutationFenceAccepts(fence, expectedClient: sourceClient) {
+                setCronRESTSupported(false, gatewayID: target.route.gatewayID,
+                                     sourceFence: fence.source)
+                throw error
+            }
+            throw cronSourceChangedError()
+        } catch {
+            if !cronMutationFenceAccepts(fence, expectedClient: sourceClient) {
+                throw cronSourceChangedError()
+            }
+            throw error
+        }
         await refreshRoutinesLive(force: true)
+        guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+            throw cronSourceChangedError()
+        }
+        if let savedDetail {
+            CronDetailRuntime.shared.detail[routineID] = savedDetail
+            CronDetailRuntime.shared.detailAuthority[routineID] = fence
+            CronDetailRuntime.shared.detailError[routineID] = nil
+        }
     }
 }
 
@@ -573,8 +1652,10 @@ public extension AppModel {
     /// text between single quotes, so an instruction containing an apostrophe
     /// escaped the quoting. Jobs still carrying the unmarked form are
     /// quarantined on sight (`quarantineLegacyRoutines`).
-    static func delegatedPrompt(botID: String, title: String, instruction: String) -> String {
-        if botID.lowercased() == (LiveRuntime.shared.defaultBotID ?? "").lowercased() {
+    static func delegatedPrompt(botID: String, title: String, instruction: String,
+                                launchProfile: String? = nil) -> String {
+        if let launchProfile,
+           botID.lowercased() == launchProfile.lowercased() {
             return instruction
         }
         return safeRoutineMarker + """
@@ -666,6 +1747,30 @@ public extension CopyPack {
         }
     }
 
+    func routineDetailLoading(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Loading the full routine detail…"
+        case .control: "READING AUTHORITATIVE JOB DETAIL…"
+        case .ink: "Reading the whole rite…"
+        }
+    }
+
+    func routineDetailUnavailable(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The full routine detail is unavailable, so editing is paused."
+        case .control: "DETAIL UNAVAILABLE · EDITING LOCKED UNTIL READ SUCCEEDS"
+        case .ink: "The whole rite could not be read, so its words remain untouched."
+        }
+    }
+
+    func routineRetryDetail(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Retry detail"
+        case .control: "RETRY DETAIL"
+        case .ink: "Read again"
+        }
+    }
+
     func routineEditAction(_ t: ThemeID) -> String {
         switch t {
         case .soft: "Edit"
@@ -752,6 +1857,78 @@ public extension CopyPack {
         case .soft: "Model"
         case .control: "MODEL PIN"
         case .ink: "The mind it uses"
+        }
+    }
+
+    func routineReasoningLabel(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Reasoning"
+        case .control: "REASONING EFFORT"
+        case .ink: "How deeply it thinks"
+        }
+    }
+
+    func routineReasoningFollowConfig(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Follow model / gateway settings"
+        case .control: "CONFIG RESOLUTION"
+        case .ink: "Follow the mind's own setting"
+        }
+    }
+
+    func routineReasoningOff(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Off"
+        case .control: "OFF"
+        case .ink: "No extended thought"
+        }
+    }
+
+    func routineReasoningUnknown(_ t: ThemeID, value: String) -> String {
+        switch t {
+        case .soft: "Unknown stored value: \(value)"
+        case .control: "UNKNOWN · \(value)"
+        case .ink: "An unknown mark: \(value)"
+        }
+    }
+
+    func routineReasoningPickerHint(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Choose this routine's reasoning effort, or follow configuration."
+        case .control: "SELECT PER-JOB EFFORT OR CONFIG RESOLUTION."
+        case .ink: "Choose this rite's depth of thought, or let its mind decide."
+        }
+    }
+
+    func routineReasoningConfigPrecedence(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Resolved when it runs: this model's override first, then the gateway default."
+        case .control: "RUN-TIME RESOLUTION · MODEL OVERRIDE > AGENT DEFAULT"
+        case .ink: "When it is kept, the model's own rule comes first, then the gateway's."
+        }
+    }
+
+    func routineReasoningPinned(_ t: ThemeID, value: String) -> String {
+        switch t {
+        case .soft: "Routine override: \(value). It wins over model and gateway settings; the provider may clamp unsupported levels."
+        case .control: "JOB PIN · \(value.uppercased()) · OVERRIDES MODEL/GLOBAL; PROVIDER MAY CLAMP"
+        case .ink: "This rite asks for \(value). It outranks the model and gateway rules, though the provider may temper it."
+        }
+    }
+
+    func routineReasoningInvalid(_ t: ThemeID, value: String) -> String {
+        switch t {
+        case .soft: "“\(value)” is not recognized. Hermes ignores it and follows configuration at run time; unrelated edits preserve it."
+        case .control: "INVALID STORED VALUE \(value.debugDescription) · IGNORED AT RUN TIME · CONFIG WINS"
+        case .ink: "“\(value)” is unknown. Hermes passes it by and follows configuration; other amendments leave the mark untouched."
+        }
+    }
+
+    func routineReasoningUnusedForScript(_ t: ThemeID, value: String) -> String {
+        switch t {
+        case .soft: "Stored as \(value), but unused: this routine runs a script without an agent or model."
+        case .control: "STORED \(value.uppercased()) · INERT FOR NO-AGENT SCRIPT"
+        case .ink: "Written as \(value), but unused: this rite runs only its script, with no mind invoked."
         }
     }
 
@@ -974,6 +2151,57 @@ public extension CopyPack {
         case .control: "JOB CREATED · DELIVER/MODEL NOT APPLIED — EDIT TO RETRY"
         case .ink: "The rite is inscribed, but its channel and mind were not bound. "
             + "Open it and try once more."
+        }
+    }
+
+    func routineMadeSourceChanged(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The routine was created, but the gateway changed before Talaria "
+            + "could confirm it. Open it to verify; no automatic retry was attempted."
+        case .control: "JOB CREATED · SOURCE CHANGED BEFORE CONFIRMATION — VERIFY IN EDITOR"
+        case .ink: "The rite is inscribed, but its gateway changed before it could be "
+            + "witnessed. Open it to verify; it was not retried."
+        }
+    }
+
+    func routineMadeFollowUpAmbiguous(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The routine was created, but Talaria could not confirm its delivery or model settings. "
+            + "Open it to verify; do not schedule it again."
+        case .control: "JOB CREATED · FOLLOW-UP NOT CONFIRMED — OPEN TO VERIFY; DO NOT RETRY CREATE"
+        case .ink: "The rite is inscribed, but its second witness did not arrive. "
+            + "Open it to verify; do not inscribe another."
+        }
+    }
+
+    /// Used only when the socket add itself returned no authoritative
+    /// acknowledgement. This copy must never imply that the job was created,
+    /// scheduled, or safe to retry.
+    func toastRoutineOutcomeUnknown(_ title: String, _ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Couldn’t confirm “\(title)”"
+        case .control: "OUTCOME UNKNOWN — \(title.uppercased())"
+        case .ink: "The outcome of “\(title)” is unwitnessed"
+        }
+    }
+
+    func routineAddOutcomeUnknown(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Talaria could not confirm whether this routine was added. "
+            + "Check the routine list; do not retry yet."
+        case .control: "OUTCOME UNKNOWN — CHECK ROUTINE LIST; DO NOT RETRY YET"
+        case .ink: "The rite’s outcome is unwitnessed. Check the routine list; "
+            + "do not retry yet."
+        }
+    }
+
+    func routineSourceChanged(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The gateway changed before Talaria could confirm this routine action. "
+            + "Nothing was reported as successful; reopen the routine on the current gateway."
+        case .control: "SOURCE CHANGED BEFORE CONFIRMATION — NO SUCCESS RECORDED; REOPEN ROUTINE"
+        case .ink: "The gateway changed before this rite could be witnessed. Nothing was "
+            + "claimed; open it again from the current way."
         }
     }
 

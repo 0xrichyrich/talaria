@@ -110,6 +110,7 @@ public struct RoutinesView: View {
                                    isBusy: busyRoutineID == routine.id,
                                    showsActions: model.mode == .live
                                        && model.routineHasFullManagement(routine),
+                                   runNowAvailable: model.cronRESTReady(routineID: routine.id),
                                    open: { open(routine) },
                                    toggle: { model.setRoutineEnabled(routine, enabled: !routine.isOn) },
                                    runNow: { runNow(routine) },
@@ -182,6 +183,11 @@ public struct RoutinesView: View {
     }
 
     private func runNow(_ routine: Routine) {
+        guard model.cronRESTReady(routineID: routine.id) else {
+            actionError = copy.needsRESTNote(theme.id)
+            actionNote = nil
+            return
+        }
         busyRoutineID = routine.id
         actionError = nil
         actionNote = nil
@@ -389,6 +395,7 @@ private struct RoutineRow: View {
     let quarantined: Bool
     let isBusy: Bool
     let showsActions: Bool
+    let runNowAvailable: Bool
     let open: () -> Void
     let toggle: () -> Void
     let runNow: () -> Void
@@ -433,7 +440,11 @@ private struct RoutineRow: View {
             if showsActions {
                 Menu {
                     Button(copy.routineEditAction(theme.id), action: open)
-                    Button(copy.runNow(theme.id), action: runNow).disabled(quarantined)
+                    if runNowAvailable {
+                        Button(copy.runNow(theme.id), action: runNow).disabled(quarantined)
+                    } else {
+                        Text(copy.needsRESTNote(theme.id))
+                    }
                     Button(copy.deleteRoutineLabel(theme.id), role: .destructive, action: remove)
                 } label: {
                     Text(verbatim: "···")
@@ -459,7 +470,11 @@ private struct RoutineRow: View {
         .contextMenu {
             if showsActions {
                 Button(copy.routineEditAction(theme.id), action: open)
-                Button(copy.runNow(theme.id), action: runNow).disabled(quarantined)
+                if runNowAvailable {
+                    Button(copy.runNow(theme.id), action: runNow).disabled(quarantined)
+                } else {
+                    Text(copy.needsRESTNote(theme.id))
+                }
                 Button(copy.deleteRoutineLabel(theme.id), role: .destructive, action: remove)
             }
         }

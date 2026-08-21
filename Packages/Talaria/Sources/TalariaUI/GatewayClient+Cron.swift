@@ -50,6 +50,22 @@ public struct CronJobRecord: Sendable, Identifiable, Equatable {
     /// Delivery target ("local" unless a messaging platform is configured).
     public var deliver: String?
     public var repeatDisplay: String?
+    /// Profile metadata echoed by the gateway, preserved for inspection. It is
+    /// authoritative only when the request itself was profile-scoped and the
+    /// listing also echoed that exact scope; unscoped callers must ignore it.
+    public var profile: String?
+    /// Exact optional per-job reasoning pin emitted by `_format_job`.
+    ///
+    /// Keep this raw instead of eagerly folding it into the known choices:
+    /// jobs.json is user-editable, and Hermes deliberately ignores an unknown
+    /// stored value at fire time and falls back to config. A client that turns
+    /// that unknown value into nil would hide the repairable bad pin and could
+    /// erase it on an otherwise unrelated edit.
+    public var reasoningEffortRaw: String?
+
+    public var reasoningEffort: CronReasoningEffort {
+        CronReasoningEffort(raw: reasoningEffortRaw)
+    }
 
     /// True when the gateway considers this job live — `enabled` alone is not
     /// enough, a half-paused record keeps `enabled: true` with `state:"paused"`
@@ -84,6 +100,9 @@ public struct CronJobRecord: Sendable, Identifiable, Equatable {
         lastStatus = v["last_status"]?.stringValue
         deliver = v["deliver"]?.stringValue
         repeatDisplay = v["repeat"]?.stringValue
+        profile = v["profile"]?.stringValue ?? v["profile_name"]?.stringValue
+            ?? v["info"]?["profile_name"]?.stringValue
+        reasoningEffortRaw = v["reasoning_effort"]?.stringValue
     }
 }
 
@@ -91,12 +110,16 @@ public struct CronJobRecord: Sendable, Identifiable, Equatable {
 /// whether the gateway honored the `profile` param.
 public struct CronListing: Sendable {
     public var jobs: [CronJobRecord]
-    /// Non-nil only when the gateway echoed `scoped` — proof every job in this
-    /// listing belongs to that profile's own cron store.
+    /// Non-nil when the gateway echoed `scoped`, `profile`, or `profile_name` —
+    /// proof every job in this listing belongs to that profile's own store.
     public var scopedProfile: String?
+    /// Some REST/WS bridges call the scope `profile_name` instead of `scoped`.
+    /// Preserve the raw field for diagnostics; unscoped callers never use it to
+    /// attribute the process launch store.
+    public var profile: String?
 
-    public init(jobs: [CronJobRecord], scopedProfile: String?) {
-        self.jobs = jobs; self.scopedProfile = scopedProfile
+    public init(jobs: [CronJobRecord], scopedProfile: String?, profile: String? = nil) {
+        self.jobs = jobs; self.scopedProfile = scopedProfile; self.profile = profile
     }
 }
 
@@ -279,8 +302,11 @@ public extension GatewayClient {
         let result = try await rpc("cron.manage", .object(params))
         try Self.throwIfToolFailed(result)
         let rows = result["jobs"]?.arrayValue ?? []
+        let responseProfile = result["profile"]?.stringValue
+            ?? result["profile_name"]?.stringValue
         return CronListing(jobs: rows.map(CronJobRecord.init),
-                           scopedProfile: result["scoped"]?.stringValue)
+                           scopedProfile: result["scoped"]?.stringValue ?? responseProfile,
+                           profile: responseProfile)
     }
 
     /// `cron.manage {action:"add"}`. `name` carries the full stored title —

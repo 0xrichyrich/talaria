@@ -18,6 +18,34 @@ import TalariaTheme
 // stay readable, editing/history/pinning disappear, and pause/resume/delete —
 // which ride the socket — keep working.
 
+/// Existing-job controls are only authoritative after the full REST detail has
+/// arrived. The socket listing is a useful read-only projection, but it does
+/// not carry enough fields to safely edit or save a routine.
+enum RoutineEditorDetailPolicy {
+    static func allowsEditingExisting(
+        restAvailable: Bool,
+        hasAuthoritativeDetail: Bool,
+        quarantined: Bool
+    ) -> Bool {
+        restAvailable && hasAuthoritativeDetail && !quarantined
+    }
+
+    static func allowsSubmittingExisting(
+        restAvailable: Bool,
+        hasAuthoritativeDetail: Bool,
+        quarantined: Bool,
+        dirty: Bool,
+        saving: Bool,
+        busy: Bool
+    ) -> Bool {
+        !saving && !busy && dirty
+            && allowsEditingExisting(
+                restAvailable: restAvailable,
+                hasAuthoritativeDetail: hasAuthoritativeDetail,
+                quarantined: quarantined)
+    }
+}
+
 public struct RoutineEditorView: View {
 
     public enum Mode: Equatable {
@@ -44,6 +72,10 @@ public struct RoutineEditorView: View {
     @State private var deliver: [String] = ["local"]
     @State private var modelPin = ""
     @State private var providerPin = ""
+    /// Exact draft spelling. Unknown stored values stay here unchanged until
+    /// this one control is deliberately changed; unrelated saves omit the
+    /// field entirely.
+    @State private var reasoningEffort = ""
     @State private var continuity = false
     @State private var repeatForever = true
     @State private var seeded = false
@@ -75,6 +107,25 @@ public struct RoutineEditorView: View {
     private var job: CronJobDetail? {
         guard let routine else { return nil }
         return runtime.detail[routine.id]
+    }
+
+    /// A detail dictionary entry is only authoritative when its exact source
+    /// fence still matches the row. A stale display snapshot may remain visible
+    /// while a retry is pending, but it must never unlock an existing-job save.
+    private var hasAuthoritativeDetail: Bool {
+        guard let routine, job != nil,
+              let currentFence = model.cronRoutineMutationFence(routine.id) else { return false }
+        return runtime.detailAuthority[routine.id] == currentFence
+            && model.cronRoutineAuthorityIsCurrent(currentFence)
+    }
+
+    /// The socket projection remains useful on a legacy gateway without the
+    /// REST detail router: current Hermes includes a non-empty per-job effort
+    /// pin in this row, so it can still be inspected even when it cannot be
+    /// edited from the phone.
+    private var listingJob: CronJobRecord? {
+        guard let routine else { return nil }
+        return FeedsRuntime.shared.cronJobs[routine.id]
     }
 
     /// Editing, history and pinning all ride the REST cron router; without it
@@ -111,12 +162,14 @@ public struct RoutineEditorView: View {
         var deliver: [String]
         var model: String
         var provider: String
+        var reasoningEffort: String
         var continuity: Bool
     }
 
     private var draft: RoutineDraft {
         RoutineDraft(title: title, schedule: schedule, instruction: instruction,
                      deliver: deliver, model: modelPin, provider: providerPin,
+                     reasoningEffort: reasoningEffort,
                      continuity: continuity)
     }
 
@@ -125,12 +178,26 @@ public struct RoutineEditorView: View {
         return baseline != draft
     }
 
+    /// nil is the preservation instruction sent to `saveRoutine`. In
+    /// particular, an unseeded form must never interpret its blank local state
+    /// as authority to clear a raw server value.
+    private var reasoningEffortMutation: String? {
+        CronReasoningEffort.authoredMutation(
+            draft: reasoningEffort, baseline: baseline?.reasoningEffort)
+    }
+
     private var canSubmit: Bool {
         guard !saving, !busy else { return false }
         guard !title.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
         guard scriptOnly || !instruction.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
         if isCreating { return normalizedSchedule != nil }
-        return restAvailable && !quarantined && dirty
+        return RoutineEditorDetailPolicy.allowsSubmittingExisting(
+            restAvailable: restAvailable,
+            hasAuthoritativeDetail: hasAuthoritativeDetail,
+            quarantined: quarantined,
+            dirty: dirty,
+            saving: saving,
+            busy: busy)
     }
 
     public var body: some View {
@@ -139,6 +206,7 @@ public struct RoutineEditorView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     noticeBlock
+                    detailStatusBlock
                     healthBlock
                     editorBlock
                     inferenceBlock
@@ -173,7 +241,12 @@ public struct RoutineEditorView: View {
 
     private func load(initial: Bool) async {
         if isCreating {
-            await model.loadCronDeliveryTargets(botID: botID)
+            // Create has no authoritative launch profile, so delivery/model
+            // REST-only controls remain hidden and no delivery probe is
+            // needed. The socket add is still fully usable.
+            if restAvailable {
+                await model.loadCronDeliveryTargets(botID: botID)
+            }
             if initial { seedForCreate() }
             return
         }
@@ -196,7 +269,7 @@ public struct RoutineEditorView: View {
         guard !seeded else { return }
         seeded = true
         apply(RoutineDraft(title: "", schedule: "", instruction: "", deliver: ["local"],
-                           model: "", provider: "", continuity: false))
+                           model: "", provider: "", reasoningEffort: "", continuity: false))
     }
 
     /// Fallback seed from the `cron.manage list` projection. The prompt there
@@ -207,7 +280,9 @@ public struct RoutineEditorView: View {
         let preview = FeedsRuntime.shared.cronJobs[routine.id]?.promptPreview ?? ""
         apply(RoutineDraft(title: routine.name, schedule: routine.schedule,
                            instruction: AppModel.routineInstruction(in: preview) ?? preview,
-                           deliver: ["local"], model: "", provider: "", continuity: false))
+                           deliver: ["local"], model: "", provider: "",
+                           reasoningEffort: listingJob?.reasoningEffortRaw ?? "",
+                           continuity: false))
     }
 
     private func seed(from detail: CronJobDetail) {
@@ -222,6 +297,7 @@ public struct RoutineEditorView: View {
                            deliver: route,
                            model: detail.model ?? "",
                            provider: detail.provider ?? "",
+                           reasoningEffort: detail.reasoningEffortRaw ?? "",
                            continuity: detail.continuity))
     }
 
@@ -234,6 +310,7 @@ public struct RoutineEditorView: View {
         deliver = draft.deliver
         modelPin = draft.model
         providerPin = draft.provider
+        reasoningEffort = draft.reasoningEffort
         continuity = draft.continuity
         baseline = draft
     }
@@ -295,8 +372,12 @@ public struct RoutineEditorView: View {
 
     @ViewBuilder private var rowMenu: some View {
         Menu {
-            Button(copy.runNow(theme.id)) { runNow() }
-                .disabled(quarantined)
+            if restAvailable {
+                Button(copy.runNow(theme.id)) { runNow() }
+                    .disabled(quarantined)
+            } else {
+                Text(copy.needsRESTNote(theme.id))
+            }
             Button(copy.deleteRoutineLabel(theme.id), role: .destructive) {
                 confirmingDelete = true
             }
@@ -323,9 +404,40 @@ public struct RoutineEditorView: View {
             noticeLine(errorLine, tone: theme.danger)
         } else if let noteLine {
             noticeLine(noteLine, tone: theme.ok)
-        } else if let routine, let failure = runtime.detailError[routine.id] {
-            noticeLine(failure, tone: theme.danger)
         }
+    }
+
+    /// A listing row can render before the authoritative REST record arrives.
+    /// Keep all detail-backed controls read-only in that interval, and make a
+    /// failed read an explicit retry state rather than letting Save become a
+    /// no-op behind an absent `job`.
+    @ViewBuilder private var detailStatusBlock: some View {
+        if !isCreating, let routine, !hasAuthoritativeDetail, restAvailable {
+            VStack(alignment: .leading, spacing: 7) {
+                if runtime.loadingDetail.contains(routine.id) {
+                    noticeLine(copy.routineDetailLoading(theme.id), tone: theme.faint)
+                } else if let failure = runtime.detailError[routine.id] {
+                    noticeLine(failure, tone: theme.danger)
+                    retryDetailButton
+                } else {
+                    noticeLine(copy.routineDetailUnavailable(theme.id), tone: theme.warn)
+                    retryDetailButton
+                }
+            }
+        }
+    }
+
+    private var retryDetailButton: some View {
+        Button { retryDetail() } label: {
+            Text(copy.routineRetryDetail(theme.id))
+                .font(chipFont)
+                .foregroundStyle(theme.accent)
+                .padding(.vertical, 6)
+                .padding(.horizontal, 11)
+                .chipShell(theme)
+        }
+        .buttonStyle(.plain)
+        .disabled(saving || busy || runtime.loadingDetail.contains(routine?.id ?? ""))
     }
 
     private func noticeLine(_ text: String, tone: Color) -> some View {
@@ -396,7 +508,7 @@ public struct RoutineEditorView: View {
     /// True when at least one axis is unpinned AND carries a snapshot — i.e.
     /// the drift guard is armed on it and there is a recorded value to pin to.
     private func canPin(_ job: CronJobDetail) -> Bool {
-        guard restAvailable, !quarantined else { return false }
+        guard restAvailable, hasAuthoritativeDetail, !quarantined else { return false }
         return (job.model == nil && job.modelSnapshot != nil)
             || (job.provider == nil && job.providerSnapshot != nil)
     }
@@ -446,7 +558,10 @@ public struct RoutineEditorView: View {
     private var editorBlock: some View {
         // Editing an existing routine needs the REST PUT; without it the
         // fields would take input that could never be saved.
-        let editable = isCreating || (restAvailable && !quarantined)
+        let editable = isCreating || RoutineEditorDetailPolicy.allowsEditingExisting(
+            restAvailable: restAvailable,
+            hasAuthoritativeDetail: hasAuthoritativeDetail,
+            quarantined: quarantined)
 
         return VStack(alignment: .leading, spacing: 7) {
             sectionLabel(copy.routineTitleLabel(theme.id))
@@ -501,7 +616,7 @@ public struct RoutineEditorView: View {
 
     @ViewBuilder private func deliveryBlock(editable: Bool) -> some View {
         let targets = deliveryTargets
-        if !targets.isEmpty {
+        if restAvailable, !targets.isEmpty {
             sectionLabel(copy.routineDeliverLabel(theme.id))
             FlowChips(items: offeredTargets) { id in
                 let target = targets.first { $0.id == id }
@@ -571,11 +686,16 @@ public struct RoutineEditorView: View {
     // MARK: - Inference (the fail-closed axis)
 
     @ViewBuilder private var inferenceBlock: some View {
-        if restAvailable, !scriptOnly {
+        if restAvailable, (isCreating || job != nil), !scriptOnly {
             VStack(alignment: .leading, spacing: 8) {
                 sectionLabel(copy.routineInferenceLabel(theme.id))
-                field(providerPlaceholder, text: $providerPin, lines: 1, editable: !quarantined)
-                field(modelPlaceholder, text: $modelPin, lines: 1, editable: !quarantined)
+                let editable = isCreating || RoutineEditorDetailPolicy.allowsEditingExisting(
+                    restAvailable: restAvailable,
+                    hasAuthoritativeDetail: hasAuthoritativeDetail,
+                    quarantined: quarantined)
+                field(providerPlaceholder, text: $providerPin, lines: 1, editable: editable)
+                field(modelPlaceholder, text: $modelPin, lines: 1, editable: editable)
+                reasoningEffortBlock(editable: editable, scriptOnly: false)
                 if let job, job.model == nil || job.provider == nil {
                     Text(copy.routineFollowsGateway(theme.id))
                         .font(footFont)
@@ -602,6 +722,134 @@ public struct RoutineEditorView: View {
                     }
                 }
             }
+        } else if !isCreating,
+                  let raw = job?.reasoningEffortRaw ?? listingJob?.reasoningEffortRaw {
+            // A script-only job can carry a historical pin, but run_job exits
+            // through its no-agent branch before constructing an LLM. A
+            // current gateway without REST can expose the pin in its socket
+            // listing but offers no authoritative mutation path. Both are
+            // inspect-only, and both need an explicit truthful explanation.
+            VStack(alignment: .leading, spacing: 8) {
+                sectionLabel(copy.routineReasoningLabel(theme.id))
+                reasoningEffortReadout(CronReasoningEffort(raw: raw), scriptOnly: scriptOnly)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func reasoningEffortBlock(editable: Bool, scriptOnly: Bool) -> some View {
+        sectionLabel(copy.routineReasoningLabel(theme.id))
+        if editable {
+            Menu {
+                Button {
+                    reasoningEffort = ""
+                } label: {
+                    effortMenuLabel(
+                        copy.routineReasoningFollowConfig(theme.id),
+                        selected: reasoningPickerFollowsConfiguration)
+                }
+                Divider()
+                ForEach(CronReasoningEffort.canonicalValues, id: \.self) { value in
+                    Button {
+                        reasoningEffort = value
+                    } label: {
+                        effortMenuLabel(reasoningChoiceLabel(value),
+                                        selected: CronReasoningEffort(
+                                            raw: reasoningEffort).pinnedValue == value)
+                    }
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    Text(reasoningPickerLabel)
+                        .font(fieldFont)
+                        .foregroundStyle(theme.ink)
+                        .lineLimit(2)
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(theme.faint)
+                }
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .padding(.horizontal, 14)
+                .background(theme.id == .ink ? Color.clear : theme.panel)
+                .clipShape(RoundedRectangle(cornerRadius: fieldRadius, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: fieldRadius, style: .continuous)
+                    .strokeBorder(theme.id == .soft ? theme.line : theme.lineStrong, lineWidth: 1))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(copy.routineReasoningLabel(theme.id))
+            .accessibilityValue(reasoningPickerLabel)
+            .accessibilityHint(copy.routineReasoningPickerHint(theme.id))
+        }
+        reasoningEffortReadout(CronReasoningEffort(raw: reasoningEffort), scriptOnly: scriptOnly)
+    }
+
+    @ViewBuilder
+    private func effortMenuLabel(_ text: String, selected: Bool) -> some View {
+        if selected {
+            Label(text, systemImage: "checkmark")
+        } else {
+            Text(text)
+        }
+    }
+
+    private var reasoningPickerLabel: String {
+        switch CronReasoningEffort(raw: reasoningEffort) {
+        case .followsConfiguration:
+            return copy.routineReasoningFollowConfig(theme.id)
+        case .pinned(let value):
+            return reasoningChoiceLabel(value)
+        case .unknown(let raw):
+            return copy.routineReasoningUnknown(theme.id, value: raw)
+        }
+    }
+
+    private var reasoningPickerFollowsConfiguration: Bool {
+        if case .followsConfiguration = CronReasoningEffort(raw: reasoningEffort) { return true }
+        return false
+    }
+
+    private func reasoningChoiceLabel(_ value: String) -> String {
+        value == "none" ? copy.routineReasoningOff(theme.id)
+                        : ModelLabels.effortLabel(value)
+    }
+
+    private func reasoningEffortReadout(_ status: CronReasoningEffort,
+                                        scriptOnly: Bool) -> some View {
+        let text: String
+        let tone: Color
+        if scriptOnly {
+            text = copy.routineReasoningUnusedForScript(theme.id,
+                                                        value: reasoningStatusLabel(status))
+            tone = theme.faint
+        } else {
+            switch status {
+            case .followsConfiguration:
+                text = copy.routineReasoningConfigPrecedence(theme.id)
+                tone = theme.sub
+            case .pinned(let value):
+                text = copy.routineReasoningPinned(theme.id,
+                                                    value: reasoningChoiceLabel(value))
+                tone = theme.sub
+            case .unknown(let raw):
+                text = copy.routineReasoningInvalid(theme.id, value: raw)
+                tone = theme.warn
+            }
+        }
+        return Text(text)
+            .font(footFont)
+            .foregroundStyle(tone)
+            .lineSpacing(3)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityLabel(text)
+    }
+
+    private func reasoningStatusLabel(_ status: CronReasoningEffort) -> String {
+        switch status {
+        case .followsConfiguration: return copy.routineReasoningFollowConfig(theme.id)
+        case .pinned(let value): return reasoningChoiceLabel(value)
+        case .unknown(let raw): return copy.routineReasoningUnknown(theme.id, value: raw)
         }
     }
 
@@ -659,7 +907,7 @@ public struct RoutineEditorView: View {
     // MARK: - Run history
 
     @ViewBuilder private var historyBlock: some View {
-        if let routine, restAvailable {
+        if let routine, restAvailable, hasAuthoritativeDetail {
             let runs = runtime.runs[routine.id]
             // Three states, and the third is not an error: a history that has
             // not been read yet says so, and one that failed to read says
@@ -795,13 +1043,20 @@ public struct RoutineEditorView: View {
         Task { @MainActor in
             defer { saving = false }
             do {
-                try await model.scheduleRoutineWithFeedback(
+                let outcome = try await model.scheduleRoutineWithFeedback(
                     botID: botID, title: title, schedule: schedule, instruction: instruction,
                     repeatForever: repeatForever, continuity: continuity,
                     deliver: restAvailable ? deliver : [],
                     model: restAvailable ? modelPin : nil,
-                    provider: restAvailable ? providerPin : nil)
-                onBack()
+                    provider: restAvailable ? providerPin : nil,
+                    reasoningEffort: restAvailable && !reasoningEffort.isEmpty
+                        ? reasoningEffort : nil)
+                // A partial result means the socket may already have accepted
+                // the job; keeping this form open would make its primary
+                // action a duplicate-create invitation.
+                if outcome.shouldDismissCreateEditor {
+                    onBack()
+                }
             } catch {
                 errorLine = AppModel.reason(error)
             }
@@ -809,7 +1064,10 @@ public struct RoutineEditorView: View {
     }
 
     private func save() {
-        guard let job else { return }
+        guard hasAuthoritativeDetail, let job else {
+            errorLine = copy.routineDetailUnavailable(theme.id)
+            return
+        }
         saving = true; errorLine = nil; noteLine = nil
         Task { @MainActor in
             defer { saving = false }
@@ -820,6 +1078,7 @@ public struct RoutineEditorView: View {
                     instruction: instruction,
                     deliver: deliveryTargets.isEmpty ? nil : deliver,
                     model: modelPin, provider: providerPin,
+                    reasoningEffort: reasoningEffortMutation,
                     continuity: continuity)
                 // The save landed; the draft is now the truth, so the reload
                 // below is free to reseed from the server's answer.
@@ -830,6 +1089,13 @@ public struct RoutineEditorView: View {
                 errorLine = AppModel.reason(error)
             }
         }
+    }
+
+    private func retryDetail() {
+        guard !saving, !busy else { return }
+        errorLine = nil
+        noteLine = nil
+        Task { await load(initial: false) }
     }
 
     private func pin(_ job: CronJobDetail) {
@@ -849,6 +1115,11 @@ public struct RoutineEditorView: View {
 
     private func runNow() {
         guard let routine else { return }
+        guard restAvailable else {
+            errorLine = copy.needsRESTNote(theme.id)
+            noteLine = nil
+            return
+        }
         busy = true; errorLine = nil; noteLine = nil
         Task { @MainActor in
             defer { busy = false }
