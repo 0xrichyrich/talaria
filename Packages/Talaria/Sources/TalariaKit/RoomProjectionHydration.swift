@@ -9,13 +9,19 @@ public struct RoomProjectionReconcileResult: Equatable, Sendable {
     public var rooms: [RoomRecord]
     public var roomProjection: RoomProjectionEnvelope
     public var projectedImages: [RoomID: Data]
+    /// Rooms whose accepted authoritative projection carried the explicit
+    /// empty-string image sentinel. Callers must evict transient projected
+    /// bytes even though there is intentionally no replacement image payload.
+    public var clearedImageRoomIDs: Set<RoomID>
 
     public init(rooms: [RoomRecord] = [],
                 roomProjection: RoomProjectionEnvelope = RoomProjectionEnvelope(),
-                projectedImages: [RoomID: Data] = [:]) {
+                projectedImages: [RoomID: Data] = [:],
+                clearedImageRoomIDs: Set<RoomID> = []) {
         self.rooms = rooms
         self.roomProjection = roomProjection
         self.projectedImages = projectedImages
+        self.clearedImageRoomIDs = clearedImageRoomIDs
     }
 }
 
@@ -26,6 +32,7 @@ enum RoomProjectionHydration {
         var rooms: [RoomID: RoomRecord]
         var projectedImages: [RoomID: Data]
         var deletedRoomIDs: Set<RoomID>
+        var clearedImageRoomIDs: Set<RoomID>
     }
 
     static func reconciling(
@@ -38,6 +45,7 @@ enum RoomProjectionHydration {
         var rooms = existing
         var deletedRoomIDs = Set<RoomID>()
         var imageEligibleKeys = Set<String>()
+        var clearedImageRoomIDs = Set<RoomID>()
 
         // Omission is never deletion. Only an observed explicit tombstone may
         // remove the matching rich record, and the caller can temporarily
@@ -68,13 +76,26 @@ enum RoomProjectionHydration {
                         || current.rawProjectionRoomKey == key else { continue }
                 let hydrated = hydrate(projected, key: key, into: current,
                                        allowedGatewayIDs: allowedGatewayIDs)
-                rooms[roomID] = hydrated.room
+                var hydratedRoom = hydrated.room
+                if hydrated.acceptedIdentityOverlay,
+                   projected.revision == hydratedRoom.rawProjectionRevision,
+                   projected.image == "" {
+                    hydratedRoom.avatar = nil
+                    clearedImageRoomIDs.insert(roomID)
+                }
+                rooms[roomID] = hydratedRoom
                 if hydrated.acceptedIdentityOverlay { imageEligibleKeys.insert(key) }
             } else if let hydrated = hydrateNew(
                 projected, key: key, id: roomID,
                 allowedGatewayIDs: allowedGatewayIDs
             ) {
-                rooms[roomID] = hydrated
+                var hydratedRoom = hydrated
+                if projected.revision == hydrated.rawProjectionRevision,
+                   projected.image == "" {
+                    hydratedRoom.avatar = nil
+                    clearedImageRoomIDs.insert(roomID)
+                }
+                rooms[roomID] = hydratedRoom
                 imageEligibleKeys.insert(key)
             }
         }
@@ -91,7 +112,8 @@ enum RoomProjectionHydration {
         }
 
         return Result(rooms: rooms, projectedImages: images,
-                      deletedRoomIDs: deletedRoomIDs)
+                      deletedRoomIDs: deletedRoomIDs,
+                      clearedImageRoomIDs: clearedImageRoomIDs)
     }
 
     private static func tombstone(_ key: String, revision: UInt64,

@@ -255,6 +255,9 @@ public actor RoomStore {
         updatedAt: UInt64? = nil
     ) throws -> RoomProjectionReconcileResult {
         let existing = try ensureLoaded()
+        let previousAvatars = Dictionary(uniqueKeysWithValues: existing.compactMap {
+            id, room in room.avatar.map { (id, $0) }
+        })
         let previous = cachedRoomProjection ?? RoomProjectionEnvelope()
         let tombstones = reconciliationTombstones(
             remote: previous, local: incoming, intent: intent)
@@ -282,9 +285,15 @@ public actor RoomStore {
                 try? fileManager.removeItem(at: directory)
             }
         }
+        for id in hydrated.clearedImageRoomIDs {
+            guard let avatar = previousAvatars[id],
+                  hydrated.rooms[id]?.avatar == nil else { continue }
+            try? removeBlobs(Set([avatar.blobID]), roomID: id)
+        }
         return RoomProjectionReconcileResult(
             rooms: committedRooms, roomProjection: merged,
-            projectedImages: hydrated.projectedImages)
+            projectedImages: hydrated.projectedImages,
+            clearedImageRoomIDs: hydrated.clearedImageRoomIDs)
     }
 
     public func metadataOutbox() throws -> [RoomMetadataMutation] {

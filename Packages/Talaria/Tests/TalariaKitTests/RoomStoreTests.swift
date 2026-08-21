@@ -1578,5 +1578,62 @@ final class RoomStoreTests: XCTestCase {
         XCTAssertEqual(stillCleared.rooms[key]?.image, "",
                        "a later bounded omission must not resurrect old bytes")
     }
+
+    func testAuthoritativePeerImageClearRemovesRichAvatarAndSignalsCacheEviction() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let key = "id:peer-clear-room"
+        let imageBytes = Data([7, 8, 9])
+        let image = "data:image/png;base64,\(imageBytes.base64EncodedString())"
+        let entry = RoomProjectionEntry(
+            id: "message", from: RoomProjectionAuthor(kind: .user, name: "You"),
+            text: "hello", at: 1, thread: "thread")
+        let roomValue: (UInt64, String?) -> RoomProjectionRoom = { revision, image in
+            RoomProjectionRoom(name: "Peer", roomID: "peer-clear-room",
+                               log: [entry], revision: revision,
+                               members: self.projectedMembers(), image: image)
+        }
+        let store = RoomStore(baseDirectory: base)
+        let hydrated = try await store.reconcileRoomProjection(
+            RoomProjectionEnvelope(rooms: [key: roomValue(3, image)]),
+            allowedGatewayIDs: projectedGatewayIDs)
+        let roomID = try XCTUnwrap(hydrated.rooms.first?.id)
+        let avatarBytes = Data([0x89, 0x50, 0x4e, 0x47])
+        let attachment = try await store.storeBlob(
+            roomID: roomID, data: avatarBytes, fileName: "local.png",
+            mediaType: "image/png")
+        _ = try await store.mutate(roomID: roomID) { room in
+            room.avatar = attachment
+        }
+
+        let omitted = try await store.reconcileRoomProjection(
+            RoomProjectionEnvelope(rooms: [key: roomValue(4, nil)]),
+            allowedGatewayIDs: projectedGatewayIDs)
+        XCTAssertEqual(omitted.rooms.first?.avatar, attachment)
+        XCTAssertTrue(omitted.clearedImageRoomIDs.isEmpty)
+        XCTAssertEqual(omitted.projectedImages[roomID], imageBytes)
+        let retainedAvatarBytes = try await store.readBlob(
+            roomID: roomID, attachment: attachment)
+        XCTAssertEqual(retainedAvatarBytes, avatarBytes)
+
+        let cleared = try await store.reconcileRoomProjection(
+            RoomProjectionEnvelope(rooms: [key: roomValue(5, "")]),
+            allowedGatewayIDs: projectedGatewayIDs)
+        XCTAssertNil(cleared.rooms.first?.avatar)
+        XCTAssertEqual(cleared.clearedImageRoomIDs, Set([roomID]))
+        XCTAssertNil(cleared.projectedImages[roomID])
+        do {
+            _ = try await store.readBlob(roomID: roomID, attachment: attachment)
+            XCTFail("the atomically unreferenced rich avatar blob must be reclaimed")
+        } catch {
+            XCTAssertEqual(error as? RoomStoreError, .attachmentNotFound)
+        }
+
+        let fresh = RoomStore(baseDirectory: base)
+        let restored = try await fresh.room(id: roomID)
+        let ledger = try await fresh.roomProjection()
+        XCTAssertNil(restored?.avatar)
+        XCTAssertEqual(ledger.rooms[key]?.image, "")
+    }
 }
 #endif
