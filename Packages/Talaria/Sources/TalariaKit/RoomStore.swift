@@ -287,7 +287,10 @@ public actor RoomStore {
         }
         for id in hydrated.clearedImageRoomIDs {
             guard let avatar = previousAvatars[id],
-                  hydrated.rooms[id]?.avatar == nil else { continue }
+                  let committedRoom = hydrated.rooms[id],
+                  committedRoom.avatar == nil,
+                  !referencedBlobIDs(committedRoom).contains(avatar.blobID)
+            else { continue }
             try? removeBlobs(Set([avatar.blobID]), roomID: id)
         }
         return RoomProjectionReconcileResult(

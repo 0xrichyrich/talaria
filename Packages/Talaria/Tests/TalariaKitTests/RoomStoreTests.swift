@@ -1635,5 +1635,55 @@ final class RoomStoreTests: XCTestCase {
         XCTAssertNil(restored?.avatar)
         XCTAssertEqual(ledger.rooms[key]?.image, "")
     }
+
+    func testPeerAvatarClearRetainsBlobSharedByCommittedEntry() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let key = "id:shared-avatar-blob"
+        let projectedEntry = RoomProjectionEntry(
+            id: "shared-entry", from: RoomProjectionAuthor(kind: .user, name: "You"),
+            text: "keeps the picture", at: 1, thread: "thread")
+        let store = RoomStore(baseDirectory: base)
+        let hydrated = try await store.reconcileRoomProjection(
+            RoomProjectionEnvelope(rooms: [
+                key: RoomProjectionRoom(
+                    name: "Shared blob", roomID: "shared-avatar-blob",
+                    log: [projectedEntry], revision: 1,
+                    members: projectedMembers(),
+                    image: "data:image/png;base64,AQID")
+            ]), allowedGatewayIDs: projectedGatewayIDs)
+        let roomID = try XCTUnwrap(hydrated.rooms.first?.id)
+        let bytes = Data([0x89, 0x50, 0x4e, 0x47, 4, 5, 6])
+        let attachment = try await store.storeBlob(
+            roomID: roomID, data: bytes, fileName: "shared.png",
+            mediaType: "image/png")
+        _ = try await store.mutate(roomID: roomID) { room in
+            room.avatar = attachment
+            room.entries[0].attachments = [attachment]
+        }
+
+        let cleared = try await store.reconcileRoomProjection(
+            RoomProjectionEnvelope(rooms: [
+                key: RoomProjectionRoom(
+                    name: "Shared blob", roomID: "shared-avatar-blob",
+                    log: [projectedEntry], revision: 2,
+                    members: projectedMembers(), image: "")
+            ]), allowedGatewayIDs: projectedGatewayIDs)
+        let committed = try XCTUnwrap(cleared.rooms.first)
+        XCTAssertNil(committed.avatar)
+        XCTAssertEqual(committed.entries.first?.attachments, [attachment])
+        XCTAssertEqual(cleared.clearedImageRoomIDs, Set([roomID]))
+        let retained = try await store.readBlob(roomID: roomID, attachment: attachment)
+        XCTAssertEqual(retained, bytes)
+
+        let fresh = RoomStore(baseDirectory: base)
+        let restoredRooms = try await fresh.loadAll()
+        let restored = try XCTUnwrap(restoredRooms.first)
+        XCTAssertNil(restored.avatar)
+        XCTAssertEqual(restored.entries.first?.attachments, [attachment])
+        let restoredBytes = try await fresh.readBlob(
+            roomID: roomID, attachment: attachment)
+        XCTAssertEqual(restoredBytes, bytes)
+    }
 }
 #endif
