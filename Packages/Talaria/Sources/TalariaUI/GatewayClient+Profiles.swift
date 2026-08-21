@@ -407,9 +407,13 @@ extension GatewayClient {
     func applyProfileEditResult(name: String, _ edit: ProfileEdit) async throws
         -> ProfileConfigureResult {
         guard !edit.isEmpty else { return .empty }
-        guard edit.hasValidUIMetaCASRequest else {
+        // This entry point is CAS-only. A detailed acknowledgement cannot
+        // retroactively protect a write that omitted its precondition.
+        guard let expected = edit.uiMetaExpectedRevisions,
+              !expected.isEmpty,
+              edit.hasValidUIMetaCASRequest else {
             throw GatewayError(code: -8,
-                               message: "ui_meta CAS revisions were invalid or incomplete")
+                               message: "ui_meta CAS revisions were missing, invalid, or incomplete")
         }
         return ProfileConfigureResult(
             try await rpc("profiles.configure", edit.params(name: name)))

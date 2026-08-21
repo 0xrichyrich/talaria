@@ -75,6 +75,23 @@ final class ProfileUIMetaCASTests: XCTestCase {
             uiMetaExpectedRevisions: ["shared-room": 9_007_199_254_740_992]).isWireValid)
     }
 
+    func testDetailedConfigurePathRefusesToWriteWithoutCASPreconditions() async throws {
+        let client = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://cas-guard.invalid")),
+            credential: .sessionToken("unused")
+        )
+        let unguarded = ProfileEdit(
+            uiMeta: .object(["shared-room": .object(["name": "unsafe"])])
+        )
+
+        do {
+            _ = try await client.applyProfileEditResult(name: "default", unguarded)
+            XCTFail("the detailed CAS path must reject an unguarded write before transport")
+        } catch let error as GatewayError {
+            XCTAssertEqual(error.code, -8)
+        }
+    }
+
     func testDetailedConfigureResultConfirmsOnlyExactIncrement() {
         let result = configureResult(
             applied: true,
