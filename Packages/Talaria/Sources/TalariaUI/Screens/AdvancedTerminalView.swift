@@ -3,7 +3,7 @@ import TalariaTheme
 
 struct AdvancedTerminalView: View {
     let model: AppModel
-    let resume: String?
+    @Binding var sourceBinding: AdvancedTerminalSourceBinding
     @Environment(\.openURL) private var openURL
     private var coordinator: AdvancedTerminalCoordinator { .shared }
     private var workspace: WorkspaceRuntime { .shared }
@@ -30,8 +30,16 @@ struct AdvancedTerminalView: View {
             }
         }
         .background(theme.inset)
-        .task(id: "\(workspace.gatewayID ?? "")|\(workspace.profile ?? "")|\(workspace.generation)|\(workspace.profiles.map(\.profile).joined(separator: "\u{1f}"))") {
-            coordinator.startFromWorkspace(resume: resume)
+        .task(id: "\(workspace.gatewayID ?? "")|\(workspace.profile ?? "")|\(workspace.generation)|\(workspace.profiles.map(\.profile).joined(separator: "\u{1f}"))|\(sourceBinding.taskIdentity)") {
+            guard let request = sourceBinding.request(
+                workspaceGatewayID: workspace.gatewayID,
+                workspaceProfile: workspace.profile,
+                knownProfiles: workspace.profiles.map(\.profile)
+            ) else {
+                coordinator.waitForRequestedSource()
+                return
+            }
+            coordinator.startFromWorkspace(request)
         }
         .onDisappear { coordinator.stop(clearTranscript: true) }
     }

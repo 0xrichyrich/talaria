@@ -2,6 +2,88 @@ import Foundation
 import Observation
 import TalariaKit
 
+struct AdvancedTerminalLaunchRequest: Equatable {
+    let gatewayID: String
+    let profile: String
+    let resume: String?
+}
+
+/// Keeps a session launch pinned to the source that requested it until that
+/// exact source has become authoritative. Once it has bound, same-source tab
+/// recreation deliberately reattaches that durable session. Picker changes
+/// may move the terminal, but the session id is never carried to the new
+/// source (or reused after switching away and back).
+struct AdvancedTerminalSourceBinding: Equatable {
+    let initialGatewayID: String?
+    let initialProfile: String?
+    let initialResume: String?
+    private(set) var hasBoundInitialTarget = false
+    private(set) var hasLeftInitialTarget = false
+
+    var taskIdentity: String {
+        "\(hasBoundInitialTarget ? 1 : 0)|\(hasLeftInitialTarget ? 1 : 0)"
+    }
+
+    mutating func clearResumeForSourceChange() {
+        hasBoundInitialTarget = true
+        hasLeftInitialTarget = true
+    }
+
+    mutating func request(
+        workspaceGatewayID: String?,
+        workspaceProfile: String?,
+        knownProfiles: [String]
+    ) -> AdvancedTerminalLaunchRequest? {
+        let pinnedGateway = initialGatewayID?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let pinnedProfile = initialProfile?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+
+        // A durable session id is meaningful only with its exact origin.
+        if initialResume != nil, pinnedGateway == nil || pinnedProfile == nil { return nil }
+
+        if !hasBoundInitialTarget, let pinnedGateway {
+            guard workspaceGatewayID == pinnedGateway,
+                  let workspaceProfile,
+                  pinnedProfile == nil || workspaceProfile == pinnedProfile,
+                  knownProfiles.contains(workspaceProfile) else { return nil }
+            hasBoundInitialTarget = true
+            return AdvancedTerminalLaunchRequest(
+                gatewayID: pinnedGateway,
+                profile: workspaceProfile,
+                resume: initialResume
+            )
+        }
+
+        guard let gatewayID = workspaceGatewayID,
+              let profile = workspaceProfile,
+              knownProfiles.contains(profile) else { return nil }
+
+        if !hasBoundInitialTarget { hasBoundInitialTarget = true }
+
+        if let pinnedGateway {
+            let remainsInitial = gatewayID == pinnedGateway
+                && (pinnedProfile == nil || profile == pinnedProfile)
+            if !remainsInitial { hasLeftInitialTarget = true }
+            return AdvancedTerminalLaunchRequest(
+                gatewayID: gatewayID,
+                profile: profile,
+                resume: remainsInitial && !hasLeftInitialTarget ? initialResume : nil
+            )
+        }
+
+        return AdvancedTerminalLaunchRequest(
+            gatewayID: gatewayID,
+            profile: profile,
+            resume: nil
+        )
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
 @MainActor
 final class GatewayPTYAttachmentStore {
     static let shared = GatewayPTYAttachmentStore()
@@ -79,6 +161,22 @@ final class AdvancedTerminalCoordinator {
     func startFromWorkspace(resume: String? = nil, fresh: Bool = false) {
         let workspace = WorkspaceRuntime.shared
         guard let gatewayID = workspace.gatewayID,
+              let rawProfile = workspace.profile else {
+            stop()
+            message = "Choose a signed-in gateway and an available profile before opening Advanced Terminal."
+            return
+        }
+        startFromWorkspace(
+            AdvancedTerminalLaunchRequest(gatewayID: gatewayID, profile: rawProfile, resume: resume),
+            fresh: fresh
+        )
+    }
+
+    func startFromWorkspace(_ request: AdvancedTerminalLaunchRequest, fresh: Bool = false) {
+        let workspace = WorkspaceRuntime.shared
+        guard workspace.gatewayID == request.gatewayID,
+              workspace.profile == request.profile,
+              let gatewayID = workspace.gatewayID,
               let rawProfile = workspace.profile,
               workspace.profiles.contains(where: { $0.profile == rawProfile }),
               ProfileLifecycleTrafficAdmission.allows(gatewayID),
@@ -90,7 +188,7 @@ final class AdvancedTerminalCoordinator {
             return
         }
 
-        let requestedResume = fresh ? nil : resume
+        let requestedResume = fresh ? nil : request.resume
         let attach = fresh
             ? GatewayPTYAttachmentStore.shared.rotate(gatewayID: gatewayID, profile: rawProfile, resume: nil)
             : GatewayPTYAttachmentStore.shared.token(
@@ -205,6 +303,11 @@ final class AdvancedTerminalCoordinator {
     }
 
     func startNewSession() { startFromWorkspace(fresh: true) }
+
+    func waitForRequestedSource() {
+        stop(clearTranscript: true)
+        message = "Preparing the requested gateway and profile before opening Advanced Terminal."
+    }
 
     func stop(clearTranscript: Bool = false) {
         eventTask?.cancel()

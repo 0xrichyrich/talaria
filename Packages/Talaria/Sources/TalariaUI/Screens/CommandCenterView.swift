@@ -17,6 +17,7 @@ public struct CommandCenterView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @State private var section: Section = .projects
+    @State private var terminalSourceBinding: AdvancedTerminalSourceBinding
 
     enum Section: String, CaseIterable, Identifiable {
         case projects = "Projects"
@@ -36,6 +37,11 @@ public struct CommandCenterView: View {
         self.initialProfile = initialProfile
         self.initialTerminalResume = initialTerminalResume
         _section = State(initialValue: initialTerminalResume == nil ? .projects : .terminal)
+        _terminalSourceBinding = State(initialValue: AdvancedTerminalSourceBinding(
+            initialGatewayID: initialGatewayID,
+            initialProfile: initialProfile,
+            initialResume: initialTerminalResume
+        ))
     }
 
     private var theme: ThemePack { model.theme.pack }
@@ -73,7 +79,8 @@ public struct CommandCenterView: View {
                             case .review: WorkspaceGitSection(model: model)
                             case .commands: WorkspaceCommandsSection(model: model)
                             case .terminal: AdvancedTerminalView(
-                                model: model, resume: initialTerminalResume)
+                                model: model,
+                                sourceBinding: $terminalSourceBinding)
                             case .system: WorkspaceSystemSection(model: model, close: { dismiss() })
                             }
                         }
@@ -130,7 +137,12 @@ public struct CommandCenterView: View {
                 if model.workspaceSources.count > 1 {
                     Picker("Gateway", selection: Binding(
                         get: { runtime.gatewayID ?? model.workspaceSources.first?.id ?? "" },
-                        set: { model.selectWorkspaceGateway($0) }
+                        set: {
+                            if $0 != runtime.gatewayID {
+                                terminalSourceBinding.clearResumeForSourceChange()
+                            }
+                            model.selectWorkspaceGateway($0)
+                        }
                     )) {
                         ForEach(model.workspaceSources) { source in
                             Text(source.isActive ? "\(source.name) · active" : source.name).tag(source.id)
@@ -141,7 +153,12 @@ public struct CommandCenterView: View {
                 if runtime.profiles.count > 1 || profileNeedsRecovery {
                     Picker("Projects profile", selection: Binding(
                         get: { runtime.profile ?? runtime.profiles.first?.profile ?? "" },
-                        set: { model.selectWorkspaceProfile($0) }
+                        set: {
+                            if $0 != runtime.profile {
+                                terminalSourceBinding.clearResumeForSourceChange()
+                            }
+                            model.selectWorkspaceProfile($0)
+                        }
                     )) {
                         if profileNeedsRecovery, let profile = runtime.profile {
                             Text("Unavailable · @\(profile)").tag(profile)
@@ -1341,7 +1358,7 @@ private struct WorkspaceSystemSection: View {
                 Text("Command Center reuses Talaria’s existing source-qualified Operator and provider settings instead of cloning a second control plane.")
             }
             Section("Platform boundary") {
-                Text("Interactive Terminal remains a desktop-only surface until Hermes exposes a hardened remote PTY contract with explicit session, cwd, resize, backpressure, reconnect and approval semantics. Commands above are safe, bounded and noninteractive.")
+                Text("Advanced Terminal uses Hermes’ authenticated remote PTY with source-qualified sessions, resize, backpressure and reconnect handling. Direct access to a local host shell remains desktop-only. Commands above are safe, bounded and noninteractive.")
             }
         }
         .confirmationDialog(pending?.displayName ?? "Confirm action",
