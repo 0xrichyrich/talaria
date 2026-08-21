@@ -82,7 +82,10 @@ final class SessionsRuntime {
 private struct StoredSessionOpenSource {
     var route: GatewayBotRoute
     var client: GatewayClient
-    var validateBeforeBinding: @MainActor () async throws -> Void
+    /// A fully authority-checked resume projection. Exact notification/deep-
+    /// link opens obtain this before visible navigation or transcript state is
+    /// changed.
+    var resumed: LiveSession
 }
 
 private struct StoredSessionOpenAttempt {
@@ -243,13 +246,51 @@ extension AppModel {
     func openStoredSessionAwaiting(
         _ id: String, botID: String, route: GatewayBotRoute,
         client: GatewayClient,
-        validateBeforeBinding: @escaping @MainActor () async throws -> Void
+        validateBeforeBinding: @escaping @MainActor () async throws -> Void,
+        resumeForTesting: (@MainActor () async throws -> LiveSession)? = nil
     ) async throws -> Bool {
+        guard !id.isEmpty else {
+            throw GatewayError(code: 400, message: "A stored session identity is required.")
+        }
+        // Exact out-of-process navigation is transactional at the visible-state
+        // boundary. Resume and validate both durable/profile identity and the
+        // caller's fresh source authority before `beginStoredSessionOpen`
+        // clears the current chat, unread mark, or navigation selection.
+        let live: LiveSession
+        if let resumeForTesting {
+            live = try await resumeForTesting()
+        } else {
+            await attachRoutedEventsIfNeeded(client: client, gatewayID: route.gatewayID)
+            live = try await client.resumeSession(id, profile: route.profile,
+                                                  deferHistory: false)
+        }
+        try Task.checkCancellation()
+        guard !live.sessionID.isEmpty else {
+            throw GatewayError(code: -8, message: "session.resume returned no id")
+        }
+        let stored = live.storedSessionID.isEmpty ? id : live.storedSessionID
+        do {
+            try ExactStoredSessionResumeAckAuthority.requireExact(
+                route: route,
+                requestedStoredSessionID: id,
+                returnedStoredSessionID: stored,
+                returnedProfile: live.info.profileName)
+        } catch ExactStoredSessionResumeAckAuthorityError.durableSessionMismatch {
+            throw AckValidationError(
+                operation: "Resume session",
+                detail: "Hermes returned a different durable session identity.")
+        } catch {
+            throw AckValidationError(
+                operation: "Resume session",
+                detail: "Hermes returned a different profile identity.")
+        }
+        try await validateBeforeBinding()
+        try Task.checkCancellation()
+
         let attempt = try beginStoredSessionOpen(
             id, botID: botID,
             exactSource: StoredSessionOpenSource(
-                route: route, client: client,
-                validateBeforeBinding: validateBeforeBinding
+                route: route, client: client, resumed: live
             )
         )
         // Cancelling the outer navigation task must also cancel the unstructured
@@ -390,54 +431,32 @@ extension AppModel {
             try requireCurrentOpen()
             let route: GatewayBotRoute
             let client: GatewayClient
+            let live: LiveSession
             if let exactSource {
                 route = exactSource.route
                 client = exactSource.client
+                live = exactSource.resumed
             } else {
                 guard let resolvedRoute = self.gatewayRoute(for: botID) else {
                     throw GatewayRouteError.noRoute
                 }
                 route = resolvedRoute
                 client = try await self.routedClient(for: resolvedRoute)
-            }
-            try requireCurrentOpen()
-            await self.attachRoutedEventsIfNeeded(client: client,
-                                                  gatewayID: route.gatewayID)
-            try requireCurrentOpen()
-            // Full projection in the ack (deferHistory returns a bounded
-            // stub) — one round trip, authoritative rows, same tradeoff
-            // ensureSession makes.
-            let live = try await client.resumeSession(id, profile: route.profile,
+                try requireCurrentOpen()
+                await self.attachRoutedEventsIfNeeded(client: client,
+                                                      gatewayID: route.gatewayID)
+                try requireCurrentOpen()
+                // Full projection in the ack (deferHistory returns a bounded
+                // stub) — one round trip, authoritative rows, same tradeoff
+                // ensureSession makes.
+                live = try await client.resumeSession(id, profile: route.profile,
                                                       deferHistory: false)
+            }
             try requireCurrentOpen()
             guard !live.sessionID.isEmpty else {
                 throw GatewayError(code: -8, message: "session.resume returned no id")
             }
             let stored = live.storedSessionID.isEmpty ? id : live.storedSessionID
-            if let exactSource {
-                do {
-                    try ExactStoredSessionResumeAckAuthority.requireExact(
-                        route: exactSource.route,
-                        requestedStoredSessionID: id,
-                        returnedStoredSessionID: stored,
-                        returnedProfile: live.info.profileName)
-                } catch ExactStoredSessionResumeAckAuthorityError.durableSessionMismatch {
-                    throw AckValidationError(
-                        operation: "Resume session",
-                        detail: "Hermes returned a different durable session identity."
-                    )
-                } catch {
-                    throw AckValidationError(
-                        operation: "Resume session",
-                        detail: "Hermes returned a different profile identity."
-                    )
-                }
-                // The resume response can itself have crossed c1e25's
-                // unknown-profile fallback. Re-prove the captured profile
-                // after that response and before any chat/session binding.
-                try await exactSource.validateBeforeBinding()
-                try requireCurrentOpen()
-            }
             chat.storedSessionID = stored
             // Clear state from the session we left, then derive the selected
             // session's turn state before yielding to REST hydration. Events

@@ -619,7 +619,164 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
             returnedProfile: "")) { error in
                 XCTAssertEqual(error as? ExactStoredSessionResumeAckAuthorityError,
                                .profileMismatch)
-            }
+        }
+    }
+
+    func testExactOpenAuthorityFailuresPreserveVisibleChatTranscriptAndUnread() async throws {
+        let model = AppModel()
+        let gatewayID = "exact-transaction"
+        let target = "researcher"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: target)
+        let client = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://exact-transaction.example")),
+            credential: .sessionToken("unused-test-token"))
+        let previous = ChatState(messages: [
+            ChatMessage(author: .bot, text: "keep the visible transcript"),
+        ])
+        previous.sessionID = "visible-runtime"
+        previous.storedSessionID = "visible-stored"
+        let targetChat = ChatState(messages: [
+            ChatMessage(author: .bot, text: "keep the target transcript too"),
+        ])
+        targetChat.sessionID = "target-old-runtime"
+        targetChat.storedSessionID = "target-old-stored"
+        model.mode = .live
+        model.openBotID = "visible"
+        model.chats["visible"] = previous
+        model.chats[target] = targetChat
+        model.bots = [Bot(
+            id: target, job: "", shape: .circle, hue: .violet, unread: 7)]
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        LiveRuntime.shared.gatewayID = gatewayID
+        defer {
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            LiveRuntime.shared.sessionToBot.removeValue(forKey: "wrong-runtime")
+            LiveRuntime.shared.sessionToBot.removeValue(forKey: "right-runtime")
+        }
+
+        do {
+            _ = try await model.openStoredSessionAwaiting(
+                "wanted-stored", botID: target, route: route, client: client,
+                validateBeforeBinding: {
+                    XCTFail("a wrong-profile ACK must fail before the second authority check")
+                },
+                resumeForTesting: {
+                    LiveSession(.object([
+                        "session_id": .string("wrong-runtime"),
+                        "stored_session_id": .string("wanted-stored"),
+                        "info": .object(["profile_name": .string("default")]),
+                    ]))
+                })
+            XCTFail("wrong-profile resume must be rejected")
+        } catch {
+            XCTAssertTrue(error is AckValidationError)
+        }
+
+        XCTAssertEqual(model.openBotID, "visible")
+        XCTAssertTrue(model.chats["visible"] === previous)
+        XCTAssertEqual(previous.messages.map(\.text), ["keep the visible transcript"])
+        XCTAssertTrue(model.chats[target] === targetChat)
+        XCTAssertEqual(targetChat.messages.map(\.text), ["keep the target transcript too"])
+        XCTAssertEqual(targetChat.sessionID, "target-old-runtime")
+        XCTAssertEqual(targetChat.storedSessionID, "target-old-stored")
+        XCTAssertEqual(model.bots.first(where: { $0.id == target })?.unread, 7)
+
+        do {
+            _ = try await model.openStoredSessionAwaiting(
+                "wanted-stored", botID: target, route: route, client: client,
+                validateBeforeBinding: {
+                    throw ExactStoredSessionRouteAuthorityError.missingProfile(
+                        try XCTUnwrap(ExactStoredSessionRoute(
+                            gatewayID: gatewayID, profile: target,
+                            storedSessionID: "wanted-stored")))
+                },
+                resumeForTesting: {
+                    LiveSession(.object([
+                        "session_id": .string("right-runtime"),
+                        "stored_session_id": .string("wanted-stored"),
+                        "info": .object(["profile_name": .string(target)]),
+                    ]))
+                })
+            XCTFail("post-resume profile deletion must be rejected")
+        } catch {
+            XCTAssertTrue(error is ExactStoredSessionRouteAuthorityError)
+        }
+
+        XCTAssertEqual(model.openBotID, "visible")
+        XCTAssertTrue(model.chats["visible"] === previous)
+        XCTAssertEqual(previous.messages.map(\.text), ["keep the visible transcript"])
+        XCTAssertTrue(model.chats[target] === targetChat)
+        XCTAssertEqual(targetChat.messages.map(\.text), ["keep the target transcript too"])
+        XCTAssertEqual(targetChat.sessionID, "target-old-runtime")
+        XCTAssertEqual(targetChat.storedSessionID, "target-old-stored")
+        XCTAssertEqual(model.bots.first(where: { $0.id == target })?.unread, 7)
+    }
+
+    func testExactOpenPublishesOnlyAfterResumeAndFreshProfileAuthority() async throws {
+        let model = AppModel()
+        let gatewayID = "exact-positive"
+        let target = "researcher"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: target)
+        let client = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://exact-positive.example")),
+            credential: .sessionToken("unused-test-token"))
+        let previous = ChatState(messages: [
+            ChatMessage(author: .bot, text: "old visible transcript"),
+        ])
+        let targetChat = ChatState(messages: [
+            ChatMessage(author: .bot, text: "old target transcript"),
+        ])
+        targetChat.sessionID = "old-runtime"
+        targetChat.storedSessionID = "old-stored"
+        model.mode = .live
+        model.client = client
+        model.openBotID = "visible"
+        model.chats["visible"] = previous
+        model.chats[target] = targetChat
+        model.bots = [Bot(
+            id: target, job: "", shape: .circle, hue: .violet, unread: 5)]
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        LiveRuntime.shared.gatewayID = gatewayID
+        var observedBeforeResume = false
+        var observedBeforeAuthority = false
+        defer {
+            model.client = nil
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            LiveRuntime.shared.sessionToBot.removeValue(forKey: "new-runtime")
+        }
+
+        let opened = try await model.openStoredSessionAwaiting(
+            "wanted-stored", botID: target, route: route, client: client,
+            validateBeforeBinding: {
+                observedBeforeAuthority = model.openBotID == "visible"
+                    && targetChat.messages.map(\.text) == ["old target transcript"]
+                    && model.bots.first(where: { $0.id == target })?.unread == 5
+            },
+            resumeForTesting: {
+                observedBeforeResume = model.openBotID == "visible"
+                    && targetChat.messages.map(\.text) == ["old target transcript"]
+                    && model.bots.first(where: { $0.id == target })?.unread == 5
+                return LiveSession(.object([
+                    "session_id": .string("new-runtime"),
+                    "stored_session_id": .string("wanted-stored"),
+                    "messages": .array([
+                        .object(["role": .string("assistant"),
+                                 "text": .string("authoritative response")]),
+                    ]),
+                    "info": .object(["profile_name": .string(target)]),
+                ]))
+            })
+
+        XCTAssertTrue(opened)
+        XCTAssertTrue(observedBeforeResume)
+        XCTAssertTrue(observedBeforeAuthority)
+        XCTAssertEqual(model.openBotID, target)
+        XCTAssertTrue(model.chats[target] === targetChat)
+        XCTAssertEqual(targetChat.sessionID, "new-runtime")
+        XCTAssertEqual(targetChat.storedSessionID, "wanted-stored")
+        XCTAssertEqual(targetChat.messages.map(\.text), ["authoritative response"])
+        XCTAssertEqual(model.bots.first(where: { $0.id == target })?.unread, 0)
+        XCTAssertEqual(previous.messages.map(\.text), ["old visible transcript"])
     }
 
     func testDeepLinkParserRetainsUnknownSourceForVisibleAuthorityFailure() throws {
