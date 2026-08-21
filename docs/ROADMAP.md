@@ -1,9 +1,12 @@
 # Talaria roadmap — phased plan to Bot Mode parity
 
-**Status: phases 0–5 landed in the overnight run of 2026-08-18. Nothing has been
-run against a live gateway.** See [OVERNIGHT-REPORT.md](OVERNIGHT-REPORT.md) for
-what shipped, what a reviewer flagged, and the live checks to run first — and
-[What is actually left](#what-is-actually-left) at the bottom of this file.
+**Status: phases 0–5 landed in the overnight run of 2026-08-18, and subsequent
+reviewed slices added current-Hermes contracts, source-qualified multi-gateway
+state, standalone shared rooms with CAS, push corrections, and authenticated
+Advanced Terminal.** Informal live use has confirmed response/approval push
+delivery, but it is not retained certification evidence. The complete Debug /
+TestFlight, room-convergence, PTY, reconnect, and row-specific live matrices in
+[`TESTING.md`](../TESTING.md) remain authoritative.
 
 Written 2026-08-18 from three sources: the 1,190-row desktop audit
 ([PARITY.md](../PARITY.md)), the 443-row Bot Mode plugin audit
@@ -263,22 +266,21 @@ row by row in [PARITY.md](../PARITY.md#mobile-ceiling).
 
 <a id="what-is-actually-left"></a>
 
-## What is actually left (after the 2026-08-18 run)
+## What is actually left (reconciled 2026-08-21)
 
-Recorded the morning after phases 0–5 landed. Ordered by what a phone-first
-operator loses, not by effort.
+Reconciled against pinned Hermes `40643cba`, the current source, and reviewed
+delivery through Advanced Terminal. Ordered by what a phone-first operator
+loses, not by effort.
 
 ### 1. Verification, which is now the whole critical path
 
-**No line of the run was executed against a live gateway** — none was reachable
-overnight. Everything below the word "landed" is a shape read from the upstream
-Python and compiled, not a shape seen on the wire. That is why 26 of the 30 rows
-this run moved in [PARITY.md](../PARITY.md) are 🔶 rather than ✅, and why the
-first real session matters more than any remaining feature. The ordered list of
-checks is in [OVERNIGHT-REPORT.md](OVERNIGHT-REPORT.md#live-checks-in-the-order-most-likely-to-find-a-bug);
-the three that carry the most risk are the canonical-chat resolver (Phase 0),
-the `session.active_list` reconcile (Phase 1), and the cron REST write path
-(Phase 3).
+Some gateway/device paths have now been exercised informally, including real
+response and approval notifications. That does not satisfy the retained
+evidence standard. The critical path is still the complete live matrix in
+[`TESTING.md`](../TESTING.md): canonical chat/reconnect, push Debug and
+TestFlight cases, shared-room convergence/CAS, current-Hermes deployment
+behavior, and Advanced Terminal across both auth modes, radio/background/TTL,
+close taxonomy, accessibility, and cleanup.
 
 Phase 1's own item 4 — kill the socket mid-turn, confirm the ~20 s park/reattach
 and the `inflight` replay — is unchanged from the original plan and is still the
@@ -314,7 +316,7 @@ to record, against the pinned Hermes revision:
 Until that matrix is recorded, keep push/background rows partial and describe
 them as implemented-but-uncertified rather than production-ready.
 
-### 2. Bot Mode gaps that survived Phase 4
+### 2. Bot Mode implementation complete; certification remains
 
 - **Group rooms / multi-bot chats — implemented, certification pending.** The
   room row is interleaved into the roster; the mobile room view has threaded
@@ -324,22 +326,27 @@ them as implemented-but-uncertified rather than production-ready.
   across retained gateways. Automated Swift, protocol, Debug and Release gates
   are green; live Hermes and phone reliability checks are still required before
   this can be called production-certified.
-- **`/new` and `/reset` inside the canonical chat** are still offered as plain
-  slash commands with no reroute to `/compact` and no "this chat never resets"
-  explanation — so the app still hands the user a way to fork the one thing
-  Phase 0 exists to protect.
-- **`hideOwnedBotSessions` reconciliation sweep.** New chats are born hidden,
-  but nothing sweeps sessions that predate the fix or were created by another
-  client, so a stray "Bot Chat" can still surface in desktop's global lists.
-- **Pets** remain in flight rather than finished (Region 2).
+- Canonical `/new` and `/reset` protection, the `hideOwnedBotSessions`
+  reconciliation sweep, and the source-qualified pet gallery/mutations have
+  landed. Their remaining work is row-specific live-gateway/device evidence,
+  not another client implementation pass.
 
-### 3. Settings that a phone genuinely wants and still lacks
+### Advanced Terminal — implemented, certification pending
 
-Out of the deliberately-not-202: `agent.max_turns` (the runaway brake),
-persistent-memory toggles, image attachment mode, and a log viewer over
-`GET /api/logs` for when a gateway misbehaves. Adding a *pattern* to the command
-allowlist is also still absent — the phone can revoke a standing grant but not
-mint one, which is the safe asymmetry to keep unless it proves annoying.
+Command Center now opens an exact gateway/profile/durable session through
+Hermes’ authenticated `/api/pty`, renders with SwiftTerm, preserves ordered
+backpressure, handles resize/reconnect/close semantics, and clears scoped
+attachment state on profile/gateway/privacy lifecycle events. It is not
+production-certified until the real-device matrix in `TESTING.md` is retained.
+
+### 3. Remaining management depth
+
+Operator Settings now includes `agent.max_turns`, persistent-memory controls,
+image-input mode, and gateway logs. Remaining management work is messaging /
+webhook / relay lifecycle, subagent tree/live-tail/files/cost, learned-memory
+curation and import/export, MCP logs, auxiliary goal-judge/vision slots, and
+MoA management. Implemented routine reasoning effort still needs its live
+create/edit/clone/run certification cases.
 
 ### 4. Known-latent, not yet a bug
 
@@ -359,10 +366,10 @@ mint one, which is the safe asymmetry to keep unless it proves annoying.
   with a nested or array argument would vanish from the on-device tier with no
   diagnostic. Worth an assertion before the tool set grows.
 
-### 5. Not started, and deliberately so
+### 5. Remaining transcript and session depth
 
-The transcript's *acting* half — message edit, rewind/restore, branch
-navigation, regenerate — is untouched and remains the biggest ⭕ cluster in
-`chat-transcript`. It was never in phases 0–5. It is the obvious Phase 6, and it
-is worth doing only after the verification in §1, because rewind writes to the
-same session the canonical-chat resolver now owns.
+Message edit, rewind/restore, and regenerate are implemented. Remaining depth
+includes branch navigation, persistent multimodal parts and generated-media
+lightboxes, grouped tool runs, diff/ANSI/search/math/diagram presentation,
+per-message TTS and timing, and the durable prompt queue. These should be split
+into independently reviewed slices after the certification critical path.
