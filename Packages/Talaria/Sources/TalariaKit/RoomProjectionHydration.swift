@@ -36,6 +36,7 @@ enum RoomProjectionHydration {
     ) -> Result {
         var rooms = existing
         var deletedRoomIDs = Set<RoomID>()
+        var imageEligibleKeys = Set<String>()
 
         // Omission is never deletion. Only an observed explicit tombstone may
         // remove the matching rich record, and the caller can temporarily
@@ -64,18 +65,21 @@ enum RoomProjectionHydration {
                 // but never let one projection identity claim the other.
                 guard current.rawProjectionRoomKey == nil
                         || current.rawProjectionRoomKey == key else { continue }
-                rooms[roomID] = hydrate(projected, key: key, into: current)
+                let hydrated = hydrate(projected, key: key, into: current)
+                rooms[roomID] = hydrated.room
+                if hydrated.acceptedIdentityOverlay { imageEligibleKeys.insert(key) }
             } else if let hydrated = hydrateNew(projected, key: key, id: roomID) {
                 rooms[roomID] = hydrated
+                imageEligibleKeys.insert(key)
             }
         }
 
         var images: [RoomID: Data] = [:]
-        for key in projection.rooms.keys.sorted() {
+        for key in imageEligibleKeys.sorted() {
             guard let projected = projection.rooms[key],
                   let id = RoomProjectionEnvelope.localRoomID(forProjectionKey: key),
                   let rich = rooms[id], rich.rawProjectionRoomKey == key,
-                  projected.revision >= rich.rawProjectionRevision,
+                  projected.revision == rich.rawProjectionRevision,
                   let image = projected.image.flatMap(decodeImageDataURL)
             else { continue }
             images[id] = image
@@ -119,40 +123,48 @@ enum RoomProjectionHydration {
         return hydrated
     }
 
+    private struct ExistingHydration {
+        var room: RoomRecord
+        var acceptedIdentityOverlay: Bool
+    }
+
     private static func hydrate(_ projected: RoomProjectionRoom,
-                                key: String, into existing: RoomRecord) -> RoomRecord {
+                                key: String, into existing: RoomRecord) -> ExistingHydration {
         var room = existing
         room.rawProjectionRoomKey = key
-        let revisionWins = projected.revision > existing.rawProjectionRevision
+        // A first exact-key association may safely consume revision zero. Once
+        // associated, only a strictly newer revision may change identity.
+        let revisionWins = existing.rawProjectionRoomKey == nil
+            || projected.revision > existing.rawProjectionRevision
+        var acceptedIdentityOverlay = existing.rawProjectionRoomKey == key
+            && projected.revision == existing.rawProjectionRevision
 
         if revisionWins {
-            // Rename is independent from mutable session identity and is safe
-            // as long as it remains a valid nonempty room label.
-            if !projected.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                room.name = projected.name
-            }
-
-            if let members = routableMembers(
+            if !projected.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let members = routableMembers(
                 projected.members,
                 preserving: existing.members + existing.formerMembers
             ), members.count >= RoomEngine.minimumMembers {
-                var memberCandidate = room
+                var identityCandidate = room
+                identityCandidate.name = projected.name
                 let liveRoutes = Set(members.map(\.route))
                 var former = existing.formerMembers.filter { !liveRoutes.contains($0.route) }
                 for removed in existing.members where !liveRoutes.contains(removed.route)
                     && !former.contains(where: { $0.route == removed.route }) {
                     former.append(removed)
                 }
-                memberCandidate.members = members
-                memberCandidate.formerMembers = former
+                identityCandidate.members = members
+                identityCandidate.formerMembers = former
+                identityCandidate.rawProjectionRevision = projected.revision
                 // Attempts, drives, sessions, watermarks, and historical rows
                 // stay byte-for-byte intact. Validation is the safety proof
-                // that the revisioned member overlay does not strand them.
-                if (try? RoomEngine.validate(memberCandidate)) != nil {
-                    room = memberCandidate
+                // that the revisioned name/member/image overlay does not
+                // strand them. The overlay advances as one unit or not at all.
+                if (try? RoomEngine.validate(identityCandidate)) != nil {
+                    room = identityCandidate
+                    acceptedIdentityOverlay = true
                 }
             }
-            room.rawProjectionRevision = projected.revision
         }
 
         // Missing stable-id messages are a union independent of room revision.
@@ -162,7 +174,8 @@ enum RoomProjectionHydration {
            (try? RoomEngine.validate(withEntries)) != nil {
             room = withEntries
         }
-        return room
+        return ExistingHydration(room: room,
+                                 acceptedIdentityOverlay: acceptedIdentityOverlay)
     }
 
     private static func routableMembers(_ projected: [RoomProjectionMember],

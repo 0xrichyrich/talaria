@@ -1162,6 +1162,39 @@ final class RoomStoreTests: XCTestCase {
         XCTAssertEqual(room.members[0].handle, "research")
     }
 
+    func testUnsafeHigherRevisionIdentityOverlayStaysLedgerOnlyUntilSafe() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let key = "id:safe-overlay"
+        let store = RoomStore(baseDirectory: base)
+        let first = try await store.reconcileRoomProjection(RoomProjectionEnvelope(rooms: [
+            key: RoomProjectionRoom(name: "Protected", roomID: "safe-overlay", log: [],
+                                    revision: 1, members: projectedMembers()),
+        ]))
+        let roomID = try XCTUnwrap(first.rooms.first?.id)
+        let image = "data:image/png;base64,\(Data([1, 2, 3]).base64EncodedString())"
+        let unsafe = try await store.reconcileRoomProjection(RoomProjectionEnvelope(rooms: [
+            key: RoomProjectionRoom(
+                name: "Unsafe rename", roomID: "safe-overlay", log: [], revision: 2,
+                members: [projectedMembers()[0]], image: image),
+        ]))
+        let protected = try XCTUnwrap(unsafe.rooms.first { $0.id == roomID })
+        XCTAssertEqual(protected.name, "Protected")
+        XCTAssertEqual(protected.rawProjectionRevision, 1)
+        XCTAssertNil(unsafe.projectedImages[roomID])
+        XCTAssertEqual(unsafe.roomProjection.rooms[key]?.name, "Unsafe rename",
+                       "the untrusted identity remains available in the ledger")
+
+        let safe = try await store.reconcileRoomProjection(RoomProjectionEnvelope(rooms: [
+            key: RoomProjectionRoom(name: "Safe rename", roomID: "safe-overlay", log: [],
+                                    revision: 2, members: projectedMembers(), image: image),
+        ]))
+        let renamed = try XCTUnwrap(safe.rooms.first { $0.id == roomID })
+        XCTAssertEqual(renamed.name, "Safe rename")
+        XCTAssertEqual(renamed.rawProjectionRevision, 2)
+        XCTAssertEqual(safe.projectedImages[roomID], Data([1, 2, 3]))
+    }
+
     func testProjectionTombstonesDeleteMatchingRichRoomsUnlessExplicitlyPreserved() async throws {
         let base = try temporaryBase()
         defer { try? FileManager.default.removeItem(at: base) }
