@@ -889,6 +889,29 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         XCTAssertEqual(model.routineGatewayID(botID: "homelab::default"), "homelab")
     }
 
+    func testCollidingCronActivityUsesPrimaryAndRetainedSourceIdentity() {
+        let primaryTarget = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "primary", jobID: "same"),
+            bot: GatewayBotRoute(gatewayID: "primary", profile: "default"),
+            profile: "default")
+        let retainedTarget = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "homelab", jobID: "same"),
+            bot: GatewayBotRoute(gatewayID: "homelab", profile: "default"),
+            profile: "default")
+        let primaryFence = CronRoutineMutationFence(
+            routineID: "same", target: primaryTarget,
+            source: CronSourceMutationFence(
+                gatewayID: "primary", profile: "default", generation: .primary(4)),
+            profileGeneration: 8)
+        let retainedFence = CronRoutineMutationFence(
+            routineID: "same", target: retainedTarget,
+            source: CronSourceMutationFence(
+                gatewayID: "homelab", profile: "default", generation: .retained(9)),
+            profileGeneration: 8)
+
+        XCTAssertNotEqual(primaryFence.activityIdentity, retainedFence.activityIdentity)
+    }
+
     func testRoutineRESTCapabilityAndDeliveryCachesAreGatewayScoped() {
         let model = AppModel()
         model.mode = .live

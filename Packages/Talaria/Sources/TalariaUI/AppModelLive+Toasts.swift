@@ -420,14 +420,14 @@ public extension AppModel {
     /// the delete is confirmed by the row vanishing, and the create by a screen
     /// that pops back to a list the new row may not have reached yet.
     ///
-    /// Rethrows, deliberately: the editor keeps the gateway's sentence on its
-    /// own error line for the failure the user is looking straight at, and it
-    /// stays on screen with the typing intact.
+    /// A socket add is irreversible. Once it returns an id, a failed or stale
+    /// REST follow-up is returned as a typed partial result and the create
+    /// editor dismisses with a warning; it must not invite a duplicate create.
     func scheduleRoutineWithFeedback(botID: String, title: String, schedule: String,
                                      instruction: String, repeatForever: Bool = true,
                                      continuity: Bool = false, deliver: [String] = [],
                                      model: String? = nil, provider: String? = nil,
-                                     reasoningEffort: String? = nil) async throws {
+                                     reasoningEffort: String? = nil) async throws -> CronCreateOutcome {
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let sourceFence = mode == .live
             ? routineGatewayID(botID: botID).flatMap { gatewayID in
@@ -446,23 +446,31 @@ public extension AppModel {
         toast(kind: .info, title: theme.copy.toastSchedulingRoutine(clean, theme.themeID),
               botID: botID, key: key)
         do {
-            try await scheduleRoutine(botID: botID, title: clean, schedule: schedule,
-                                      instruction: instruction, repeatForever: repeatForever,
-                                      continuity: continuity, deliver: deliver,
-                                      model: model, provider: provider,
-                                      reasoningEffort: reasoningEffort)
-            toast(kind: .success, title: theme.copy.toastRoutineScheduled(clean, theme.themeID),
-                  botID: botID, key: key)
+            let outcome = try await scheduleRoutine(
+                botID: botID, title: clean, schedule: schedule,
+                instruction: instruction, repeatForever: repeatForever,
+                continuity: continuity, deliver: deliver,
+                model: model, provider: provider,
+                reasoningEffort: reasoningEffort)
+            if let partial = outcome.acceptedPartial {
+                let message: String
+                switch partial.reason {
+                case .sourceChanged:
+                    message = theme.copy.routineMadeSourceChanged(theme.themeID)
+                case .followUpUnavailable, .followUpAmbiguous:
+                    message = theme.copy.routineMadeFollowUpAmbiguous(theme.themeID)
+                }
+                toast(kind: .warning,
+                      title: theme.copy.toastRoutineScheduled(clean, theme.themeID),
+                      message: message, botID: botID, key: key)
+            } else {
+                toast(kind: .success, title: theme.copy.toastRoutineScheduled(clean, theme.themeID),
+                      botID: botID, key: key)
+            }
+            return outcome
         } catch {
-            // `scheduleRoutine` raises -4 for the one half-landed case: the job
-            // EXISTS and will fire, only its delivery route or model pin did
-            // not take. Reporting that as a failure would tell the user to
-            // schedule it again and give them two.
             let reason = Self.reason(error)
-            let partial = (error as? GatewayError)?.code == -4
-            toast(kind: partial ? .warning : .failure,
-                  title: partial ? theme.copy.toastRoutineScheduled(clean, theme.themeID)
-                                 : theme.copy.toastRoutineScheduleFailed(theme.themeID),
+            toast(kind: .failure, title: theme.copy.toastRoutineScheduleFailed(theme.themeID),
                   message: reason, botID: botID, key: key)
             throw error
         }

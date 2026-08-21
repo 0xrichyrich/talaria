@@ -31,10 +31,12 @@ final class CronReasoningEffortTests: XCTestCase {
         let listed = CronJobRecord([
             "job_id": "job-1",
             "reasoning_effort": "  FUTURE-level  ",
+            "profile_name": "primary-store",
         ])
         let detail = CronJobDetail([
             "id": "job-1",
             "reasoning_effort": "  FUTURE-level  ",
+            "profile": "primary-store",
         ])
         let empty = CronJobDetail([
             "id": "job-2",
@@ -43,7 +45,9 @@ final class CronReasoningEffortTests: XCTestCase {
         let absent = CronJobDetail(["id": "job-3"])
 
         XCTAssertEqual(listed.reasoningEffortRaw, "  FUTURE-level  ")
+        XCTAssertEqual(listed.profile, "primary-store")
         XCTAssertEqual(detail.reasoningEffortRaw, "  FUTURE-level  ")
+        XCTAssertEqual(detail.profile, "primary-store")
         XCTAssertEqual(empty.reasoningEffortRaw, "")
         XCTAssertNil(absent.reasoningEffortRaw)
     }
@@ -136,6 +140,76 @@ final class CronReasoningEffortTests: XCTestCase {
         XCTAssertFalse(CronRoutineMutationFence.accepts(
             mismatchedStore, currentTarget: target, primaryGatewayID: "primary",
             primaryGeneration: 7, retainedGenerations: [:]))
+    }
+
+    func testSourceChangedErrorDoesNotCollideWithTransportTimeout() {
+        XCTAssertNotEqual(CronMutationFenceError.sourceChanged, -5)
+        XCTAssertEqual(CronMutationFenceError.sourceChanged, -10)
+    }
+
+    func testActivityIdentityIncludesProfileGeneration() {
+        let target = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "homelab", jobID: "same-id"),
+            bot: GatewayBotRoute(gatewayID: "homelab", profile: "default"),
+            profile: "default")
+        let source = CronSourceMutationFence(
+            gatewayID: "homelab", profile: "default", generation: .retained(4))
+        let first = CronRoutineMutationFence(
+            routineID: "same-id", target: target, source: source, profileGeneration: 11)
+        let replacement = CronRoutineMutationFence(
+            routineID: "same-id", target: target, source: source, profileGeneration: 12)
+
+        XCTAssertNotEqual(first.activityIdentity, replacement.activityIdentity)
+    }
+
+    func testAcceptedDeleteCannotClearReplacementSameIDTarget() {
+        let oldTarget = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "primary", jobID: "same-id"),
+            bot: GatewayBotRoute(gatewayID: "primary", profile: "default"),
+            profile: "default")
+        var replacement = oldTarget
+        replacement.profile = "researcher"
+        replacement.bot = GatewayBotRoute(gatewayID: "primary", profile: "researcher")
+
+        XCTAssertTrue(CronDeletePostRefreshPolicy.mayClear(
+            capturedTarget: oldTarget, currentTarget: nil))
+        XCTAssertTrue(CronDeletePostRefreshPolicy.mayClear(
+            capturedTarget: oldTarget, currentTarget: oldTarget))
+        XCTAssertFalse(CronDeletePostRefreshPolicy.mayClear(
+            capturedTarget: oldTarget, currentTarget: replacement))
+    }
+
+    func testCreateRESTAcknowledgementRequiresExactIDAndProfile() {
+        let expected = CronJobDetail([
+            "id": "same-id", "profile_name": "default",
+        ])
+        let wrongID = CronJobDetail([
+            "id": "other-id", "profile_name": "default",
+        ])
+        let wrongProfile = CronJobDetail([
+            "id": "same-id", "profile": "researcher",
+        ])
+        let unscoped = CronJobDetail(["id": "same-id"])
+
+        XCTAssertTrue(CronCreateAcknowledgementPolicy.accepts(
+            expected, jobID: "same-id", profile: "default"))
+        XCTAssertFalse(CronCreateAcknowledgementPolicy.accepts(
+            wrongID, jobID: "same-id", profile: "default"))
+        XCTAssertFalse(CronCreateAcknowledgementPolicy.accepts(
+            wrongProfile, jobID: "same-id", profile: "default"))
+        XCTAssertFalse(CronCreateAcknowledgementPolicy.accepts(
+            unscoped, jobID: "same-id", profile: "default"))
+    }
+
+    func testAcceptedPartialOutcomeIsNotAResubmitInstruction() {
+        let outcome = CronCreateOutcome.acceptedPartial(
+            CronAcceptedPartialOutcome(
+                jobID: "same-id", gatewayID: "homelab", profile: "default",
+                reason: .followUpAmbiguous))
+
+        XCTAssertEqual(outcome.acceptedPartial?.jobID, "same-id")
+        XCTAssertEqual(outcome.acceptedPartial?.reason, .followUpAmbiguous)
+        XCTAssertNil(CronCreateOutcome.completed.acceptedPartial)
     }
 
     func testRetainedMutationFenceRejectsReplacedClientGeneration() {
@@ -235,9 +309,10 @@ final class CronReasoningEffortTests: XCTestCase {
     }
 
     func testQuarantinePauseFailureLeavesVictimRetryable() {
-        var quarantined: Set<String> = ["legacy-job"]
+        var quarantined: Set<String> = ["legacy-job|homelab|legacy-job|default|retained-4|9"]
+        let quarantineKey = "legacy-job|homelab|legacy-job|default|retained-4|9"
         if !CronQuarantinePolicy.retainMarkerAfterPauseFailure {
-            quarantined.remove("legacy-job")
+            quarantined.remove(quarantineKey)
         }
         XCTAssertTrue(quarantined.isEmpty)
     }

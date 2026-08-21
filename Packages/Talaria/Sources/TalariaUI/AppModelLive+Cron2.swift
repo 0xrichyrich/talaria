@@ -79,8 +79,9 @@ public final class CronDetailRuntime {
     @ObservationIgnored var runsAuthority: [String: CronRoutineMutationFence] = [:]
     @ObservationIgnored var detailLoadingAuthority: [String: CronRoutineMutationFence] = [:]
     @ObservationIgnored var runsLoadingAuthority: [String: CronRoutineMutationFence] = [:]
-    /// Legacy delegated jobs already force-paused on this link, so the
-    /// migration runs once per job instead of on every list refresh.
+    /// Full routine-fence identities already force-paused on this link, so the
+    /// migration runs once per source/profile generation instead of on every
+    /// list refresh. Raw job ids are deliberately not enough here.
     @ObservationIgnored var quarantined: Set<String> = []
 
     /// Everything derived from one gateway; dropped when the link changes.
@@ -115,7 +116,10 @@ enum CronGatewayGeneration: Sendable, Equatable {
 /// partial result. A stale completion must never look like a successful write
 /// or invite a retry against the replacement source.
 enum CronMutationFenceError {
-    static let sourceChanged = -5
+    /// GatewayTransport reserves -5 for an ordinary request timeout. A stale
+    /// completion is a different state: the request may have landed on the
+    /// old source, but its result is not authoritative for the current one.
+    static let sourceChanged = -10
 }
 
 /// Common post-await decision for cron reads and writes. Keeping stale as an
@@ -211,6 +215,61 @@ enum CronCreatePostAddPolicy {
             return .acceptedWithoutREST
         }
         return .readyForREST
+    }
+}
+
+/// A socket add is irreversible. If its REST completion is not authoritative,
+/// callers must carry the accepted job forward as a typed partial result so a
+/// UI cannot turn an ambiguous follow-up into a duplicate create retry.
+public enum CronAcceptedPartialReason: Sendable, Equatable {
+    case sourceChanged
+    case followUpUnavailable
+    case followUpAmbiguous
+}
+
+public struct CronAcceptedPartialOutcome: Sendable, Equatable {
+    public var jobID: String
+    public var gatewayID: String
+    public var profile: String?
+    public var reason: CronAcceptedPartialReason
+
+    public init(jobID: String, gatewayID: String, profile: String?,
+                reason: CronAcceptedPartialReason) {
+        self.jobID = jobID; self.gatewayID = gatewayID; self.profile = profile
+        self.reason = reason
+    }
+}
+
+public enum CronCreateOutcome: Sendable, Equatable {
+    case completed
+    case acceptedPartial(CronAcceptedPartialOutcome)
+
+    public var acceptedPartial: CronAcceptedPartialOutcome? {
+        guard case .acceptedPartial(let outcome) = self else { return nil }
+        return outcome
+    }
+}
+
+enum CronCreateAcknowledgementPolicy {
+    /// A REST create follow-up is only authoritative when both dimensions of
+    /// the launch-store identity are echoed. A missing profile is not an ACK:
+    /// an unscoped response could belong to a colliding profile store.
+    static func accepts(_ detail: CronJobDetail, jobID: String,
+                        profile: String?) -> Bool {
+        guard !jobID.isEmpty, detail.id == jobID,
+              let profile, !profile.isEmpty else { return false }
+        return detail.profile == profile
+    }
+}
+
+enum CronDeletePostRefreshPolicy {
+    /// A successful remove may be followed by a refresh that installs a newer
+    /// same-id row. Clearing is safe only when that id is now absent (the
+    /// accepted delete is reflected) or still points at the exact captured
+    /// target. A different target owns the caches and must be left alone.
+    static func mayClear(capturedTarget: RoutineTarget,
+                        currentTarget: RoutineTarget?) -> Bool {
+        currentTarget == nil || currentTarget == capturedTarget
     }
 }
 
@@ -468,7 +527,9 @@ public extension AppModel {
         let runtime = CronDetailRuntime.shared
         let feeds = FeedsRuntime.shared
         let victims = feeds.cronJobs.filter { id, job in
-            Self.isLegacyDelegated(job) && job.isActive && !runtime.quarantined.contains(id)
+            guard let fence = cronRoutineMutationFence(id) else { return false }
+            return Self.isLegacyDelegated(job) && job.isActive
+                && !runtime.quarantined.contains(fence.activityIdentity)
         }
         guard !victims.isEmpty else { return }
         var paused = false
@@ -478,12 +539,13 @@ public extension AppModel {
                   let client = try? await routedClient(gatewayID: target.route.gatewayID)
             else { continue }
             guard cronMutationFenceAccepts(fence, expectedClient: client) else { continue }
-            runtime.quarantined.insert(id)
+            let quarantineKey = fence.activityIdentity
+            runtime.quarantined.insert(quarantineKey)
             do {
                 try await client.cronSetPaused(jobID: target.route.jobID, paused: true,
                                                profile: target.profile)
                 guard cronMutationFenceAccepts(fence, expectedClient: client) else {
-                    runtime.quarantined.remove(id)
+                    runtime.quarantined.remove(quarantineKey)
                     continue
                 }
                 paused = true
@@ -492,7 +554,7 @@ public extension AppModel {
                 recordActivity(kind: .routine, botID: botID,
                                text: theme.copy.routineQuarantined(theme.themeID) + " — " + job.displayTitle,
                                subtext: theme.copy.routineQuarantineWhy(theme.themeID),
-                               key: "cron-quarantine:\(id)")
+                               key: "cron-quarantine:\(fence.activityIdentity)")
             } catch {
                 // Retried on the next list; never surfaced as a list failure.
                 // The marker is only a same-source dedupe lease. If the pause
@@ -500,7 +562,7 @@ public extension AppModel {
                 // retaining it would permanently hide the victim from the
                 // next quarantine sweep and could leave an unsafe job armed.
                 if !CronQuarantinePolicy.retainMarkerAfterPauseFailure {
-                    runtime.quarantined.remove(id)
+                    runtime.quarantined.remove(quarantineKey)
                 }
             }
         }
@@ -913,7 +975,7 @@ public extension AppModel {
                          repeatForever: Bool = true, continuity: Bool = false,
                          deliver: [String] = [], model: String? = nil,
                          provider: String? = nil,
-                         reasoningEffort: String? = nil) async throws {
+                         reasoningEffort: String? = nil) async throws -> CronCreateOutcome {
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanInstruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTitle.isEmpty, !cleanInstruction.isEmpty else {
@@ -931,22 +993,41 @@ public extension AppModel {
               let gatewayID = routineGatewayID(botID: botID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
         }
-        let launchProfile = gatewayID == LiveRuntime.shared.gatewayID
-            ? (LiveRuntime.shared.defaultBotID ?? bots.first?.id ?? "default")
-            : nil
-        guard let sourceFence = cronSourceMutationFence(
-            gatewayID: gatewayID, profile: nil, lifecycleProfile: launchProfile) else {
+        // Capture gateway authority before resolving the launch profile. A
+        // retained gateway has its own default profile; the selected bot is
+        // not necessarily the store whose scheduler will fire the job.
+        guard let initialFence = cronSourceMutationFence(
+            gatewayID: gatewayID, profile: nil) else {
             throw GatewayRouteError.noRoute
+        }
+        let client = try await routedClient(gatewayID: gatewayID)
+        guard cronMutationFenceAccepts(initialFence, expectedClient: client) else {
+            throw CancellationError()
+        }
+        let launchProfile: String
+        if gatewayID == LiveRuntime.shared.gatewayID {
+            launchProfile = LiveRuntime.shared.defaultBotID ?? bots.first?.id ?? "default"
+        } else {
+            let profiles = try await client.listProfiles(includeSessions: false)
+            guard cronMutationFenceAccepts(initialFence, expectedClient: client) else {
+                throw CancellationError()
+            }
+            guard let resolved = profiles.first(where: \.isDefault)?.name
+                    ?? profiles.first?.name,
+                  !resolved.isEmpty else { throw GatewayRouteError.noRoute }
+            launchProfile = resolved
+        }
+        guard let sourceFence = cronSourceMutationFence(
+            gatewayID: gatewayID, profile: launchProfile,
+            lifecycleProfile: launchProfile),
+              cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
+            throw CancellationError()
         }
         // Capture the REST authority before the first suspension. If the
         // socket add commits, finishing its PUT is one transaction and must
         // keep using this exact source/profile even if navigation changes.
         let restAuthority = gatewayRESTContext(gatewayID: gatewayID)
         let botProfile = GatewayBotRoute(qualifiedID: botID)?.profile ?? botID
-        let client = try await routedClient(gatewayID: gatewayID)
-        guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
-            throw CancellationError()
-        }
 
         // Validate every authored value before the socket creates anything.
         // Create is necessarily a two-step transaction (cron.manage add, then
@@ -970,6 +1051,7 @@ public extension AppModel {
             schedule: normalized,
             prompt: Self.delegatedPrompt(botID: botProfile, title: cleanTitle,
                                          instruction: cleanInstruction),
+            profile: launchProfile,
             repeatCount: repeatForever ? nil : 1,
             continuity: continuity)
 
@@ -979,8 +1061,14 @@ public extension AppModel {
         // socket call is suspended; in that case preserve the accepted add as
         // a recoverable partial result and never retry it against a new source.
         guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
-            throw GatewayError(code: -4,
-                               message: theme.copy.routineMadeSourceChanged(theme.themeID))
+            return .acceptedPartial(CronAcceptedPartialOutcome(
+                jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                reason: .sourceChanged))
+        }
+        guard !jobID.isEmpty else {
+            return .acceptedPartial(CronAcceptedPartialOutcome(
+                jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                reason: .followUpAmbiguous))
         }
         let postAddDecision = CronCreatePostAddPolicy.decision(
             sourceFence: sourceFence,
@@ -993,47 +1081,55 @@ public extension AppModel {
             restSupported: cronRESTSupported(gatewayID: gatewayID,
                                              sourceFence: sourceFence) != false)
         guard postAddDecision != .acceptedButStale else {
-            throw GatewayError(code: -4,
-                               message: theme.copy.routineMadeSourceChanged(theme.themeID))
+            return .acceptedPartial(CronAcceptedPartialOutcome(
+                jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                reason: .sourceChanged))
         }
 
         guard postAddDecision != .acceptedWithoutREST else {
             guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
-                throw GatewayError(code: -4,
-                                   message: theme.copy.routineMadeSourceChanged(theme.themeID))
+                return .acceptedPartial(CronAcceptedPartialOutcome(
+                    jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                    reason: .sourceChanged))
             }
             await refreshRoutinesLive(force: true)
             guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
-                throw GatewayError(code: -4,
-                                   message: theme.copy.routineMadeSourceChanged(theme.themeID))
+                return .acceptedPartial(CronAcceptedPartialOutcome(
+                    jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                    reason: .sourceChanged))
             }
             recordActivity(kind: .routine, botID: botID,
                            text: theme.copy.feedRoutineAdded(theme.themeID) + " — " + cleanTitle,
                            subtext: normalized)
-            throw GatewayError(code: -4,
-                               message: theme.copy.routineMadeNotRouted(theme.themeID))
+            return .acceptedPartial(CronAcceptedPartialOutcome(
+                jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                reason: .followUpUnavailable))
         }
         guard postAddDecision.shouldIssueRESTPatch,
               let (base, credential) = restAuthority else {
             await refreshRoutinesLive(force: true)
             guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
-                throw GatewayError(code: -4,
-                                   message: theme.copy.routineMadeSourceChanged(theme.themeID))
+                return .acceptedPartial(CronAcceptedPartialOutcome(
+                    jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                    reason: .sourceChanged))
             }
             recordActivity(kind: .routine, botID: botID,
                            text: theme.copy.feedRoutineAdded(theme.themeID) + " — " + cleanTitle,
                            subtext: normalized)
-            return
+            return .completed
         }
         var sourceChangedAfterREST = false
         do {
             let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
-                                                            jobID: jobID, profile: sourceFence.profile,
+                                                            jobID: jobID, profile: launchProfile,
                                                             updates: extras)
+            guard CronCreateAcknowledgementPolicy.accepts(
+                saved, jobID: jobID, profile: launchProfile) else {
+                throw GatewayError(code: -4, message: "cron REST response did not confirm the created job")
+            }
             guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
                 sourceChangedAfterREST = true
-                throw GatewayError(code: -4,
-                                   message: theme.copy.routineMadeSourceChanged(theme.themeID))
+                throw cronSourceChangedError()
             }
             let routineID: String
             if case .primary = sourceFence.generation {
@@ -1045,16 +1141,23 @@ public extension AppModel {
             await refreshRoutinesLive(force: true)
             guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
                 sourceChangedAfterREST = true
+                throw cronSourceChangedError()
+            }
+            guard let detailFence = cronRoutineMutationFence(routineID),
+                  detailFence.target.route.gatewayID == gatewayID,
+                  detailFence.target.route.jobID == jobID,
+                  detailFence.target.profile == launchProfile,
+                  detailFence.source.profile == launchProfile,
+                  cronMutationFenceAccepts(detailFence, expectedClient: client) else {
                 throw GatewayError(code: -4,
-                                   message: theme.copy.routineMadeSourceChanged(theme.themeID))
+                                   message: "cron list did not confirm the created job's profile")
             }
-            if let detailFence = cronRoutineMutationFence(routineID) {
-                CronDetailRuntime.shared.detail[routineID] = saved
-                CronDetailRuntime.shared.detailAuthority[routineID] = detailFence
-            }
+            CronDetailRuntime.shared.detail[routineID] = saved
+            CronDetailRuntime.shared.detailAuthority[routineID] = detailFence
             recordActivity(kind: .routine, botID: botID,
                            text: theme.copy.feedRoutineAdded(theme.themeID) + " — " + cleanTitle,
                            subtext: normalized)
+            return .completed
         } catch {
             // A transport error after the request began is ambiguous: the
             // gateway may have accepted the PUT even though no response made
@@ -1077,10 +1180,13 @@ public extension AppModel {
                     sourceFence, expectedClient: client)
             }
             if sourceChangedAfterREST {
-                throw GatewayError(code: -4,
-                                   message: theme.copy.routineMadeSourceChanged(theme.themeID))
+                return .acceptedPartial(CronAcceptedPartialOutcome(
+                    jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                    reason: .sourceChanged))
             }
-            throw GatewayError(code: -4, message: theme.copy.routineMadeNotRouted(theme.themeID))
+            return .acceptedPartial(CronAcceptedPartialOutcome(
+                jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
+                reason: .followUpAmbiguous))
         }
     }
 
@@ -1793,6 +1899,16 @@ public extension CopyPack {
         case .control: "JOB CREATED · SOURCE CHANGED BEFORE CONFIRMATION — VERIFY IN EDITOR"
         case .ink: "The rite is inscribed, but its gateway changed before it could be "
             + "witnessed. Open it to verify; it was not retried."
+        }
+    }
+
+    func routineMadeFollowUpAmbiguous(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "The routine was created, but Talaria could not confirm its delivery or model settings. "
+            + "Open it to verify; do not schedule it again."
+        case .control: "JOB CREATED · FOLLOW-UP NOT CONFIRMED — OPEN TO VERIFY; DO NOT RETRY CREATE"
+        case .ink: "The rite is inscribed, but its second witness did not arrive. "
+            + "Open it to verify; do not inscribe another."
         }
     }
 

@@ -1038,7 +1038,7 @@ public struct RoutineEditorView: View {
         Task { @MainActor in
             defer { saving = false }
             do {
-                try await model.scheduleRoutineWithFeedback(
+                let outcome = try await model.scheduleRoutineWithFeedback(
                     botID: botID, title: title, schedule: schedule, instruction: instruction,
                     repeatForever: repeatForever, continuity: continuity,
                     deliver: restAvailable ? deliver : [],
@@ -1046,7 +1046,13 @@ public struct RoutineEditorView: View {
                     provider: restAvailable ? providerPin : nil,
                     reasoningEffort: restAvailable && !reasoningEffort.isEmpty
                         ? reasoningEffort : nil)
-                onBack()
+                // Both outcomes leave the create form. A partial result means
+                // the socket already accepted the job; keeping this form open
+                // would make its primary action a duplicate-create invitation.
+                switch outcome {
+                case .completed, .acceptedPartial:
+                    onBack()
+                }
             } catch {
                 errorLine = AppModel.reason(error)
             }

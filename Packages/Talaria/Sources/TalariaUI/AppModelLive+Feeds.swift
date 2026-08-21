@@ -484,8 +484,7 @@ public extension AppModel {
                            text: theme.copy.feedRoutineRan(theme.themeID) + " — " + routine.name,
                            subtext: status == "error" ? theme.copy.feedRoutineFailed(theme.themeID)
                                                       : theme.copy.feedRoutineOK(theme.themeID),
-                           key: "cron-run:\(target.route.gatewayID):\(target.route.jobID):"
-                               + "\(target.profile ?? ""):\(sourceFence.generation.activityIdentity):"
+                           key: "cron-run:\(routineFence.activityIdentity):"
                                + "\(Int(last.timeIntervalSince1970))",
                            at: last)
         }
@@ -512,6 +511,15 @@ public extension AppModel {
         detail.loadingRuns.remove(routineID)
     }
 
+    /// Quarantine markers are full routine-fence identities. Clear every
+    /// generation owned by a removed row, including a legacy raw-id marker
+    /// left by an older process.
+    func clearCronRoutineQuarantine(_ routineID: String) {
+        let prefix = "\(routineID)|"
+        CronDetailRuntime.shared.quarantined = CronDetailRuntime.shared.quarantined
+            .filter { $0 != routineID && !$0.hasPrefix(prefix) }
+    }
+
     func dropRoutineScope(gatewayID: String) {
         let runtime = FeedsRuntime.shared
         let stale = Set(runtime.routineTargets.compactMap { key, target in
@@ -526,7 +534,7 @@ public extension AppModel {
             runtime.cronScope.removeValue(forKey: id)
             runtime.routineTargets.removeValue(forKey: id)
             clearCronRoutineCaches(id)
-            CronDetailRuntime.shared.quarantined.remove(id)
+            clearCronRoutineQuarantine(id)
         }
         CronDetailRuntime.shared.deliveryTargets.removeValue(forKey: gatewayID)
         CronDetailRuntime.shared.deliveryLoaded.remove(gatewayID)
@@ -579,7 +587,8 @@ public extension AppModel {
                   cronMutationFenceAccepts(sourceFence, expectedClient: client),
                   profileLifecycleAccepts(primaryFallbackToken) else { return }
             for job in listing.jobs where !job.id.isEmpty {
-                jobs[job.id] = (job, job.taggedBotID ?? fallback, nil)
+                let launchProfile = job.profile ?? listing.profile ?? fallback
+                jobs[job.id] = (job, job.taggedBotID ?? launchProfile, launchProfile)
             }
         } catch {
             failed = (error as? GatewayError)?.message ?? error.localizedDescription
@@ -588,19 +597,30 @@ public extension AppModel {
         // Per-profile stores: only trust the rows when the gateway echoes the
         // scope marker — an older gateway ignores `profile` and would hand the
         // launch store back once per bot.
-        for botID in primaryProfileIDs {
-            guard self.client === client,
-                  cronMutationFenceAccepts(sourceFence, expectedClient: client),
-                  let token = primaryProfileTokens[botID], profileLifecycleAccepts(token)
-            else { return }
-            guard let listing = try? await client.cronJobs(profile: botID, includeDisabled: true),
-                  listing.scopedProfile == botID else { continue }
-            guard self.client === client,
-                  cronMutationFenceAccepts(sourceFence, expectedClient: client),
-                  profileLifecycleAccepts(token) else { return }
-            scopedCount += 1
-            for job in listing.jobs where !job.id.isEmpty {
-                jobs[job.id] = (job, job.taggedBotID ?? botID, botID)
+        if failed == nil {
+            for botID in primaryProfileIDs {
+                guard self.client === client,
+                      cronMutationFenceAccepts(sourceFence, expectedClient: client),
+                      let token = primaryProfileTokens[botID], profileLifecycleAccepts(token)
+                else { return }
+                do {
+                    let listing = try await client.cronJobs(profile: botID,
+                                                            includeDisabled: true)
+                    // A successful response without the scope marker is the
+                    // legacy gateway compatibility path, not a read failure.
+                    guard listing.scopedProfile == botID else { continue }
+                    guard self.client === client,
+                          cronMutationFenceAccepts(sourceFence, expectedClient: client),
+                          profileLifecycleAccepts(token) else { return }
+                    scopedCount += 1
+                    for job in listing.jobs where !job.id.isEmpty {
+                        let profile = job.profile ?? listing.profile ?? botID
+                        jobs[job.id] = (job, job.taggedBotID ?? profile, profile)
+                    }
+                } catch {
+                    failed = (error as? GatewayError)?.message ?? error.localizedDescription
+                    break
+                }
             }
         }
 
@@ -629,7 +649,7 @@ public extension AppModel {
         let newPrimaryIDs = Set(jobs.keys)
         for id in oldPrimaryIDs.subtracting(newPrimaryIDs) {
             clearCronRoutineCaches(id)
-            CronDetailRuntime.shared.quarantined.remove(id)
+            clearCronRoutineQuarantine(id)
         }
         runtime.cronJobs = runtime.cronJobs.filter {
             runtime.routineTargets[$0.key]?.route.gatewayID != primaryGatewayID
@@ -656,7 +676,7 @@ public extension AppModel {
                 || (priorDetailAuthority != nil
                     && cronRoutineMutationFence(jobID) != priorDetailAuthority) {
                 clearCronRoutineCaches(jobID)
-                CronDetailRuntime.shared.quarantined.remove(jobID)
+                clearCronRoutineQuarantine(jobID)
             }
             runtime.cronJobs[jobID] = entry.job
             runtime.cronScope[jobID] = entry.scope
@@ -710,7 +730,9 @@ public extension AppModel {
                   current.client === client,
                   let sourceFence = cronSourceMutationFence(gatewayID: gatewayID, profile: nil),
                   cronMutationFenceAccepts(sourceFence, expectedClient: client) else { continue }
-            let profiles = (try? await client.listProfiles(includeSessions: false)) ?? []
+            guard let profiles = try? await client.listProfiles(includeSessions: false) else {
+                continue
+            }
             guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
                   current.client === client,
                   cronMutationFenceAccepts(sourceFence, expectedClient: client) else { continue }
@@ -727,23 +749,39 @@ public extension AppModel {
                   cronMutationFenceAccepts(sourceFence, expectedClient: client),
                   profileLifecycleAccepts(fallbackToken) else { continue }
             for job in launchListing.jobs where !job.id.isEmpty {
-                jobs[job.id] = (job, job.taggedBotID ?? fallback, nil)
+                let launchProfile = job.profile ?? launchListing.profile ?? fallback
+                jobs[job.id] = (job, job.taggedBotID ?? launchProfile, launchProfile)
             }
+            var profileReadFailed = false
             for profile in profiles.prefix(10) where profile.name != fallback {
                 guard let profileToken = profileLifecycleGenerationToken(
                     for: GatewayBotRoute(gatewayID: gatewayID, profile: profile.name).qualifiedID),
                       profileLifecycleAccepts(profileToken) else { continue }
-                guard let listing = try? await client.cronJobs(
-                    profile: profile.name, includeDisabled: true),
-                      listing.scopedProfile == profile.name else { continue }
-                guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
-                      current.client === client,
-                      cronMutationFenceAccepts(sourceFence, expectedClient: client),
-                      profileLifecycleAccepts(profileToken) else { continue }
-                for job in listing.jobs where !job.id.isEmpty {
-                    jobs[job.id] = (job, job.taggedBotID ?? profile.name, profile.name)
+                do {
+                    let listing = try await client.cronJobs(
+                        profile: profile.name, includeDisabled: true)
+                    // A successful unscoped response is the old-gateway
+                    // compatibility case; it is not evidence of deletion.
+                    guard listing.scopedProfile == profile.name else { continue }
+                    guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
+                          current.client === client,
+                          cronMutationFenceAccepts(sourceFence, expectedClient: client),
+                          profileLifecycleAccepts(profileToken) else { continue }
+                    for job in listing.jobs where !job.id.isEmpty {
+                        let resolvedProfile = job.profile ?? listing.profile ?? profile.name
+                        jobs[job.id] = (job, job.taggedBotID ?? resolvedProfile,
+                                        resolvedProfile)
+                    }
+                } catch {
+                    profileReadFailed = true
+                    break
                 }
             }
+
+            // Do not prune/publish this gateway's old rows when one scoped
+            // request threw. A successful legacy response above is explicitly
+            // allowed; only a transport/tool failure aborts this snapshot.
+            if profileReadFailed { continue }
 
             guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
                   current.client === client,
@@ -765,7 +803,7 @@ public extension AppModel {
                 feeds.cronScope.removeValue(forKey: id)
                 feeds.routineTargets.removeValue(forKey: id)
                 clearCronRoutineCaches(id)
-                CronDetailRuntime.shared.quarantined.remove(id)
+                clearCronRoutineQuarantine(id)
             }
             for entry in jobs.values {
                 let route = GatewayRoutineRoute(gatewayID: gatewayID, jobID: entry.job.id)
@@ -779,7 +817,7 @@ public extension AppModel {
                     || (priorDetailAuthority != nil
                         && cronRoutineMutationFence(id) != priorDetailAuthority) {
                     clearCronRoutineCaches(id)
-                    CronDetailRuntime.shared.quarantined.remove(id)
+                    clearCronRoutineQuarantine(id)
                 }
                 feeds.cronJobs[id] = entry.job
                 feeds.cronScope[id] = entry.scope
@@ -984,12 +1022,27 @@ public extension AppModel {
         guard cronMutationFenceAccepts(fence.source, expectedClient: client) else {
             throw cronSourceChangedError()
         }
+        let refreshedTarget = FeedsRuntime.shared.routineTargets[routine.id]
+        guard CronDeletePostRefreshPolicy.mayClear(
+            capturedTarget: fence.target, currentTarget: refreshedTarget) else {
+            // A newer same-id target now owns the row and all of its caches.
+            // The accepted delete is not permission to clear that replacement.
+            throw cronSourceChangedError()
+        }
+        if refreshedTarget != nil {
+            // The target may be byte-for-byte equal while its profile
+            // lifecycle generation has been retired and recreated. Require
+            // the full routine fence before clearing that still-present row.
+            guard cronRoutineMutationFence(routine.id) == fence else {
+                throw cronSourceChangedError()
+            }
+        }
         routines.removeAll { $0.id == routine.id }
         FeedsRuntime.shared.cronJobs.removeValue(forKey: routine.id)
         FeedsRuntime.shared.cronScope.removeValue(forKey: routine.id)
         FeedsRuntime.shared.routineTargets.removeValue(forKey: routine.id)
         clearCronRoutineCaches(routine.id)
-        CronDetailRuntime.shared.quarantined.remove(routine.id)
+        clearCronRoutineQuarantine(routine.id)
     }
 
     /// Fire a job now. `cron.manage` has no run action (4016) — the trigger

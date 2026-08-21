@@ -32,6 +32,9 @@ import TalariaKit
 /// the lossy `_format_job` projection the WS list emits.
 public struct CronJobDetail: Sendable, Equatable, Identifiable {
     public var id: String
+    /// Profile store that answered the request. Newer routers use `profile`,
+    /// while some bridges expose the same identity as `profile_name`.
+    public var profile: String?
     /// Full stored title, "[bot:<name>] " prefix included.
     public var name: String
     /// The COMPLETE prompt — not the 100-char preview the socket list carries.
@@ -130,6 +133,8 @@ public struct CronJobDetail: Sendable, Equatable, Identifiable {
 
     public init(_ v: JSONValue) {
         id = v["id"]?.stringValue ?? v["job_id"]?.stringValue ?? ""
+        profile = v["profile"]?.stringValue ?? v["profile_name"]?.stringValue
+            ?? v["info"]?["profile_name"]?.stringValue
         name = v["name"]?.stringValue ?? ""
         prompt = v["prompt"]?.stringValue ?? ""
         scheduleDisplay = v["schedule_display"]?.stringValue
