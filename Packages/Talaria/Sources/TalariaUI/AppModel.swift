@@ -113,6 +113,12 @@ public final class AppModel {
         }
         ConnectionRegistry.shared.setSecondaryRefresh { [weak self] gatewayIDs in
             self?.exactStoredSessionSecondarySourcesDidRefresh(gatewayIDs)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                for gatewayID in gatewayIDs.sorted() {
+                    await self.pullAndReseedRoomProjection(gatewayID: gatewayID)
+                }
+            }
         }
     }
 

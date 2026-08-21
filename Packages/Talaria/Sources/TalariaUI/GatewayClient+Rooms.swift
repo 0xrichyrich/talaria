@@ -215,10 +215,15 @@ public extension GatewayClient {
     /// decoded from the old name-title format gets one additional lookup by
     /// its captured (rename-stable) legacy name. Creation always uses RoomID,
     /// so a disbanded and same-name recreated room cannot adopt old sessions.
-    func ensureRoomSession(roomID: RoomID, sessionTitleIdentityVersion: UInt8,
+    func ensureRoomSession(roomID: RoomID, projectionRoomKey: String? = nil,
+                           sessionTitleIdentityVersion: UInt8,
                            legacySessionTitleName: String?, profile: String,
                            storedID: String?) async throws -> RoomMemberSessionSnapshot {
-        let immutableTitle = "Group: \(roomID.description)"
+        let sharedID = projectionRoomKey.flatMap { key -> String? in
+            guard key.hasPrefix("id:"), key.count > 3 else { return nil }
+            return String(key.dropFirst(3))
+        }
+        let immutableTitle = "Group: \(sharedID ?? roomID.description)"
         let legacyTitle: String?
         if sessionTitleIdentityVersion == RoomRecord.legacyNameSessionTitleVersion,
            let legacyName = legacySessionTitleName,

@@ -244,6 +244,7 @@ extension AppModel {
         connections = registry.rows
         await hideOwnedBotSessions()
         await flushComposeQueue()
+        await pullAndReseedRoomProjection(gatewayID: savedGateway.id)
     }
 
     /// Deliberate disconnect (Settings → Connections). No reconnect follows.
@@ -258,6 +259,7 @@ extension AppModel {
         runtime.reconnectTask?.cancel(); runtime.reconnectTask = nil
         runtime.monitorTask?.cancel(); runtime.monitorTask = nil
         runtime.eventPump?.cancel(); runtime.eventPump = nil
+        if let departingGatewayID { cancelRoomProjectionSync(gatewayID: departingGatewayID) }
         if let gatewayID = departingGatewayID { dropApprovalScope(gatewayID: gatewayID) }
         if let departingGatewayID,
            !ConnectionSupervisor.shared.isReconnecting {
@@ -1586,6 +1588,9 @@ extension AppModel {
         connections = ConnectionRegistry.shared.rows
         await hideOwnedBotSessions()
         await flushComposeQueue()
+        if let gatewayID = runtime.gatewayID {
+            await pullAndReseedRoomProjection(gatewayID: gatewayID)
+        }
     }
 
     // MARK: - Model / reasoning / YOLO controls (chat model strip)

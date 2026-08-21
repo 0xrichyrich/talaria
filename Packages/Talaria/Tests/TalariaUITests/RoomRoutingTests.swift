@@ -977,6 +977,39 @@ final class RoomRoutingTests: XCTestCase {
         try await fresh.deleteAll()
     }
 
+    func testLoadAppliesCachedProjectionTombstoneBeforeGatewayReconnect() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("talaria-room-cached-tombstone-\(UUID().uuidString)",
+                                   isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let store = RoomStore(baseDirectory: base)
+        let room = RoomRecord(name: "Disbanded", members: [
+            RoomMember(route: GatewayBotRoute(gatewayID: "offline", profile: "default")),
+            RoomMember(route: GatewayBotRoute(gatewayID: "offline", profile: "reviewer"))
+        ])
+        try await store.upsert(room)
+        let projectionKey = RoomProjectionEnvelope.idKey(room.id.description)
+        _ = try await store.mergeRoomProjection(
+            RoomProjectionEnvelope(),
+            intent: RoomProjectionMergeIntent(
+                deletedRooms: [projectionKey], writeRevision: 1)
+        )
+
+        let runtime = RoomRuntime.shared
+        runtime.store = RoomStore(baseDirectory: base)
+        runtime.rooms = [room]
+        runtime.isLoaded = false
+
+        await AppModel().loadRooms()
+
+        XCTAssertTrue(runtime.rooms.isEmpty)
+        let reloadedRoom = try await runtime.store.room(id: room.id)
+        let reloadedProjection = try await runtime.store.roomProjection()
+        XCTAssertNil(reloadedRoom)
+        XCTAssertEqual(reloadedProjection.deleted[projectionKey], 1)
+    }
+
     func testLateMetadataCompletionCannotRemoveRenamedDestinationMutation() async throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("talaria-room-late-metadata-\(UUID().uuidString)",

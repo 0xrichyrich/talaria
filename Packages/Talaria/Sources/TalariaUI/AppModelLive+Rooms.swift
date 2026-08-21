@@ -497,6 +497,10 @@ public extension AppModel {
 
     func roomAvatarData(_ id: RoomID) -> Data? { RoomRuntime.shared.avatarData[id] }
 
+    private func roomProjectionKey(_ room: RoomRecord) -> String {
+        room.rawProjectionRoomKey ?? RoomProjectionEnvelope.idKey(room.id.description)
+    }
+
     /// Live, source-qualified prompts currently blocking this room. These are
     /// deliberately separate from `RoomRecord.needsUser`, which remains the
     /// transcript-only `@user` attention bit.
@@ -795,6 +799,9 @@ public extension AppModel {
                 runtime.deferredProfileRearmRooms.insert(room.id)
             }
         }
+        scheduleRoomProjectionSync(changedRooms: runtime.rooms.map {
+            $0.rawProjectionRoomKey ?? RoomProjectionEnvelope.idKey($0.id.description)
+        })
     }
 
     /// Durable preflight fence. This is awaited before the profile REST call,
@@ -830,6 +837,9 @@ public extension AppModel {
             runtime.rooms = result.rooms.sorted { $0.lastActivityAt > $1.lastActivityAt }
             runtime.metadataPendingCount = (try? await runtime.store.metadataOutbox().count) ?? 0
         }
+        scheduleRoomProjectionSync(changedRooms: runtime.rooms.map {
+            $0.rawProjectionRoomKey ?? RoomProjectionEnvelope.idKey($0.id.description)
+        })
     }
 
     /// Fail closed after Hermes has committed but local reconciliation could
@@ -847,6 +857,9 @@ public extension AppModel {
         }
         RoomRuntime.shared.retiredProfileRoutes.insert(route)
         RoomRuntime.shared.clearPendingPrompts(route: route)
+        scheduleRoomProjectionSync(changedRooms: RoomRuntime.shared.rooms.map {
+            $0.rawProjectionRoomKey ?? RoomProjectionEnvelope.idKey($0.id.description)
+        })
     }
 
     internal func abortRoomProfileLifecycle(_ token: RoomProfileLifecycleToken) async {
@@ -915,6 +928,7 @@ public extension AppModel {
         var deletionError: Error?
         var roomsToResume: [RoomRecord] = []
         await RoomMutationGate.shared.withQuiescence {
+            resetRoomProjectionSyncForPrivacyDeletion()
             let runtime = RoomRuntime.shared
             let tasks = Array(runtime.driveTasks.values)
                 + Array(runtime.postSettleHarvestTasks.values)
@@ -991,8 +1005,18 @@ public extension AppModel {
         guard !runtime.isLoaded else { return }
         do {
             let loaded: [RoomRecord]
-            if let operation = runtime.loadOperation { loaded = try await operation() }
-            else { loaded = try await runtime.store.loadAll() }
+            if let operation = runtime.loadOperation {
+                loaded = try await operation()
+            } else {
+                _ = try await runtime.store.loadAll()
+                let cachedProjection = try await runtime.store.roomProjection()
+                let reconciled = try await runtime.store.reconcileRoomProjection(
+                    cachedProjection)
+                loaded = reconciled.rooms
+                for (roomID, data) in reconciled.projectedImages {
+                    runtime.avatarData[roomID] = data
+                }
+            }
             runtime.rooms = loaded.sorted { $0.lastActivityAt > $1.lastActivityAt }
             runtime.retiredProfileRoutes = (try? await runtime.store.retiredMetadataRoutes()) ?? []
             for room in loaded {
@@ -1003,7 +1027,10 @@ public extension AppModel {
             }
             runtime.loadError = nil
             runtime.isLoaded = true
-            for room in loaded {
+            if let gatewayID = LiveRuntime.shared.gatewayID {
+                await pullAndReseedRoomProjection(gatewayID: gatewayID)
+            }
+            for room in runtime.rooms {
                 if !room.drives.isEmpty { scheduleRoomDrive(roomID: room.id) }
                 else if room.attempts.contains(where: { $0.finishedAt == nil }) {
                     scheduleRoomReconciliation(roomID: room.id)
@@ -1047,6 +1074,7 @@ public extension AppModel {
         try await RoomRuntime.shared.store.upsert(record, metadataMutations: metadata)
         RoomRuntime.shared.replace(record)
         RoomRuntime.shared.openRoomID = record.id
+        scheduleRoomProjectionSync(changedRooms: [roomProjectionKey(record)])
         return record.id
     }
 
@@ -1125,6 +1153,16 @@ public extension AppModel {
                 result = try await RoomRuntime.shared.store.mutate(
                     roomID: roomID, metadataMutations: metadata
                 ) { current in
+                    if current.rawProjectionRoomKey?.hasPrefix("name:") == true,
+                       current.name != normalized {
+                        // A legacy name-key maps its local UUID from the old
+                        // name and therefore cannot be re-keyed to another
+                        // name without changing protected RoomID. Promote the
+                        // rename to this room's immutable local id and retire
+                        // the old migration key with the sync intent below.
+                        current.rawProjectionRoomKey = RoomProjectionEnvelope.idKey(
+                            current.id.description)
+                    }
                     current.name = normalized
                     let currentRoutes = Set(members.map(\.route))
                     if membershipChanged {
@@ -1151,6 +1189,10 @@ public extension AppModel {
             if let avatar { RoomRuntime.shared.avatarData[roomID] = avatar.data }
             else if removeAvatar { RoomRuntime.shared.avatarData[roomID] = nil }
             RoomRuntime.shared.replace(result)
+            scheduleRoomProjectionSync(
+                changedRooms: [roomProjectionKey(result)],
+                deletedRooms: before.name == result.name ? [] : [before.name]
+            )
             await flushRoomMetadataOutboxAlreadyAdmitted()
         }
     }
@@ -1172,10 +1214,18 @@ public extension AppModel {
         room = try await RoomRuntime.shared.store.mutate(
             roomID: roomID, metadataMutations: metadata
         ) { current in
+            if current.rawProjectionRoomKey?.hasPrefix("name:") == true,
+               current.name != normalized {
+                current.rawProjectionRoomKey = RoomProjectionEnvelope.idKey(
+                    current.id.description)
+            }
             current.name = normalized
             current.updatedAt = Date()
         }
         RoomRuntime.shared.replace(room)
+        scheduleRoomProjectionSync(
+            changedRooms: [roomProjectionKey(room)], deletedRooms: [oldName]
+        )
     }
 
     /// Invalidate/persist first, cancel and await the sole driver second,
@@ -1223,6 +1273,19 @@ public extension AppModel {
         let metadata = room.members.map {
             RoomMetadataMutation(route: $0.route, kind: .remove, oldName: room.name)
         }
+        let projectionKey = roomProjectionKey(room)
+        let nextRevision = room.rawProjectionRevision == .max
+            ? UInt64.max : room.rawProjectionRevision + 1
+        // Publish the anti-resurrection fact to protected storage before the
+        // rich record disappears. A crash between these commits may leave a
+        // room beside its tombstone, but it can never lose the tombstone and
+        // later republish the disbanded immutable id.
+        _ = try await runtime.store.mergeRoomProjection(
+            RoomProjectionEnvelope(),
+            intent: RoomProjectionMergeIntent(
+                deletedRooms: [projectionKey], writeRevision: nextRevision
+            )
+        )
         try await runtime.store.delete(roomID: roomID, metadataMutations: metadata)
         runtime.driveTasks[roomID] = nil
         runtime.driveTokens[roomID] = nil
@@ -1230,6 +1293,9 @@ public extension AppModel {
         runtime.postSettleHarvestTokens[roomID] = nil
         runtime.clearPendingPrompts(roomID: roomID)
         runtime.remove(roomID)
+        scheduleRoomProjectionSync(
+            allowEmpty: true, deletedRooms: [projectionKey]
+        )
     }
 
     /// Main composer mints a stable topic; a reply supplies its thread id.
@@ -1316,6 +1382,7 @@ public extension AppModel {
             throw error
         }
         runtime.replace(final)
+        scheduleRoomProjectionSync(changedRooms: [roomProjectionKey(final)])
         scheduleRoomDrive(roomID: roomID)
         return target
     }
@@ -1723,6 +1790,7 @@ extension AppModel {
         do {
             session = try await client.ensureRoomSession(
                 roomID: room.id,
+                projectionRoomKey: room.rawProjectionRoomKey,
                 sessionTitleIdentityVersion: room.sessionTitleIdentityVersion,
                 legacySessionTitleName: room.legacySessionTitleName,
                 profile: member.route.profile,
@@ -2200,6 +2268,9 @@ extension AppModel {
            !(await roomHarvestOwnerIsCurrent(roomID: roomID, epoch: expectedRoomEpoch,
                                              harvestToken: harvestToken)) { return }
         runtime.replace(room)
+        if let reply, !RoomEngine.isPass(reply) {
+            scheduleRoomProjectionSync(changedRooms: [roomProjectionKey(room)])
+        }
         if let completed = room.attempts.first(where: { $0.id == attemptID }) {
             runtime.clearPendingPrompt(for: completed, roomID: roomID)
         }

@@ -280,10 +280,13 @@ completed answer per API family, and both tool calls.
 This is not yet a passing live certification case. Exact Hermes publishes
 bounded version-3 room projections in default-profile
 `ui_meta["hermes-bots-groups"]` and exposes per-key `ui_meta_revisions`.
-Talaria now has the bounded projection/ledger foundation and strict typed CAS
-wire support, but not AppModel hydration, all-gateway fan-out, conflict retry,
-read-back confirmation, or reconnect reseeding. Do not claim Desktop/mobile
-shared-room convergence from the foundation tests.
+Talaria now has bounded projection/ledger storage, safe protected-room
+hydration, all-credentialed-gateway fan-out, per-gateway serialization and
+bounded conflict retry, exact CAS read-back confirmation, feature-detected
+legacy fallback, and adoption/reconnect/foreground reseeding. Automated tests
+cover these contracts, including privacy cancellation and applying a cached
+disband tombstone before network recovery. Do not claim certified
+Desktop/mobile shared-room convergence from automated tests alone.
 
 First pin the gateway protocol directly: two clients must read the same
 revision, then submit different `profiles.configure` writes with that expected
@@ -293,7 +296,7 @@ the current revision. Delete the key and prove its revision survives deletion
 so the stale client cannot recreate it. Also prove that omission of
 `ui_meta_expected_revisions` retains the documented legacy best-effort path.
 
-After Talaria support lands, retain a two-Desktop/one-phone report covering:
+Retain a two-Desktop/one-phone report covering:
 
 1. Hydration of name, picture, source-qualified members, and bounded recent
    transcript from each attached gateway without replacing Talaria's full
