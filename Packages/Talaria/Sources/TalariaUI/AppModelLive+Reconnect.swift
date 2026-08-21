@@ -438,7 +438,7 @@ extension AppModel {
         }
 
         try? await refreshRoster()
-        try? await refreshRoutines()
+        await refreshRoutinesLive(force: true)
         connections = ConnectionRegistry.shared.rows
         await flushComposeQueue()
         exactStoredSessionSourceDidReconnect()

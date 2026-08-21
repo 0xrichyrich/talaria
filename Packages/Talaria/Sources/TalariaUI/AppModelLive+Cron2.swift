@@ -379,6 +379,55 @@ enum CronProfileRefreshPolicy {
     }
 }
 
+/// Only the request's explicit profile plus Hermes' exact `scoped` echo can
+/// identify a profile store. Per-row `profile` fields and an unscoped listing's
+/// top-level profile are merely payload data and cannot retarget a row.
+enum CronListingScopePolicy {
+    static func scope(for listing: CronListing, requestedProfile: String?) -> String? {
+        guard let requestedProfile, !requestedProfile.isEmpty,
+              listing.scopedProfile == requestedProfile else { return nil }
+        return requestedProfile
+    }
+
+    static func botID(for job: CronJobRecord, scope: String?) -> String {
+        // An unscoped response has no owner authority. Do not let its
+        // `[bot:…]` display tag become a routable/authoritative bot id; only a
+        // scoped request may use the tag alongside its exact store scope.
+        guard let scope else { return "" }
+        return job.taggedBotID ?? scope
+    }
+}
+
+/// The old flat refresh has no source-qualified target fold and is therefore
+/// safe only for the canned demo world. Every live caller uses
+/// `refreshRoutinesLive`, which updates rows and targets under one fence.
+enum CronRoutineRefreshAuthorityPolicy {
+    static func allowsLegacyRefresh(mode: AppMode) -> Bool {
+        mode == .demo
+    }
+}
+
+/// Create's socket step is authoritative but unscoped. Until Hermes exposes
+/// the process launch profile, no REST-only field may be serialized or shown as
+/// available; otherwise the follow-up would be an ambiguous cross-store write.
+enum CronCreateRESTPolicy {
+    static func allowsExtras(launchProfile: String?) -> Bool {
+        guard let launchProfile else { return false }
+        return !launchProfile.isEmpty
+    }
+
+    static func extras(launchProfile: String?, deliver: [String], model: String?,
+                       provider: String?, reasoningEffort: String?) -> [String: JSONValue] {
+        guard allowsExtras(launchProfile: launchProfile) else { return [:] }
+        var values: [String: JSONValue] = [:]
+        if !deliver.isEmpty { values["deliver"] = .string(deliver.joined(separator: ",")) }
+        if let model, !model.isEmpty { values["model"] = .string(model) }
+        if let provider, !provider.isEmpty { values["provider"] = .string(provider) }
+        if let reasoningEffort { values["reasoning_effort"] = .string(reasoningEffort) }
+        return values
+    }
+}
+
 extension AppModel {
     func cronSourceMutationFence(gatewayID: String,
                                  profile: String?,
@@ -704,21 +753,16 @@ public extension AppModel {
     /// Everything past list/toggle/delete depends on it, so the surfaces that
     /// need it check this before rendering rather than after failing.
     func cronRESTReady(routineID: String? = nil, botID: String? = nil) -> Bool {
-        guard mode == .live,
+        // Create has no authoritative process-launch profile. Do not expose
+        // gateway-wide REST capability as if it authorized a future
+        // unscoped add/follow-up; the create form must stay socket-only.
+        guard mode == .live, let routineID,
               let gatewayID = routineGatewayID(routineID: routineID, botID: botID)
         else { return false }
-        let sourceFence: CronSourceMutationFence
-        if let routineID {
-            guard let fence = cronRoutineMutationFence(routineID),
-                  fence.target.profile != nil,
-                  cronRoutineAuthorityIsCurrent(fence) else { return false }
-            sourceFence = fence.source
-        } else {
-            guard let fence = cronSourceMutationFence(gatewayID: gatewayID, profile: nil),
-                  let sourceClient = cronSourceClient(gatewayID: gatewayID),
-                  cronMutationFenceAccepts(fence, expectedClient: sourceClient) else { return false }
-            sourceFence = fence
-        }
+        guard let fence = cronRoutineMutationFence(routineID),
+              CronDetailAuthorityPolicy.allowsProfileScopedREST(profile: fence.target.profile),
+              cronRoutineAuthorityIsCurrent(fence) else { return false }
+        let sourceFence = fence.source
         return cronRESTSupported(gatewayID: gatewayID, sourceFence: sourceFence) != false
             && gatewayRESTContext(gatewayID: gatewayID) != nil
     }
@@ -1098,11 +1142,13 @@ public extension AppModel {
             canonicalEffort = nil
         }
 
-        var extras: [String: JSONValue] = [:]
-        if !deliver.isEmpty { extras["deliver"] = .string(deliver.joined(separator: ",")) }
-        if let model, !model.isEmpty { extras["model"] = .string(model) }
-        if let provider, !provider.isEmpty { extras["provider"] = .string(provider) }
-        if let canonicalEffort { extras["reasoning_effort"] = .string(canonicalEffort) }
+        // No launch profile means no REST-only create fields. In particular,
+        // the editor's default `local` delivery is a UI floor, not a wire
+        // update; serializing it here would turn an ordinary socket create
+        // into an ambiguous cross-profile follow-up.
+        let extras = CronCreateRESTPolicy.extras(
+            launchProfile: launchProfile, deliver: deliver, model: model,
+            provider: provider, reasoningEffort: canonicalEffort)
 
         let jobID = try await client.cronAdd(
             name: Self.namespacedTitle(botID: botProfile, title: cleanTitle),

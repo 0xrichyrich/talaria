@@ -50,8 +50,9 @@ public struct CronJobRecord: Sendable, Identifiable, Equatable {
     /// Delivery target ("local" unless a messaging platform is configured).
     public var deliver: String?
     public var repeatDisplay: String?
-    /// Profile store that produced this row when the gateway echoes it. Older
-    /// gateways omit it; callers then use the resolved launch/scoped profile.
+    /// Profile metadata echoed by the gateway, preserved for inspection. It is
+    /// authoritative only when the request itself was profile-scoped and the
+    /// listing also echoed that exact scope; unscoped callers must ignore it.
     public var profile: String?
     /// Exact optional per-job reasoning pin emitted by `_format_job`.
     ///
@@ -113,7 +114,8 @@ public struct CronListing: Sendable {
     /// proof every job in this listing belongs to that profile's own store.
     public var scopedProfile: String?
     /// Some REST/WS bridges call the scope `profile_name` instead of `scoped`.
-    /// Preserve that response identity for launch-store attribution.
+    /// Preserve the raw field for diagnostics; unscoped callers never use it to
+    /// attribute the process launch store.
     public var profile: String?
 
     public init(jobs: [CronJobRecord], scopedProfile: String?, profile: String? = nil) {

@@ -241,7 +241,12 @@ public struct RoutineEditorView: View {
 
     private func load(initial: Bool) async {
         if isCreating {
-            await model.loadCronDeliveryTargets(botID: botID)
+            // Create has no authoritative launch profile, so delivery/model
+            // REST-only controls remain hidden and no delivery probe is
+            // needed. The socket add is still fully usable.
+            if restAvailable {
+                await model.loadCronDeliveryTargets(botID: botID)
+            }
             if initial { seedForCreate() }
             return
         }
@@ -611,7 +616,7 @@ public struct RoutineEditorView: View {
 
     @ViewBuilder private func deliveryBlock(editable: Bool) -> some View {
         let targets = deliveryTargets
-        if !targets.isEmpty {
+        if restAvailable, !targets.isEmpty {
             sectionLabel(copy.routineDeliverLabel(theme.id))
             FlowChips(items: offeredTargets) { id in
                 let target = targets.first { $0.id == id }

@@ -240,7 +240,7 @@ extension AppModel {
         #endif
 
         try await rosterRefresh()
-        try? await refreshRoutines()
+        await refreshRoutinesLive(force: true)
         connections = registry.rows
         await hideOwnedBotSessions()
         await flushComposeQueue()
@@ -1069,7 +1069,7 @@ extension AppModel {
             Task { @MainActor in
                 if sourceGatewayID == LiveRuntime.shared.gatewayID {
                     if what == "sessions.changed" { try? await self.refreshRoster() }
-                    if what == "cron.changed" { try? await self.refreshRoutines() }
+                    if what == "cron.changed" { await self.refreshRoutinesLive(force: true) }
                 } else if let sourceGatewayID, what == "sessions.changed" {
                     await ConnectionRegistry.shared.refreshSecondaryRoster(
                         gatewayID: sourceGatewayID)
@@ -1419,9 +1419,13 @@ extension AppModel {
 
     // MARK: - Routines (Hermes cron)
 
-    /// cron.manage list → routines. Jobs are namespaced "[bot:<name>] <title>"
-    /// by convention; anything else belongs to the gateway's default profile.
+    /// Legacy flat list used only by the canned demo world. Live refreshes must
+    /// use `refreshRoutinesLive`, which folds source-qualified targets and
+    /// refuses to infer ownership from a default or a title tag.
     public func refreshRoutines() async throws {
+        guard CronRoutineRefreshAuthorityPolicy.allowsLegacyRefresh(mode: mode) else {
+            return
+        }
         guard let client else { return }
         let jobs = try await client.cronList()
         let fallback = LiveRuntime.shared.defaultBotID ?? bots.first?.id ?? "default"
@@ -1578,7 +1582,7 @@ extension AppModel {
         }
 
         try? await refreshRoster()
-        try? await refreshRoutines()
+        await refreshRoutinesLive(force: true)
         connections = ConnectionRegistry.shared.rows
         await hideOwnedBotSessions()
         await flushComposeQueue()

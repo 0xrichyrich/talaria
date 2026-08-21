@@ -260,6 +260,44 @@ final class CronReasoningEffortTests: XCTestCase {
         XCTAssertEqual(retained.taggedBotID, "default")
     }
 
+    func testPrimaryAndRetainedUnscopedListingsIgnoreDeceptiveProfileFields() {
+        let primaryJob = CronJobRecord([
+            "job_id": "same-id", "name": "[bot:primary] Job",
+            "profile": "retained-store",
+        ])
+        let retainedJob = CronJobRecord([
+            "job_id": "same-id", "name": "[bot:retained] Job",
+            "profile_name": "primary-store",
+        ])
+        let primaryListing = CronListing(
+            jobs: [primaryJob], scopedProfile: nil, profile: "retained-store")
+        let retainedListing = CronListing(
+            jobs: [retainedJob], scopedProfile: nil, profile: "primary-store")
+
+        // Both calls were unscoped. Neither row nor top-level profile metadata
+        // can prove which HERMES_HOME produced the result.
+        XCTAssertNil(CronListingScopePolicy.scope(
+            for: primaryListing, requestedProfile: nil))
+        XCTAssertNil(CronListingScopePolicy.scope(
+            for: retainedListing, requestedProfile: nil))
+        XCTAssertEqual(CronListingScopePolicy.botID(for: primaryJob, scope: nil), "")
+        XCTAssertEqual(CronListingScopePolicy.botID(for: retainedJob, scope: nil), "")
+
+        // A requested profile becomes authoritative only when the response
+        // echoes that exact requested scope; deceptive row metadata is ignored.
+        let scoped = CronListing(
+            jobs: [primaryJob], scopedProfile: "primary-store", profile: "retained-store")
+        XCTAssertEqual(CronListingScopePolicy.scope(
+            for: scoped, requestedProfile: "primary-store"), "primary-store")
+        XCTAssertEqual(CronListingScopePolicy.botID(for: primaryJob,
+                                                    scope: "primary-store"), "primary")
+    }
+
+    func testLegacyRoutineRefreshIsDemoOnlyAndCannotPublishLiveRows() {
+        XCTAssertTrue(CronRoutineRefreshAuthorityPolicy.allowsLegacyRefresh(mode: .demo))
+        XCTAssertFalse(CronRoutineRefreshAuthorityPolicy.allowsLegacyRefresh(mode: .live))
+    }
+
     func testPrimaryAndRetainedRESTOnlyCreateStayAcceptedPartialWithoutLaunchAuthority() {
         let primary = CronCreatePostAddPolicy.decision(
             sourceFence: CronSourceMutationFence(
@@ -278,6 +316,22 @@ final class CronReasoningEffortTests: XCTestCase {
         XCTAssertEqual(retained, .acceptedWithoutREST)
         XCTAssertFalse(primary.shouldIssueRESTPatch)
         XCTAssertFalse(retained.shouldIssueRESTPatch)
+    }
+
+    func testUnscopedCreateSuppressesRESTExtrasAndOrdinaryAddCompletes() {
+        XCTAssertFalse(CronCreateRESTPolicy.allowsExtras(launchProfile: nil))
+        XCTAssertTrue(CronCreateRESTPolicy.extras(
+            launchProfile: nil, deliver: ["local"], model: "model",
+            provider: "provider", reasoningEffort: "high").isEmpty)
+
+        let primary = CronCreatePostAddPolicy.decision(
+            sourceFence: CronSourceMutationFence(
+                gatewayID: "primary", profile: nil, generation: .primary(4)),
+            primaryGatewayID: "primary", primaryGeneration: 4,
+            retainedGenerations: [:], hasRESTOnlyFields: false, hasJobID: true,
+            hasRESTAuthority: false, restSupported: false)
+        XCTAssertEqual(primary, .accepted)
+        XCTAssertFalse(primary.requiresRecoveryNotice)
     }
 
     func testAcceptedPartialOutcomeIsNotAResubmitInstruction() {

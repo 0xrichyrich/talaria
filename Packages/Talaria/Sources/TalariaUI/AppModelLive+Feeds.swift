@@ -596,8 +596,10 @@ public extension AppModel {
                   cronMutationFenceAccepts(sourceFence, expectedClient: client),
                   primaryProfileTokens.values.allSatisfy({ profileLifecycleAccepts($0) }) else { return }
             for job in listing.jobs where !job.id.isEmpty {
-                let scope = job.profile ?? listing.profile
-                jobs[job.id] = (job, job.taggedBotID ?? scope ?? "", scope)
+                // This request is unscoped: even a deceptive row/top-level
+                // profile is not evidence that the process launched that
+                // store. Keep the raw payload, but leave target/scope nil.
+                jobs[job.id] = (job, CronListingScopePolicy.botID(for: job, scope: nil), nil)
             }
         } catch {
             failed = (error as? GatewayError)?.message ?? error.localizedDescription
@@ -617,14 +619,15 @@ public extension AppModel {
                                                             includeDisabled: true)
                     // A successful response without the scope marker is the
                     // legacy gateway compatibility path, not a read failure.
-                    guard listing.scopedProfile == botID else { continue }
+                    guard let scope = CronListingScopePolicy.scope(
+                        for: listing, requestedProfile: botID) else { continue }
                     guard self.client === client,
                           cronMutationFenceAccepts(sourceFence, expectedClient: client),
                           profileLifecycleAccepts(token) else { return }
                     scopedCount += 1
                     for job in listing.jobs where !job.id.isEmpty {
-                        let profile = job.profile ?? listing.profile ?? botID
-                        jobs[job.id] = (job, job.taggedBotID ?? profile, profile)
+                        jobs[job.id] = (job, CronListingScopePolicy.botID(
+                            for: job, scope: scope), scope)
                     }
                 } catch {
                     failed = (error as? GatewayError)?.message ?? error.localizedDescription
@@ -771,8 +774,10 @@ public extension AppModel {
                               .map(profileLifecycleAccepts) ?? false
                       })) else { continue }
             for job in launchListing.jobs where !job.id.isEmpty {
-                let scope = job.profile ?? launchListing.profile
-                jobs[job.id] = (job, job.taggedBotID ?? scope ?? "", scope)
+                // The unscoped launch store has no profile authority. Ignore
+                // both the row and listing profile fields until a scoped
+                // request with an exact echo proves ownership.
+                jobs[job.id] = (job, CronListingScopePolicy.botID(for: job, scope: nil), nil)
             }
             var profileReadFailed = false
             for profile in profiles.prefix(10) {
@@ -794,11 +799,11 @@ public extension AppModel {
                     }
                     // A successful unscoped response is the old-gateway
                     // compatibility case; it is not evidence of deletion.
-                    guard listing.scopedProfile == profile.name else { continue }
+                    guard let scope = CronListingScopePolicy.scope(
+                        for: listing, requestedProfile: profile.name) else { continue }
                     for job in listing.jobs where !job.id.isEmpty {
-                        let resolvedProfile = job.profile ?? listing.profile ?? profile.name
-                        jobs[job.id] = (job, job.taggedBotID ?? resolvedProfile,
-                                        resolvedProfile)
+                        jobs[job.id] = (job, CronListingScopePolicy.botID(
+                            for: job, scope: scope), scope)
                     }
                 } catch {
                     profileReadFailed = true
