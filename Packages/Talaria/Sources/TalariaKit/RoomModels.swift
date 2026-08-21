@@ -1015,20 +1015,23 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
         for key in deleted.keys.sorted() where Self.isRoomKey(key) {
             canonicalDeleted[key] = max(canonicalDeleted[key] ?? 0, deleted[key] ?? 0)
         }
+        // A merge can legitimately union two already-bounded 64-tombstone
+        // gateway snapshots. Hermes applies every unioned tombstone before
+        // retaining the newest 64 for onward propagation; bounding first can
+        // resurrect a room whose lower-ranked tombstone was just dropped.
+        for (key, revision) in canonicalDeleted {
+            if key.hasPrefix("id:") || revision >= (rooms[key]?.revision ?? 0) {
+                rooms.removeValue(forKey: key)
+            } else {
+                canonicalDeleted.removeValue(forKey: key)
+            }
+        }
         deleted = Dictionary(
             uniqueKeysWithValues: canonicalDeleted.sorted {
                 if $0.value != $1.value { return $0.value > $1.value }
                 return $0.key < $1.key
             }.prefix(Self.maximumTombstones).map { ($0.key, $0.value) }
         )
-
-        for (key, revision) in deleted {
-            if key.hasPrefix("id:") || revision >= (rooms[key]?.revision ?? 0) {
-                rooms.removeValue(forKey: key)
-            } else {
-                deleted.removeValue(forKey: key)
-            }
-        }
 
         let ranked = rooms.keys.sorted { leftKey, rightKey in
             let left = rooms[leftKey]?.log.last?.at ?? 0

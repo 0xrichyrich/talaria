@@ -744,6 +744,36 @@ final class RoomStoreTests: XCTestCase {
         XCTAssertEqual(envelope.deleted.values.max(), 99)
     }
 
+    func testRoomProjectionAppliesUnionedTombstonesBeforeRetentionBound() {
+        let user = RoomProjectionAuthor(kind: .user, name: "You")
+        let victimKey = "id:victim"
+        let victim = RoomProjectionRoom(
+            name: "Victim", roomID: "victim",
+            log: [RoomProjectionEntry(id: "old", from: user, text: "old", at: 1)],
+            revision: 999
+        )
+        let remoteDeleted = Dictionary(uniqueKeysWithValues: (0..<63).map {
+            ("id:remote-\($0)", UInt64(200 + $0))
+        })
+        var localDeleted = Dictionary(uniqueKeysWithValues: (0..<63).map {
+            ("id:local-\($0)", UInt64(100 + $0))
+        })
+        localDeleted[victimKey] = 1
+
+        let merged = RoomProjectionEnvelope.merging(
+            remote: RoomProjectionEnvelope(rooms: [victimKey: victim],
+                                           deleted: remoteDeleted),
+            local: RoomProjectionEnvelope(deleted: localDeleted)
+        )
+
+        XCTAssertNil(merged.rooms[victimKey],
+                     "every explicit id tombstone applies before retention bounding")
+        XCTAssertLessThanOrEqual(merged.deleted.count,
+                                 RoomProjectionEnvelope.maximumTombstones)
+        XCTAssertNil(merged.deleted[victimKey],
+                     "the lower-ranked applied tombstone need not be retained")
+    }
+
     func testRoomProjectionMergeUnionsOmissionsAndAppliesTombstoneClasses() {
         let user = RoomProjectionAuthor(kind: .user, name: "You")
         let remote = RoomProjectionEnvelope(rooms: [
