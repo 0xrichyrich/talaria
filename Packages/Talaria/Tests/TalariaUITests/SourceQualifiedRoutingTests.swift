@@ -944,9 +944,9 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         MultiGatewayRuntime.shared.routedEvents["homelab"] = MultiGatewayRuntime.RoutedEvents(
             client: remoteClient, handlerID: UUID(), pump: remotePump, generation: 1)
         runtime.deliveryGeneration["primary"] = model.cronDeliverySourceFence(
-            routineID: primary.id)?.fence
+            routineID: primary.id, botID: "primary::deceptive")?.fence
         runtime.deliveryGeneration["homelab"] = model.cronDeliverySourceFence(
-            routineID: remote.id)?.fence
+            routineID: remote.id, botID: "homelab::deceptive")?.fence
         defer {
             runtime.deliveryGeneration.removeValue(forKey: "primary")
             runtime.deliveryGeneration.removeValue(forKey: "homelab")
@@ -959,6 +959,26 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         XCTAssertEqual(model.cronDeliveryTargets(routineID: remote.id).map(\.id), ["telegram"])
         XCTAssertEqual(runtime.restSupported[model.routineGatewayID(routineID: primary.id)!], false)
         XCTAssertEqual(runtime.restSupported[model.routineGatewayID(routineID: remote.id)!], true)
+    }
+
+    func testUnscopedTaggedRoutineKeepsDisplayBotForSocketManagementOnly() {
+        let model = AppModel()
+        model.mode = .live
+        LiveRuntime.shared.gatewayID = "primary"
+        let routine = routine(id: "created", botID: "worker")
+        FeedsRuntime.shared.routineTargets[routine.id] = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "primary", jobID: "created"),
+            bot: GatewayBotRoute(gatewayID: "primary", profile: "worker"),
+            profile: nil)
+        defer { FeedsRuntime.shared.routineTargets.removeValue(forKey: routine.id) }
+
+        XCTAssertEqual(routine.botID, "worker")
+        XCTAssertTrue(model.routineHasFullManagement(routine))
+        XCTAssertEqual(model.cronScope(routine.id), nil)
+        XCTAssertEqual(model.routineGatewayID(routineID: routine.id), "primary")
+        XCTAssertFalse(model.cronRESTReady(routineID: routine.id, botID: "primary::worker"))
+        XCTAssertEqual(model.cronDeliverySourceFence(
+            routineID: routine.id, botID: "primary::worker")?.fence.profile, nil)
     }
 
     func testRoutineRunTranscriptKeepsOwningGateway() {

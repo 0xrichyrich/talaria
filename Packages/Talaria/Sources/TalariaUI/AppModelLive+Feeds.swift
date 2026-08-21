@@ -107,7 +107,12 @@ final class FeedsRuntime {
 
 struct RoutineTarget: Sendable, Equatable {
     var route: GatewayRoutineRoute
+    /// The bot route is a display/manageability identity parsed from the
+    /// namespaced job title. It is never REST/store authority.
     var bot: GatewayBotRoute
+    /// Only an exact echo from a profile-scoped listing may populate this
+    /// store scope. Nil means the launch store remains intentionally
+    /// unscoped, even when `bot` carries a display tag.
     var profile: String?
 }
 
@@ -586,7 +591,7 @@ public extension AppModel {
             runtime.routinesLoaded = false
             return
         }
-        var jobs: [String: (job: CronJobRecord, botID: String, scope: String?)] = [:]
+        var jobs: [String: (job: CronJobRecord, displayBotID: String, scope: String?)] = [:]
         var scopedCount = 0
         var failed: String?
 
@@ -599,7 +604,7 @@ public extension AppModel {
                 // This request is unscoped: even a deceptive row/top-level
                 // profile is not evidence that the process launched that
                 // store. Keep the raw payload, but leave target/scope nil.
-                jobs[job.id] = (job, CronListingScopePolicy.botID(for: job, scope: nil), nil)
+                jobs[job.id] = (job, CronListingAttributionPolicy.displayBotID(for: job), nil)
             }
         } catch {
             failed = (error as? GatewayError)?.message ?? error.localizedDescription
@@ -617,17 +622,24 @@ public extension AppModel {
                 do {
                     let listing = try await client.cronJobs(profile: botID,
                                                             includeDisabled: true)
-                    // A successful response without the scope marker is the
-                    // legacy gateway compatibility path, not a read failure.
-                    guard let scope = CronListingScopePolicy.scope(
-                        for: listing, requestedProfile: botID) else { continue }
+                    // A successful response without the exact scope marker is
+                    // an incomplete snapshot, not legacy success. Continuing
+                    // would make the final publication prune a prior verified
+                    // row for this profile.
+                    guard CronListingScopePolicy.acceptsExactScopeEcho(
+                        listing, requestedProfile: botID),
+                          let scope = CronListingScopePolicy.scope(
+                              for: listing, requestedProfile: botID) else {
+                        failed = CronListingScopePolicy.incompleteScopeMessage
+                        break
+                    }
                     guard self.client === client,
                           cronMutationFenceAccepts(sourceFence, expectedClient: client),
                           profileLifecycleAccepts(token) else { return }
                     scopedCount += 1
                     for job in listing.jobs where !job.id.isEmpty {
-                        jobs[job.id] = (job, CronListingScopePolicy.botID(
-                            for: job, scope: scope), scope)
+                        jobs[job.id] = (job, CronListingAttributionPolicy.displayBotID(
+                            for: job, scopedProfile: scope), scope)
                     }
                 } catch {
                     failed = (error as? GatewayError)?.message ?? error.localizedDescription
@@ -674,7 +686,7 @@ public extension AppModel {
         for (jobID, entry) in jobs {
             let nextTarget = RoutineTarget(
                 route: GatewayRoutineRoute(gatewayID: primaryGatewayID, jobID: jobID),
-                bot: GatewayBotRoute(gatewayID: primaryGatewayID, profile: entry.botID),
+                bot: GatewayBotRoute(gatewayID: primaryGatewayID, profile: entry.displayBotID),
                 profile: entry.scope)
             let priorTarget = priorPrimaryTargets[jobID]
             let priorDetailAuthority = CronDetailRuntime.shared.detailAuthority[jobID]
@@ -699,7 +711,7 @@ public extension AppModel {
         let primaryRows = jobs.values
             .sorted { ($0.job.nextRun ?? .distantFuture) < ($1.job.nextRun ?? .distantFuture) }
             .map { entry in
-                Routine(id: entry.job.id, botID: entry.botID, name: entry.job.displayTitle,
+                Routine(id: entry.job.id, botID: entry.displayBotID, name: entry.job.displayTitle,
                         schedule: entry.job.schedule,
                         next: entry.job.nextRun.map { Self.relativeNext($0.timeIntervalSince1970) } ?? "",
                         last: Self.lastRunLine(entry.job, theme: theme.themeID),
@@ -753,7 +765,27 @@ public extension AppModel {
                       sourceAccepted: cronMutationFenceAccepts(sourceFence,
                                                                expectedClient: client),
                       lifecycleAuthorityAccepted: true) else { continue }
-            var jobs: [String: (job: CronJobRecord, botID: String, scope: String?)] = [:]
+            // Capture every expected profile token before reading any cron
+            // store. Re-reading only the profile currently in the loop would
+            // accept a stale A snapshot when A changes during a later B read.
+            let expectedProfiles = Array(profiles.prefix(10))
+            let expectedProfileNames = expectedProfiles.map(\.name)
+            var profileTokens: [String: ProfileLifecycleGenerationToken] = [:]
+            for profile in expectedProfiles {
+                guard let token = profileLifecycleGenerationToken(
+                    for: GatewayBotRoute(gatewayID: gatewayID,
+                                         profile: profile.name).qualifiedID) else {
+                    profileTokens.removeAll()
+                    break
+                }
+                profileTokens[profile.name] = token
+            }
+            guard CronProfileRefreshPolicy.capturedProfilesRemainCurrent(
+                expectedProfiles: expectedProfileNames,
+                tokens: profileTokens,
+                isCurrent: profileLifecycleAccepts) else { continue }
+
+            var jobs: [String: (job: CronJobRecord, displayBotID: String, scope: String?)] = [:]
             let launchListing: CronListing
             do {
                 launchListing = try await client.cronJobs(includeDisabled: true)
@@ -767,23 +799,23 @@ public extension AppModel {
                   CronProfileRefreshPolicy.mayPublishSnapshot(
                       sourceAccepted: cronMutationFenceAccepts(sourceFence,
                                                                expectedClient: client),
-                      lifecycleAuthorityAccepted: profiles.allSatisfy({
-                          let id = GatewayBotRoute(gatewayID: gatewayID,
-                                                   profile: $0.name).qualifiedID
-                          return profileLifecycleGenerationToken(for: id)
-                              .map(profileLifecycleAccepts) ?? false
-                      })) else { continue }
+                      lifecycleAuthorityAccepted: CronProfileRefreshPolicy
+                          .capturedProfilesRemainCurrent(
+                              expectedProfiles: expectedProfileNames,
+                              tokens: profileTokens,
+                              isCurrent: profileLifecycleAccepts)) else { continue }
             for job in launchListing.jobs where !job.id.isEmpty {
                 // The unscoped launch store has no profile authority. Ignore
                 // both the row and listing profile fields until a scoped
                 // request with an exact echo proves ownership.
-                jobs[job.id] = (job, CronListingScopePolicy.botID(for: job, scope: nil), nil)
+                jobs[job.id] = (job, CronListingAttributionPolicy.displayBotID(for: job), nil)
             }
             var profileReadFailed = false
-            for profile in profiles.prefix(10) {
-                guard let profileToken = profileLifecycleGenerationToken(
-                    for: GatewayBotRoute(gatewayID: gatewayID, profile: profile.name).qualifiedID),
-                      profileLifecycleAccepts(profileToken) else {
+            for profile in expectedProfiles {
+                guard CronProfileRefreshPolicy.capturedProfilesRemainCurrent(
+                    expectedProfiles: expectedProfileNames,
+                    tokens: profileTokens,
+                    isCurrent: profileLifecycleAccepts) else {
                     profileReadFailed = true
                     break
                 }
@@ -793,17 +825,26 @@ public extension AppModel {
                     guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
                           current.client === client,
                           cronMutationFenceAccepts(sourceFence, expectedClient: client),
-                          profileLifecycleAccepts(profileToken) else {
+                          CronProfileRefreshPolicy.capturedProfilesRemainCurrent(
+                              expectedProfiles: expectedProfileNames,
+                              tokens: profileTokens,
+                              isCurrent: profileLifecycleAccepts) else {
                         profileReadFailed = true
                         break
                     }
-                    // A successful unscoped response is the old-gateway
-                    // compatibility case; it is not evidence of deletion.
-                    guard let scope = CronListingScopePolicy.scope(
-                        for: listing, requestedProfile: profile.name) else { continue }
+                    // A successful response without the exact scope marker is
+                    // an incomplete snapshot, not legacy success. Continuing
+                    // would make publication prune a prior verified row.
+                    guard CronListingScopePolicy.acceptsExactScopeEcho(
+                        listing, requestedProfile: profile.name),
+                          let scope = CronListingScopePolicy.scope(
+                              for: listing, requestedProfile: profile.name) else {
+                        profileReadFailed = true
+                        break
+                    }
                     for job in listing.jobs where !job.id.isEmpty {
-                        jobs[job.id] = (job, CronListingScopePolicy.botID(
-                            for: job, scope: scope), scope)
+                        jobs[job.id] = (job, CronListingAttributionPolicy.displayBotID(
+                            for: job, scopedProfile: scope), scope)
                     }
                 } catch {
                     profileReadFailed = true
@@ -812,8 +853,7 @@ public extension AppModel {
             }
 
             // Do not prune/publish this gateway's old rows when one scoped
-            // request threw. A successful legacy response above is explicitly
-            // allowed; only a transport/tool failure aborts this snapshot.
+            // request threw or omitted its exact scope echo.
             if profileReadFailed { continue }
 
             guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
@@ -821,7 +861,11 @@ public extension AppModel {
                   CronProfileRefreshPolicy.mayPublishSnapshot(
                       sourceAccepted: cronMutationFenceAccepts(sourceFence,
                                                                expectedClient: client),
-                      lifecycleAuthorityAccepted: !profileReadFailed) else { continue }
+                      lifecycleAuthorityAccepted: CronProfileRefreshPolicy
+                          .capturedProfilesRemainCurrent(
+                              expectedProfiles: expectedProfileNames,
+                              tokens: profileTokens,
+                              isCurrent: profileLifecycleAccepts)) else { continue }
 
             let oldIDs = Set(feeds.routineTargets.compactMap { key, target in
                 target.route.gatewayID == gatewayID ? key : nil
@@ -843,7 +887,7 @@ public extension AppModel {
             }
             for entry in jobs.values {
                 let route = GatewayRoutineRoute(gatewayID: gatewayID, jobID: entry.job.id)
-                let bot = GatewayBotRoute(gatewayID: gatewayID, profile: entry.botID)
+                let bot = GatewayBotRoute(gatewayID: gatewayID, profile: entry.displayBotID)
                 let id = route.qualifiedID
                 let nextTarget = RoutineTarget(route: route, bot: bot, profile: entry.scope)
                 let priorTarget = feeds.routineTargets[id]

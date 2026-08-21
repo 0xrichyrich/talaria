@@ -377,24 +377,63 @@ enum CronProfileRefreshPolicy {
                                    lifecycleAuthorityAccepted: Bool) -> Bool {
         sourceAccepted && lifecycleAuthorityAccepted
     }
+
+    /// A profile list is a set of expected stores. Capture one lifecycle token
+    /// for every expected name before the first cron read; a token missing from
+    /// the map makes the whole snapshot incomplete rather than authorizing a
+    /// partial prune.
+    static func hasAllExpectedProfileTokens(
+        expectedProfiles: [String],
+        tokens: [String: ProfileLifecycleGenerationToken]
+    ) -> Bool {
+        guard Set(expectedProfiles).count == expectedProfiles.count,
+              tokens.count == expectedProfiles.count else { return false }
+        return expectedProfiles.allSatisfy { profile in
+            tokens[profile]?.route.profile == profile
+        }
+    }
+
+    /// Re-check every captured token, not just the profile whose RPC just
+    /// completed. This closes the A-changes-during-B-read race.
+    static func capturedProfilesRemainCurrent(
+        expectedProfiles: [String],
+        tokens: [String: ProfileLifecycleGenerationToken],
+        isCurrent: (ProfileLifecycleGenerationToken) -> Bool
+    ) -> Bool {
+        hasAllExpectedProfileTokens(expectedProfiles: expectedProfiles, tokens: tokens)
+            && expectedProfiles.allSatisfy { profile in
+                guard let token = tokens[profile] else { return false }
+                return isCurrent(token)
+            }
+    }
 }
 
 /// Only the request's explicit profile plus Hermes' exact `scoped` echo can
 /// identify a profile store. Per-row `profile` fields and an unscoped listing's
 /// top-level profile are merely payload data and cannot retarget a row.
 enum CronListingScopePolicy {
+    static let incompleteScopeMessage =
+        "Profile-scoped routine response did not echo its requested profile."
+
     static func scope(for listing: CronListing, requestedProfile: String?) -> String? {
         guard let requestedProfile, !requestedProfile.isEmpty,
               listing.scopedProfile == requestedProfile else { return nil }
         return requestedProfile
     }
 
-    static func botID(for job: CronJobRecord, scope: String?) -> String {
-        // An unscoped response has no owner authority. Do not let its
-        // `[bot:…]` display tag become a routable/authoritative bot id; only a
-        // scoped request may use the tag alongside its exact store scope.
-        guard let scope else { return "" }
-        return job.taggedBotID ?? scope
+    static func acceptsExactScopeEcho(_ listing: CronListing,
+                                      requestedProfile: String?) -> Bool {
+        scope(for: listing, requestedProfile: requestedProfile) != nil
+    }
+}
+
+/// Display attribution is deliberately separate from store authority. The
+/// parser validates the namespaced `[bot:…]` shape; the result may identify the
+/// row's UI bot and socket-management destination, but it never becomes a
+/// `RoutineTarget.profile` or a REST profile argument.
+enum CronListingAttributionPolicy {
+    static func displayBotID(for job: CronJobRecord, scopedProfile: String? = nil) -> String {
+        job.taggedBotID ?? scopedProfile ?? ""
     }
 }
 
@@ -783,9 +822,13 @@ public extension AppModel {
         let selectedBotRoute = botID.flatMap(GatewayBotRoute.init(qualifiedID:))
         guard routineID == nil || selectedTarget != nil else { return nil }
         // A routine target with nil profile is the process launch store. Keep
-        // that identity unscoped; the selected bot route is only a caller
-        // identity for create-editor delivery loading, not launch authority.
-        let selectedProfile = selectedTarget?.profile ?? selectedBotRoute?.profile
+        // that identity unscoped; never fall back to the editor's selected bot
+        // route for an existing row, because that display identity is not
+        // launch-store authority. The selected bot is only meaningful for the
+        // create-editor path, where there is no routine target yet.
+        let selectedProfile = selectedTarget != nil
+            ? selectedTarget?.profile
+            : selectedBotRoute?.profile
         guard let gatewayID = selectedTarget?.route.gatewayID ?? selectedBotRoute?.gatewayID
                 ?? routineGatewayID(routineID: routineID, botID: botID),
               let sourceFence = cronSourceMutationFence(

@@ -280,8 +280,8 @@ final class CronReasoningEffortTests: XCTestCase {
             for: primaryListing, requestedProfile: nil))
         XCTAssertNil(CronListingScopePolicy.scope(
             for: retainedListing, requestedProfile: nil))
-        XCTAssertEqual(CronListingScopePolicy.botID(for: primaryJob, scope: nil), "")
-        XCTAssertEqual(CronListingScopePolicy.botID(for: retainedJob, scope: nil), "")
+        XCTAssertEqual(CronListingAttributionPolicy.displayBotID(for: primaryJob), "primary")
+        XCTAssertEqual(CronListingAttributionPolicy.displayBotID(for: retainedJob), "retained")
 
         // A requested profile becomes authoritative only when the response
         // echoes that exact requested scope; deceptive row metadata is ignored.
@@ -289,8 +289,71 @@ final class CronReasoningEffortTests: XCTestCase {
             jobs: [primaryJob], scopedProfile: "primary-store", profile: "retained-store")
         XCTAssertEqual(CronListingScopePolicy.scope(
             for: scoped, requestedProfile: "primary-store"), "primary-store")
-        XCTAssertEqual(CronListingScopePolicy.botID(for: primaryJob,
-                                                    scope: "primary-store"), "primary")
+        XCTAssertEqual(CronListingAttributionPolicy.displayBotID(
+            for: primaryJob, scopedProfile: "primary-store"), "primary")
+    }
+
+    func testUnscopedDisplayTagIsNotStoreOrRESTAuthority() {
+        let job = CronJobRecord([
+            "job_id": "created",
+            "name": "[bot:worker] Created",
+            "profile": "deceptive-store",
+        ])
+        let target = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "primary", jobID: job.id),
+            bot: GatewayBotRoute(gatewayID: "primary", profile: "worker"),
+            profile: nil)
+
+        // The validated namespace remains useful for the selected bot's UI
+        // row and socket actions, but it cannot authorize a REST/profile store.
+        XCTAssertEqual(CronListingAttributionPolicy.displayBotID(for: job), "worker")
+        XCTAssertEqual(target.bot.profile, "worker")
+        XCTAssertNil(target.profile)
+        XCTAssertFalse(CronDetailAuthorityPolicy.allowsProfileScopedREST(
+            profile: target.profile))
+    }
+
+    func testMissingScopedEchoIsAnIncompleteSnapshot() {
+        let missing = CronListing(
+            jobs: [CronJobRecord(["job_id": "same-id", "name": "[bot:a] Job"])],
+            scopedProfile: nil,
+            profile: "a")
+        let exact = CronListing(
+            jobs: [], scopedProfile: "a", profile: "deceptive")
+
+        XCTAssertFalse(CronListingScopePolicy.acceptsExactScopeEcho(
+            missing, requestedProfile: "a"))
+        XCTAssertTrue(CronListingScopePolicy.acceptsExactScopeEcho(
+            exact, requestedProfile: "a"))
+        XCTAssertEqual(
+            CronListingScopePolicy.incompleteScopeMessage,
+            "Profile-scoped routine response did not echo its requested profile.")
+    }
+
+    func testSecondaryRefreshCapturesEveryProfileAndRejectsAChangeDuringB() {
+        let profileA = ProfileLifecycleGenerationToken(
+            route: GatewayBotRoute(gatewayID: "homelab", profile: "a"), generation: 4)
+        let profileB = ProfileLifecycleGenerationToken(
+            route: GatewayBotRoute(gatewayID: "homelab", profile: "b"), generation: 9)
+        let expected = ["a", "b"]
+        let tokens = ["a": profileA, "b": profileB]
+        var current = ["a": UInt64(4), "b": UInt64(9)]
+
+        XCTAssertTrue(CronProfileRefreshPolicy.hasAllExpectedProfileTokens(
+            expectedProfiles: expected, tokens: tokens))
+        XCTAssertTrue(CronProfileRefreshPolicy.capturedProfilesRemainCurrent(
+            expectedProfiles: expected, tokens: tokens,
+            isCurrent: { current[$0.route.profile] == $0.generation }))
+
+        // Profile A changes while the later B request is in flight. Checking
+        // only B would publish a mixed snapshot; checking all captured tokens
+        // retains the previous verified rows instead.
+        current["a"] = 5
+        XCTAssertFalse(CronProfileRefreshPolicy.capturedProfilesRemainCurrent(
+            expectedProfiles: expected, tokens: tokens,
+            isCurrent: { current[$0.route.profile] == $0.generation }))
+        XCTAssertFalse(CronProfileRefreshPolicy.hasAllExpectedProfileTokens(
+            expectedProfiles: expected, tokens: ["a": profileA]))
     }
 
     func testLegacyRoutineRefreshIsDemoOnlyAndCannotPublishLiveRows() {
