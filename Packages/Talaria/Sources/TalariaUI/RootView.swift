@@ -56,6 +56,7 @@ public struct TalariaRootView: View {
     @State private var capabilitiesRequest: CapabilitiesRequest?
     @State private var sessionsRequest: SessionsRequest?
     @State private var commandCenterRequest: CommandCenterRequest?
+    @State private var pendingTerminalRequest: CommandCenterRequest?
 
     /// Capabilities opens on a profile, and `nil` means "the gateway's launch
     /// profile" — a real value — so presentation can't key off the profile
@@ -79,6 +80,8 @@ public struct TalariaRootView: View {
     private struct CommandCenterRequest: Identifiable, Equatable {
         let id = UUID()
         let gatewayID: String?
+        let profile: String?
+        let terminalResume: String?
     }
 
     // Demo push banner cycle.
@@ -232,16 +235,28 @@ public struct TalariaRootView: View {
                 Text("Create one agent or a room shared by agents across your gateways.")
             }
         }
-        .sheet(item: $sessionsRequest) { request in
+        .sheet(item: $sessionsRequest, onDismiss: {
+            guard let pending = pendingTerminalRequest else { return }
+            pendingTerminalRequest = nil
+            commandCenterRequest = pending
+        }) { request in
             // onOpen fires after the sheet has already rebound the chat, so
             // this only has to clear the way to it.
-            SessionsSheet(model: model, botID: request.botID) { _ in
+            SessionsSheet(model: model, botID: request.botID,
+                          onOpenTerminal: { gatewayID, profile, resume in
+                pendingTerminalRequest = CommandCenterRequest(
+                    gatewayID: gatewayID, profile: profile,
+                    terminalResume: resume)
+                sessionsRequest = nil
+            }) { _ in
                 sessionsRequest = nil
                 revealChat()
             }
         }
         .sheet(item: $commandCenterRequest) { request in
-            CommandCenterView(model: model, initialGatewayID: request.gatewayID)
+            CommandCenterView(model: model, initialGatewayID: request.gatewayID,
+                              initialProfile: request.profile,
+                              initialTerminalResume: request.terminalResume)
                 .presentationBackground(theme.bg)
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
@@ -297,7 +312,9 @@ public struct TalariaRootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .talariaOpenCommandCenter)) { note in
             guard commandCenterRequest == nil else { return }
             commandCenterRequest = CommandCenterRequest(
-                gatewayID: note.userInfo?["gatewayID"] as? String)
+                gatewayID: note.userInfo?["gatewayID"] as? String,
+                profile: note.userInfo?["profile"] as? String,
+                terminalResume: note.userInfo?["terminalResume"] as? String)
         }
         .onReceive(NotificationCenter.default.publisher(for: .talariaOpenSessions)) { note in
             // object carries the bot id; fall back to whatever chat is open.

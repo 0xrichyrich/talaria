@@ -323,6 +323,7 @@ extension AppModel {
         }
         guard ProfileLifecycleTrafficAdmission.beginLifecycle(target.route.gatewayID)
         else { return .refused("That gateway is busy with another request or profile change. Try again when it finishes.") }
+        AdvancedTerminalCoordinator.shared.stopAndForget(gatewayID: target.route.gatewayID)
         let exclusive = ProfileLifecycleExclusiveLease(gatewayID: target.route.gatewayID)
         defer { exclusive.releaseIfHeld() }
 
@@ -492,6 +493,7 @@ extension AppModel {
         }
         guard ProfileLifecycleTrafficAdmission.beginLifecycle(target.route.gatewayID)
         else { return .refused("That gateway is busy with another request or profile change. Try again when it finishes.") }
+        AdvancedTerminalCoordinator.shared.stopAndForget(gatewayID: target.route.gatewayID)
         let exclusive = ProfileLifecycleExclusiveLease(gatewayID: target.route.gatewayID)
         defer { exclusive.releaseIfHeld() }
 

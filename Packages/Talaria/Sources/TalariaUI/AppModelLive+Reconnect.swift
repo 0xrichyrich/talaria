@@ -593,6 +593,7 @@ extension AppModel {
     /// Forget the credential but keep the row: the gateway stays listed and
     /// probeable, and the next tap runs sign-in again.
     public func signOutGateway(_ gateway: SavedGateway) async {
+        AdvancedTerminalCoordinator.shared.stopAndForget(gatewayID: gateway.id)
         beginExactStoredSessionSourceTeardown(gatewayID: gateway.id)
         defer { finishExactStoredSessionSourceTeardown(gatewayID: gateway.id) }
         cancelRoomProjectionSync(gatewayID: gateway.id)
@@ -617,6 +618,7 @@ extension AppModel {
 
     /// Remove the gateway entirely — registry row and Keychain credential.
     public func removeGateway(_ gateway: SavedGateway) async {
+        AdvancedTerminalCoordinator.shared.stopAndForget(gatewayID: gateway.id)
         beginExactStoredSessionSourceTeardown(gatewayID: gateway.id)
         defer { finishExactStoredSessionSourceTeardown(gatewayID: gateway.id) }
         cancelRoomProjectionSync(gatewayID: gateway.id)

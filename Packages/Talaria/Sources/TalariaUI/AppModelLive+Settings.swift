@@ -643,6 +643,7 @@ extension AppModel {
     /// the in-memory world. Bots and their history live on the gateway and are
     /// untouched — this only unmakes what Talaria wrote here.
     public func deleteAllLocalData() async throws {
+        AdvancedTerminalCoordinator.shared.stopAndForgetEverything()
         // Device-owned transcripts/blobs are the only part of this reset that
         // can fail durably. Prove their empty index first; otherwise preserve
         // credentials/preferences and surface an actionable partial failure.

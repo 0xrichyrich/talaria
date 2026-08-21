@@ -19,10 +19,20 @@ let package = Package(
         .library(name: "TalariaUI", targets: ["TalariaUI"]),
         .executable(name: "talaria-verify", targets: ["TalariaVerify"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.15.0"),
+    ],
     targets: [
         .target(name: "TalariaKit"),
         .target(name: "TalariaTheme", dependencies: ["TalariaKit"]),
-        .target(name: "TalariaUI", dependencies: ["TalariaKit", "TalariaTheme"]),
+        .target(
+            name: "TalariaUI",
+            dependencies: [
+                "TalariaKit",
+                "TalariaTheme",
+                .product(name: "SwiftTerm", package: "SwiftTerm"),
+            ]
+        ),
         .executableTarget(name: "TalariaVerify", dependencies: ["TalariaKit"]),
         .testTarget(name: "TalariaKitTests", dependencies: ["TalariaKit"]),
         .testTarget(name: "TalariaUITests", dependencies: ["TalariaUI", "TalariaKit"]),
