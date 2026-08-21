@@ -54,6 +54,15 @@ public struct CronJobDetail: Sendable, Equatable, Identifiable {
     /// model_snapshots`). Present ⇒ the drift guard is armed on that axis.
     public var providerSnapshot: String?
     public var modelSnapshot: String?
+    /// Exact optional value in the raw job record. Do not normalize on read:
+    /// unknown hand-edited values are observable state, and partial updates
+    /// must leave them byte-for-byte untouched unless the user changes this
+    /// setting explicitly.
+    public var reasoningEffortRaw: String?
+
+    public var reasoningEffort: CronReasoningEffort {
+        CronReasoningEffort(raw: reasoningEffortRaw)
+    }
 
     /// Script-only job: runs a shell script on schedule with no agent. Its
     /// prompt is legitimately empty and must never be written back as one.
@@ -134,6 +143,7 @@ public struct CronJobDetail: Sendable, Equatable, Identifiable {
         baseURL = Self.text(v["base_url"])
         providerSnapshot = Self.text(v["provider_snapshot"])
         modelSnapshot = Self.text(v["model_snapshot"])
+        reasoningEffortRaw = v["reasoning_effort"]?.stringValue
         noAgent = v["no_agent"]?.boolValue ?? false
         script = Self.text(v["script"])
         if let list = v["context_from"]?.arrayValue {
@@ -164,6 +174,93 @@ public struct CronJobDetail: Sendable, Equatable, Identifiable {
         guard let s = value?.stringValue?.trimmingCharacters(in: .whitespaces), !s.isEmpty else { return nil }
         return s
     }
+}
+
+// MARK: - Per-job reasoning effort
+
+/// Hermes' per-job reasoning-effort contract, reduced to the three states a
+/// client can truthfully render.
+///
+/// Current Hermes resolves a recognized pin ahead of both
+/// `agent.reasoning_overrides` and `agent.reasoning_effort`. An absent/empty
+/// value follows that config chain. An unknown value in a hand-edited store is
+/// *also* ignored in favor of config, but remains an error worth surfacing and
+/// preserving. Capability clamping belongs to the provider at request time,
+/// so this type never claims that (for example) `ultra` is supported by the
+/// model that eventually runs.
+public enum CronReasoningEffort: Sendable, Equatable {
+    case followsConfiguration
+    case pinned(String)
+    case unknown(String)
+
+    /// Canonical create/edit spellings accepted by cron.jobs. `none` is the
+    /// explicit thinking-off value, not an enabled effort level.
+    public static let canonicalValues = [
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ]
+
+    public init(raw: String?) {
+        guard let raw else {
+            self = .followsConfiguration
+            return
+        }
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else {
+            self = .followsConfiguration
+            return
+        }
+        if normalized == "false" || normalized == "disabled" {
+            self = .pinned("none")
+        } else if Self.canonicalValues.contains(normalized) {
+            self = .pinned(normalized)
+        } else {
+            self = .unknown(raw)
+        }
+    }
+
+    /// Validate a user-authored mutation exactly like Hermes' storage choke
+    /// point. nil means clear/follow config; recognized values are returned in
+    /// canonical form. `false`/`disabled` are accepted for API parity even
+    /// though the picker only offers the unambiguous `none` spelling.
+    public static func canonicalMutation(_ raw: String) throws -> String? {
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return nil }
+        if normalized == "false" || normalized == "disabled" { return "none" }
+        guard canonicalValues.contains(normalized) else {
+            throw GatewayError(
+                code: 400,
+                message: "Invalid reasoning_effort \(raw.debugDescription). Valid levels: "
+                    + canonicalValues.joined(separator: ", ")
+                    + " (empty clears the override).")
+        }
+        return normalized
+    }
+
+    /// REST `CronJobUpdate.updates` wire value. Hermes treats JSON null and an
+    /// empty CLI string as the same clear operation; sending null avoids
+    /// relying on dashboard string cleanup while keeping omission available
+    /// for the distinct "leave untouched" lane.
+    public static func wireMutation(_ raw: String) throws -> JSONValue {
+        try canonicalMutation(raw).map(JSONValue.string) ?? .null
+    }
+
+    /// Translate picker state into the optional patch lane. A missing baseline
+    /// means the form has not completed an authoritative read and therefore
+    /// has no permission to write this field. Equal strings (including an
+    /// unknown future value) are omitted byte-for-byte.
+    public static func authoredMutation(draft: String, baseline: String?) -> String? {
+        guard let baseline, baseline != draft else { return nil }
+        return draft
+    }
+
+    /// The canonical effective per-job request when one exists. nil means
+    /// Hermes resolves config at fire time (including the unknown-value case).
+    public var pinnedValue: String? {
+        if case .pinned(let value) = self { return value }
+        return nil
+    }
+
+    public var followsConfiguration: Bool { pinnedValue == nil }
 }
 
 // MARK: - Health (the fail-closed states)

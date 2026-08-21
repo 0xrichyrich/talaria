@@ -78,6 +78,102 @@ public final class CronDetailRuntime {
     }
 }
 
+// MARK: - Mutation authority
+
+/// Connection-role generation captured with a cron mutation. Gateway ids are
+/// durable registry identities; generations prove that the client currently
+/// occupying that identity is still the one the user acted on.
+enum CronGatewayGeneration: Sendable, Equatable {
+    case primary(Int)
+    case retained(UInt64)
+}
+
+/// Exact source + profile store authority for one cron write.
+struct CronSourceMutationFence: Sendable, Equatable {
+    var gatewayID: String
+    var profile: String?
+    var generation: CronGatewayGeneration
+
+    static func accepts(_ fence: Self, primaryGatewayID: String?,
+                        primaryGeneration: Int,
+                        retainedGenerations: [String: UInt64]) -> Bool {
+        switch fence.generation {
+        case .primary(let generation):
+            return fence.gatewayID == primaryGatewayID && generation == primaryGeneration
+        case .retained(let generation):
+            return fence.gatewayID != primaryGatewayID
+                && retainedGenerations[fence.gatewayID] == generation
+        }
+    }
+}
+
+/// Existing-job authority adds the UI row identity to the source fence. The
+/// profile is part of `RoutineTarget`, so a refresh that moves the same raw job
+/// id to another profile store invalidates this fence even if the source
+/// connection did not change.
+struct CronRoutineMutationFence: Sendable, Equatable {
+    var routineID: String
+    var target: RoutineTarget
+    var source: CronSourceMutationFence
+
+    static func accepts(_ fence: Self, currentTarget: RoutineTarget?,
+                        primaryGatewayID: String?, primaryGeneration: Int,
+                        retainedGenerations: [String: UInt64]) -> Bool {
+        currentTarget == fence.target
+            && sourceMatchesTarget(fence)
+            && CronSourceMutationFence.accepts(
+                fence.source, primaryGatewayID: primaryGatewayID,
+                primaryGeneration: primaryGeneration,
+                retainedGenerations: retainedGenerations)
+    }
+
+    private static func sourceMatchesTarget(_ fence: Self) -> Bool {
+        fence.source.gatewayID == fence.target.route.gatewayID
+            && fence.source.profile == fence.target.profile
+    }
+}
+
+extension AppModel {
+    func cronSourceMutationFence(gatewayID: String,
+                                 profile: String?) -> CronSourceMutationFence? {
+        if gatewayID == LiveRuntime.shared.gatewayID {
+            return CronSourceMutationFence(
+                gatewayID: gatewayID, profile: profile,
+                generation: .primary(LiveRuntime.shared.generation))
+        }
+        let routed = MultiGatewayRuntime.shared
+        guard routed.routedEvents[gatewayID] != nil,
+              let generation = routed.routedEventGenerations[gatewayID] else { return nil }
+        return CronSourceMutationFence(
+            gatewayID: gatewayID, profile: profile,
+            generation: .retained(generation))
+    }
+
+    func cronRoutineMutationFence(_ routineID: String) -> CronRoutineMutationFence? {
+        guard let target = routineTarget(routineID),
+              let source = cronSourceMutationFence(
+                gatewayID: target.route.gatewayID, profile: target.profile) else { return nil }
+        return CronRoutineMutationFence(routineID: routineID, target: target, source: source)
+    }
+
+    func cronMutationFenceAccepts(_ fence: CronSourceMutationFence) -> Bool {
+        profileLifecycleAllowsGatewayTraffic(fence.gatewayID)
+            && CronSourceMutationFence.accepts(
+                fence, primaryGatewayID: LiveRuntime.shared.gatewayID,
+                primaryGeneration: LiveRuntime.shared.generation,
+                retainedGenerations: MultiGatewayRuntime.shared.routedEventGenerations)
+    }
+
+    func cronMutationFenceAccepts(_ fence: CronRoutineMutationFence) -> Bool {
+        profileLifecycleAllowsGatewayTraffic(fence.source.gatewayID)
+            && CronRoutineMutationFence.accepts(
+                fence, currentTarget: routineTarget(fence.routineID),
+                primaryGatewayID: LiveRuntime.shared.gatewayID,
+                primaryGeneration: LiveRuntime.shared.generation,
+                retainedGenerations: MultiGatewayRuntime.shared.routedEventGenerations)
+    }
+}
+
 // MARK: - Legacy delegation quarantine
 
 public extension AppModel {
@@ -126,13 +222,19 @@ public extension AppModel {
         guard !victims.isEmpty else { return }
         var paused = false
         for (id, job) in victims {
-            guard let target = feeds.routineTargets[id],
+            guard let fence = cronRoutineMutationFence(id),
+                  let target = feeds.routineTargets[id], target == fence.target,
                   let client = try? await routedClient(gatewayID: target.route.gatewayID)
             else { continue }
+            guard cronMutationFenceAccepts(fence) else { continue }
             runtime.quarantined.insert(id)
             do {
                 try await client.cronSetPaused(jobID: target.route.jobID, paused: true,
                                                profile: target.profile)
+                guard cronMutationFenceAccepts(fence) else {
+                    runtime.quarantined.remove(id)
+                    continue
+                }
                 paused = true
                 let botID = target.route.gatewayID == LiveRuntime.shared.gatewayID
                     ? target.bot.profile : target.bot.qualifiedID
@@ -142,7 +244,7 @@ public extension AppModel {
                                key: "cron-quarantine:\(id)")
             } catch {
                 // Retried on the next list; never surfaced as a list failure.
-                runtime.quarantined.remove(id)
+                if cronMutationFenceAccepts(fence) { runtime.quarantined.remove(id) }
             }
         }
         if paused { await refreshRoutinesLive(force: true) }
@@ -315,6 +417,14 @@ public extension AppModel {
                 baseURL: base, credential: credential)
             guard gatewayRESTContext(gatewayID: gatewayID) != nil else { return }
             runtime.deliveryTargets[gatewayID] = targets
+        } catch let error as GatewayError where error.code == GatewayREST.cronRESTUnavailable {
+            // Delivery-target discovery and job update are routes on the same
+            // Hermes cron router. This probe is what lets a legacy gateway
+            // become inspect-only before the form offers a REST-only effort
+            // picker that could never save.
+            guard gatewayRESTContext(gatewayID: gatewayID) != nil else { return }
+            runtime.restSupported[gatewayID] = false
+            runtime.deliveryLoaded.remove(gatewayID)
         } catch {
             // No targets discovered = the picker stays hidden and every job
             // keeps whatever route it already has.
@@ -367,7 +477,8 @@ public extension AppModel {
     func scheduleRoutine(botID: String, title: String, schedule: String, instruction: String,
                          repeatForever: Bool = true, continuity: Bool = false,
                          deliver: [String] = [], model: String? = nil,
-                         provider: String? = nil) async throws {
+                         provider: String? = nil,
+                         reasoningEffort: String? = nil) async throws {
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanInstruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTitle.isEmpty, !cleanInstruction.isEmpty else {
@@ -385,8 +496,27 @@ public extension AppModel {
               let gatewayID = routineGatewayID(botID: botID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
         }
+        guard let sourceFence = cronSourceMutationFence(gatewayID: gatewayID, profile: nil) else {
+            throw GatewayRouteError.noRoute
+        }
+        // Capture the REST authority before the first suspension. If the
+        // socket add commits, finishing its PUT is one transaction and must
+        // keep using this exact source/profile even if navigation changes.
+        let restAuthority = gatewayRESTContext(gatewayID: gatewayID)
         let botProfile = GatewayBotRoute(qualifiedID: botID)?.profile ?? botID
         let client = try await routedClient(gatewayID: gatewayID)
+        guard cronMutationFenceAccepts(sourceFence) else { throw CancellationError() }
+
+        // Validate every authored value before the socket creates anything.
+        // Create is necessarily a two-step transaction (cron.manage add, then
+        // REST PUT for fields the socket cannot carry); rejecting bad effort
+        // after step one would leave a live, partially configured routine.
+        let canonicalEffort: String?
+        if let reasoningEffort {
+            canonicalEffort = try CronReasoningEffort.canonicalMutation(reasoningEffort)
+        } else {
+            canonicalEffort = nil
+        }
 
         let jobID = try await client.cronAdd(
             name: Self.namespacedTitle(botID: botProfile, title: cleanTitle),
@@ -404,24 +534,37 @@ public extension AppModel {
         if !deliver.isEmpty { extras["deliver"] = .string(deliver.joined(separator: ",")) }
         if let model, !model.isEmpty { extras["model"] = .string(model) }
         if let provider, !provider.isEmpty { extras["provider"] = .string(provider) }
+        if let canonicalEffort { extras["reasoning_effort"] = .string(canonicalEffort) }
 
-        guard !extras.isEmpty, !jobID.isEmpty,
-              let (base, credential) = gatewayRESTContext(gatewayID: gatewayID),
-              CronDetailRuntime.shared.restSupported[gatewayID] != false else {
+        guard !extras.isEmpty else {
             await refreshRoutinesLive(force: true)
             return
         }
+        guard !jobID.isEmpty, let (base, credential) = restAuthority,
+              CronDetailRuntime.shared.restSupported[gatewayID] != false else {
+            await refreshRoutinesLive(force: true)
+            throw GatewayError(code: -4,
+                               message: theme.copy.routineMadeNotRouted(theme.themeID))
+        }
         do {
             let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
-                                                            jobID: jobID, profile: nil,
+                                                            jobID: jobID, profile: sourceFence.profile,
                                                             updates: extras)
-            let routineID = gatewayID == LiveRuntime.shared.gatewayID
-                ? jobID
-                : GatewayRoutineRoute(gatewayID: gatewayID, jobID: jobID).qualifiedID
-            CronDetailRuntime.shared.detail[routineID] = saved
+            if cronMutationFenceAccepts(sourceFence) {
+                let routineID: String
+                if case .primary = sourceFence.generation {
+                    routineID = jobID
+                } else {
+                    routineID = GatewayRoutineRoute(
+                        gatewayID: gatewayID, jobID: jobID).qualifiedID
+                }
+                CronDetailRuntime.shared.detail[routineID] = saved
+            }
             await refreshRoutinesLive(force: true)
         } catch {
-            if let gateway = error as? GatewayError, gateway.code == GatewayREST.cronRESTUnavailable {
+            if cronMutationFenceAccepts(sourceFence),
+               let gateway = error as? GatewayError,
+               gateway.code == GatewayREST.cronRESTUnavailable {
                 CronDetailRuntime.shared.restSupported[gatewayID] = false
             }
             // The routine exists and WILL fire; only the route/pin did not
@@ -437,11 +580,15 @@ public extension AppModel {
     /// field cannot be cleared by a partial write.
     ///
     /// - Parameter model/provider: `.some("")` clears a pin, `nil` leaves it.
+    /// - Parameter reasoningEffort: nil leaves the raw stored value untouched;
+    ///   an empty string clears it; a level sets a canonical per-job pin.
     func saveRoutine(_ job: CronJobDetail, routineID: String, botID: String,
                      title: String, schedule: String,
                      instruction: String, deliver: [String]?, model: String?,
-                     provider: String?, continuity: Bool?) async throws {
-        guard mode == .live, let target = routineTarget(routineID),
+                     provider: String?, reasoningEffort: String? = nil,
+                     continuity: Bool?) async throws {
+        guard mode == .live, let fence = cronRoutineMutationFence(routineID),
+              let target = routineTarget(routineID), target == fence.target,
               let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
         }
@@ -494,6 +641,13 @@ public extension AppModel {
             if p != (job.provider ?? "") { updates["provider"] = p.isEmpty ? .null : .string(p) }
         }
 
+        // Unlike model/provider, this pin is one independent axis. Omission
+        // must mean "do not touch": that is what preserves a future or
+        // hand-edited value during an unrelated title/schedule save.
+        if let reasoningEffort {
+            updates["reasoning_effort"] = try CronReasoningEffort.wireMutation(reasoningEffort)
+        }
+
         if let continuity, continuity != job.continuity {
             // Preserve any real cross-job dependency; only the reserved "self"
             // entry is the continuity toggle (cronjob_tools.py:665).
@@ -503,16 +657,17 @@ public extension AppModel {
         }
 
         guard !updates.isEmpty else { return }
+        guard cronMutationFenceAccepts(fence) else { throw CancellationError() }
         do {
             let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
                                                             jobID: target.route.jobID,
                                                             profile: target.profile,
                                                             updates: updates)
-            guard routineTarget(routineID) == target else { return }
+            guard cronMutationFenceAccepts(fence) else { return }
             CronDetailRuntime.shared.detail[routineID] = saved
             CronDetailRuntime.shared.detailError[routineID] = nil
         } catch let error as GatewayError where error.code == GatewayREST.cronRESTUnavailable {
-            if routineTarget(routineID) == target {
+            if cronMutationFenceAccepts(fence) {
                 CronDetailRuntime.shared.restSupported[target.route.gatewayID] = false
             }
             throw error
@@ -528,7 +683,8 @@ public extension AppModel {
     /// gateway's current default — restores the behaviour the routine was
     /// created with, which is what "keep the original values" means there.
     func pinRoutineInference(_ job: CronJobDetail, routineID: String) async throws {
-        guard mode == .live, let target = routineTarget(routineID),
+        guard mode == .live, let fence = cronRoutineMutationFence(routineID),
+              let target = routineTarget(routineID), target == fence.target,
               let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
         }
@@ -540,11 +696,12 @@ public extension AppModel {
             updates["model"] = .string(snapshot)
         }
         guard !updates.isEmpty else { return }
+        guard cronMutationFenceAccepts(fence) else { throw CancellationError() }
         let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
                                                         jobID: target.route.jobID,
                                                         profile: target.profile,
                                                         updates: updates)
-        guard routineTarget(routineID) == target else { return }
+        guard cronMutationFenceAccepts(fence) else { return }
         CronDetailRuntime.shared.detail[routineID] = saved
         CronDetailRuntime.shared.detailError[routineID] = nil
         await refreshRoutinesLive(force: true)
@@ -752,6 +909,78 @@ public extension CopyPack {
         case .soft: "Model"
         case .control: "MODEL PIN"
         case .ink: "The mind it uses"
+        }
+    }
+
+    func routineReasoningLabel(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Reasoning"
+        case .control: "REASONING EFFORT"
+        case .ink: "How deeply it thinks"
+        }
+    }
+
+    func routineReasoningFollowConfig(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Follow model / gateway settings"
+        case .control: "CONFIG RESOLUTION"
+        case .ink: "Follow the mind's own setting"
+        }
+    }
+
+    func routineReasoningOff(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Off"
+        case .control: "OFF"
+        case .ink: "No extended thought"
+        }
+    }
+
+    func routineReasoningUnknown(_ t: ThemeID, value: String) -> String {
+        switch t {
+        case .soft: "Unknown stored value: \(value)"
+        case .control: "UNKNOWN · \(value)"
+        case .ink: "An unknown mark: \(value)"
+        }
+    }
+
+    func routineReasoningPickerHint(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Choose this routine's reasoning effort, or follow configuration."
+        case .control: "SELECT PER-JOB EFFORT OR CONFIG RESOLUTION."
+        case .ink: "Choose this rite's depth of thought, or let its mind decide."
+        }
+    }
+
+    func routineReasoningConfigPrecedence(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Resolved when it runs: this model's override first, then the gateway default."
+        case .control: "RUN-TIME RESOLUTION · MODEL OVERRIDE > AGENT DEFAULT"
+        case .ink: "When it is kept, the model's own rule comes first, then the gateway's."
+        }
+    }
+
+    func routineReasoningPinned(_ t: ThemeID, value: String) -> String {
+        switch t {
+        case .soft: "Routine override: \(value). It wins over model and gateway settings; the provider may clamp unsupported levels."
+        case .control: "JOB PIN · \(value.uppercased()) · OVERRIDES MODEL/GLOBAL; PROVIDER MAY CLAMP"
+        case .ink: "This rite asks for \(value). It outranks the model and gateway rules, though the provider may temper it."
+        }
+    }
+
+    func routineReasoningInvalid(_ t: ThemeID, value: String) -> String {
+        switch t {
+        case .soft: "“\(value)” is not recognized. Hermes ignores it and follows configuration at run time; unrelated edits preserve it."
+        case .control: "INVALID STORED VALUE \(value.debugDescription) · IGNORED AT RUN TIME · CONFIG WINS"
+        case .ink: "“\(value)” is unknown. Hermes passes it by and follows configuration; other amendments leave the mark untouched."
+        }
+    }
+
+    func routineReasoningUnusedForScript(_ t: ThemeID, value: String) -> String {
+        switch t {
+        case .soft: "Stored as \(value), but unused: this routine runs a script without an agent or model."
+        case .control: "STORED \(value.uppercased()) · INERT FOR NO-AGENT SCRIPT"
+        case .ink: "Written as \(value), but unused: this rite runs only its script, with no mind invoked."
         }
     }
 

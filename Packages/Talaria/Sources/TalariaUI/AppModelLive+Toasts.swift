@@ -409,7 +409,8 @@ public extension AppModel {
     func scheduleRoutineWithFeedback(botID: String, title: String, schedule: String,
                                      instruction: String, repeatForever: Bool = true,
                                      continuity: Bool = false, deliver: [String] = [],
-                                     model: String? = nil, provider: String? = nil) async throws {
+                                     model: String? = nil, provider: String? = nil,
+                                     reasoningEffort: String? = nil) async throws {
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = "routine-add:\(botID):\(clean)"
         toast(kind: .info, title: theme.copy.toastSchedulingRoutine(clean, theme.themeID),
@@ -418,7 +419,8 @@ public extension AppModel {
             try await scheduleRoutine(botID: botID, title: clean, schedule: schedule,
                                       instruction: instruction, repeatForever: repeatForever,
                                       continuity: continuity, deliver: deliver,
-                                      model: model, provider: provider)
+                                      model: model, provider: provider,
+                                      reasoningEffort: reasoningEffort)
             toast(kind: .success, title: theme.copy.toastRoutineScheduled(clean, theme.themeID),
                   botID: botID, key: key)
         } catch {
@@ -443,6 +445,7 @@ public extension AppModel {
                                  botID: String, title: String,
                                  schedule: String, instruction: String, deliver: [String]?,
                                  model: String?, provider: String?,
+                                 reasoningEffort: String? = nil,
                                  continuity: Bool?) async throws {
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = "routine-save:\(routineID)"
@@ -452,7 +455,8 @@ public extension AppModel {
             try await saveRoutine(job, routineID: routineID, botID: botID,
                                   title: clean, schedule: schedule,
                                   instruction: instruction, deliver: deliver, model: model,
-                                  provider: provider, continuity: continuity)
+                                  provider: provider, reasoningEffort: reasoningEffort,
+                                  continuity: continuity)
             toast(kind: .success, title: theme.copy.toastRoutineSaved(clean, theme.themeID),
                   botID: botID, key: key)
         } catch {

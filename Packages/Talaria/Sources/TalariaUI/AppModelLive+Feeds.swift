@@ -665,7 +665,10 @@ public extension AppModel {
         toast(kind: .info,
               title: theme.copy.toastRoutinePaused(routine.name, on: enabled, theme.themeID),
               botID: routine.botID, key: key)
-        guard mode == .live, let target = FeedsRuntime.shared.routineTargets[routine.id] else {
+        guard mode == .live, let fence = cronRoutineMutationFence(routine.id),
+              let target = FeedsRuntime.shared.routineTargets[routine.id],
+              target == fence.target else {
+            routines[idx].isOn = !enabled
             settleToast(key: key)
             return
         }
@@ -673,12 +676,15 @@ public extension AppModel {
             let runtime = FeedsRuntime.shared
             do {
                 let client = try await self.routedClient(gatewayID: target.route.gatewayID)
+                guard self.cronMutationFenceAccepts(fence) else { return }
                 try await client.cronSetPaused(jobID: target.route.jobID, paused: !enabled,
                                                profile: target.profile)
+                guard self.cronMutationFenceAccepts(fence) else { return }
                 runtime.routinesError = nil
                 await refreshRoutinesLive(force: true)
                 settleToast(key: key)
             } catch {
+                guard self.cronMutationFenceAccepts(fence) else { return }
                 if let i = routines.firstIndex(where: { $0.id == routine.id }) {
                     routines[i].isOn = !enabled
                 }
@@ -719,12 +725,16 @@ public extension AppModel {
         guard mode == .live, let client else {
             throw GatewayError(code: -3, message: "connect a gateway to schedule routines")
         }
+        guard let gatewayID = LiveRuntime.shared.gatewayID,
+              let fence = cronSourceMutationFence(gatewayID: gatewayID, profile: nil),
+              cronMutationFenceAccepts(fence) else { throw GatewayRouteError.noRoute }
         try await client.cronAdd(name: "[bot:\(botID)] \(cleanTitle)",
                                  schedule: normalized,
                                  prompt: routinePrompt(botID: botID, title: cleanTitle,
                                                        instruction: cleanPrompt),
                                  repeatCount: repeatCount,
                                  continuity: continuity)
+        guard cronMutationFenceAccepts(fence) else { return }
         await refreshRoutinesLive(force: true)
         recordActivity(kind: .routine, botID: botID,
                        text: theme.copy.feedRoutineAdded(theme.themeID) + " — " + cleanTitle,
@@ -750,12 +760,14 @@ public extension AppModel {
     }
 
     func deleteRoutine(_ routine: Routine) async throws {
-        guard routineHasFullManagement(routine),
-              let target = FeedsRuntime.shared.routineTargets[routine.id]
+        guard routineHasFullManagement(routine), let fence = cronRoutineMutationFence(routine.id),
+              let target = FeedsRuntime.shared.routineTargets[routine.id], target == fence.target
         else { throw GatewayRouteError.noRoute }
         guard mode == .live else { return }
         let client = try await routedClient(gatewayID: target.route.gatewayID)
+        guard cronMutationFenceAccepts(fence) else { throw CancellationError() }
         try await client.cronRemove(jobID: target.route.jobID, profile: target.profile)
+        guard cronMutationFenceAccepts(fence) else { return }
         routines.removeAll { $0.id == routine.id }
         FeedsRuntime.shared.cronJobs.removeValue(forKey: routine.id)
         FeedsRuntime.shared.cronScope.removeValue(forKey: routine.id)
@@ -773,16 +785,18 @@ public extension AppModel {
     ///   agent run) so the caller can say "started" rather than "done".
     @discardableResult
     func runRoutineNow(_ routine: Routine) async throws -> Bool {
-        guard routineHasFullManagement(routine),
-              let target = FeedsRuntime.shared.routineTargets[routine.id]
+        guard routineHasFullManagement(routine), let fence = cronRoutineMutationFence(routine.id),
+              let target = FeedsRuntime.shared.routineTargets[routine.id], target == fence.target
         else { throw GatewayRouteError.noRoute }
         guard mode == .live else { return false }
         guard let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
             throw GatewayError(code: -3, message: theme.copy.needsRESTNote(theme.themeID))
         }
+        guard cronMutationFenceAccepts(fence) else { throw CancellationError() }
         let finished = try await GatewayREST.triggerCronJob(
             baseURL: base, credential: credential, jobID: target.route.jobID,
             profile: target.profile)
+        guard cronMutationFenceAccepts(fence) else { return finished }
         recordActivity(kind: .routine, botID: routine.botID,
                        text: theme.copy.feedRoutineTriggered(theme.themeID) + " — " + routine.name,
                        subtext: routine.schedule)

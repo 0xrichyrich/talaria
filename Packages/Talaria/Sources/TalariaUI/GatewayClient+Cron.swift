@@ -50,6 +50,18 @@ public struct CronJobRecord: Sendable, Identifiable, Equatable {
     /// Delivery target ("local" unless a messaging platform is configured).
     public var deliver: String?
     public var repeatDisplay: String?
+    /// Exact optional per-job reasoning pin emitted by `_format_job`.
+    ///
+    /// Keep this raw instead of eagerly folding it into the known choices:
+    /// jobs.json is user-editable, and Hermes deliberately ignores an unknown
+    /// stored value at fire time and falls back to config. A client that turns
+    /// that unknown value into nil would hide the repairable bad pin and could
+    /// erase it on an otherwise unrelated edit.
+    public var reasoningEffortRaw: String?
+
+    public var reasoningEffort: CronReasoningEffort {
+        CronReasoningEffort(raw: reasoningEffortRaw)
+    }
 
     /// True when the gateway considers this job live — `enabled` alone is not
     /// enough, a half-paused record keeps `enabled: true` with `state:"paused"`
@@ -84,6 +96,7 @@ public struct CronJobRecord: Sendable, Identifiable, Equatable {
         lastStatus = v["last_status"]?.stringValue
         deliver = v["deliver"]?.stringValue
         repeatDisplay = v["repeat"]?.stringValue
+        reasoningEffortRaw = v["reasoning_effort"]?.stringValue
     }
 }
 
