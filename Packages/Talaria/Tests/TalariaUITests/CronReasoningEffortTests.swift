@@ -201,6 +201,85 @@ final class CronReasoningEffortTests: XCTestCase {
             unscoped, jobID: "same-id", profile: "default"))
     }
 
+    func testCentralCronAcknowledgementRejectsMissingOrMismatchedProfile() {
+        let primary = CronJobDetail([
+            "id": "same-id", "profile_name": "primary-launch",
+        ])
+        let retained = CronJobDetail([
+            "id": "same-id", "profile": "retained-launch",
+        ])
+        let missing = CronJobDetail(["id": "same-id"])
+
+        XCTAssertEqual(CronJobAcknowledgementPolicy.returnedProfile(
+            primary, jobID: "same-id", expectedProfile: "primary-launch"),
+                       "primary-launch")
+        XCTAssertEqual(CronJobAcknowledgementPolicy.returnedProfile(
+            retained, jobID: "same-id", expectedProfile: "retained-launch"),
+                       "retained-launch")
+        XCTAssertNil(CronJobAcknowledgementPolicy.returnedProfile(
+            retained, jobID: "same-id", expectedProfile: "primary-launch"))
+        XCTAssertNil(CronJobAcknowledgementPolicy.returnedProfile(
+            missing, jobID: "same-id", expectedProfile: "retained-launch"))
+        XCTAssertFalse(CronJobAcknowledgementPolicy.accepts(
+            primary, jobID: "same-id", profile: nil))
+    }
+
+    func testUnscopedRESTDetailCannotRetargetCollidingJobID() {
+        let launchRow = CronJobDetail([
+            "id": "same-id", "profile": "launch-store",
+        ])
+        let retainedCollision = CronJobDetail([
+            "id": "same-id", "profile": "retained-store",
+        ])
+
+        // `_find_cron_job_profile` may return either store for an unscoped
+        // REST lookup. Only the socket's already-scoped target can authorize
+        // detail publication; a nil target profile must never be promoted.
+        XCTAssertFalse(CronDetailAuthorityPolicy.allowsProfileScopedREST(profile: nil))
+        XCTAssertTrue(CronDetailAuthorityPolicy.allowsProfileScopedREST(
+            profile: "retained-store"))
+        XCTAssertFalse(CronJobAcknowledgementPolicy.accepts(
+            retainedCollision, jobID: "same-id", profile: "launch-store"))
+        XCTAssertTrue(CronJobAcknowledgementPolicy.accepts(
+            launchRow, jobID: "same-id", profile: "launch-store"))
+    }
+
+    func testUnscopedNamedLaunchRowsNeverGainRosterDefaultAuthority() {
+        let primary = CronJobRecord([
+            "job_id": "primary-job", "name": "[bot:default] Primary",
+        ])
+        let retained = CronJobRecord([
+            "job_id": "retained-job", "name": "[bot:default] Retained",
+        ])
+
+        // A title tag is a display/delegation identity, not the process
+        // launch profile. The list response did not echo either store.
+        XCTAssertNil(primary.profile)
+        XCTAssertNil(retained.profile)
+        XCTAssertEqual(primary.taggedBotID, "default")
+        XCTAssertEqual(retained.taggedBotID, "default")
+    }
+
+    func testPrimaryAndRetainedRESTOnlyCreateStayAcceptedPartialWithoutLaunchAuthority() {
+        let primary = CronCreatePostAddPolicy.decision(
+            sourceFence: CronSourceMutationFence(
+                gatewayID: "primary", profile: nil, generation: .primary(3)),
+            primaryGatewayID: "primary", primaryGeneration: 3,
+            retainedGenerations: [:], hasRESTOnlyFields: true, hasJobID: true,
+            hasRESTAuthority: false, restSupported: false)
+        let retained = CronCreatePostAddPolicy.decision(
+            sourceFence: CronSourceMutationFence(
+                gatewayID: "retained", profile: nil, generation: .retained(7)),
+            primaryGatewayID: "primary", primaryGeneration: 3,
+            retainedGenerations: ["retained": 7], hasRESTOnlyFields: true,
+            hasJobID: true, hasRESTAuthority: false, restSupported: false)
+
+        XCTAssertEqual(primary, .acceptedWithoutREST)
+        XCTAssertEqual(retained, .acceptedWithoutREST)
+        XCTAssertFalse(primary.shouldIssueRESTPatch)
+        XCTAssertFalse(retained.shouldIssueRESTPatch)
+    }
+
     func testAcceptedPartialOutcomeIsNotAResubmitInstruction() {
         let outcome = CronCreateOutcome.acceptedPartial(
             CronAcceptedPartialOutcome(
@@ -315,6 +394,30 @@ final class CronReasoningEffortTests: XCTestCase {
             quarantined.remove(quarantineKey)
         }
         XCTAssertTrue(quarantined.isEmpty)
+    }
+
+    func testProfileRefreshRaceRetainsSnapshotWhenLifecycleAuthorityChanges() {
+        XCTAssertTrue(CronProfileRefreshPolicy.mayPublishSnapshot(
+            sourceAccepted: true, lifecycleAuthorityAccepted: true))
+        XCTAssertFalse(CronProfileRefreshPolicy.mayPublishSnapshot(
+            sourceAccepted: true, lifecycleAuthorityAccepted: false))
+        XCTAssertFalse(CronProfileRefreshPolicy.mayPublishSnapshot(
+            sourceAccepted: false, lifecycleAuthorityAccepted: true))
+    }
+
+    func testProfileDeletionOwnsFullCronActivityKeys() {
+        XCTAssertTrue(CronQuarantinePolicy.ownsActivityKey(
+            "cron-quarantine:job-1|homelab|job-1|default|retained-4|9",
+            routineID: "job-1"))
+        XCTAssertTrue(CronQuarantinePolicy.ownsActivityKey(
+            "cron-run:job-1|homelab|job-1|default|retained-4|9:1720000000",
+            routineID: "job-1"))
+        XCTAssertFalse(CronQuarantinePolicy.ownsActivityKey(
+            "cron-quarantine:job-10|homelab|job-10|default|retained-4|9",
+            routineID: "job-1"))
+        XCTAssertFalse(CronQuarantinePolicy.ownsActivityKey(
+            "routine-toggle:job-1|homelab|job-1|default|retained-4|9",
+            routineID: "job-1"))
     }
 
     func testRoutineEditorLocksExistingMutationUntilDetailIsAuthoritative() {

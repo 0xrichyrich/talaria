@@ -431,11 +431,8 @@ public extension AppModel {
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let sourceFence = mode == .live
             ? routineGatewayID(botID: botID).flatMap { gatewayID in
-                let launchProfile = gatewayID == LiveRuntime.shared.gatewayID
-                    ? (LiveRuntime.shared.defaultBotID ?? bots.first?.id ?? "default")
-                    : nil
                 return cronSourceMutationFence(
-                    gatewayID: gatewayID, profile: nil, lifecycleProfile: launchProfile)
+                    gatewayID: gatewayID, profile: nil)
             }
             : nil
         let key = sourceFence.map {

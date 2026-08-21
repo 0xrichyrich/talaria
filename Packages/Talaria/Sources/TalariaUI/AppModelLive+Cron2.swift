@@ -141,6 +141,23 @@ enum CronQuarantinePolicy {
     /// A failed pause never owns a durable local dedupe marker. Keeping it
     /// would suppress the next safety sweep indefinitely.
     static let retainMarkerAfterPauseFailure = false
+
+    /// Activity keys carry either the full routine-fence identity or a legacy
+    /// raw id. Both forms belong to the removed routine; a sibling whose id
+    /// merely shares the same prefix must survive.
+    static func ownsActivityKey(_ key: String, routineID: String) -> Bool {
+        let identity: String
+        if key.hasPrefix("cron-quarantine:") {
+            identity = String(key.dropFirst("cron-quarantine:".count))
+        } else if key.hasPrefix("cron-run:") {
+            identity = String(key.dropFirst("cron-run:".count))
+        } else {
+            return false
+        }
+        return identity == routineID
+            || identity.hasPrefix("\(routineID)|")
+            || identity.hasPrefix("\(routineID):")
+    }
 }
 
 /// Exact source + profile store authority for one cron write.
@@ -250,15 +267,46 @@ public enum CronCreateOutcome: Sendable, Equatable {
     }
 }
 
-enum CronCreateAcknowledgementPolicy {
-    /// A REST create follow-up is only authoritative when both dimensions of
-    /// the launch-store identity are echoed. A missing profile is not an ACK:
-    /// an unscoped response could belong to a colliding profile store.
+/// The only REST cron acknowledgement accepted for publication. The job id is
+/// not enough: an unscoped response can come from any profile store on the
+/// gateway, so every response must echo a non-empty exact profile as well.
+enum CronJobAcknowledgementPolicy {
+    static func returnedProfile(_ detail: CronJobDetail, jobID: String,
+                                expectedProfile: String) -> String? {
+        guard !jobID.isEmpty, detail.id == jobID,
+              let returned = detail.profile,
+              !returned.isEmpty,
+              returned == returned.trimmingCharacters(in: .whitespacesAndNewlines),
+              !expectedProfile.isEmpty, expectedProfile == returned else { return nil }
+        return returned
+    }
+
     static func accepts(_ detail: CronJobDetail, jobID: String,
                         profile: String?) -> Bool {
-        guard !jobID.isEmpty, detail.id == jobID,
-              let profile, !profile.isEmpty else { return false }
-        return detail.profile == profile
+        guard let profile else { return false }
+        return returnedProfile(detail, jobID: jobID, expectedProfile: profile) != nil
+    }
+}
+
+/// REST detail/history/update routes search by job id when no profile query is
+/// supplied. That lookup is unsafe for colliding ids, so only a profile already
+/// established by a scoped socket listing may authorize those calls.
+enum CronDetailAuthorityPolicy {
+    static func allowsProfileScopedREST(profile: String?) -> Bool {
+        guard let profile else { return false }
+        return !profile.isEmpty
+    }
+}
+
+/// Kept as a source-compatible spelling for the original create tests. All
+/// production call sites use `CronJobAcknowledgementPolicy` directly so
+/// detail/save/pin/create share one identity check.
+enum CronCreateAcknowledgementPolicy {
+    static func accepts(_ detail: CronJobDetail, jobID: String,
+                        profile: String?) -> Bool {
+        guard let profile else { return false }
+        return CronJobAcknowledgementPolicy.accepts(detail, jobID: jobID,
+                                                    profile: profile)
     }
 }
 
@@ -321,6 +369,16 @@ enum CronReadCachePolicy {
     }
 }
 
+/// A secondary sweep is all-or-nothing for one gateway. A missing profile
+/// token or a lifecycle change after any awaited RPC means the accumulated
+/// dictionary is not a snapshot and must never prune the previous one.
+enum CronProfileRefreshPolicy {
+    static func mayPublishSnapshot(sourceAccepted: Bool,
+                                   lifecycleAuthorityAccepted: Bool) -> Bool {
+        sourceAccepted && lifecycleAuthorityAccepted
+    }
+}
+
 extension AppModel {
     func cronSourceMutationFence(gatewayID: String,
                                  profile: String?,
@@ -356,16 +414,23 @@ extension AppModel {
         guard let target = routineTarget(routineID),
               let source = cronSourceMutationFence(
                 gatewayID: target.route.gatewayID, profile: target.profile) else { return nil }
-        let effectiveProfile = target.profile
-            ?? (target.route.gatewayID == LiveRuntime.shared.gatewayID
-                ? (LiveRuntime.shared.defaultBotID ?? target.bot.profile)
-                : target.bot.profile)
-        let profileID = target.route.gatewayID == LiveRuntime.shared.gatewayID
-            ? effectiveProfile
-            : GatewayBotRoute(gatewayID: target.route.gatewayID,
-                              profile: effectiveProfile).qualifiedID
-        guard let profileToken = profileLifecycleGenerationToken(for: profileID) else { return nil }
-        let profileGeneration = profileToken.generation
+        // An unscoped cron row belongs to the process launch store, whose
+        // profile name is intentionally unknown here. Never turn a roster
+        // default or a display bot into profile authority; only an exact
+        // profile echoed by Hermes may carry lifecycle generation.
+        let profileGeneration: UInt64?
+        if let profile = target.profile, !profile.isEmpty {
+            let profileID = target.route.gatewayID == LiveRuntime.shared.gatewayID
+                ? profile
+                : GatewayBotRoute(gatewayID: target.route.gatewayID,
+                                  profile: profile).qualifiedID
+            guard let profileToken = profileLifecycleGenerationToken(for: profileID) else {
+                return nil
+            }
+            profileGeneration = profileToken.generation
+        } else {
+            profileGeneration = nil
+        }
         return CronRoutineMutationFence(routineID: routineID, target: target, source: source,
                                         profileGeneration: profileGeneration)
     }
@@ -433,10 +498,9 @@ extension AppModel {
     }
 
     private func cronRoutineProfileLifecycleAccepts(_ fence: CronRoutineMutationFence) -> Bool {
-        let profile = fence.target.profile
-            ?? (fence.source.gatewayID == LiveRuntime.shared.gatewayID
-                ? (LiveRuntime.shared.defaultBotID ?? fence.target.bot.profile)
-                : fence.target.bot.profile)
+        guard let profile = fence.target.profile, !profile.isEmpty else {
+            return fence.profileGeneration == nil
+        }
         return cronProfileLifecycleAccepts(gatewayID: fence.source.gatewayID, profile: profile,
                                            generation: fence.profileGeneration)
     }
@@ -482,6 +546,7 @@ extension AppModel {
         CronDetailRuntime.shared.restSupportGeneration[gatewayID] =
             cronSourceMutationFence(gatewayID: gatewayID, profile: nil) ?? sourceFence
     }
+
 }
 
 // MARK: - Legacy delegation quarantine
@@ -645,6 +710,7 @@ public extension AppModel {
         let sourceFence: CronSourceMutationFence
         if let routineID {
             guard let fence = cronRoutineMutationFence(routineID),
+                  fence.target.profile != nil,
                   cronRoutineAuthorityIsCurrent(fence) else { return false }
             sourceFence = fence.source
         } else {
@@ -672,12 +738,10 @@ public extension AppModel {
         let selectedTarget = routineID.flatMap(routineTarget)
         let selectedBotRoute = botID.flatMap(GatewayBotRoute.init(qualifiedID:))
         guard routineID == nil || selectedTarget != nil else { return nil }
-        let selectedProfile = selectedTarget.map { target in
-            target.profile
-                ?? (target.route.gatewayID == LiveRuntime.shared.gatewayID
-                    ? (LiveRuntime.shared.defaultBotID ?? target.bot.profile)
-                    : target.bot.profile)
-        } ?? selectedBotRoute?.profile
+        // A routine target with nil profile is the process launch store. Keep
+        // that identity unscoped; the selected bot route is only a caller
+        // identity for create-editor delivery loading, not launch authority.
+        let selectedProfile = selectedTarget?.profile ?? selectedBotRoute?.profile
         guard let gatewayID = selectedTarget?.route.gatewayID ?? selectedBotRoute?.gatewayID
                 ?? routineGatewayID(routineID: routineID, botID: botID),
               let sourceFence = cronSourceMutationFence(
@@ -692,6 +756,11 @@ public extension AppModel {
         let runtime = CronDetailRuntime.shared
         guard mode == .live, let fence = cronRoutineMutationFence(routineID),
               let target = routineTarget(routineID), target == fence.target,
+              // Hermes' unscoped REST lookup searches every profile store.
+              // Keep launch-store rows read-only until a scoped socket list
+              // establishes the exact profile; never retarget from a REST
+              // response that may belong to a colliding row.
+              CronDetailAuthorityPolicy.allowsProfileScopedREST(profile: target.profile),
               cronRESTSupported(gatewayID: target.route.gatewayID,
                                 sourceFence: fence.source) != false,
               let sourceClient = cronSourceClient(gatewayID: target.route.gatewayID),
@@ -744,8 +813,13 @@ public extension AppModel {
             let job = try await GatewayREST.cronJob(baseURL: base, credential: credential,
                                                     jobID: target.route.jobID,
                                                     profile: target.profile)
-            guard CronAsyncFencePolicy(
-                sourceAccepted: cronMutationFenceAccepts(fence, expectedClient: sourceClient)).mayPublish else { return nil }
+            guard CronJobAcknowledgementPolicy.accepts(
+                job, jobID: target.route.jobID, profile: target.profile) else {
+                throw AckValidationError(
+                    operation: "Load routine detail",
+                    detail: "Hermes did not echo the exact cron job id and profile.")
+            }
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else { return nil }
             setCronRESTSupported(true, gatewayID: target.route.gatewayID,
                                  sourceFence: fence.source)
             runtime.detail[routineID] = job
@@ -788,6 +862,7 @@ public extension AppModel {
         let runtime = CronDetailRuntime.shared
         guard mode == .live, let fence = cronRoutineMutationFence(routineID),
               let target = routineTarget(routineID), target == fence.target,
+              CronDetailAuthorityPolicy.allowsProfileScopedREST(profile: target.profile),
               cronRESTSupported(gatewayID: target.route.gatewayID,
                                 sourceFence: fence.source) != false,
               let sourceClient = cronSourceClient(gatewayID: target.route.gatewayID),
@@ -943,11 +1018,12 @@ public extension AppModel {
     internal func routineRunBotID(_ run: CronRun, routineID: String,
                                   fallbackBotID: String) -> String? {
         // Precedence: the profile the server stamped on the row, then the scope
-        // the job's own RPCs use, then the launch profile. `run.id` is a
-        // SESSION id, never a job id, so it must not be used as a scope key.
-        let owner = run.profile ?? cronScope(routineID)
-            ?? LiveRuntime.shared.defaultBotID ?? fallbackBotID
-        guard let target = routineTarget(routineID) else { return nil }
+        // the job's own RPCs use, then the row's exact bot tag. An unscoped row
+        // with no server profile remains unresolved. `run.id` is a SESSION id,
+        // never a job id, so it must not be used as a scope key.
+        guard let target = routineTarget(routineID),
+              let owner = run.profile ?? cronScope(routineID) ?? target.profile,
+              !owner.isEmpty else { return nil }
         return target.route.gatewayID == LiveRuntime.shared.gatewayID
             ? owner
             : GatewayBotRoute(gatewayID: target.route.gatewayID, profile: owner).qualifiedID
@@ -993,34 +1069,16 @@ public extension AppModel {
               let gatewayID = routineGatewayID(botID: botID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
         }
-        // Capture gateway authority before resolving the launch profile. A
-        // retained gateway has its own default profile; the selected bot is
-        // not necessarily the store whose scheduler will fire the job.
-        guard let initialFence = cronSourceMutationFence(
+        // Hermes' unscoped cron.manage call addresses the process launch
+        // HERMES_HOME, but this client has no authoritative process-profile
+        // response. Keep the wire unscoped; never substitute a roster default.
+        let launchProfile: String? = nil
+        guard let sourceFence = cronSourceMutationFence(
             gatewayID: gatewayID, profile: nil) else {
             throw GatewayRouteError.noRoute
         }
         let client = try await routedClient(gatewayID: gatewayID)
-        guard cronMutationFenceAccepts(initialFence, expectedClient: client) else {
-            throw CancellationError()
-        }
-        let launchProfile: String
-        if gatewayID == LiveRuntime.shared.gatewayID {
-            launchProfile = LiveRuntime.shared.defaultBotID ?? bots.first?.id ?? "default"
-        } else {
-            let profiles = try await client.listProfiles(includeSessions: false)
-            guard cronMutationFenceAccepts(initialFence, expectedClient: client) else {
-                throw CancellationError()
-            }
-            guard let resolved = profiles.first(where: \.isDefault)?.name
-                    ?? profiles.first?.name,
-                  !resolved.isEmpty else { throw GatewayRouteError.noRoute }
-            launchProfile = resolved
-        }
-        guard let sourceFence = cronSourceMutationFence(
-            gatewayID: gatewayID, profile: launchProfile,
-            lifecycleProfile: launchProfile),
-              cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
+        guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
             throw CancellationError()
         }
         // Capture the REST authority before the first suspension. If the
@@ -1050,7 +1108,8 @@ public extension AppModel {
             name: Self.namespacedTitle(botID: botProfile, title: cleanTitle),
             schedule: normalized,
             prompt: Self.delegatedPrompt(botID: botProfile, title: cleanTitle,
-                                         instruction: cleanInstruction),
+                                         instruction: cleanInstruction,
+                                         launchProfile: launchProfile),
             profile: launchProfile,
             repeatCount: repeatForever ? nil : 1,
             continuity: continuity)
@@ -1077,9 +1136,10 @@ public extension AppModel {
             retainedGenerations: MultiGatewayRuntime.shared.routedEventGenerations,
             hasRESTOnlyFields: !extras.isEmpty,
             hasJobID: !jobID.isEmpty,
-            hasRESTAuthority: restAuthority != nil,
-            restSupported: cronRESTSupported(gatewayID: gatewayID,
-                                             sourceFence: sourceFence) != false)
+            hasRESTAuthority: restAuthority != nil && launchProfile != nil,
+            restSupported: launchProfile != nil
+                && cronRESTSupported(gatewayID: gatewayID,
+                                     sourceFence: sourceFence) != false)
         guard postAddDecision != .acceptedButStale else {
             return .acceptedPartial(CronAcceptedPartialOutcome(
                 jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
@@ -1123,9 +1183,11 @@ public extension AppModel {
             let saved = try await GatewayREST.updateCronJob(baseURL: base, credential: credential,
                                                             jobID: jobID, profile: launchProfile,
                                                             updates: extras)
-            guard CronCreateAcknowledgementPolicy.accepts(
+            guard CronJobAcknowledgementPolicy.accepts(
                 saved, jobID: jobID, profile: launchProfile) else {
-                throw GatewayError(code: -4, message: "cron REST response did not confirm the created job")
+                throw AckValidationError(
+                    operation: "Create routine",
+                    detail: "Hermes did not echo the exact cron job id and profile.")
             }
             guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
                 sourceChangedAfterREST = true
@@ -1204,9 +1266,16 @@ public extension AppModel {
                      continuity: Bool?) async throws {
         guard mode == .live, let fence = cronRoutineMutationFence(routineID),
               let target = routineTarget(routineID), target == fence.target,
+              target.profile != nil,
               let sourceClient = cronSourceClient(gatewayID: target.route.gatewayID),
               let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
+        }
+        guard CronJobAcknowledgementPolicy.accepts(
+            job, jobID: target.route.jobID, profile: target.profile) else {
+            throw AckValidationError(
+                operation: "Save routine",
+                detail: "The editor does not hold an exact cron job/profile record.")
         }
         var updates: [String: JSONValue] = [:]
 
@@ -1237,7 +1306,8 @@ public extension AppModel {
                 throw GatewayError(code: -1, message: theme.copy.routineNeedsBoth(theme.themeID))
             }
             let rewritten = Self.delegatedPrompt(botID: target.bot.profile, title: cleanTitle,
-                                                 instruction: cleanInstruction)
+                                                 instruction: cleanInstruction,
+                                                 launchProfile: target.profile)
             if rewritten != job.prompt { updates["prompt"] = .string(rewritten) }
         }
 
@@ -1282,6 +1352,12 @@ public extension AppModel {
                                                                jobID: target.route.jobID,
                                                                profile: target.profile,
                                                                updates: updates)
+            guard CronJobAcknowledgementPolicy.accepts(
+                response, jobID: target.route.jobID, profile: target.profile) else {
+                throw AckValidationError(
+                    operation: "Save routine",
+                    detail: "Hermes did not echo the exact cron job id and profile.")
+            }
             guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
                 throw cronSourceChangedError()
             }
@@ -1320,9 +1396,16 @@ public extension AppModel {
     func pinRoutineInference(_ job: CronJobDetail, routineID: String) async throws {
         guard mode == .live, let fence = cronRoutineMutationFence(routineID),
               let target = routineTarget(routineID), target == fence.target,
+              target.profile != nil,
               let sourceClient = cronSourceClient(gatewayID: target.route.gatewayID),
               let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
             throw GatewayError(code: -3, message: theme.copy.routineNeedsGateway(theme.themeID))
+        }
+        guard CronJobAcknowledgementPolicy.accepts(
+            job, jobID: target.route.jobID, profile: target.profile) else {
+            throw AckValidationError(
+                operation: "Pin routine inference",
+                detail: "The editor does not hold an exact cron job/profile record.")
         }
         var updates: [String: JSONValue] = [:]
         if job.provider == nil, let snapshot = job.providerSnapshot {
@@ -1341,6 +1424,12 @@ public extension AppModel {
                                                                jobID: target.route.jobID,
                                                                profile: target.profile,
                                                                updates: updates)
+            guard CronJobAcknowledgementPolicy.accepts(
+                response, jobID: target.route.jobID, profile: target.profile) else {
+                throw AckValidationError(
+                    operation: "Pin routine inference",
+                    detail: "Hermes did not echo the exact cron job id and profile.")
+            }
             guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
                 throw cronSourceChangedError()
             }
@@ -1392,8 +1481,10 @@ public extension AppModel {
     /// text between single quotes, so an instruction containing an apostrophe
     /// escaped the quoting. Jobs still carrying the unmarked form are
     /// quarantined on sight (`quarantineLegacyRoutines`).
-    static func delegatedPrompt(botID: String, title: String, instruction: String) -> String {
-        if botID.lowercased() == (LiveRuntime.shared.defaultBotID ?? "").lowercased() {
+    static func delegatedPrompt(botID: String, title: String, instruction: String,
+                                launchProfile: String? = nil) -> String {
+        if let launchProfile,
+           botID.lowercased() == launchProfile.lowercased() {
             return instruction
         }
         return safeRoutineMarker + """

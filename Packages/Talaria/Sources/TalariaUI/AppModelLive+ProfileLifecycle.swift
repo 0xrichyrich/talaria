@@ -1930,7 +1930,11 @@ extension AppModel {
                 feeds.cronScope.removeValue(forKey: key)
                 feeds.routineTargets.removeValue(forKey: key)
                 clearCronRoutineCaches(key)
-                CronDetailRuntime.shared.quarantined.remove(key)
+                // Quarantine keys carry the full routine fence (gateway,
+                // profile, source generation, and profile generation). A raw
+                // job-id removal leaves the exact marker behind, so a
+                // delete/recreate can inherit a stale quarantine lease.
+                clearCronRoutineQuarantine(key)
                 continue
             }
             guard var route = feeds.routineTargets[key] else { continue }
