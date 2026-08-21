@@ -33,6 +33,62 @@ final class TranscriptRuntimeRemediationTests: XCTestCase {
     }
 
     @MainActor
+    func testQueuedSteerWireAcceptanceDiscardsTicketWhileRedirectAndFallbackMirrorNextTurn() {
+        let model = AppModel()
+        let botID = "steer-queue-disposition-\(UUID().uuidString)"
+        let sessionID = "runtime"
+        let previousGatewayID = LiveRuntime.shared.gatewayID
+        let chat = model.chat(for: botID)
+        chat.sessionID = sessionID
+        chat.storedSessionID = "stored"
+        chat.isRunning = true
+        chat.isTyping = true
+        let optimisticSteer = ChatMessage(author: .user, text: "current-turn steer")
+        chat.messages = [optimisticSteer]
+        LiveRuntime.shared.gatewayID = "queue-disposition-gateway"
+        model.promptQueue = []
+        ChatRuntime.shared.queuedBindings = [:]
+        ChatRuntime.shared.queuedLifecycles = [:]
+        ChatRuntime.shared.pendingQueuedSubmissions = [:]
+        defer {
+            model.promptQueue = []
+            ChatRuntime.shared.queuedBindings = [:]
+            ChatRuntime.shared.queuedLifecycles = [:]
+            ChatRuntime.shared.pendingQueuedSubmissions = [:]
+            LiveRuntime.shared.gatewayID = previousGatewayID
+        }
+
+        let steerTicket = model.beginQueuedSubmission(botID: botID, sessionID: sessionID)
+        XCTAssertEqual(model.settleSteerReceipt(
+            steerTicket, text: optimisticSteer.text,
+            stage: .steer, status: "queued"), .acceptedCurrentTurn)
+
+        XCTAssertTrue(model.queuedPrompts(for: botID).isEmpty,
+                      "session.steer queued means accepted into the current turn")
+        XCTAssertTrue(ChatRuntime.shared.pendingQueuedSubmissions.isEmpty)
+        XCTAssertEqual(chat.messages.map(\.id), [optimisticSteer.id],
+                       "settlement must preserve the optimistic current-turn row")
+        XCTAssertTrue(chat.isRunning)
+        XCTAssertTrue(chat.isTyping)
+
+        let redirectTicket = model.beginQueuedSubmission(botID: botID, sessionID: sessionID)
+        XCTAssertEqual(model.settleSteerReceipt(
+            redirectTicket, text: "redirect queued next turn",
+            stage: .redirect, status: "queued"), .mirrorNextTurn)
+        XCTAssertEqual(model.queuedPrompts(for: botID).map(\.text),
+                       ["redirect queued next turn"],
+                       "session.redirect queued remains genuine next-turn work")
+
+        let fallbackTicket = model.beginQueuedSubmission(botID: botID, sessionID: sessionID)
+        XCTAssertEqual(model.settleSteerReceipt(
+            fallbackTicket, text: "explicit queued fallback",
+            stage: .queuedSubmit, status: "queued"), .mirrorNextTurn)
+        XCTAssertEqual(model.queuedPrompts(for: botID).map(\.text),
+                       ["redirect queued next turn", "explicit queued fallback"])
+        XCTAssertTrue(ChatRuntime.shared.pendingQueuedSubmissions.isEmpty)
+    }
+
+    @MainActor
     func testQueuedMirrorKeepsDuplicateTextByIdentityAndDrainsExactLifecycle() {
         let model = AppModel()
         model.promptQueue = []

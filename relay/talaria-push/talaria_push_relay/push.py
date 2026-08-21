@@ -39,14 +39,19 @@ gateway -> Connections screen, everything else -> that bot's chat.
 from __future__ import annotations
 
 import hashlib
+import base64
+import io
 import json
 import logging
+import os
 import queue
+import stat
 import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
 from .apns import APNsClient
 from .config import apns_settings, relay_settings
@@ -61,6 +66,15 @@ _BODY_MAX = 900  # Readability ceiling; the serialized byte budget is authoritat
 # framing/encoding changes; response bodies are duplicated in aps.alert.body
 # and the top-level body, so a character-only cap is not sufficient.
 APNS_PAYLOAD_SAFE_BYTES = 3800
+BOT_DISPLAY_NAME_KEY = "bot_display_name"
+BOT_AVATAR_KEY = "bot_avatar"
+BOT_AVATAR_MIME_KEY = "mime"
+BOT_AVATAR_DATA_KEY = "data"
+_AVATAR_SOURCE_MAX_BYTES = 256 * 1024
+_AVATAR_PAYLOAD_MAX_BYTES = 1400
+_AVATAR_EDGE_PX = 40
+_AVATAR_MIME_ALLOWLIST = {"image/png", "image/jpeg"}
+_PROFILE_META_MAX_BYTES = 128 * 1024
 
 # APNs category per event kind (the iOS client registers matching
 # UNNotificationCategory actions — TALARIA_APPROVAL carries the
@@ -138,6 +152,193 @@ def _truncate(text: Any, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+@dataclass(frozen=True)
+class ProfileAvatar:
+    """Tiny, metadata-free local portrait safe to embed in one APNs payload."""
+
+    mime: str
+    data: bytes
+
+
+@dataclass(frozen=True)
+class ProfilePresentation:
+    """Display-only profile identity; raw routing identity remains separate."""
+
+    display_name: str
+    avatar: Optional[ProfileAvatar] = None
+
+
+def response_display_name(bot: Any, configured_display_name: Any = "") -> str:
+    """Return a truthful response title without inventing a friendly alias."""
+    configured = _truncate(configured_display_name, _TITLE_MAX)
+    if configured:
+        return configured
+    raw = _truncate(bot, _TITLE_MAX)
+    return "Hermes" if raw == "default" or not raw else raw
+
+
+def _current_profile_home() -> Optional[Path]:
+    """Resolve the hook's context-local profile home, never another roster row."""
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+
+        return Path(get_hermes_home()).expanduser().resolve()
+    except Exception:
+        raw = os.environ.get("HERMES_HOME", "").strip()
+        return Path(raw).expanduser().resolve() if raw else None
+
+
+def _read_current_profile_meta(home: Path) -> Dict[str, Any]:
+    """Read only the context profile's bounded profile.yaml with safe YAML.
+
+    Hermes' public ``read_profile_meta`` projection deliberately drops
+    ``ui_meta``. Bot Mode's visible configured title lives at
+    ``ui_meta['hermes-bots']['title']``, so this narrow read is the only way to
+    preserve the desktop-authored name without consulting another profile.
+    """
+    path = home / "profile.yaml"
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            return {}
+        if info.st_size <= 0 or info.st_size > _PROFILE_META_MAX_BYTES:
+            return {}
+        import yaml  # type: ignore
+
+        value = yaml.safe_load(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _configured_profile_display_name(meta: Dict[str, Any]) -> str:
+    ui_meta = meta.get("ui_meta")
+    bot_mode = ui_meta.get("hermes-bots") if isinstance(ui_meta, dict) else None
+    title = bot_mode.get("title") if isinstance(bot_mode, dict) else None
+    if isinstance(title, str) and title.strip():
+        return title
+    display_name = meta.get("display_name")
+    return display_name if isinstance(display_name, str) else ""
+
+
+def _avatar_mime(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    return ""
+
+
+def _read_bounded_avatar_source(home: Path) -> Optional[bytes]:
+    """Open the exact context-local avatar without following any symlink.
+
+    Directory-relative ``open`` plus ``O_NOFOLLOW`` closes the lstat/read race:
+    once opened, a later path replacement cannot change the inode read below.
+    Platforms missing these primitives fail closed to the app icon.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        return None
+    home_fd: Optional[int] = None
+    assets_fd: Optional[int] = None
+    avatar_fd: Optional[int] = None
+    try:
+        home_fd = os.open(home, os.O_RDONLY | directory | nofollow)
+        assets_fd = os.open(
+            "assets", os.O_RDONLY | directory | nofollow, dir_fd=home_fd)
+        avatar_fd = os.open(
+            "avatar.png", os.O_RDONLY | nofollow, dir_fd=assets_fd)
+        info = os.fstat(avatar_fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if info.st_size <= 0 or info.st_size > _AVATAR_SOURCE_MAX_BYTES:
+            return None
+        chunks: List[bytes] = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(avatar_fd, min(remaining, 64 * 1024))
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        # Reject growth after fstat instead of reading an unbounded replacement.
+        if os.read(avatar_fd, 1):
+            return None
+        return b"".join(chunks)
+    except (OSError, TypeError, ValueError):
+        return None
+    finally:
+        for descriptor in (avatar_fd, assets_fd, home_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def _bounded_profile_avatar(home: Path) -> Optional[ProfileAvatar]:
+    """Read only ``<context home>/assets/avatar.png`` and re-encode to a tiny image.
+
+    No URL, token, or arbitrary metadata path crosses this boundary. Symlinks,
+    non-regular files, oversized inputs, unsupported formats, and unavailable
+    optional image tooling all fail closed to the ordinary app-icon fallback.
+    """
+    source = _read_bounded_avatar_source(home)
+    if source is None:
+        return None
+
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError:
+        mime = _avatar_mime(source)
+        if mime in _AVATAR_MIME_ALLOWLIST and len(source) <= _AVATAR_PAYLOAD_MAX_BYTES:
+            return ProfileAvatar(mime, source)
+        return None
+
+    try:
+        with Image.open(io.BytesIO(source)) as image:
+            if image.width <= 0 or image.height <= 0:
+                return None
+            if image.width > 4096 or image.height > 4096:
+                return None
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            image.thumbnail((_AVATAR_EDGE_PX, _AVATAR_EDGE_PX), resampling)
+
+            png = io.BytesIO()
+            image.save(png, format="PNG", optimize=True)
+            png_data = png.getvalue()
+            if 0 < len(png_data) <= _AVATAR_PAYLOAD_MAX_BYTES:
+                return ProfileAvatar("image/png", png_data)
+
+            rgba = image.convert("RGBA")
+            flattened = Image.new("RGB", rgba.size, (255, 255, 255))
+            flattened.paste(rgba, mask=rgba.getchannel("A"))
+            jpeg = io.BytesIO()
+            flattened.save(jpeg, format="JPEG", quality=72, optimize=True)
+            jpeg_data = jpeg.getvalue()
+            if 0 < len(jpeg_data) <= _AVATAR_PAYLOAD_MAX_BYTES:
+                return ProfileAvatar("image/jpeg", jpeg_data)
+            return None
+    except Exception:
+        return None
+
+
+def current_profile_presentation(bot: str) -> ProfilePresentation:
+    """Resolve display_name/avatar from the exact context-local profile."""
+    home = _current_profile_home()
+    configured = ""
+    avatar: Optional[ProfileAvatar] = None
+    if home is not None:
+        meta = _read_current_profile_meta(home)
+        configured = _configured_profile_display_name(meta)
+        avatar = _bounded_profile_avatar(home)
+    return ProfilePresentation(
+        display_name=response_display_name(bot, configured),
+        avatar=avatar,
+    )
+
+
 def _payload_size(payload: Dict[str, Any]) -> int:
     """Return a conservative compact JSON size for an APNs payload.
 
@@ -160,9 +361,39 @@ def _payload_size(payload: Dict[str, Any]) -> int:
 
 
 def _fit_payload_body(payload: Dict[str, Any], source_body: Any) -> None:
-    """Fit duplicated alert/top-level body text under the APNs byte budget."""
+    """Fit optional presentation around immutable routing identity.
+
+    Raw ``bot``, ``gateway_id``, and ``session_id`` are never shortened or
+    removed. If those fixed fields cannot fit after every optional display and
+    duplicated route field is reduced, raise instead of handing APNs an
+    oversized payload.
+    """
     if _payload_size(payload) <= APNS_PAYLOAD_SAFE_BYTES:
         return
+
+    # The response text is the notification's meaning; the portrait is an
+    # optional decoration. Drop it before shortening the body. This also makes
+    # source stamping safe when gateway_id/deeplink are added after the first
+    # event-level fit.
+    if BOT_AVATAR_KEY in payload:
+        payload.pop(BOT_AVATAR_KEY, None)
+        if _payload_size(payload) <= APNS_PAYLOAD_SAFE_BYTES:
+            return
+
+    # The URL duplicates the raw, source-qualified routing fields consumed by
+    # the notification delegate. It is useful for external URL handoff but is
+    # optional inside an APNs tap and may be much larger after source stamping.
+    payload.pop("deeplink", None)
+    if _payload_size(payload) <= APNS_PAYLOAD_SAFE_BYTES:
+        return
+
+    # Display identity is duplicated in the actual alert title. Response
+    # tracing is diagnostic only. Shed each optional copy before spending even
+    # one byte of the user-visible response or title.
+    for key in (BOT_DISPLAY_NAME_KEY, "title", "task_id", "turn_id"):
+        payload.pop(key, None)
+        if _payload_size(payload) <= APNS_PAYLOAD_SAFE_BYTES:
+            return
 
     text = _safe_text(source_body).strip()
     aps = payload.get("aps")
@@ -170,25 +401,115 @@ def _fit_payload_body(payload: Dict[str, Any], source_body: Any) -> None:
     if not isinstance(alert, dict):
         return
 
-    def set_body(value: str) -> None:
-        alert["body"] = value
-        payload["body"] = value
+    full_body = _truncate(text, _BODY_MAX)
+    full_title = _safe_text(alert.get("title", "")).strip()
 
-    # Find the largest Unicode-character prefix that fits. `_payload_size`
-    # measures encoded bytes, so this handles CJK, emoji, and mixed output
-    # without splitting a UTF-8 sequence or relying on a worst-case multiplier.
-    low, high = 0, min(len(text), _BODY_MAX)
-    best = ""
-    while low <= high:
-        mid = (low + high) // 2
-        candidate = _truncate(text, mid)
-        set_body(candidate)
+    def set_body(value: str, *, duplicate: bool = True) -> None:
+        alert["body"] = value
+        if duplicate:
+            payload["body"] = value
+
+    def fit_prefix(
+        text: str, limit: int, setter: Callable[[str], None],
+    ) -> tuple[str, bool]:
+        """Set the longest Unicode-character prefix that fits the byte cap."""
+        high = min(len(text), limit)
+        # When the complete string is within the character ceiling it has no
+        # ellipsis. Under conservative ensure_ascii JSON, `Done.` can therefore
+        # be *smaller* than `Don…`; test that non-monotonic endpoint explicitly
+        # before binary-searching the ellipsized prefixes below it.
+        complete = _truncate(text, high)
+        setter(complete)
         if _payload_size(payload) <= APNS_PAYLOAD_SAFE_BYTES:
-            best = candidate
-            low = mid + 1
-        else:
-            high = mid - 1
-    set_body(best)
+            return complete, True
+
+        low = 0
+        high -= 1
+        best = ""
+        found = False
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = _truncate(text, mid)
+            setter(candidate)
+            if _payload_size(payload) <= APNS_PAYLOAD_SAFE_BYTES:
+                best = candidate
+                found = True
+                low = mid + 1
+            else:
+                high = mid - 1
+        setter(best)
+        return best, found
+
+    # A short response such as "Done." must not disappear merely because a
+    # cosmetic title is unusually expensive once escaped. Shorten the real
+    # title first only when that lets the complete response (and its duplicate)
+    # survive. Byte measurement makes this safe for emoji/CJK without slicing a
+    # UTF-8 sequence.
+    alert["title"] = full_title
+    set_body(full_body)
+    best_title, title_fit = fit_prefix(
+        full_title, _TITLE_MAX, lambda value: alert.__setitem__("title", value))
+    if title_fit:
+        return
+
+    # A normal-size title is more useful intact beside a long response. Restore
+    # it, then find the largest response prefix while retaining the top-level
+    # duplicate consumed by older clients and the notification extension.
+    alert["title"] = full_title
+    best_body, body_fit = fit_prefix(
+        text, _BODY_MAX, lambda value: set_body(value))
+    if body_fit and (best_body or not text):
+        return
+
+    # The top-level body duplicates aps.alert.body. Drop only this compatibility
+    # copy before allowing a non-empty visible response to be crowded out.
+    payload.pop("body", None)
+    alert["title"] = full_title
+    set_body(full_body, duplicate=False)
+    best_title, title_fit = fit_prefix(
+        full_title, _TITLE_MAX, lambda value: alert.__setitem__("title", value))
+    if title_fit:
+        return
+
+    alert["title"] = full_title
+    best_body, body_fit = fit_prefix(
+        text, _BODY_MAX, lambda value: set_body(value, duplicate=False))
+    if body_fit and (best_body or not text):
+        return
+
+    # If a pathological title left room only for an empty response, keep at
+    # least a measured response prefix and the smallest truthful title whenever
+    # the fixed authority permits both.
+    if text and full_title:
+        alert["title"] = _truncate(full_title, 1)
+        best_body, body_fit = fit_prefix(
+            text, _BODY_MAX, lambda value: set_body(value, duplicate=False))
+        if body_fit and best_body:
+            return
+
+    alert["title"] = ""
+    best_body, body_fit = fit_prefix(
+        text, _BODY_MAX, lambda value: set_body(value, duplicate=False))
+    if body_fit and (best_body or not text):
+        return
+
+    # An alert title is optional at the absolute boundary. Removing the empty
+    # key is the final way to prove that fixed route + visible body can fit; do
+    # not refuse (or return an empty body) over the JSON cost of `"title":""`.
+    alert.pop("title", None)
+    best_body, body_fit = fit_prefix(
+        text, _BODY_MAX, lambda value: set_body(value, duplicate=False))
+    if body_fit:
+        return
+
+    size = _payload_size(payload)
+    logger.warning(
+        "talaria-push: refusing oversized payload (%d bytes) with fixed routing authority",
+        size,
+    )
+    raise ValueError(
+        f"APNs payload fixed routing authority exceeds {APNS_PAYLOAD_SAFE_BYTES} bytes"
+    )
 
 
 def build_deeplink(
@@ -555,6 +876,8 @@ def response_event(
     task_id: str = "",
     response: str = "",
     assistant_response: Optional[str] = None,
+    display_name: str = "",
+    avatar: Optional[ProfileAvatar] = None,
 ) -> PushEvent:
     """Build the final assistant-response notification.
 
@@ -570,6 +893,7 @@ def response_event(
     turn_text = _safe_text(turn_id).strip()
     task_text = _safe_text(task_id).strip()
     response_text = _safe_text(response)
+    title = response_display_name(bot_text, display_name)
     identity = stable_hash(
         bot_text,
         session_text,
@@ -577,15 +901,26 @@ def response_event(
         task_text,
         response_text,
     )
+    extra: Dict[str, Any] = {
+        "task_id": task_text,
+        "turn_id": turn_text,
+        BOT_DISPLAY_NAME_KEY: title,
+    }
+    if avatar is not None and avatar.mime in _AVATAR_MIME_ALLOWLIST \
+            and 0 < len(avatar.data) <= _AVATAR_PAYLOAD_MAX_BYTES:
+        extra[BOT_AVATAR_KEY] = {
+            BOT_AVATAR_MIME_KEY: avatar.mime,
+            BOT_AVATAR_DATA_KEY: base64.b64encode(avatar.data).decode("ascii"),
+        }
     return PushEvent(
         kind="response",
         bot=bot_text,
-        title=f"{bot_text}: response ready",
+        title=title,
         body=response_text,
         session_id=session_text,
         collapse_id=f"response-{stable_hash(bot_text, session_text)}",
         dedupe_key=f"response:{identity}",
-        extra={"task_id": task_text, "turn_id": turn_text},
+        extra=extra,
     )
 
 

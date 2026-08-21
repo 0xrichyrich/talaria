@@ -40,11 +40,16 @@ public enum TransportState: Sendable, Equatable {
 /// Low-level JSON-RPC WebSocket transport. One instance per live socket;
 /// `GatewayClient` owns reconnect policy and re-creates transports.
 public actor GatewayTransport {
+    public struct SequencedResponse: Sendable {
+        public var value: JSONValue
+        public var inboundSequence: UInt64
+    }
     private let url: URL
     private let session: URLSession
     private var task: URLSessionWebSocketTask?
     private var nextID = 1
-    private var pending: [String: CheckedContinuation<JSONValue, Error>] = [:]
+    private var pending: [String: CheckedContinuation<SequencedResponse, Error>] = [:]
+    private var inboundSequence: UInt64 = 0
     private var eventContinuation: AsyncStream<GatewayEvent>.Continuation?
     private(set) public var state: TransportState = .idle
 
@@ -99,6 +104,13 @@ public actor GatewayTransport {
     /// responses may arrive out of order relative to other requests).
     public func request(_ method: String, params: JSONValue? = nil,
                         timeout: TimeInterval = 120) async throws -> JSONValue {
+        try await requestSequenced(method, params: params, timeout: timeout).value
+    }
+
+    /// Request plus the exact inbound frame position of its response. Callers
+    /// can use this as a lossless event/snapshot boundary.
+    public func requestSequenced(_ method: String, params: JSONValue? = nil,
+                                 timeout: TimeInterval = 120) async throws -> SequencedResponse {
         guard let task else {
             throw GatewayError(code: -3, message: "not connected")
         }
@@ -119,7 +131,7 @@ public actor GatewayTransport {
         // Install the continuation before the socket send. A fast response
         // (or a send failure) must always find and settle its exact waiter.
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<JSONValue, Error>) in
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<SequencedResponse, Error>) in
                 pending[id] = cont
                 Task {
                     do {
@@ -142,7 +154,9 @@ public actor GatewayTransport {
 
     // MARK: - Internals
 
-    private func registerPending(id: String, _ cont: CheckedContinuation<JSONValue, Error>) {
+    private func registerPending(
+        id: String, _ cont: CheckedContinuation<SequencedResponse, Error>
+    ) {
         pending[id] = cont
     }
 
@@ -170,6 +184,8 @@ public actor GatewayTransport {
     }
 
     private func handleFrame(_ text: String) {
+        inboundSequence &+= 1
+        let frameSequence = inboundSequence
         guard let data = text.data(using: .utf8),
               let value = try? JSONDecoder().decode(JSONValue.self, from: data),
               let obj = value.objectValue else { return }
@@ -178,7 +194,8 @@ public actor GatewayTransport {
         if obj["method"]?.stringValue == "event", let params = obj["params"] {
             let event = GatewayEvent(type: params["type"]?.stringValue ?? "",
                                      sessionID: params["session_id"]?.stringValue ?? "",
-                                     payload: params["payload"])
+                                     payload: params["payload"],
+                                     inboundSequence: frameSequence)
             eventsCont.yield(event)
             return
         }
@@ -192,7 +209,9 @@ public actor GatewayTransport {
                                                message: error["message"]?.stringValue ?? "error",
                                                data: error["data"]))
         } else {
-            cont.resume(returning: obj["result"] ?? .null)
+            cont.resume(returning: SequencedResponse(
+                value: obj["result"] ?? .null,
+                inboundSequence: frameSequence))
         }
     }
 

@@ -441,6 +441,14 @@ extension AppModel {
         try? await refreshRoutines()
         connections = ConnectionRegistry.shared.rows
         await flushComposeQueue()
+        exactStoredSessionSourceDidReconnect()
+    }
+
+    /// Supervised reconnect finishes after the foreground/network callbacks
+    /// that initiated it. Signal the retained exact-route queue only once the
+    /// replacement link, roster, and parked sessions have been adopted.
+    func exactStoredSessionSourceDidReconnect() {
+        retryExactStoredSessionNavigation()
     }
 
     /// The client's event pump finishes exactly when the socket dies; awaiting
@@ -579,6 +587,8 @@ extension AppModel {
     /// Forget the credential but keep the row: the gateway stays listed and
     /// probeable, and the next tap runs sign-in again.
     public func signOutGateway(_ gateway: SavedGateway) async {
+        beginExactStoredSessionSourceTeardown(gatewayID: gateway.id)
+        defer { finishExactStoredSessionSourceTeardown(gatewayID: gateway.id) }
         guard let base = gateway.baseURL else { return }
         if isActiveGateway(gateway) {
             await disconnectGateway()
@@ -586,6 +596,10 @@ extension AppModel {
         } else {
             await detachRoutedEvents(gatewayID: gateway.id)
             await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gateway.id)
+            // The first detach closes the old owner before the pool barrier.
+            // This second pass closes anything that was already committed by
+            // an exact open while that barrier was held.
+            await detachRoutedEvents(gatewayID: gateway.id)
         }
         ConnectionSupervisor.shared.keychain.delete(for: base)
         if ConnectionSupervisor.shared.reauthGateway?.absoluteString == base.absoluteString {
@@ -596,12 +610,18 @@ extension AppModel {
 
     /// Remove the gateway entirely — registry row and Keychain credential.
     public func removeGateway(_ gateway: SavedGateway) async {
+        beginExactStoredSessionSourceTeardown(gatewayID: gateway.id)
+        defer { finishExactStoredSessionSourceTeardown(gatewayID: gateway.id) }
         if isActiveGateway(gateway) {
             await disconnectGateway()
             flushWorldForGatewaySwitch()
         } else {
             await detachRoutedEvents(gatewayID: gateway.id)
             await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gateway.id)
+            // A pool lease can keep an exact open alive across the first
+            // detach. Scrub again after disconnect so no committed handler or
+            // source-qualified runtime survives removal.
+            await detachRoutedEvents(gatewayID: gateway.id)
         }
         let supervisor = ConnectionSupervisor.shared
         if let base = gateway.baseURL,
@@ -612,6 +632,9 @@ extension AppModel {
         // ConnectionRegistry.remove deletes the Keychain credential with the row.
         ConnectionRegistry.shared.remove(id: gateway.id)
         connections = ConnectionRegistry.shared.rows
+        // Reject a retained exact-session route now that its source is no
+        // longer trusted, instead of leaving it parked until another launch.
+        retryExactStoredSessionNavigation()
     }
 
     /// Drop the outgoing gateway's world. flushDemoWorld() is the single place

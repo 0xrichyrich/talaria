@@ -280,6 +280,13 @@ public struct LiveSession: Sendable {
         pendingApproval = v["pending_approval"].map { ApprovalRequest($0, sessionID: v["session_id"]?.stringValue ?? "") }
         pendingClarify = v["pending_clarify"]
     }
+
+    /// The exact durable/state evidence represented by this resume payload.
+    /// Consumers must use this rather than treating the transport sequence as
+    /// proof that every earlier event was included in the snapshot.
+    public var snapshotEvidence: ResumeSnapshotEvidence {
+        ResumeSnapshotEvidence(session: self)
+    }
 }
 
 public struct CronJob: Sendable, Identifiable {
@@ -354,6 +361,12 @@ public actor GatewayClient {
 
     public func removeEventHandler(_ id: UUID) {
         eventHandlers.removeValue(forKey: id)
+    }
+
+    /// Deterministic package-test seam for event/snapshot ordering. Production
+    /// delivery still comes exclusively from the transport event task.
+    func emitEventForTesting(_ event: GatewayEvent) {
+        for handler in handlerSnapshot() { handler(event) }
     }
 
     /// Install the owning app's source-qualified lifecycle admission. The
@@ -634,6 +647,32 @@ public actor GatewayClient {
         if let profile { params["profile"] = .string(profile) }
         if deferHistory { params["defer_history"] = .bool(true) }
         return LiveSession(try await rpc("session.resume", .object(params), timeout: 180))
+    }
+
+    /// Exact resume plus the transport frame boundary of the authoritative
+    /// projection. Used by transactional navigation to replay only events that
+    /// arrived after this snapshot.
+    public func resumeSessionSequenced(_ storedID: String, profile: String? = nil,
+                                       deferHistory: Bool = false) async throws
+        -> (session: LiveSession, inboundSequence: UInt64) {
+        let lease = try await acquireTrafficLease()
+        do {
+            guard let transport else {
+                throw GatewayError(code: -3, message: "not connected")
+            }
+            var params: [String: JSONValue] = [
+                "session_id": .string(storedID), "source": "talaria",
+            ]
+            if let profile { params["profile"] = .string(profile) }
+            if deferHistory { params["defer_history"] = .bool(true) }
+            let response = try await transport.requestSequenced(
+                "session.resume", params: .object(params), timeout: 180)
+            await lease?.release()
+            return (LiveSession(response.value), response.inboundSequence)
+        } catch {
+            await lease?.release()
+            throw error
+        }
     }
 
     public func closeSession(_ sessionID: String) async throws {

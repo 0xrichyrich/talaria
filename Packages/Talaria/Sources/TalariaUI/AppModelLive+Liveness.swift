@@ -280,6 +280,7 @@ extension AppModel {
     /// Safe to call repeatedly: concurrent callers coalesce onto one snapshot.
     public func foregroundReseed() {
         startLivenessSupervision()
+        retryExactStoredSessionNavigation()
         guard mode == .live else { return }
         Task { @MainActor in await self.reconcileLiveness(trigger: .foreground) }
     }
@@ -288,6 +289,7 @@ extension AppModel {
     /// handoff). Skip the backoff sleep instead of waiting it out
     /// (PARITY.md:1120).
     private func networkPathBecameUsable() {
+        retryExactStoredSessionNavigation()
         guard mode == .live, LiveRuntime.shared.baseURL != nil else { return }
         Task { @MainActor in
             // A handoff kills the socket without the transport noticing
