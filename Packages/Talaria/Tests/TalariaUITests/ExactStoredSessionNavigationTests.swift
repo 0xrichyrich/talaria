@@ -712,6 +712,41 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
             inboundSequence: 14)), "retired generation rejects stale frames")
     }
 
+    func testRetiredStagedGateRejectsOldUnsequencedButAcceptsTargetAndNewFrames() throws {
+        let client = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://gate-unsequenced-\(UUID().uuidString).example")),
+            credential: .sessionToken("gate-unsequenced-token"))
+        let gate = RoutedEventGate(client: client, generation: 13)
+        let old = GatewayEvent(
+            type: "status.update", sessionID: "other-runtime",
+            payload: .object(["text": .string("old")]), inboundSequence: 0)
+        let target = GatewayEvent(
+            type: "tool.start", sessionID: "new-runtime",
+            payload: .object(["name": .string("search")]), inboundSequence: 0)
+
+        gate.beginStaging()
+        XCTAssertFalse(gate.claimForPump(old))
+        XCTAssertFalse(gate.claimForPump(target))
+        let returned = gate.finishStaging(targetSessionID: "new-runtime")
+        XCTAssertEqual(returned.count, 1)
+        gate.prepareOldReplay(returned)
+        XCTAssertTrue(gate.claimForPump(old), "old unsequenced frame replays to old pump")
+        XCTAssertTrue(gate.claimForStaged(target), "target frame remains staged-owned")
+
+        gate.retireForStagedReplacement()
+        XCTAssertFalse(gate.claimForStaged(old),
+                       "old unsequenced frame must not replay through replacement")
+        XCTAssertFalse(gate.claimForStaged(target),
+                       "already-delivered target frame must remain exactly once")
+        let fresh = GatewayEvent(
+            type: "status.update", sessionID: "other-runtime",
+            payload: .object(["text": .string("fresh")]), inboundSequence: 0)
+        XCTAssertTrue(gate.claimForStaged(fresh),
+                      "a new unsequenced frame after retirement is admitted")
+        XCTAssertFalse(gate.claimForStaged(fresh),
+                       "the new unsequenced frame is still delivered once")
+    }
+
     func testForeignExactOpenStagesAlongsideExistingSameClientPump() async throws {
         let model = AppModel()
         let gatewayID = "foreign-existing-pump-(UUID().uuidString)"
@@ -819,8 +854,11 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
             Task { await client.removeEventHandler(oldHandler) }
             runtime.routedEvents[gatewayID] = nil
             runtime.routedEventGenerations[gatewayID] = nil
+            runtime.routedUnread[otherRoute] = nil
             LiveRuntime.shared.routedSessionToBot.removeValue(forKey:
                 GatewaySessionRoute(gatewayID: gatewayID, sessionID: "other-runtime"))
+            LiveRuntime.shared.routedSessionToBot.removeValue(forKey:
+                GatewaySessionRoute(gatewayID: gatewayID, sessionID: "new-runtime"))
             LiveRuntime.shared.gatewayID = oldGatewayID
             model.mode = oldMode
             Task { await pool.disconnect(gatewayID: gatewayID) }
@@ -879,11 +917,45 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
                        "transient tool state is retained even below the resume boundary")
         XCTAssertEqual(otherChat.messages.map(\.text), ["other once"],
                        "unrelated same-client frames stay with the old pump")
+        for _ in 0..<100 where runtime.routedUnread[otherRoute] != 1 {
+            await Task.yield()
+        }
+        XCTAssertEqual(runtime.routedUnread[otherRoute], 1,
+                       "an old-owned unrelated completion must not replay through the replacement")
         let oldSequences = await oldProbe.events.map(\.inboundSequence)
         XCTAssertEqual(oldSequences.filter { $0 == 3 }.count, 1)
         XCTAssertEqual(oldSequences.filter { $0 == 4 }.count, 1)
         XCTAssertFalse(oldSequences.contains(1), "snapshot-owned target row is staged")
         XCTAssertFalse(oldSequences.contains(2), "target transient is staged")
+
+        // The old handler has now been retired and removed. Frames that first
+        // arrive after that boundary must still flow through the replacement,
+        // exactly once, for both an unrelated session and the newly adopted
+        // target session.
+        await client.emitEventForTesting(GatewayEvent(
+            type: "message.complete", sessionID: "other-runtime",
+            payload: .object([
+                "text": .string("other after retirement"),
+                "status": .string("complete"),
+            ]), inboundSequence: 20))
+        await client.emitEventForTesting(GatewayEvent(
+            type: "message.complete", sessionID: "new-runtime",
+            payload: .object([
+                "text": .string("target after retirement"),
+                "status": .string("complete"),
+            ]), inboundSequence: 21))
+        for _ in 0..<100 where otherChat.messages.count < 2
+            || targetChat.messages.filter({ $0.text == "target after retirement" }).isEmpty {
+            await Task.yield()
+        }
+        XCTAssertEqual(otherChat.messages.map(\.text),
+                       ["other once", "other after retirement"],
+                       "a post-retire unrelated frame is delivered once")
+        XCTAssertEqual(runtime.routedUnread[otherRoute], 2,
+                       "the post-retire unrelated completion increments unread once")
+        XCTAssertEqual(targetChat.messages.filter { $0.text == "target after retirement" }.count,
+                       1,
+                       "a post-retire target frame is delivered once")
 
         await model.removeRoutedEventSubscription(gatewayID: gatewayID)
         await pool.disconnect(gatewayID: gatewayID)

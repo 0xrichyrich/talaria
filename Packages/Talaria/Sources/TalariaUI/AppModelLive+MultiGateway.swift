@@ -192,6 +192,20 @@ final class RoutedEventGate {
             return markDelivered(event)
         case .retired:
             guard allowsStagedAfterRetire else { return false }
+            // The prepared handler saw the same frames as the old handler
+            // before that handler was retired.  Keep those old-owned frames
+            // out of the replacement pump, while still admitting frames that
+            // first arrive after retirement (and target frames that were
+            // parked for the staged handoff).
+            if event.inboundSequence != 0 {
+                guard !oldSequences.contains(event.inboundSequence) else {
+                    return false
+                }
+            } else {
+                guard !oldUnsequenced.contains(where: { sameEvent($0, event) }) else {
+                    return false
+                }
+            }
             return markDelivered(event)
         }
     }
