@@ -641,7 +641,9 @@ public actor RoomStore {
             let member = room.members[index]
             room.members[index] = RoomMember(route: destination, title: member.title,
                                              handle: member.handle,
-                                             sourceLabel: member.sourceLabel)
+                                             sourceLabel: member.sourceLabel,
+                                             friendlyName: member.friendlyName,
+                                             rawDisplayName: member.rawDisplayName)
             changed = true
         }
         if let index = room.formerMembers.firstIndex(where: { $0.route == source }),
@@ -649,7 +651,9 @@ public actor RoomStore {
             let member = room.formerMembers[index]
             room.formerMembers[index] = RoomMember(route: destination, title: member.title,
                                                    handle: member.handle,
-                                                   sourceLabel: member.sourceLabel)
+                                                   sourceLabel: member.sourceLabel,
+                                                   friendlyName: member.friendlyName,
+                                                   rawDisplayName: member.rawDisplayName)
             changed = true
         }
         // Destination collisions are deterministic: keep the authoritative

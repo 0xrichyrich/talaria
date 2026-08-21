@@ -10,6 +10,7 @@ import TalariaKit
 /// later foreground/reachability event can retry.
 public actor GatewayClientPool {
     public typealias Connector = @Sendable (URL, GatewayCredential) async throws -> GatewayClient
+    typealias LifecycleAdmissionInstaller = @Sendable (GatewayClient, String) async -> Void
 
     /// The exact pooled connection a caller started work against. The client
     /// identity alone is not enough: `adopt` can replace it with another
@@ -34,11 +35,16 @@ public actor GatewayClientPool {
         public let gatewayID: String
         fileprivate let token: UUID
 
-        fileprivate init(snapshot: ConnectionSnapshot, gatewayID: String) {
+        fileprivate init(snapshot: ConnectionSnapshot, gatewayID: String, token: UUID) {
             self.snapshot = snapshot
             self.gatewayID = gatewayID
-            self.token = UUID()
+            self.token = token
         }
+    }
+
+    private struct LeaseWaiter {
+        let token: UUID
+        let continuation: CheckedContinuation<Bool, Never>
     }
 
     private struct Slot {
@@ -51,7 +57,14 @@ public actor GatewayClientPool {
     private var slots: [String: Slot] = [:]
     private var nextGeneration: UInt64 = 0
     private let connector: Connector
-    private var leaseWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private let lifecycleAdmissionInstaller: LifecycleAdmissionInstaller?
+    /// One exclusive pool barrier per source. An operation lease retains this
+    /// token through publication; adopt/disconnect hold it only across their
+    /// synchronous slot mutation. Keeping the owner outside `Slot` lets a
+    /// guarded disconnect hand the barrier onward after removing the slot.
+    private var leaseOwners: [String: UUID] = [:]
+    private var leaseWaiters: [String: [LeaseWaiter]] = [:]
+    private var publicationWaiterCounts: [String: Int] = [:]
 
     public init() {
         connector = { baseURL, credential in
@@ -59,6 +72,7 @@ public actor GatewayClientPool {
             try await client.connect()
             return client
         }
+        lifecycleAdmissionInstaller = nil
     }
 
     /// Test/support initializer. Production uses the connecting initializer
@@ -66,6 +80,16 @@ public actor GatewayClientPool {
     /// deterministic without opening a network socket.
     public init(connector: @escaping Connector) {
         self.connector = connector
+        lifecycleAdmissionInstaller = nil
+    }
+
+    /// Deterministic test seam for the actor hop required to install profile
+    /// lifecycle admission on a replacement client. Production always uses
+    /// the real installer below.
+    init(connector: @escaping Connector,
+         lifecycleAdmissionInstaller: @escaping LifecycleAdmissionInstaller) {
+        self.connector = connector
+        self.lifecycleAdmissionInstaller = lifecycleAdmissionInstaller
     }
 
     public func client(for gatewayID: String) -> GatewayClient? {
@@ -94,35 +118,41 @@ public actor GatewayClientPool {
             return ConnectionSnapshot(client: client, generation: slot.generation)
         }
         if let slot = slots[gatewayID], let task = slot.task {
-            let client = try await task.value
-            guard let current = slots[gatewayID], current.generation == slot.generation else {
-                await client.disconnect()
-                throw CancellationError()
-            }
-            return ConnectionSnapshot(client: client, generation: current.generation)
+            return try await publishedConnection(
+                task, gatewayID: gatewayID, generation: slot.generation)
         }
 
         nextGeneration &+= 1
         let generation = nextGeneration
         let connector = self.connector
-        let task = Task { try await connector(baseURL, credential) }
+        // The shared task is the complete publication transaction, not merely
+        // the socket dial. Every coalesced caller therefore remains parked
+        // through lifecycle-admission installation and the final actor-owned
+        // slot mutation; no caller can receive an unadmitted client while the
+        // slot still contains only `task`.
+        let task = Task { [weak self] () throws -> GatewayClient in
+            var connectedClient: GatewayClient?
+            do {
+                let client = try await connector(baseURL, credential)
+                connectedClient = client
+                try Task.checkCancellation()
+                guard let self else { throw CancellationError() }
+                try await self.publishConnectedClient(
+                    client, gatewayID: gatewayID, generation: generation)
+                return client
+            } catch {
+                await connectedClient?.disconnect()
+                if let self {
+                    await self.clearConnectingSlotIfCurrent(
+                        gatewayID: gatewayID, generation: generation)
+                }
+                throw error
+            }
+        }
         slots[gatewayID] = Slot(generation: generation, task: task, client: nil,
                                  leaseToken: nil)
-
-        do {
-            let client = try await task.value
-            guard slots[gatewayID]?.generation == generation else {
-                await client.disconnect()
-                throw CancellationError()
-            }
-            await installLifecycleAdmission(on: client, gatewayID: gatewayID)
-            slots[gatewayID] = Slot(generation: generation, task: nil, client: client,
-                                     leaseToken: nil)
-            return ConnectionSnapshot(client: client, generation: generation)
-        } catch {
-            if slots[gatewayID]?.generation == generation { slots[gatewayID] = nil }
-            throw error
-        }
+        return try await publishedConnection(
+            task, gatewayID: gatewayID, generation: generation)
     }
 
     /// Whether this exact client still owns the named slot.
@@ -138,21 +168,27 @@ public actor GatewayClientPool {
     /// disconnect) completes.
     public func acquireLease(_ snapshot: ConnectionSnapshot,
                              for gatewayID: String) async -> ConnectionLease? {
-        await waitForLease(gatewayID: gatewayID)
+        guard let token = await acquireLeaseBarrier(gatewayID: gatewayID) else { return nil }
         guard let slot = slots[gatewayID], slot.generation == snapshot.generation,
               let client = slot.client,
               ObjectIdentifier(client) == ObjectIdentifier(snapshot.client),
-              slot.leaseToken == nil else { return nil }
-        let lease = ConnectionLease(snapshot: snapshot, gatewayID: gatewayID)
+              slot.leaseToken == nil else {
+            releaseLeaseBarrier(token, gatewayID: gatewayID)
+            return nil
+        }
+        let lease = ConnectionLease(snapshot: snapshot, gatewayID: gatewayID,
+                                    token: token)
         slots[gatewayID]?.leaseToken = lease.token
         return lease
     }
 
     /// Release a critical-section lease without disconnecting its client.
     public func release(_ lease: ConnectionLease) {
-        guard slots[lease.gatewayID]?.leaseToken == lease.token else { return }
-        slots[lease.gatewayID]?.leaseToken = nil
-        resumeLeaseWaiters(gatewayID: lease.gatewayID)
+        guard leaseOwners[lease.gatewayID] == lease.token else { return }
+        if slots[lease.gatewayID]?.leaseToken == lease.token {
+            slots[lease.gatewayID]?.leaseToken = nil
+        }
+        releaseLeaseBarrier(lease.token, gatewayID: lease.gatewayID)
     }
 
     /// Disconnect only if the slot still belongs to the expected connection.
@@ -177,12 +213,13 @@ public actor GatewayClientPool {
               let client = slot.client,
               ObjectIdentifier(client) == ObjectIdentifier(snapshot.client),
               let ownedLease,
-              slot.leaseToken == ownedLease.token else {
+              slot.leaseToken == ownedLease.token,
+              leaseOwners[gatewayID] == ownedLease.token else {
             if lease == nil, let ownedLease { release(ownedLease) }
             return false
         }
         slots[gatewayID] = nil
-        resumeLeaseWaiters(gatewayID: gatewayID)
+        releaseLeaseBarrier(ownedLease.token, gatewayID: gatewayID)
         await client.disconnect()
         return true
     }
@@ -191,12 +228,16 @@ public actor GatewayClientPool {
     /// Replacing a different pooled client closes the old one after the new
     /// identity is installed, so a re-entrant lookup never returns the loser.
     public func adopt(_ client: GatewayClient, for gatewayID: String) async {
-        await waitForLease(gatewayID: gatewayID)
-        let previous = slots[gatewayID]
+        // Install admission before entering the pool barrier. This actor hop
+        // used to occur after `waitForLease`; a second operation could acquire
+        // a lease during the hop and then be overwritten by this adoption.
         await installLifecycleAdmission(on: client, gatewayID: gatewayID)
+        guard let reservation = await acquireLeaseBarrier(gatewayID: gatewayID) else { return }
+        let previous = slots[gatewayID]
         nextGeneration &+= 1
         slots[gatewayID] = Slot(generation: nextGeneration, task: nil, client: client,
                                  leaseToken: nil)
+        releaseLeaseBarrier(reservation, gatewayID: gatewayID)
 
         previous?.task?.cancel()
         if let old = previous?.client, ObjectIdentifier(old) != ObjectIdentifier(client) {
@@ -208,8 +249,10 @@ public actor GatewayClientPool {
     }
 
     public func disconnect(gatewayID: String) async {
-        await waitForLease(gatewayID: gatewayID)
-        guard let slot = slots.removeValue(forKey: gatewayID) else { return }
+        guard let reservation = await acquireLeaseBarrier(gatewayID: gatewayID) else { return }
+        let slot = slots.removeValue(forKey: gatewayID)
+        releaseLeaseBarrier(reservation, gatewayID: gatewayID)
+        guard let slot else { return }
         slot.task?.cancel()
         if let client = slot.client {
             await client.disconnect()
@@ -224,20 +267,137 @@ public actor GatewayClientPool {
     }
 
     private func installLifecycleAdmission(on client: GatewayClient, gatewayID: String) async {
+        if let lifecycleAdmissionInstaller {
+            await lifecycleAdmissionInstaller(client, gatewayID)
+            return
+        }
         await client.setTrafficAdmission {
             await ProfileLifecycleTrafficAdmission.acquire(gatewayID)
         }
     }
 
-    private func waitForLease(gatewayID: String) async {
-        guard slots[gatewayID]?.leaseToken != nil else { return }
-        await withCheckedContinuation { continuation in
-            leaseWaiters[gatewayID, default: []].append(continuation)
+    /// Finish an in-flight dial on the pool actor. Admission installation is
+    /// the sole suspension before publication; a concurrent adopt/disconnect
+    /// may replace the generation during that hop, so both cancellation and
+    /// generation are re-proven immediately before the slot becomes visible.
+    private func publishConnectedClient(_ client: GatewayClient, gatewayID: String,
+                                        generation: UInt64) async throws {
+        await installLifecycleAdmission(on: client, gatewayID: gatewayID)
+        try Task.checkCancellation()
+        guard let current = slots[gatewayID], current.generation == generation,
+              current.client == nil, current.task != nil else {
+            throw CancellationError()
+        }
+        slots[gatewayID] = Slot(generation: generation, task: nil, client: client,
+                                leaseToken: nil)
+    }
+
+    /// Await the one shared publication transaction, then validate that its
+    /// exact client still owns the exact generation. A cancelled waiter never
+    /// cancels shared work for other callers and never receives the result.
+    private func publishedConnection(_ task: Task<GatewayClient, Error>,
+                                     gatewayID: String,
+                                     generation: UInt64) async throws -> ConnectionSnapshot {
+        try Task.checkCancellation()
+        publicationWaiterCounts[gatewayID, default: 0] += 1
+        defer {
+            let remaining = max(0, publicationWaiterCounts[gatewayID, default: 1] - 1)
+            publicationWaiterCounts[gatewayID] = remaining == 0 ? nil : remaining
+        }
+        let client = try await task.value
+        try Task.checkCancellation()
+        guard let current = slots[gatewayID], current.generation == generation,
+              let published = current.client,
+              ObjectIdentifier(published) == ObjectIdentifier(client),
+              current.task == nil else {
+            throw CancellationError()
+        }
+        return ConnectionSnapshot(client: published, generation: generation)
+    }
+
+    private func clearConnectingSlotIfCurrent(gatewayID: String, generation: UInt64) {
+        guard let current = slots[gatewayID], current.generation == generation,
+              current.client == nil else { return }
+        slots[gatewayID] = nil
+    }
+
+    /// Acquire the source's exclusive pool barrier. A released owner hands the
+    /// token directly to one FIFO waiter before resuming it, so wakeups cannot
+    /// race each other or be overtaken by a new caller. The loop re-checks the
+    /// handed-off identity after every suspension; cancellation removes a
+    /// queued waiter, and a cancelled granted waiter releases its handoff.
+    private func acquireLeaseBarrier(gatewayID: String) async -> UUID? {
+        let token = UUID()
+        while true {
+            guard !Task.isCancelled else {
+                if leaseOwners[gatewayID] == token {
+                    releaseLeaseBarrier(token, gatewayID: gatewayID)
+                }
+                return nil
+            }
+            if leaseOwners[gatewayID] == token { return token }
+            if leaseOwners[gatewayID] == nil {
+                leaseOwners[gatewayID] = token
+                return token
+            }
+
+            let granted = await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if Task.isCancelled {
+                        continuation.resume(returning: false)
+                    } else if leaseOwners[gatewayID] == nil {
+                        // The owner may have released between the loop check
+                        // and continuation installation. Claim synchronously
+                        // instead of waiting for a wakeup that already passed.
+                        leaseOwners[gatewayID] = token
+                        continuation.resume(returning: true)
+                    } else {
+                        leaseWaiters[gatewayID, default: []].append(
+                            LeaseWaiter(token: token, continuation: continuation)
+                        )
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancelLeaseWaiter(token, gatewayID: gatewayID) }
+            }
+            guard granted else { return nil }
+            // Re-check in the loop. Direct handoff installs `token` before the
+            // continuation resumes, while cancellation may have retired it.
         }
     }
 
-    private func resumeLeaseWaiters(gatewayID: String) {
-        let waiters = leaseWaiters.removeValue(forKey: gatewayID) ?? []
-        for waiter in waiters { waiter.resume() }
+    private func releaseLeaseBarrier(_ token: UUID, gatewayID: String) {
+        guard leaseOwners[gatewayID] == token else { return }
+        leaseOwners[gatewayID] = nil
+        resumeNextLeaseWaiter(gatewayID: gatewayID)
+    }
+
+    private func resumeNextLeaseWaiter(gatewayID: String) {
+        guard leaseOwners[gatewayID] == nil,
+              var queue = leaseWaiters[gatewayID], !queue.isEmpty else { return }
+        let next = queue.removeFirst()
+        if queue.isEmpty { leaseWaiters[gatewayID] = nil }
+        else { leaseWaiters[gatewayID] = queue }
+        leaseOwners[gatewayID] = next.token
+        next.continuation.resume(returning: true)
+    }
+
+    private func cancelLeaseWaiter(_ token: UUID, gatewayID: String) {
+        guard var queue = leaseWaiters[gatewayID],
+              let index = queue.firstIndex(where: { $0.token == token }) else { return }
+        let waiter = queue.remove(at: index)
+        if queue.isEmpty { leaseWaiters[gatewayID] = nil }
+        else { leaseWaiters[gatewayID] = queue }
+        waiter.continuation.resume(returning: false)
+    }
+
+    /// Focused concurrency-test visibility; production callers do not need to
+    /// observe the barrier queue.
+    func queuedLeaseWaiterCount(for gatewayID: String) -> Int {
+        leaseWaiters[gatewayID]?.count ?? 0
+    }
+
+    func connectingPublicationWaiterCount(for gatewayID: String) -> Int {
+        publicationWaiterCounts[gatewayID] ?? 0
     }
 }

@@ -40,19 +40,114 @@ public struct RoomActivityID: Codable, Hashable, Sendable, Identifiable {
 public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
     public let route: GatewayBotRoute
     public var title: String?
+    /// The durable raw friendly identity captured when this seat was selected.
+    /// It survives a later roster disappearance so room mentions keep the
+    /// same `@research-buddy` spelling instead of falling back to a mutable
+    /// profile handle or a themed visual label.
+    public var friendlyName: String?
+    /// Core profile `display_name` captured independently of Bot Mode's
+    /// friendly title. Both remain valid room aliases after the roster vanishes.
+    public var rawDisplayName: String?
     public var handle: String
     public var sourceLabel: String?
     public var id: GatewayBotRoute { route }
 
     public init(route: GatewayBotRoute, title: String? = nil,
-                handle: String? = nil, sourceLabel: String? = nil) {
+                handle: String? = nil, sourceLabel: String? = nil,
+                friendlyName: String? = nil, rawDisplayName: String? = nil) {
         self.route = route
         self.title = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.friendlyName = Self.normalizedFriendlyName(friendlyName)
+        self.rawDisplayName = Self.normalizedFriendlyName(rawDisplayName)
         let proposed = handle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         self.handle = proposed.isEmpty
             ? (route.profile.lowercased() == "default" ? "hermes" : route.profile)
             : proposed
         self.sourceLabel = sourceLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The identity which produces room-friendly mention forms. New records
+    /// use `friendlyName`; legacy records did not have it, so their retained
+    /// title remains the safest compatible fallback. The profile is last: it
+    /// is stable, but it is not necessarily what the user saw when choosing
+    /// the member.
+    public var friendlyMentionName: String {
+        if let friendlyName, !friendlyName.isEmpty { return friendlyName }
+        if let title, !title.isEmpty { return title }
+        return route.profile
+    }
+
+    /// All preserved friendly identity inputs. `friendlyName` selects the
+    /// canonical insertion tag, while title/core display aliases stay valid
+    /// resolvers so a later rename cannot strand an older room draft.
+    public var friendlyMentionNames: [String] {
+        let candidates = [friendlyName, title, rawDisplayName].compactMap {
+            $0?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }.filter { !$0.isEmpty }
+        guard !candidates.isEmpty else { return [route.profile] }
+        var seen = Set<String>()
+        return candidates.filter { seen.insert($0.lowercased()).inserted }
+    }
+
+    /// All safe spellings a room mention parser can map to this exact,
+    /// source-qualified seat. Legacy handle/profile forms remain available;
+    /// reserved words and unsafe friendly aliases never become destinations.
+    public var mentionForms: Set<String> {
+        var forms = Set<String>()
+        for legacy in [route.profile, handle] {
+            let normalized = legacy.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !normalized.isEmpty else { continue }
+            forms.insert(normalized)
+            forms.insert(Self.collapsedMentionForm(normalized))
+        }
+        for name in friendlyMentionNames {
+            forms.formUnion(BotMention.friendlyForms(from: name))
+        }
+        return forms
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case route, title, friendlyName, rawDisplayName, handle, sourceLabel
+    }
+
+    /// `friendlyName` is additive. Decode all pre-existing identity fields
+    /// exactly as their synthesized Codable representation did, while an old
+    /// room that naturally has no new key receives nil rather than becoming
+    /// unreadable. Invalid new optional data is ignored rather than allowed to
+    /// claim a mention address.
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        route = try values.decode(GatewayBotRoute.self, forKey: .route)
+        title = try values.decodeIfPresent(String.self, forKey: .title)
+        handle = try values.decode(String.self, forKey: .handle)
+        sourceLabel = try values.decodeIfPresent(String.self, forKey: .sourceLabel)
+        friendlyName = Self.normalizedFriendlyName(
+            try? values.decodeIfPresent(String.self, forKey: .friendlyName))
+        rawDisplayName = Self.normalizedFriendlyName(
+            try? values.decodeIfPresent(String.self, forKey: .rawDisplayName))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(route, forKey: .route)
+        try values.encodeIfPresent(title, forKey: .title)
+        try values.encodeIfPresent(friendlyName, forKey: .friendlyName)
+        try values.encodeIfPresent(rawDisplayName, forKey: .rawDisplayName)
+        try values.encode(handle, forKey: .handle)
+        try values.encodeIfPresent(sourceLabel, forKey: .sourceLabel)
+    }
+
+    private static func normalizedFriendlyName(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A name which cannot produce a safe non-reserved tag is not durable
+        // mention identity. Keep the seat and its legacy forms intact.
+        return BotMention.friendlyTag(from: trimmed) == nil ? nil : trimmed
+    }
+
+    private static func collapsedMentionForm(_ value: String) -> String {
+        value.replacingOccurrences(of: #"[._-]+"#, with: "",
+                                   options: .regularExpression)
     }
 }
 
@@ -288,8 +383,23 @@ public struct RoomActivity: Codable, Hashable, Sendable, Identifiable {
 }
 
 public struct RoomRecord: Codable, Hashable, Sendable, Identifiable {
+    /// Session-title identity version written with the room record. Rooms
+    /// created before immutable session titles had no version and decode as
+    /// `legacyNameSessionTitleVersion`; newly created rooms always use the
+    /// stable `RoomID` title.
+    public static let legacyNameSessionTitleVersion: UInt8 = 0
+    public static let immutableIDSessionTitleVersion: UInt8 = 1
+
     public let id: RoomID
     public var name: String
+    /// Version 0 is an on-disk compatibility marker, never a request to title
+    /// a newly created member session by the editable display name. The room
+    /// transport tries the immutable RoomID first, then the captured legacy
+    /// title only while resolving an already-existing pre-version room.
+    public var sessionTitleIdentityVersion: UInt8
+    /// Exact display name used by pre-version `Group: <name>` sessions. It is
+    /// captured during decode and deliberately does not change on rename.
+    public var legacySessionTitleName: String?
     public var members: [RoomMember]
     /// Seats removed from the live responder roster but retained as durable
     /// transcript/attempt identities. They never receive new work.
@@ -314,6 +424,8 @@ public struct RoomRecord: Codable, Hashable, Sendable, Identifiable {
     public var updatedAt: Date
 
     public init(id: RoomID = RoomID(), name: String, members: [RoomMember],
+                sessionTitleIdentityVersion: UInt8 = Self.immutableIDSessionTitleVersion,
+                legacySessionTitleName: String? = nil,
                 formerMembers: [RoomMember] = [],
                 avatar: RoomAttachment? = nil,
                 threads: [RoomThread] = [], entries: [RoomEntry] = [],
@@ -322,7 +434,11 @@ public struct RoomRecord: Codable, Hashable, Sendable, Identifiable {
                 memberSessions: [String: String] = [:], watermarks: [String: Int] = [:],
                 epoch: UInt64 = 0, needsUser: Bool = false,
                 createdAt: Date = Date(), updatedAt: Date? = nil) {
-        self.id = id; self.name = name; self.members = members
+        self.id = id; self.name = name
+        self.sessionTitleIdentityVersion = sessionTitleIdentityVersion
+        self.legacySessionTitleName = sessionTitleIdentityVersion
+            == Self.legacyNameSessionTitleVersion ? (legacySessionTitleName ?? name) : nil
+        self.members = members
         self.formerMembers = formerMembers; self.avatar = avatar
         self.threads = threads; self.entries = entries; self.attempts = attempts
         self.drives = drives
@@ -332,7 +448,8 @@ public struct RoomRecord: Codable, Hashable, Sendable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, members, formerMembers, avatar, threads, entries, attempts, drives
+        case id, name, sessionTitleIdentityVersion, legacySessionTitleName
+        case members, formerMembers, avatar, threads, entries, attempts, drives
         case activity, memberSessions, watermarks, epoch, needsUser, createdAt, updatedAt
     }
 
@@ -344,6 +461,18 @@ public struct RoomRecord: Codable, Hashable, Sendable, Identifiable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(RoomID.self, forKey: .id)
         name = try values.decode(String.self, forKey: .name)
+        sessionTitleIdentityVersion = try values.decodeIfPresent(
+            UInt8.self, forKey: .sessionTitleIdentityVersion
+        ) ?? Self.legacyNameSessionTitleVersion
+        if sessionTitleIdentityVersion == Self.legacyNameSessionTitleVersion {
+            legacySessionTitleName = try values.decodeIfPresent(
+                String.self, forKey: .legacySessionTitleName
+            ) ?? name
+        } else {
+            // A stale compatibility value must never opt a current/future
+            // identity version back into mutable-name lookup.
+            legacySessionTitleName = nil
+        }
         members = try values.decode([RoomMember].self, forKey: .members)
         formerMembers = try values.decodeIfPresent([RoomMember].self, forKey: .formerMembers) ?? []
         avatar = try values.decodeIfPresent(RoomAttachment.self, forKey: .avatar)

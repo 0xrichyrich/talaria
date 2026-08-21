@@ -12,6 +12,12 @@ public final class WorkspaceRuntime {
     ]
 
     public var gatewayID: String?
+    /// The exact raw profile selected for the profile-scoped Projects surface.
+    /// It is intentionally not synthesized from a display name or the gateway
+    /// default; a fresh `profiles.list` inventory must prove it before any
+    /// `projects.*` RPC can run.
+    public var profile: String?
+    public var profiles: [WorkspaceProfileSource] = []
     public var generation: UInt64 = 0
     public var loading = false
     public var error = ""
@@ -63,15 +69,31 @@ public final class WorkspaceRuntime {
     @ObservationIgnored var backupDownloadTask: Task<URL, Error>?
     @ObservationIgnored var backupDownloadOwner: UUID?
 
-    func begin(gatewayID: String?) -> UInt64 {
-        let changedGateway = self.gatewayID != gatewayID
+    var projectRoute: GatewayWorkspaceRoute? {
+        guard let gatewayID, let profile else { return nil }
+        // Profile lifecycle owns the gateway-wide admission gate. Returning no
+        // route here immediately removes Projects authority while a rename or
+        // delete is in flight, before its old raw name could hit Hermes.
+        guard ProfileLifecycleTrafficAdmission.allows(gatewayID) else { return nil }
+        return WorkspaceProjectScope.route(gatewayID: gatewayID, rawProfile: profile,
+                                           knownProfiles: profiles.map(\.profile))
+    }
+
+    func begin(gatewayID: String?, profile: String? = nil) -> UInt64 {
+        let changedScope = self.gatewayID != gatewayID || self.profile != profile
         loadTask?.cancel()
         // A source change invalidates both an in-flight transfer and the
         // completed export it produced. A tab change must not call this path;
         // the Command Center owns that distinction at its sheet boundary.
-        if changedGateway { endCommandCenter() }
+        if changedScope { endCommandCenter() }
         self.gatewayID = gatewayID
-        if changedGateway {
+        self.profile = profile
+        // Every workspace load requires a fresh inventory. Do not leave a
+        // route usable while `profiles.list` is in flight: an absent profile
+        // must fail closed rather than relying on Hermes' launch-profile
+        // fallback behavior. This also closes profile-bound sheets on refresh.
+        profiles = []
+        if changedScope {
             projectUncertain = ""; fileUncertain = ""; gitUncertain = ""
             commandUncertain = ""; systemUncertain = ""
             commandPrefill = ""; commandPrefillTargetID = nil; commandPrefillDisplay = nil
@@ -89,6 +111,12 @@ public final class WorkspaceRuntime {
 
     func matches(_ gatewayID: String, _ generation: UInt64) -> Bool {
         self.gatewayID == gatewayID && self.generation == generation
+    }
+
+    func matches(_ route: GatewayWorkspaceRoute, _ generation: UInt64) -> Bool {
+        matches(route.gatewayID, generation) && profile == route.rawProfile
+            && ProfileLifecycleTrafficAdmission.allows(route.gatewayID)
+            && profiles.contains(where: { $0.profile == route.rawProfile })
     }
 
     /// A process-kill completion may mutate the visible list only while the
@@ -158,6 +186,25 @@ public final class WorkspaceRuntime {
         loading = false
     }
 
+    /// Publish a freshly proven Projects snapshot only into the exact source
+    /// and profile generation that requested it.  Callers must invoke this
+    /// while their pool and profile-lifecycle leases are still held; this last
+    /// synchronous mutation is therefore the publication boundary, not a
+    /// post-release best-effort check.
+    @discardableResult
+    func publishProjectSnapshot(_ snapshot: WorkspaceProjectSnapshot,
+                                route: GatewayWorkspaceRoute,
+                                generation: UInt64) -> Bool {
+        guard matches(route, generation) else { return false }
+        projects = snapshot.listing.projects
+        activeProjectID = snapshot.listing.activeID
+        projectTree = snapshot.tree
+        capability["projects"] = true
+        capability["projectActivity"] = true
+        capability["roots"] = true
+        return true
+    }
+
     func removeBackupExport() {
         guard let url = backupExportURL else { return }
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
@@ -195,6 +242,49 @@ public struct WorkspaceSource: Identifiable, Hashable, Sendable {
     public var id: String
     public var name: String
     public var isActive: Bool
+}
+
+/// A raw Hermes profile identity plus its presentation label.  The label is
+/// never sent to the gateway; only `profile` is a routing value.
+public struct WorkspaceProfileSource: Identifiable, Hashable, Sendable {
+    public var id: String { profile }
+    public var profile: String
+    public var label: String
+    public var isDefault: Bool
+
+    public init(profile: String, label: String? = nil, isDefault: Bool = false) {
+        self.profile = profile
+        let trimmedLabel = label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self.label = trimmedLabel.isEmpty ? profile : trimmedLabel
+        self.isDefault = isDefault
+    }
+}
+
+private struct WorkspaceProjectAuthority: Sendable {
+    var connection: GatewayClientPool.ConnectionSnapshot
+    var poolLease: GatewayClientPool.ConnectionLease
+    var trafficLease: GatewayClient.TrafficLease
+    var route: GatewayWorkspaceRoute
+}
+
+/// Final publication proof for `projects.set_active`. c1e25 deliberately
+/// serves an unknown explicit profile from the launch profile, so an echoed
+/// project id is not sufficient by itself: the exact raw profile must still
+/// exist in a fresh inventory observed after the mutation response.
+enum WorkspaceProjectSelectionProof {
+    static func validatedActiveID(
+        _ acknowledgedActiveID: String?, selectedProjectID: String,
+        route: GatewayWorkspaceRoute, postResponseProfiles: [HermesProfile]
+    ) throws -> String {
+        guard acknowledgedActiveID == selectedProjectID else {
+            throw AckValidationError(
+                operation: "Select project",
+                detail: "Hermes did not echo the selected project identity."
+            )
+        }
+        _ = try WorkspaceProjectScope.requireCurrent(route, in: postResponseProfiles)
+        return selectedProjectID
+    }
 }
 
 public struct WorkspaceProcessTarget: Identifiable, Hashable, Sendable {
@@ -316,6 +406,211 @@ public extension AppModel {
         }
     }
 
+    private func workspaceProfileInventory(_ rows: [HermesProfile]) throws -> [WorkspaceProfileSource] {
+        _ = try WorkspaceProjectScope.knownRawProfiles(from: rows)
+        return rows.map {
+            WorkspaceProfileSource(profile: $0.name, label: $0.displayName, isDefault: $0.isDefault)
+        }
+    }
+
+    private func workspaceRoute(gatewayID: String, requestedProfile: String?,
+                                inventory: [WorkspaceProfileSource]) throws -> GatewayWorkspaceRoute {
+        let raw: String
+        if let requestedProfile {
+            raw = requestedProfile
+        } else if let defaultProfile = inventory.first(where: \.isDefault)?.profile {
+            raw = defaultProfile
+        } else if let first = inventory.first?.profile {
+            raw = first
+        } else {
+            throw GatewayError(code: 404, message: "Hermes did not report a selectable profile for Projects.")
+        }
+        guard let route = WorkspaceProjectScope.route(
+            gatewayID: gatewayID, rawProfile: raw, knownProfiles: inventory.map(\.profile)
+        ) else {
+            throw GatewayError(
+                code: 400,
+                message: "Projects require an exact, known Hermes profile. Choose a profile from this gateway before continuing."
+            )
+        }
+        return route
+    }
+
+    private func invalidateWorkspaceProjectRoute(_ route: GatewayWorkspaceRoute, message: String) {
+        let runtime = WorkspaceRuntime.shared
+        guard runtime.gatewayID == route.gatewayID, runtime.profile == route.rawProfile else { return }
+        // Preserve the captured raw name for an honest unavailable-picker row,
+        // but remove every authority that could form another Projects request.
+        runtime.loadTask?.cancel()
+        runtime.profiles = []
+        runtime.projects = []; runtime.projectTree = []; runtime.activeProjectID = nil
+        runtime.capability["projects"] = false
+        runtime.capability["projectActivity"] = false
+        runtime.capability["roots"] = false
+        runtime.generation &+= 1
+        runtime.loading = false
+        runtime.error = message
+    }
+
+    private func workspaceConnection(gatewayID: String) async throws
+        -> GatewayClientPool.ConnectionSnapshot {
+        guard profileLifecycleAllowsGatewayTraffic(gatewayID) else {
+            throw GatewayError(code: GatewayClient.trafficFenced,
+                               message: "Gateway traffic is paused while a profile change is being resolved.")
+        }
+        let registry = ConnectionRegistry.shared
+        guard let gateway = registry.saved.first(where: { $0.id == gatewayID }),
+              let baseURL = gateway.baseURL,
+              let credential = registry.credential(for: gateway) else {
+            throw GatewayRouteError.unknownGateway(gatewayID)
+        }
+        let snapshot = try await registry.clientPool.connectWithGeneration(
+            gatewayID: gatewayID, baseURL: baseURL, credential: credential
+        )
+        guard profileLifecycleAllowsGatewayTraffic(gatewayID),
+              gatewayID != activeGatewayID || client.map(ObjectIdentifier.init) == ObjectIdentifier(snapshot.client)
+        else { throw CancellationError() }
+        return snapshot
+    }
+
+    private func workspaceConnectionIsCurrent(_ snapshot: GatewayClientPool.ConnectionSnapshot,
+                                              gatewayID: String) async -> Bool {
+        guard profileLifecycleAllowsGatewayTraffic(gatewayID),
+              await ConnectionRegistry.shared.clientPool.isCurrent(snapshot, for: gatewayID) else {
+            return false
+        }
+        return gatewayID != activeGatewayID || client.map(ObjectIdentifier.init) == ObjectIdentifier(snapshot.client)
+    }
+
+    /// Hold both replacement and profile-lifecycle admission across one
+    /// logical Projects operation. The first RPC is always a fresh
+    /// `profiles.list` on this exact captured client. That ordering prevents a
+    /// stale raw name from reaching Hermes' unknown-profile launch-profile
+    /// fallback, while the two leases close local rename/delete and reconnect
+    /// races between validation and the `projects.*` request.
+    private func withWorkspaceProjectAuthority<Value: Sendable>(
+        gatewayID: String, requestedProfile: String?, generation: UInt64,
+        _ operation: (WorkspaceProjectAuthority) async throws -> Value
+    ) async throws -> Value {
+        let runtime = WorkspaceRuntime.shared
+        let registry = ConnectionRegistry.shared
+        let connection = try await workspaceConnection(gatewayID: gatewayID)
+        guard let poolLease = await registry.clientPool.acquireLease(connection, for: gatewayID) else {
+            throw CancellationError()
+        }
+        guard let trafficLease = ProfileLifecycleTrafficAdmission.acquire(gatewayID) else {
+            await registry.clientPool.release(poolLease)
+            throw GatewayError(code: GatewayClient.trafficFenced,
+                               message: "Gateway traffic is paused while a profile change is being resolved.")
+        }
+
+        do {
+            let rows = try await connection.client.listProfiles(includeSessions: false)
+            let inventory = try workspaceProfileInventory(rows)
+            guard runtime.matches(gatewayID, generation), !Task.isCancelled,
+                  await workspaceConnectionIsCurrent(connection, gatewayID: gatewayID) else {
+                throw CancellationError()
+            }
+            // Publish only the exact fresh inventory. Preserve a concurrently
+            // selected raw value; route resolution below either proves it or
+            // leaves it visibly unavailable and incapable of producing RPCs.
+            runtime.profiles = inventory
+            let route: GatewayWorkspaceRoute
+            do {
+                route = try workspaceRoute(gatewayID: gatewayID,
+                                           requestedProfile: requestedProfile,
+                                           inventory: inventory)
+            } catch {
+                if let requestedProfile {
+                    invalidateWorkspaceProjectRoute(
+                        GatewayWorkspaceRoute(gatewayID: gatewayID, profile: requestedProfile),
+                        message: "The selected Hermes profile was renamed or deleted. Projects stay blocked to avoid launch-profile fallback."
+                    )
+                    // `invalidateWorkspaceProjectRoute` removes stale route
+                    // authority. Restore only the newly observed picker rows.
+                    runtime.profiles = inventory
+                }
+                throw error
+            }
+            runtime.profile = route.rawProfile
+            guard runtime.matches(route, generation), !Task.isCancelled,
+                  await workspaceConnectionIsCurrent(connection, gatewayID: gatewayID) else {
+                throw CancellationError()
+            }
+            let authority = WorkspaceProjectAuthority(
+                connection: connection, poolLease: poolLease,
+                trafficLease: trafficLease, route: route
+            )
+            let value = try await operation(authority)
+            await trafficLease.release()
+            await registry.clientPool.release(poolLease)
+            return value
+        } catch {
+            await trafficLease.release()
+            await registry.clientPool.release(poolLease)
+            throw error
+        }
+    }
+
+    /// Refresh profile authority again before a second project read in the
+    /// same logical operation (for example accepted-write reconciliation or
+    /// tree -> drill-in). The outer traffic and pool leases remain held.
+    @discardableResult
+    private func refreshWorkspaceProjectAuthority(
+        _ authority: WorkspaceProjectAuthority, generation: UInt64
+    ) async throws -> [HermesProfile] {
+        let runtime = WorkspaceRuntime.shared
+        let rows = try await authority.connection.client.listProfiles(includeSessions: false)
+        let inventory = try workspaceProfileInventory(rows)
+        let names: [String]
+        do {
+            names = try WorkspaceProjectScope.requireCurrent(authority.route, in: rows)
+        } catch {
+            invalidateWorkspaceProjectRoute(
+                authority.route,
+                message: "The selected Hermes profile was renamed or deleted. Projects stay blocked to avoid launch-profile fallback."
+            )
+            runtime.profiles = inventory
+            throw error
+        }
+        guard names == inventory.map(\.profile),
+              runtime.matches(authority.route, generation), !Task.isCancelled,
+              await workspaceConnectionIsCurrent(authority.connection,
+                                                  gatewayID: authority.route.gatewayID) else {
+            throw CancellationError()
+        }
+        runtime.profiles = inventory
+        return rows
+    }
+
+    /// Build one snapshot while re-reading `profiles.list` immediately before
+    /// every constituent profile-scoped RPC. The operation-level leases keep
+    /// local lifecycle and pool replacement excluded; the repeated inventories
+    /// also catch an external rename/delete at each remaining wire boundary.
+    private func freshWorkspaceProjectSnapshot(
+        _ authority: WorkspaceProjectAuthority, generation: UInt64
+    ) async throws -> WorkspaceProjectSnapshot {
+        let client = authority.connection.client
+        try await refreshWorkspaceProjectAuthority(authority, generation: generation)
+        let roots = try await client.discoveredWorkspaceRoots(in: authority.route)
+        try await refreshWorkspaceProjectAuthority(authority, generation: generation)
+        let listing = try await client.projects(in: authority.route)
+        try await refreshWorkspaceProjectAuthority(authority, generation: generation)
+        let tree = try await client.projectTreeProof(in: authority.route)
+        // A remote profile deletion can race after the pre-request inventory
+        // and make c1e25 answer from its launch profile. Discard that response
+        // unless the exact raw profile still exists after handler completion.
+        try await refreshWorkspaceProjectAuthority(authority, generation: generation)
+        guard WorkspaceRuntime.shared.matches(authority.route, generation),
+              await workspaceConnectionIsCurrent(authority.connection,
+                                                  gatewayID: authority.route.gatewayID) else {
+            throw CancellationError()
+        }
+        return WorkspaceProjectSnapshot(listing: listing, tree: tree.projects,
+                                        discoveredRoots: roots,
+                                        scopedSessionCount: tree.scopedSessionCount)
+    }
+
     var workspaceProcessTargets: [WorkspaceProcessTarget] {
         guard let gatewayID = WorkspaceRuntime.shared.gatewayID else { return [] }
         return unionRosterBots.compactMap { bot in
@@ -328,7 +623,7 @@ public extension AppModel {
         }
     }
 
-    func prepareWorkspace(gatewayID requested: String? = nil) {
+    func prepareWorkspace(gatewayID requested: String? = nil, profile requestedProfile: String? = nil) {
         guard WorkspaceCommandCenterRequest.allows(mode: mode) else {
             WorkspaceRuntime.shared.error = "Command Center is available only with a live gateway connection."
             return
@@ -352,13 +647,30 @@ public extension AppModel {
             )
         }
         guard let target else {
-            _ = runtime.begin(gatewayID: nil)
+            _ = runtime.begin(gatewayID: nil, profile: nil)
             runtime.error = requested == nil
                 ? "No registered gateway is available for Command Center."
                 : "The requested Command Center gateway is unknown or was removed."
             return
         }
-        let generation = runtime.begin(gatewayID: target)
+        if let requestedProfile,
+           requestedProfile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            _ = runtime.begin(gatewayID: target, profile: nil)
+            runtime.error = "Projects require an exact, nonblank Hermes profile."
+            return
+        }
+        let profile: String?
+        if let requestedProfile {
+            profile = requestedProfile
+        } else if runtime.gatewayID == target, let existing = runtime.profile {
+            profile = existing
+        } else {
+            // A new gateway has no trusted local profile authority. Leave the
+            // requested value nil so the fresh Hermes inventory selects its
+            // declared default instead of a stale roster-derived guess.
+            profile = nil
+        }
+        let generation = runtime.begin(gatewayID: target, profile: profile)
         // WorkspaceRuntime outlives the sheet. Never publish a directory from
         // its previous presentation while the new capability/root probe is in
         // flight, even when the gateway id happens to be unchanged.
@@ -366,7 +678,8 @@ public extension AppModel {
         runtime.loading = true
         runtime.loadTask = Task { [weak self] in
             guard let self else { return }
-            await self.loadWorkspace(gatewayID: target, generation: generation)
+            await self.loadWorkspace(gatewayID: target, requestedProfile: profile,
+                                     generation: generation)
         }
     }
 
@@ -377,6 +690,8 @@ public extension AppModel {
         runtime.endCommandCenter()
         runtime.generation &+= 1
         runtime.gatewayID = nil
+        runtime.profile = nil
+        runtime.profiles = []
         runtime.clearPublishedData()
         runtime.projectUncertain = ""; runtime.fileUncertain = ""; runtime.gitUncertain = ""
         runtime.commandUncertain = ""; runtime.systemUncertain = ""
@@ -395,6 +710,24 @@ public extension AppModel {
         prepareWorkspace(gatewayID: gatewayID)
     }
 
+    func selectWorkspaceProfile(_ profile: String) {
+        let runtime = WorkspaceRuntime.shared
+        guard let gatewayID = runtime.gatewayID else {
+            runtime.error = "Choose a gateway before selecting a Projects profile."
+            return
+        }
+        guard WorkspaceProjectScope.route(gatewayID: gatewayID, rawProfile: profile,
+                                          knownProfiles: runtime.profiles.map(\.profile)) != nil else {
+            runtime.error = "That Projects profile is unknown or no longer available on this gateway."
+            return
+        }
+        guard !runtime.mutationBusy, !runtime.systemActionRunning, !runtime.commandRunning else {
+            runtime.error = "Wait for the current source-qualified operation before changing Projects profiles."
+            return
+        }
+        prepareWorkspace(gatewayID: gatewayID, profile: profile)
+    }
+
     func refreshWorkspace() async {
         let runtime = WorkspaceRuntime.shared
         guard let gatewayID = runtime.gatewayID else { return }
@@ -402,49 +735,62 @@ public extension AppModel {
             runtime.error = "Wait for the current gateway mutation to finish before refreshing."
             return
         }
-        let generation = runtime.begin(gatewayID: gatewayID)
+        let profile = runtime.profile
+        let generation = runtime.begin(gatewayID: gatewayID, profile: profile)
         runtime.loading = true
-        await loadWorkspace(gatewayID: gatewayID, generation: generation)
+        await loadWorkspace(gatewayID: gatewayID, requestedProfile: profile, generation: generation)
     }
 
-    private func loadWorkspace(gatewayID: String, generation: UInt64) async {
+    private func loadWorkspace(gatewayID: String, requestedProfile: String?, generation: UInt64) async {
         let runtime = WorkspaceRuntime.shared
         let fileRequest = runtime.fileRequest
         let gitRequest = runtime.gitRequest
-        defer {
-            if runtime.matches(gatewayID, generation) { runtime.loading = false }
-        }
         do {
-            let client = try await routedClient(gatewayID: gatewayID)
-            async let projectsResult = capabilityValue { try await client.projects() }
-            async let projectTreeResult = capabilityValue { try await client.allProfileProjectTree() }
-            async let filesResult = capabilityValue { try await client.managedFiles() }
-            async let commandsResult = capabilityValue { try await client.commandCatalog() }
-            async let rootsResult = capabilityValue { try await client.discoveredWorkspaceRoots() }
-            async let statusResult = capabilityValue { try await client.workspaceStatus() }
-            async let usageResult = capabilityValue { try await client.workspaceUsage(days: 30) }
-            async let memoryResult = capabilityValue { try await client.workspaceMemoryStatus() }
-            async let curatorResult = capabilityValue { try await client.workspaceCuratorStatus() }
-            let (projectEnvelope, treeEnvelope, fileEnvelope, commandEnvelope, rootsEnvelope,
-                 statusEnvelope, usageEnvelope, memoryEnvelope, curatorEnvelope) = await (
-                projectsResult, projectTreeResult, filesResult, commandsResult, rootsResult,
-                statusResult, usageResult, memoryResult, curatorResult)
-            guard runtime.matches(gatewayID, generation), !Task.isCancelled else { return }
+            // `projectSnapshot` awaits `projects.discover_repos {profile,
+            // scan:true}` before it starts `projects.tree`; do not split those
+            // calls back into independently scheduled capability probes.
+            _ = try await withWorkspaceProjectAuthority(
+                gatewayID: gatewayID, requestedProfile: requestedProfile,
+                generation: generation
+            ) { authority in
+                let projectEnvelope = await capabilityValue {
+                    try await self.freshWorkspaceProjectSnapshot(authority, generation: generation)
+                }
+                guard runtime.matches(authority.route, generation), !Task.isCancelled,
+                      await workspaceConnectionIsCurrent(
+                        authority.connection, gatewayID: authority.route.gatewayID
+                      ) else { throw CancellationError() }
+                let connection = authority.connection
+                let route = authority.route
+                let client = connection.client
 
-            if case .available(let listing) = projectEnvelope {
-                runtime.projects = listing.projects
-                runtime.activeProjectID = listing.activeID
-                runtime.capability["projects"] = true
-            } else {
-                runtime.capability["projects"] = false
-                if case .failed(let message) = projectEnvelope { runtime.error = message }
-            }
-            if case .available(let tree) = treeEnvelope {
-                runtime.projectTree = tree; runtime.capability["projectActivity"] = true
-            } else {
-                runtime.capability["projectActivity"] = false
-                if case .failed(let message) = treeEnvelope { runtime.error = message }
-            }
+                async let filesResult = capabilityValue { try await client.managedFiles() }
+                async let commandsResult = capabilityValue { try await client.commandCatalog() }
+                async let statusResult = capabilityValue { try await client.workspaceStatus() }
+                async let usageResult = capabilityValue {
+                    try await client.workspaceUsage(days: 30, profile: route.rawProfile)
+                }
+                async let memoryResult = capabilityValue { try await client.workspaceMemoryStatus() }
+                async let curatorResult = capabilityValue { try await client.workspaceCuratorStatus() }
+                let (fileEnvelope, commandEnvelope, statusEnvelope,
+                     usageEnvelope, memoryEnvelope, curatorEnvelope) = await (
+                    filesResult, commandsResult, statusResult,
+                    usageResult, memoryResult, curatorResult)
+                guard runtime.matches(route, generation), !Task.isCancelled,
+                      await workspaceConnectionIsCurrent(connection, gatewayID: gatewayID) else { return }
+
+                var discoveredRoots: [String] = []
+                if case .available(let snapshot) = projectEnvelope {
+                    guard runtime.publishProjectSnapshot(snapshot, route: route,
+                                                         generation: generation) else { return }
+                    discoveredRoots = snapshot.discoveredRoots
+                } else {
+                    runtime.projects = []; runtime.projectTree = []; runtime.activeProjectID = nil
+                    runtime.capability["projects"] = false
+                    runtime.capability["projectActivity"] = false
+                    runtime.capability["roots"] = false
+                    if case .failed(let message) = projectEnvelope { runtime.error = message }
+                }
 
             let managedListing: ManagedFileListing?
             if case .available(let listing) = fileEnvelope {
@@ -460,14 +806,8 @@ public extension AppModel {
                 for root in runtime.projects.flatMap({ $0.folders.map(\.path) }) {
                     if let normalized = WorkspacePathFence.normalized(root) { sources[normalized] = .project }
                 }
-                if case .available(let discovered) = rootsEnvelope {
-                    runtime.capability["roots"] = true
-                    for root in discovered {
-                        if let normalized = WorkspacePathFence.normalized(root) { sources[normalized] = .project }
-                    }
-                } else {
-                    runtime.capability["roots"] = false
-                    if case .failed(let message) = rootsEnvelope { runtime.error = message }
+                for root in discoveredRoots {
+                    if let normalized = WorkspacePathFence.normalized(root) { sources[normalized] = .project }
                 }
                 if let locked = managedListing?.lockedRoot, !locked.isEmpty,
                    let normalized = WorkspacePathFence.normalized(locked) { sources[normalized] = .managed }
@@ -491,7 +831,8 @@ public extension AppModel {
                 } else {
                     selectedListing = nil
                 }
-                if runtime.matches(gatewayID, generation), runtime.fileRequest == fileRequest {
+                if runtime.matches(gatewayID, generation), runtime.fileRequest == fileRequest,
+                   await workspaceConnectionIsCurrent(connection, gatewayID: gatewayID) {
                     runtime.fileRoots = safeRoots
                     runtime.fileRootSources = sources
                     runtime.capability["files"] = selectedListing != nil
@@ -506,7 +847,8 @@ public extension AppModel {
             // A user may supersede only the directory request while the broad
             // capability probe is in flight. Skip that stale Files publication
             // without abandoning the already-fetched Commands/System results.
-            guard runtime.matches(gatewayID, generation), !Task.isCancelled else { return }
+            guard runtime.matches(gatewayID, generation), !Task.isCancelled,
+                  await workspaceConnectionIsCurrent(connection, gatewayID: gatewayID) else { return }
 
             if case .available(let commands) = commandEnvelope {
                 runtime.commands = commands
@@ -554,14 +896,16 @@ public extension AppModel {
                     async let worktreesValue = client.gitWorktrees(path: path)
                     let (status, files, branches, worktrees) = try await (
                         statusValue, filesValue, branchesValue, worktreesValue)
-                    if runtime.matches(gatewayID, generation), runtime.gitRequest == gitRequest {
+                    if runtime.matches(gatewayID, generation), runtime.gitRequest == gitRequest,
+                       await workspaceConnectionIsCurrent(connection, gatewayID: gatewayID) {
                         runtime.gitStatus = status
                         runtime.gitFiles = WorkspaceGitMerge.detailed(files, status: status)
                         runtime.gitBranches = branches; runtime.gitWorktrees = worktrees
                         runtime.capability["git"] = true
                     }
                 } catch {
-                    if runtime.matches(gatewayID, generation), runtime.gitRequest == gitRequest {
+                    if runtime.matches(gatewayID, generation), runtime.gitRequest == gitRequest,
+                       await workspaceConnectionIsCurrent(connection, gatewayID: gatewayID) {
                         runtime.gitStatus = nil
                         runtime.gitFiles = []
                         runtime.gitBranches = []; runtime.gitWorktrees = []
@@ -569,9 +913,18 @@ public extension AppModel {
                     }
                 }
             }
+                // This is the final broad-workspace publication.  It happens
+                // before `withWorkspaceProjectAuthority` releases either the
+                // pool slot or lifecycle admission lease.
+                if runtime.matches(route, generation), !Task.isCancelled,
+                   await workspaceConnectionIsCurrent(connection, gatewayID: gatewayID) {
+                    runtime.loading = false
+                }
+            }
         } catch {
             guard runtime.matches(gatewayID, generation), !Task.isCancelled else { return }
             runtime.error = workspaceMessage(error)
+            runtime.loading = false
         }
     }
 
@@ -783,7 +1136,11 @@ public extension AppModel {
 
     func createWorkspaceProject(name: String, root: String) async throws {
         let runtime = WorkspaceRuntime.shared
-        guard let gatewayID = runtime.gatewayID else { throw GatewayRouteError.noRoute }
+        guard let route = runtime.projectRoute else {
+            throw GatewayError(code: 400,
+                               message: "Projects require an exact, known Hermes profile.")
+        }
+        let gatewayID = route.gatewayID
         guard WorkspacePathFence.isRoot(root, in: runtime.fileRoots) else {
             throw GatewayError(code: 400, message: "Hermes did not report this folder as a safe workspace root.")
         }
@@ -793,53 +1150,70 @@ public extension AppModel {
         defer { runtime.releaseMutation(owner) }
         let generation = runtime.generation
         let request = runtime.invalidateGit()
-        let client = try await routedClient(gatewayID: gatewayID)
-        do { _ = try await client.createProject(name: name, folders: [root], primaryPath: root, use: true) }
-        catch {
-            if runtime.matches(gatewayID, generation), workspaceMutationOutcomeIsUncertain(error) {
+        do {
+            _ = try await withWorkspaceProjectAuthority(
+                gatewayID: gatewayID, requestedProfile: route.rawProfile,
+                generation: generation
+            ) { authority in
+                guard authority.route == route else { throw CancellationError() }
+                _ = try await authority.connection.client.createProject(
+                    name: name, folders: [root], primaryPath: root, use: true, in: route
+                )
+                await reconcileProjectsAfterAcceptedMutation(
+                    authority: authority, generation: generation, gitRequest: request
+                )
+            }
+        } catch {
+            if runtime.matches(route, generation), workspaceMutationOutcomeIsUncertain(error) {
                 runtime.projectUncertain = "create project \(name)"
             }
             throw error
         }
-        await reconcileProjectsAfterAcceptedMutation(
-            client: client, gatewayID: gatewayID, generation: generation, gitRequest: request
-        )
     }
 
     func deleteWorkspaceProject(_ project: HermesProject) async throws {
         let runtime = WorkspaceRuntime.shared
-        guard let gatewayID = runtime.gatewayID else { throw GatewayRouteError.noRoute }
+        guard let route = runtime.projectRoute else {
+            throw GatewayError(code: 400,
+                               message: "Projects require an exact, known Hermes profile.")
+        }
+        let gatewayID = route.gatewayID
         guard runtime.projectUncertain.isEmpty, let owner = runtime.claimMutation() else {
             throw GatewayError(code: -80, message: "Wait for the current workspace mutation to finish.")
         }
         defer { runtime.releaseMutation(owner) }
         let generation = runtime.generation
         let request = runtime.invalidateGit()
-        let client = try await routedClient(gatewayID: gatewayID)
-        let listing: HermesProjectListing
-        do { listing = try await client.deleteProject(id: project.id) }
-        catch {
-            if runtime.matches(gatewayID, generation), workspaceMutationOutcomeIsUncertain(error) {
+        do {
+            _ = try await withWorkspaceProjectAuthority(
+                gatewayID: gatewayID, requestedProfile: route.rawProfile,
+                generation: generation
+            ) { authority in
+                guard authority.route == route else { throw CancellationError() }
+                _ = try await authority.connection.client.deleteProject(id: project.id, in: route)
+                await reconcileProjectsAfterAcceptedMutation(
+                    authority: authority, generation: generation, gitRequest: request
+                )
+            }
+        } catch {
+            if runtime.matches(route, generation), workspaceMutationOutcomeIsUncertain(error) {
                 runtime.projectUncertain = "delete project \(project.name)"
             }
             throw error
         }
-        await reconcileProjectsAfterAcceptedMutation(
-            client: client, gatewayID: gatewayID, generation: generation,
-            gitRequest: request, acceptedListing: listing
-        )
     }
 
     func updateWorkspaceProject(_ project: HermesProject, name: String,
                                 description: String) async throws {
-        try await mutateWorkspaceProject(invalidatesGit: false) { client in
-            _ = try await client.updateProject(id: project.id, name: name, description: description)
+        try await mutateWorkspaceProject(invalidatesGit: false) { client, route in
+            _ = try await client.updateProject(id: project.id, name: name, description: description,
+                                               in: route)
         }
     }
 
     func archiveWorkspaceProject(_ project: HermesProject, restore: Bool) async throws {
-        try await mutateWorkspaceProject(invalidatesGit: true) { client in
-            _ = try await client.archiveProject(id: project.id, restore: restore)
+        try await mutateWorkspaceProject(invalidatesGit: true) { client, route in
+            _ = try await client.archiveProject(id: project.id, restore: restore, in: route)
         }
     }
 
@@ -848,14 +1222,14 @@ public extension AppModel {
         guard WorkspacePathFence.isRoot(path, in: runtime.fileRoots) else {
             throw GatewayError(code: 400, message: "Hermes did not report this folder as a safe workspace root.")
         }
-        try await mutateWorkspaceProject(invalidatesGit: true) { client in
-            _ = try await client.addProjectFolder(id: project.id, path: path)
+        try await mutateWorkspaceProject(invalidatesGit: true) { client, route in
+            _ = try await client.addProjectFolder(id: project.id, path: path, in: route)
         }
     }
 
     func removeWorkspaceProjectFolder(_ project: HermesProject, path: String) async throws {
-        try await mutateWorkspaceProject(invalidatesGit: true) { client in
-            _ = try await client.removeProjectFolder(id: project.id, path: path)
+        try await mutateWorkspaceProject(invalidatesGit: true) { client, route in
+            _ = try await client.removeProjectFolder(id: project.id, path: path, in: route)
         }
     }
 
@@ -863,65 +1237,84 @@ public extension AppModel {
         guard project.folders.contains(where: { $0.path == path }) else {
             throw GatewayError(code: 400, message: "Choose a folder already attached to this project.")
         }
-        try await mutateWorkspaceProject(invalidatesGit: true) { client in
-            _ = try await client.setPrimaryProjectFolder(id: project.id, path: path)
+        try await mutateWorkspaceProject(invalidatesGit: true) { client, route in
+            _ = try await client.setPrimaryProjectFolder(id: project.id, path: path, in: route)
         }
     }
 
     private func mutateWorkspaceProject(
         invalidatesGit: Bool,
-        _ operation: @escaping @Sendable (GatewayClient) async throws -> Void
+        _ operation: @escaping @Sendable (GatewayClient, GatewayWorkspaceRoute) async throws -> Void
     ) async throws {
         let runtime = WorkspaceRuntime.shared
-        guard let gatewayID = runtime.gatewayID else { throw GatewayRouteError.noRoute }
+        guard let route = runtime.projectRoute else {
+            throw GatewayError(code: 400,
+                               message: "Projects require an exact, known Hermes profile.")
+        }
+        let gatewayID = route.gatewayID
         guard runtime.projectUncertain.isEmpty, let owner = runtime.claimMutation() else {
             throw GatewayError(code: -80, message: "Wait for the current workspace mutation to finish.")
         }
         defer { runtime.releaseMutation(owner) }
         let generation = runtime.generation
         let request = invalidatesGit ? runtime.invalidateGit() : runtime.gitRequest
-        let client = try await routedClient(gatewayID: gatewayID)
-        do { try await operation(client) }
-        catch {
-            if runtime.matches(gatewayID, generation), workspaceMutationOutcomeIsUncertain(error) {
+        do {
+            _ = try await withWorkspaceProjectAuthority(
+                gatewayID: gatewayID, requestedProfile: route.rawProfile,
+                generation: generation
+            ) { authority in
+                guard authority.route == route else { throw CancellationError() }
+                try await operation(authority.connection.client, route)
+                await reconcileProjectsAfterAcceptedMutation(
+                    authority: authority, generation: generation,
+                    gitRequest: request, hydrateGit: invalidatesGit
+                )
+            }
+        } catch {
+            if runtime.matches(route, generation), workspaceMutationOutcomeIsUncertain(error) {
                 runtime.projectUncertain = "update project"
             }
             throw error
         }
-        guard runtime.matches(gatewayID, generation) else { return }
-        await reconcileProjectsAfterAcceptedMutation(
-            client: client, gatewayID: gatewayID, generation: generation,
-            gitRequest: request, hydrateGit: invalidatesGit
-        )
     }
 
     private func reconcileProjectsAfterAcceptedMutation(
-        client: GatewayClient, gatewayID: String, generation: UInt64,
-        gitRequest: UInt64, acceptedListing: HermesProjectListing? = nil,
+        authority: WorkspaceProjectAuthority, generation: UInt64,
+        gitRequest: UInt64,
         hydrateGit: Bool = true
     ) async {
         let runtime = WorkspaceRuntime.shared
-        guard runtime.matches(gatewayID, generation), runtime.gitRequest == gitRequest else { return }
+        let route = authority.route
+        let client = authority.connection.client
+        guard runtime.matches(route, generation), runtime.gitRequest == gitRequest,
+              await workspaceConnectionIsCurrent(authority.connection,
+                                                  gatewayID: route.gatewayID) else { return }
         // The write is accepted; old rows are no longer authoritative while
         // the follow-up reads are in flight.
         runtime.projects = []; runtime.projectTree = []; runtime.activeProjectID = nil
         runtime.capability["projects"] = false
         runtime.capability["projectActivity"] = false
         do {
-            let listing: HermesProjectListing
-            if let acceptedListing { listing = acceptedListing }
-            else { listing = try await client.projects() }
-            let tree = try await client.allProfileProjectTree()
-            guard runtime.matches(gatewayID, generation), runtime.gitRequest == gitRequest else { return }
-            runtime.projects = listing.projects
-            runtime.activeProjectID = listing.activeID
-            runtime.projectTree = tree
-            runtime.capability["projects"] = true
-            runtime.capability["projectActivity"] = true
+            // The accepted write is a separate operation from the read-back.
+            // Re-read profiles immediately before the snapshot; never treat a
+            // write acknowledgement's listing as authority after a remote
+            // rename/delete could have changed the namespace.
+            let snapshot = try await freshWorkspaceProjectSnapshot(
+                authority, generation: generation
+            )
+            guard runtime.matches(route, generation), runtime.gitRequest == gitRequest,
+                  await workspaceConnectionIsCurrent(authority.connection,
+                                                      gatewayID: route.gatewayID) else { return }
+            guard runtime.publishProjectSnapshot(snapshot, route: route,
+                                                 generation: generation) else { return }
             guard hydrateGit else { return }
 
-            let path = listing.projects.first(where: { $0.id == listing.activeID })?.primaryPath
-                ?? listing.projects.first(where: { $0.id == listing.activeID })?.folders.first?.path
+            let path = snapshot.listing.projects.first(where: {
+                $0.id == snapshot.listing.activeID
+            })?.primaryPath
+                ?? snapshot.listing.projects.first(where: {
+                    $0.id == snapshot.listing.activeID
+                })?.folders.first?.path
                 ?? ""
             runtime.gitPath = path
             guard !path.isEmpty else {
@@ -930,87 +1323,233 @@ public extension AppModel {
             }
             do {
                 try await refreshGitAfterAcceptedMutation(
-                    client: client, gatewayID: gatewayID, generation: generation,
+                    client: client, gatewayID: route.gatewayID, generation: generation,
                     request: gitRequest, path: path
                 )
             } catch {
-                guard runtime.matches(gatewayID, generation), runtime.gitRequest == gitRequest else { return }
+                guard runtime.matches(route, generation), runtime.gitRequest == gitRequest,
+                      await workspaceConnectionIsCurrent(authority.connection,
+                                                          gatewayID: route.gatewayID) else { return }
                 runtime.invalidateGit(path: path)
                 runtime.error = "Project mutation completed, but Git hydration failed: \(workspaceMessage(error))"
             }
         } catch {
-            guard runtime.matches(gatewayID, generation), runtime.gitRequest == gitRequest else { return }
+            guard runtime.matches(route, generation), runtime.gitRequest == gitRequest,
+                  await workspaceConnectionIsCurrent(authority.connection,
+                                                      gatewayID: route.gatewayID) else { return }
             runtime.error = "Project mutation completed, but the authoritative refresh failed: \(workspaceMessage(error))"
         }
     }
 
     func selectProject(_ project: HermesProject) async {
         let runtime = WorkspaceRuntime.shared
-        guard let gatewayID = runtime.gatewayID, runtime.projectUncertain.isEmpty,
+        guard let route = runtime.projectRoute, runtime.projectUncertain.isEmpty,
               !runtime.commandRunning, !runtime.systemActionRunning,
               let owner = runtime.claimMutation() else {
             runtime.error = "Wait for the current workspace mutation before changing projects."
             return
         }
+        let gatewayID = route.gatewayID
         defer { runtime.releaseMutation(owner) }
         let generation = runtime.generation
         let request = runtime.invalidateGit()
-        let client: GatewayClient
         do {
-            client = try await routedClient(gatewayID: gatewayID)
-            let activeID = try await client.setActiveProject(id: project.id)
-            let path = project.primaryPath ?? project.folders.first?.path ?? ""
-            guard runtime.matches(gatewayID, generation), runtime.gitRequest == request else { return }
-            runtime.activeProjectID = activeID; runtime.gitPath = path
-            runtime.error = ""
+            _ = try await withWorkspaceProjectAuthority(
+                gatewayID: gatewayID, requestedProfile: route.rawProfile,
+                generation: generation
+            ) { authority in
+                guard authority.route == route else { throw CancellationError() }
+                let activeID = try await authority.connection.client.setActiveProject(
+                    id: project.id, in: route
+                )
+                // The response can be internally valid yet belong to c1e25's
+                // launch-profile fallback if the selected profile disappeared
+                // while the handler ran. Re-read the exact profile inventory
+                // after the response, under the same pool/lifecycle leases,
+                // before publishing even a single selection-derived field.
+                let postResponseProfiles = try await refreshWorkspaceProjectAuthority(
+                    authority, generation: generation
+                )
+                let provenActiveID = try WorkspaceProjectSelectionProof.validatedActiveID(
+                    activeID, selectedProjectID: project.id, route: route,
+                    postResponseProfiles: postResponseProfiles
+                )
+                let path = project.primaryPath ?? project.folders.first?.path ?? ""
+                guard runtime.matches(route, generation), runtime.gitRequest == request,
+                      await workspaceConnectionIsCurrent(authority.connection,
+                                                          gatewayID: gatewayID) else {
+                    throw CancellationError()
+                }
+                // Publish the accepted selection while the captured pool slot
+                // is still leased. A delayed adoption cannot interleave between
+                // this final fence and the state mutation.
+                runtime.activeProjectID = provenActiveID
+                runtime.gitPath = path
+                runtime.error = ""
+                // `projects.set_active` has already been accepted. Everything
+                // below is read-only reconciliation, but it still publishes
+                // while the same exact pool/lifecycle authority is held.
+                guard !path.isEmpty else {
+                    runtime.capability["git"] = false
+                    return
+                }
+                do {
+                    let client = authority.connection.client
+                    let status = try await client.workspaceGitStatus(path: path)
+                    async let filesValue = client.gitReviewFiles(path: path)
+                    async let branchesValue = client.gitBranches(path: path)
+                    async let worktreesValue = client.gitWorktrees(path: path)
+                    let (files, branches, worktrees) = try await (
+                        filesValue, branchesValue, worktreesValue)
+                    guard runtime.matches(route, generation), runtime.gitRequest == request,
+                          await workspaceConnectionIsCurrent(
+                            authority.connection, gatewayID: gatewayID
+                          ) else { return }
+                    runtime.gitStatus = status
+                    runtime.gitFiles = WorkspaceGitMerge.detailed(files, status: status)
+                    runtime.gitBranches = branches; runtime.gitWorktrees = worktrees
+                    runtime.capability["git"] = true
+                } catch {
+                    guard runtime.matches(route, generation), runtime.gitRequest == request,
+                          await workspaceConnectionIsCurrent(
+                            authority.connection, gatewayID: gatewayID
+                          ) else { return }
+                    runtime.gitStatus = nil; runtime.gitFiles = []
+                    runtime.gitBranches = []; runtime.gitWorktrees = []
+                    runtime.capability["git"] = false
+                    runtime.error = "Project selected, but Git reconciliation failed: \(workspaceMessage(error))"
+                }
+            }
         } catch {
-            guard runtime.matches(gatewayID, generation), runtime.gitRequest == request else { return }
+            guard runtime.matches(route, generation), runtime.gitRequest == request else { return }
             if workspaceMutationOutcomeIsUncertain(error) {
                 runtime.projectUncertain = "select project \(project.name)"
             }
             runtime.error = workspaceMessage(error)
-            return
-        }
-
-        // `projects.set_active` has already been accepted. Everything below is
-        // a read-only reconciliation; its failure must never turn the accepted
-        // selection into an "outcome uncertain" write or cause a replay.
-        let path = runtime.gitPath
-        guard !path.isEmpty else {
-            runtime.capability["git"] = false
-            return
-        }
-        do {
-            let status = try await client.workspaceGitStatus(path: path)
-            async let filesValue = client.gitReviewFiles(path: path)
-            async let branchesValue = client.gitBranches(path: path)
-            async let worktreesValue = client.gitWorktrees(path: path)
-            let (files, branches, worktrees) = try await (filesValue, branchesValue, worktreesValue)
-            guard runtime.matches(gatewayID, generation), runtime.gitRequest == request else { return }
-            runtime.gitStatus = status
-            runtime.gitFiles = WorkspaceGitMerge.detailed(files, status: status)
-            runtime.gitBranches = branches; runtime.gitWorktrees = worktrees
-            runtime.capability["git"] = true
-        } catch {
-            guard runtime.matches(gatewayID, generation), runtime.gitRequest == request else { return }
-            runtime.gitStatus = nil; runtime.gitFiles = []; runtime.gitBranches = []; runtime.gitWorktrees = []
-            runtime.capability["git"] = false
-            runtime.error = "Project selected, but Git reconciliation failed: \(workspaceMessage(error))"
         }
     }
 
-    func loadAuthoritativeWorkspaceProjectSessions(projectID: String) async throws
-        -> HermesProjectTree {
+    private func provenWorkspaceProjectSessions(
+        projectID: String, authority: WorkspaceProjectAuthority, generation: UInt64
+    ) async throws -> HermesProjectTree {
         let runtime = WorkspaceRuntime.shared
-        guard let gatewayID = runtime.gatewayID,
+        let route = authority.route
+        // `project_sessions` lacks the profile-global total and scoped id
+        // witness. Fetch a fresh tree in the same pool/traffic-leased
+        // operation; a cached overview is never drill-in authority.
+        let beforeHydration = try await authority.connection.client.projectTreeProof(in: route)
+        guard runtime.matches(route, generation),
+              await workspaceConnectionIsCurrent(authority.connection,
+                                                  gatewayID: route.gatewayID) else {
+            throw CancellationError()
+        }
+        // Validate after the tree response as well as directly before the next
+        // profile-scoped read. This catches a remote deletion that made c1e25
+        // answer the first request through launch-profile fallback.
+        try await refreshWorkspaceProjectAuthority(authority, generation: generation)
+        let hydrated = try await authority.connection.client.projectSessions(
+            id: projectID, in: route
+        )
+        // The sessions response is not publication authority until the exact
+        // profile is re-proven after handler completion. This same inventory
+        // is also the precondition for the post-hydration tree request.
+        try await refreshWorkspaceProjectAuthority(authority, generation: generation)
+        let afterHydration = try await authority.connection.client.projectTreeProof(in: route)
+        // Final response fence: no tree rows or navigation target are exposed
+        // until profiles.list still contains the exact raw route afterward.
+        try await refreshWorkspaceProjectAuthority(authority, generation: generation)
+        guard runtime.matches(route, generation),
+              await workspaceConnectionIsCurrent(authority.connection,
+                                                  gatewayID: route.gatewayID) else {
+            throw CancellationError()
+        }
+        return try WorkspaceProjectDrillInProof.validate(
+            projectID: projectID, beforeHydration: beforeHydration,
+            afterHydration: afterHydration, hydrated: hydrated
+        )
+    }
+
+    /// The supplied publication executes before the exact source's pool slot
+    /// and profile-lifecycle admission are released.  A source switch can
+    /// therefore close the sheet, but can never receive an old source's rows.
+    func publishAuthoritativeWorkspaceProjectSessions(
+        projectID: String, publish: (HermesProjectTree) -> Void
+    ) async throws {
+        let runtime = WorkspaceRuntime.shared
+        guard let route = runtime.projectRoute,
               runtime.capability["projectActivity"] == true else {
             throw GatewayRouteError.noRoute
         }
         let generation = runtime.generation
-        let project = try await routedClient(gatewayID: gatewayID)
-            .allProfileProjectSessions(id: projectID)
-        guard runtime.matches(gatewayID, generation) else { throw CancellationError() }
-        return project
+        _ = try await withWorkspaceProjectAuthority(
+            gatewayID: route.gatewayID, requestedProfile: route.rawProfile,
+            generation: generation
+        ) { authority in
+            guard authority.route == route else { throw CancellationError() }
+            let hydrated = try await provenWorkspaceProjectSessions(
+                projectID: projectID, authority: authority, generation: generation
+            )
+            guard runtime.matches(route, generation),
+                  await workspaceConnectionIsCurrent(
+                    authority.connection, gatewayID: route.gatewayID
+                  ) else { throw CancellationError() }
+            publish(hydrated)
+        }
+    }
+
+    /// Re-prove the cached row and perform the actual stored-session navigation
+    /// before releasing source/profile/pool authority.  The destination is
+    /// derived from the captured route, never `WorkspaceRuntime.gatewayID`.
+    @discardableResult
+    func openAuthoritativeWorkspaceProjectSession(
+        _ cached: HermesProjectSessionPreview, projectID: String
+    ) async throws -> Bool {
+        let runtime = WorkspaceRuntime.shared
+        guard let route = runtime.projectRoute,
+              runtime.capability["projectActivity"] == true else {
+            throw GatewayRouteError.noRoute
+        }
+        let generation = runtime.generation
+        return try await withWorkspaceProjectAuthority(
+            gatewayID: route.gatewayID, requestedProfile: route.rawProfile,
+            generation: generation
+        ) { authority in
+            guard authority.route == route else { throw CancellationError() }
+            let hydrated = try await provenWorkspaceProjectSessions(
+                projectID: projectID, authority: authority, generation: generation
+            )
+            let current = try WorkspaceProjectDrillInProof.validatedNavigation(
+                cached: cached, in: hydrated
+            )
+            let destination = GatewayBotRoute(
+                gatewayID: authority.route.gatewayID, profile: current.profile
+            )
+            guard destination.profile == authority.route.rawProfile,
+                  runtime.matches(authority.route, generation),
+                  await workspaceConnectionIsCurrent(
+                    authority.connection, gatewayID: authority.route.gatewayID
+                  ) else { throw CancellationError() }
+            guard let botID = unionRosterBots.lazy.map(\.id).first(where: {
+                stateRoute(for: $0) == destination
+            }) else {
+                throw GatewayError(code: 404,
+                                   message: "That project session's profile is no longer in the exact gateway roster.")
+            }
+            // Re-prove immediately before session.resume, then once more from
+            // the exact-source seam after its response and before binding.
+            // Both checks run while this authority's pool/lifecycle leases are
+            // held, and the seam never consults mutable active-gateway state.
+            try await refreshWorkspaceProjectAuthority(authority, generation: generation)
+            return try await openStoredSessionAwaiting(
+                current.storedID, botID: botID, route: destination,
+                client: authority.connection.client,
+                validateBeforeBinding: {
+                    try await self.refreshWorkspaceProjectAuthority(
+                        authority, generation: generation
+                    )
+                }
+            )
+        }
     }
 
     func refreshGit() async {

@@ -148,6 +148,13 @@ public extension AppModel {
         let runtime = MultiGatewayRuntime.shared
         if let existing = runtime.routedEvents[gatewayID],
            ObjectIdentifier(existing.client) == ObjectIdentifier(client) { return }
+        if preserveStateOnReplacement, runtime.routedEvents[gatewayID] != nil {
+            // Some feature lanes deliberately preserve transcript/model state
+            // while swapping a secondary socket. Command prefills and parked
+            // MCP request IDs are process-generation authority, never durable
+            // presentation state, so they must still be purged.
+            dropCommandsScope(gatewayID: gatewayID)
+        }
         if preserveStateOnReplacement || runtime.routedEvents[gatewayID] == nil {
             await removeRoutedEventSubscription(gatewayID: gatewayID)
         } else {
@@ -169,6 +176,8 @@ public extension AppModel {
             for await event in stream {
                 guard let self else { return }
                 self.handle(event: event, sourceGatewayID: gatewayID)
+                await self.handleMCPSetupWireEvent(event, sourceGatewayID: gatewayID,
+                                                   sourceClient: client)
                 self.handleBridgeEvent(event, sourceGatewayID: gatewayID)
                 self.routeToolEvent(event, sourceGatewayID: gatewayID)
                 self.routeSessionEvent(event, sourceGatewayID: gatewayID)
@@ -204,6 +213,7 @@ public extension AppModel {
         // and invalidate selected Operator reads before the pool client is
         // released, so a late status response cannot restore old controls.
         OperatorSettingsRuntime.shared.invalidateConnectionScope()
+        dropCommandsScope(gatewayID: gatewayID)
         dropWorkspaceScope(gatewayID: gatewayID)
         await removeRoutedEventSubscription(gatewayID: gatewayID)
         dropApprovalScope(gatewayID: gatewayID)
@@ -318,7 +328,8 @@ public extension AppModel {
                    handleOverride: handle,
                    remoteSource: BotSource(profile: entry.profile,
                                            gatewayID: entry.gatewayID,
-                                           connectionLabel: entry.connectionLabel))
+                                           connectionLabel: entry.connectionLabel),
+                   rawDisplayName: entry.rawDisplayName)
     }
 
     // MARK: - The @name-device rule, applied to BOTH sides
@@ -442,7 +453,26 @@ public extension AppModel {
     /// bots, so failures render in that bot's chat instead of erasing the
     /// current world.
     func openForeignBot(_ entry: ForeignRosterEntry) async {
+        hydrateForeignCanonicalPin(entry)
+        if let pin = entry.canonicalChatID,
+           let owner = try? await routedClient(gatewayID: entry.gatewayID) {
+            // Prime only the client that enumerated/owns this profile. Sending
+            // a qualified id or a foreign profile name to the primary is a
+            // fork-by-collision bug, not a harmless cache miss.
+            await owner.notePreferredSessions([entry.profile: pin])
+        }
         openChat(botID: entry.id)
+    }
+
+    /// Bring the authenticated secondary roster's canonical identity into the
+    /// source-qualified runtime before `openChat` starts resolution. A local
+    /// pin still waiting for its server echo remains newer authority.
+    func hydrateForeignCanonicalPin(_ entry: ForeignRosterEntry) {
+        guard let pin = entry.canonicalChatID, !pin.isEmpty else { return }
+        let runtime = CanonicalChatRuntime.shared
+        guard !runtime.dirtyPins.contains(entry.id) else { return }
+        runtime.pins[entry.id] = pin
+        runtime.grandfatherCandidates[entry.id] = nil
     }
 
     /// Become a saved gateway, from a roster row rather than the Connections

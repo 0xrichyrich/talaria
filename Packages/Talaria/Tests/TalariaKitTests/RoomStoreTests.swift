@@ -376,7 +376,8 @@ final class RoomStoreTests: XCTestCase {
         var object = try XCTUnwrap(JSONSerialization.jsonObject(
             with: JSONEncoder().encode(room)) as? [String: Any])
         for key in ["formerMembers", "avatar", "threads", "attempts", "drives", "activity",
-                    "memberSessions", "watermarks", "epoch", "needsUser", "updatedAt"] {
+                    "memberSessions", "watermarks", "epoch", "needsUser", "updatedAt",
+                    "sessionTitleIdentityVersion", "legacySessionTitleName"] {
             object.removeValue(forKey: key)
         }
         var entries = try XCTUnwrap(object["entries"] as? [[String: Any]])
@@ -392,6 +393,9 @@ final class RoomStoreTests: XCTestCase {
         let loaded = try await store.loadAll()
         let restored = try XCTUnwrap(loaded.first)
         XCTAssertEqual(restored.id, room.id)
+        XCTAssertEqual(restored.sessionTitleIdentityVersion,
+                       RoomRecord.legacyNameSessionTitleVersion)
+        XCTAssertEqual(restored.legacySessionTitleName, "Legacy wire")
         XCTAssertEqual(restored.entries.first?.attachments, [])
         XCTAssertNotNil(restored.entries.first?.threadID)
         XCTAssertEqual(restored.threads.count, 1)
@@ -401,6 +405,53 @@ final class RoomStoreTests: XCTestCase {
                                    encoding: .utf8)
         XCTAssertTrue(persisted.contains("\"threads\""))
         XCTAssertTrue(persisted.contains("\"attachments\""))
+        XCTAssertTrue(persisted.contains("\"sessionTitleIdentityVersion\""))
+        XCTAssertTrue(persisted.contains("\"legacySessionTitleName\":\"Legacy wire\""))
+    }
+
+    func testLegacySessionTitleMigrationSurvivesDisplayRenameAndReload() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let root = base.appendingPathComponent("Rooms", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let legacy = RoomRecord(name: "Original", members: members(), entries: [])
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(legacy)) as? [String: Any])
+        object.removeValue(forKey: "sessionTitleIdentityVersion")
+        object.removeValue(forKey: "legacySessionTitleName")
+        let envelope: [String: Any] = ["version": RoomStore.schemaVersion, "rooms": [object]]
+        try JSONSerialization.data(withJSONObject: envelope)
+            .write(to: root.appendingPathComponent("rooms-v1.json"))
+
+        let store = RoomStore(baseDirectory: base)
+        let loaded = try await store.loadAll()
+        let decoded = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(decoded.sessionTitleIdentityVersion,
+                       RoomRecord.legacyNameSessionTitleVersion)
+        XCTAssertEqual(decoded.legacySessionTitleName, "Original")
+
+        _ = try await store.mutate(roomID: decoded.id) { room in
+            room.name = "Renamed"
+        }
+        let reloadedValue = try await RoomStore(baseDirectory: base).room(id: decoded.id)
+        let reloaded = try XCTUnwrap(reloadedValue)
+        XCTAssertEqual(reloaded.name, "Renamed")
+        XCTAssertEqual(reloaded.sessionTitleIdentityVersion,
+                       RoomRecord.legacyNameSessionTitleVersion)
+        XCTAssertEqual(reloaded.legacySessionTitleName, "Original")
+    }
+
+    func testNewRoomRecordRoundTripsImmutableSessionTitleIdentity() throws {
+        let room = RoomRecord(name: "Fresh", members: members())
+        XCTAssertEqual(room.sessionTitleIdentityVersion,
+                       RoomRecord.immutableIDSessionTitleVersion)
+        XCTAssertNil(room.legacySessionTitleName)
+
+        let decoded = try JSONDecoder().decode(RoomRecord.self,
+                                               from: JSONEncoder().encode(room))
+        XCTAssertEqual(decoded.sessionTitleIdentityVersion,
+                       RoomRecord.immutableIDSessionTitleVersion)
+        XCTAssertNil(decoded.legacySessionTitleName)
     }
 
     func testMetadataOutboxIsAtomicWithRoomCreateAndDisband() async throws {
@@ -439,7 +490,8 @@ final class RoomStoreTests: XCTestCase {
         let source = GatewayBotRoute(gatewayID: "mini", profile: "old")
         let destination = GatewayBotRoute(gatewayID: "mini", profile: "new")
         let sibling = GatewayBotRoute(gatewayID: "lab", profile: "old")
-        let sourceMember = RoomMember(route: source, handle: "old")
+        let sourceMember = RoomMember(route: source, handle: "old",
+                                      friendlyName: "Research Buddy")
         let siblingMember = RoomMember(route: sibling, handle: "old-lab")
         let thread = RoomThread()
         let attempt = RoomAttempt(threadID: thread.id, member: source, epoch: 1,
@@ -472,6 +524,7 @@ final class RoomStoreTests: XCTestCase {
         let result = try await store.migrateProfileRoute(from: source, to: destination)
         let migrated = try XCTUnwrap(result.rooms.first)
         XCTAssertEqual(migrated.members.map(\.route), [destination, sibling])
+        XCTAssertEqual(migrated.members.first?.friendlyName, "Research Buddy")
         XCTAssertEqual(migrated.entries.first?.memberRoute, destination)
         XCTAssertEqual(migrated.attempts.first?.member, destination)
         XCTAssertEqual(migrated.drives.first?.roundMembers, [destination, sibling])
@@ -489,7 +542,9 @@ final class RoomStoreTests: XCTestCase {
         let fresh = RoomStore(baseDirectory: base)
         let freshOutbox = try await fresh.metadataOutbox()
         XCTAssertEqual(freshOutbox.map(\.route), [destination, sibling])
-        _ = try await fresh.loadAll()
+        let loaded = try await fresh.loadAll()
+        let reloaded = try XCTUnwrap(loaded.first)
+        XCTAssertEqual(reloaded.members.first?.friendlyName, "Research Buddy")
     }
 
     func testProfileRouteRetirementMovesSeatAndSettlesDurableWork() async throws {

@@ -22,11 +22,12 @@ import TalariaTheme
 // reading the tri-state answer.
 //
 // **2. The active-now set.** Desktop's `activeBots` (plugin.js:3831-3839): the
-// bot the gateway is running a turn for, plus every bot whose last message
-// landed inside the 90-second liveness window. Pure, and it follows the
-// roster's own order — presence must never reorder or hide the list beneath
-// it, which is the whole reason the upstream function is written as a filter
-// over the roster rather than a sort of its own.
+// bot the gateway is running a turn for, plus every bot whose conversation
+// landed inside the 90-second liveness window or whose separate worker session
+// is live for 150 seconds. Pure, and it follows the roster's own order —
+// presence must never reorder or hide the list beneath it, which is the whole
+// reason the upstream function is written as a filter over the roster rather
+// than a sort of its own.
 //
 // Re-verified against the live gateway 2026-08-18 (0.20.3): `profiles.list`
 // returns rows keyed `name, path, is_default, model, provider, description,
@@ -35,6 +36,30 @@ import TalariaTheme
 // with a pin naming a session that does not exist. That build has no
 // `preferred_session` handler, so *absent* is the only branch reachable there
 // and it is precisely the branch that must never read as "the pin is dead".
+
+struct CanonicalPinBuckets: Equatable {
+    var primary: [String: String]
+    var routed: [String: [String: String]]
+}
+
+/// Canonical runtime keys are bare only for the primary source. Remote keys
+/// are `gateway::profile` and must never be sent verbatim to the primary
+/// client, where they could become a bogus profile name or resolve a colliding
+/// local row.
+enum CanonicalPinRouting {
+    static func partition(_ pins: [String: String]) -> CanonicalPinBuckets {
+        var primary: [String: String] = [:]
+        var routed: [String: [String: String]] = [:]
+        for (key, storedID) in pins where !storedID.isEmpty {
+            if let route = GatewayBotRoute(qualifiedID: key) {
+                routed[route.gatewayID, default: [:]][route.profile] = storedID
+            } else {
+                primary[key] = storedID
+            }
+        }
+        return CanonicalPinBuckets(primary: primary, routed: routed)
+    }
+}
 
 extension AppModel {
 
@@ -50,10 +75,15 @@ extension AppModel {
     /// nothing and preview the scratch session the birth kickoff just created.
     /// Cheap enough to call on every roster appearance.
     public func syncCanonicalPins() async {
-        guard mode == .live, let client else { return }
-        let pins = CanonicalChatRuntime.shared.pins.filter { !$0.value.isEmpty }
-        guard !pins.isEmpty else { return }
-        await client.notePreferredSessions(pins)
+        guard mode == .live else { return }
+        let buckets = CanonicalPinRouting.partition(CanonicalChatRuntime.shared.pins)
+        if let client, !buckets.primary.isEmpty {
+            await client.notePreferredSessions(buckets.primary)
+        }
+        for (gatewayID, pins) in buckets.routed where !pins.isEmpty {
+            guard let owner = try? await routedClient(gatewayID: gatewayID) else { continue }
+            await owner.notePreferredSessions(pins)
+        }
     }
 
     // The tri-state answer itself is read where it is acted on: `listProfiles`
@@ -78,16 +108,25 @@ extension AppModel {
     ///   per-bot flag instead of guessing from a global gateway state. The
     ///   upstream comment is emphatic that this is *not* "every bot whenever
     ///   the gateway is busy", and the per-bot form cannot drift into that.
-    /// * **inWindow** — `last_session.last_active` within `ACTIVE_WINDOW_S`
-    ///   (90 s). This is the half that catches a cron run, a CLI turn, the
-    ///   laptop, or a bot-to-bot handoff this phone never watched.
+    /// * **inWindow** — freshest conversation activity within 90 s, or a
+    ///   separate `worker_session.last_active` inside Hermes' 150 s worker
+    ///   window. The worker half is display-only liveness: it never enters the
+    ///   rank or unread watermark, which both read conversation activity.
     ///
     /// Output follows `rankedBots`, so the strip reads top-to-bottom in the
     /// same order as the list under it and presence can never reorder that
     /// list. `remoteSource` needs no filter here: Talaria's `bots` are always
     /// the live gateway's own, and foreign rows live in their own section.
     public func activeNowBots(now: Date = .now) -> [Bot] {
-        rankedBots.filter { $0.status == .working || isActiveNow($0.id, now: now) }
+        // Hidden is a display preference, so it does not suppress the worker
+        // poll or unread watermark. It does suppress this visual rail: showing
+        // a hidden bot above the roster would leak the very row the user chose
+        // not to see. Foreign rows are never in `rankedBots` and therefore
+        // remain untouched by this primary-only rule.
+        rankedBots.filter {
+            !isRosterHidden($0.id)
+                && ($0.status == .working || isActiveNow($0.id, now: now))
+        }
     }
 
     /// Just the ids — what a view diffs on to decide whether membership

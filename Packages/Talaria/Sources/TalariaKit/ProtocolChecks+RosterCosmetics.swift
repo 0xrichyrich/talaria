@@ -140,6 +140,20 @@ extension ProtocolChecks {
                    "a present block parses even when it claims only `chat`")
         try expect(BotModeMeta(uiMeta: nil) == nil, "no ui_meta means no block")
 
+        // Roster hide is its own explicit, cross-device boolean. An omitted
+        // key remains the additive default, while unhide must serialize a
+        // literal false rather than delete the key and make its intent
+        // indistinguishable from a legacy row.
+        let hidden = BotModeMeta(uiMeta: .object([
+            "hermes-bots": .object(["hidden": .bool(true)])
+        ]))
+        try expect(hidden?.hidden == true, "hidden:true parses from Bot Mode metadata")
+        let defaultVisibility = BotModeMeta(uiMeta: .object(["hermes-bots": .object([:])]))
+        try expect(defaultVisibility?.hidden == false, "missing hidden defaults false")
+        try expect(BotModeMeta.hiddenProjection(true)["hidden"] == .bool(true)
+                    && BotModeMeta.hiddenProjection(false)["hidden"] == .bool(false),
+                   "hide/unhide projections preserve literal true and false")
+
         // 4. Talaria's own mirror is the second rank, above the hash and below
         //    desktop's block — a bot recolored on the laptop must not keep this
         //    app's older pick.

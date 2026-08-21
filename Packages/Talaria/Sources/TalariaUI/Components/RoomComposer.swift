@@ -9,6 +9,33 @@ import PhotosUI
 import UniformTypeIdentifiers
 #endif
 
+/// Room records predate the shared Bot Mode grammar and retain dotted legacy
+/// handles (for example `research.lead`). The room parser still accepts them,
+/// so completion has a deliberately local trailing-token scanner rather than
+/// borrowing `BotMention.activeToken`, whose global grammar correctly rejects
+/// dots. Keeping this exception here prevents a room from offering an alias
+/// that cannot be edited after its first dot.
+private enum RoomMentionCompletion {
+    static func activeToken(in text: String) -> (range: Range<String.Index>, token: String)? {
+        guard let at = text.lastIndex(of: "@") else { return nil }
+        if at != text.startIndex,
+           !text[text.index(before: at)].isWhitespace {
+            return nil
+        }
+        let body = text[text.index(after: at)...]
+        guard body.allSatisfy(isRoomHandleBody) else { return nil }
+        if let first = body.first, !(first.isASCII && (first.isLetter || first.isNumber)) {
+            return nil
+        }
+        return (at..<text.endIndex, body.lowercased())
+    }
+
+    private static func isRoomHandleBody(_ character: Character) -> Bool {
+        character.isASCII && (character.isLetter || character.isNumber
+            || character == "." || character == "_" || character == "-")
+    }
+}
+
 /// Full-width mobile room composer. Attachments stay visible until the async
 /// send has durably appended the user entry; a failed send never clears the
 /// draft or loses the bytes needed for retry.
@@ -137,20 +164,34 @@ public struct RoomComposer: View {
     }
 
     private var mentionHint: String {
-        let handles = members.prefix(2).map { "@\($0.handle)" }.joined(separator: " ")
+        let handles = members.prefix(2).compactMap {
+            RoomEngine.mentionInsertionTag(for: $0, among: members)
+        }
+            .map { "@\($0)" }.joined(separator: " ")
         return members.count > 2 ? "\(handles) …" : handles
     }
 
     private var mentionToken: String? {
-        guard let token = draft.components(separatedBy: .whitespacesAndNewlines).last,
-              token.hasPrefix("@") else { return nil }
-        return String(token.dropFirst()).lowercased()
+        RoomMentionCompletion.activeToken(in: draft)?.token
     }
 
     private var mentionOptions: [String] {
         guard let token = mentionToken else { return [] }
-        let handles = ["everyone", "all"] + members.map(\.handle)
-        return Array(handles.filter { token.isEmpty || $0.lowercased().hasPrefix(token) }.prefix(6))
+        // Room parsing and completion share RoomEngine's durable claim map:
+        // an option can be found through a legacy handle or friendly raw name,
+        // but only inserts a uniquely claimed friendly slug. A unique legacy
+        // handle is the escape hatch for two seats with the same friendly
+        // name. Reserved all/everyone remain broadcast verbs rather than
+        // becoming a member identity.
+        var options = ["everyone", "all"].filter { token.isEmpty || $0.hasPrefix(token) }
+        for member in RoomEngine.mentionCompletionMembers(for: token, members: members) {
+            guard let insertion = RoomEngine.mentionInsertionTag(for: member, among: members) else {
+                continue
+            }
+            options.append(insertion)
+        }
+        var seen = Set<String>()
+        return Array(options.filter { seen.insert($0).inserted }.prefix(6))
     }
 
     private var mentionSuggestions: some View {
@@ -167,8 +208,8 @@ public struct RoomComposer: View {
     }
 
     private func insertMention(_ handle: String) {
-        guard let range = draft.range(of: #"@[^\s]*$"#, options: .regularExpression) else { return }
-        draft.replaceSubrange(range, with: "@\(handle) ")
+        guard let active = RoomMentionCompletion.activeToken(in: draft) else { return }
+        draft = BotMention.complete(draft, range: active.range, with: handle)
         focused = true
     }
 

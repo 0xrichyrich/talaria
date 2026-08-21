@@ -36,7 +36,8 @@ final class LiveRuntime {
     /// The key is gateway-qualified because two retained Hermes processes may
     /// issue the same request_id at the same time.
     var approvalTargets: [String: ApprovalResponseTarget] = [:]
-    /// bot id → durable stored-session key from profiles.list last_session.
+    /// bot id → durable stored-session key from the roster's freshest
+    /// conversation projection (preferred or raw last session, never worker).
     var lastSessionByBot: [String: String] = [:]
     /// The gateway's default profile — owner of un-namespaced cron jobs and
     /// approvals we cannot attribute.
@@ -359,16 +360,26 @@ extension AppModel {
         let capturedClient = client
         let capturedGeneration = LiveRuntime.shared.generation
         let capturedGatewayID = LiveRuntime.shared.gatewayID
+        let snapshotIssuedAt = Date().timeIntervalSinceReferenceDate
         // Sampled BEFORE the await: any pin written while this poll was in
         // flight makes the block it returns stale, and the merge below reads a
         // missing `chat` key as an authoritative deletion.
         let pinWrites = CanonicalChatRuntime.shared.writeCount
+        // This is the exact primary-source request context. A later roster
+        // answer can contain a response for this pin while a newer server pin
+        // is already visible in its ui_meta; the fold below must never let the
+        // old preferred answer overwrite that newer identity.
+        let requestedPins = CanonicalChatRuntime.shared.pins.filter {
+            GatewayBotRoute(qualifiedID: $0.key) == nil && !$0.value.isEmpty
+        }
+        await capturedClient.notePreferredSessions(requestedPins)
         let profiles = try await capturedClient.listProfiles()
         guard LiveRuntime.shared.generation == capturedGeneration,
               LiveRuntime.shared.gatewayID == capturedGatewayID,
               self.client.map(ObjectIdentifier.init) == ObjectIdentifier(capturedClient)
         else { return }
-        applyRosterAnswer(profiles, pinWrites: pinWrites)
+        applyRosterAnswer(profiles, pinWrites: pinWrites, requestedPins: requestedPins,
+                          snapshotIssuedAt: snapshotIssuedAt)
     }
 
     /// THE roster builder. Every path holding a `profiles.list` answer — the
@@ -385,7 +396,9 @@ extension AppModel {
     /// stored rasters, timestamps flipped absolute → relative, the rows
     /// reordered and an Active Now rail appeared, all on one tick about eight
     /// seconds in. One answer in, one roster out, one instant.
-    func applyRosterAnswer(_ profiles: [HermesProfile], pinWrites: [String: Int]) {
+    func applyRosterAnswer(_ profiles: [HermesProfile], pinWrites: [String: Int],
+                           requestedPins: [String: String] = [:],
+                           snapshotIssuedAt: Double? = nil) {
         let runtime = LiveRuntime.shared
         runtime.defaultBotID = profiles.first(where: \.isDefault)?.name ?? profiles.first?.name
 
@@ -413,8 +426,17 @@ extension AppModel {
         let writing = RosterSignals.shared.writing
 
         bots = profiles.map { profile in
-            if let last = profile.lastSession?.id {
-                runtime.lastSessionByBot[profile.name] = last
+            // Preview identity and activity identity are deliberately distinct
+            // upstream. The resolved preferred session is what a row click
+            // opens and therefore what its text previews; recency/unread use
+            // whichever of preferred and visible last_session is fresher.
+            // worker_session participates in neither durable identity.
+            let previewSession = profile.previewSession
+            let activitySession = profile.freshestConversationSession
+            if let id = activitySession?.id, !id.isEmpty {
+                runtime.lastSessionByBot[profile.name] = id
+            } else {
+                runtime.lastSessionByBot[profile.name] = nil
             }
             let existing = bots.first { $0.id == profile.name }
             // Desktop Bot Mode's own metadata block wins over Talaria's, so a
@@ -433,13 +455,94 @@ extension AppModel {
             // out — is skipped: that answer predates the write, and reading it
             // as a deletion would drop the pin just made.
             let canonical = CanonicalChatRuntime.shared
+            let serverMetaIsAuthoritative = deskMeta != nil
             if let deskMeta {
+                let postdatesSettledWrite = snapshotIssuedAt.map {
+                    $0 >= (canonical.writeStamp[profile.name] ?? .greatestFiniteMagnitude)
+                } ?? false
                 if canonical.dirtyPins.contains(profile.name),
-                   deskMeta.pinnedChat == canonical.pins[profile.name] {
+                   deskMeta.pinnedChat == canonical.pins[profile.name]
+                    || postdatesSettledWrite {
                     canonical.dirtyPins.remove(profile.name)
                 }
-                if !canonical.hasLocalPinWrite(profile.name, since: pinWrites) {
-                    canonical.pins[profile.name] = deskMeta.pinnedChat
+                let localPinWrite = canonical.hasLocalPinWrite(
+                    profile.name, since: pinWrites)
+                if !localPinWrite {
+                    let serverPin = deskMeta.pinnedChat
+                    canonical.pins[profile.name] = serverPin?.isEmpty == false ? serverPin : nil
+                }
+            }
+            let localPinWrite = canonical.hasLocalPinWrite(profile.name, since: pinWrites)
+            // The preferred reply is deliberately tri-state. An omitted field
+            // is how older gateways answer, so it may grandfather the exact
+            // roster conversation only when no canonical identity exists. A
+            // resolved field is a verified canonical target; an explicit null
+            // proves the requested pin is gone and must never fall through to
+            // a newest arbitrary session.
+            switch profile.preferredSession {
+            case .resolved(let preferred):
+                let pinPolicy = CanonicalPinnedSessionPolicy.classify(
+                    profile.preferredSession,
+                    requestedPin: requestedPins[profile.name] ?? preferred.id)
+                if pinPolicy == .emptyNonCanonical {
+                    // A real row with no history and no canonical title is a
+                    // stray draft, not the forever chat. Reject it locally on
+                    // every precise answer; the open path clears server meta
+                    // source-qualifiably and performs exact-title adoption
+                    // before it can mint anything.
+                    // The classification belongs to the request snapshot. It
+                    // may clear only that same pin while it is still current;
+                    // an empty reply for stale A cannot erase a server/local B
+                    // learned while profiles.list was suspended.
+                    if !localPinWrite,
+                       canonical.pins[profile.name] == preferred.id,
+                       requestedPins[profile.name].map({ $0 == preferred.id }) ?? true {
+                        canonical.pins[profile.name] = nil
+                    }
+                } else if !localPinWrite, !serverMetaIsAuthoritative,
+                          !preferred.id.isEmpty {
+                    let current = canonical.pins[profile.name]
+                    let requested = requestedPins[profile.name]
+                    // `preferred_session` describes what this particular
+                    // request asked for. It can feed preview/recency, but it
+                    // cannot replace a different pin learned after the
+                    // request began (from ui_meta or another local action).
+                    if current == nil || current == preferred.id || current == requested {
+                        canonical.pins[profile.name] = preferred.id
+                    }
+                }
+                canonical.grandfatherCandidates[profile.name] = nil
+            case .gone:
+                // Explicit null is definitive only for the exact durable id
+                // sent on this request. Do not turn a stale null for A into a
+                // deletion of a newer local/server pin B.
+                if !localPinWrite, !serverMetaIsAuthoritative,
+                   let requested = requestedPins[profile.name],
+                   canonical.pins[profile.name] == requested {
+                    canonical.pins[profile.name] = nil
+                }
+                canonical.grandfatherCandidates[profile.name] = nil
+            case .notRequested:
+                // A root-title hit is exact Bot Mode identity, including a
+                // compressed leaf whose own title changed. It can safely
+                // become the local durable pin before a tap. Everything else
+                // remains a one-time grandfather candidate from the RAW
+                // last-session summary; never a fresh `session.list` result.
+                if canonical.pins[profile.name] == nil,
+                   profile.rawLastSession?.rootTitle != nil,
+                   let exactCanonical = CanonicalBotChatEvidence.durableID(
+                       in: profile.rawLastSession) {
+                    canonical.pins[profile.name] = exactCanonical
+                    canonical.grandfatherCandidates[profile.name] = nil
+                } else if canonical.pins[profile.name] == nil,
+                          let candidate = CanonicalBotChatEvidence.durableID(
+                            in: profile.rawLastSession) {
+                    // Grandfathering is history continuity, never a recency
+                    // heuristic. Only the exact Bot Chat root/title is safe
+                    // enough to keep as an adoption candidate.
+                    canonical.grandfatherCandidates[profile.name] = candidate
+                } else {
+                    canonical.grandfatherCandidates[profile.name] = nil
                 }
             }
             // `stripPreviewMarkdown` (plugin.js:2991-3007): without it a bot
@@ -447,7 +550,18 @@ extension AppModel {
             // roster. Folded in here because the 10 s poll used to do it in a
             // second pass of its own, and a row's text and its face must land
             // on the same tick.
-            let fresh = (profile.lastSession?.preview).map(Self.flattenPreview) ?? ""
+            let fresh = (previewSession?.preview).map(Self.flattenPreview) ?? ""
+            let hasAuthoritativePreferredPreview: Bool
+            if case .resolved = profile.preferredSession {
+                hasAuthoritativePreferredPreview = true
+            } else {
+                hasAuthoritativePreferredPreview = false
+            }
+            let rowPreview = fresh.isEmpty
+                ? (hasAuthoritativePreferredPreview
+                    ? "Ready when you are."
+                    : (existing?.preview ?? "Ready when you are."))
+                : fresh
             let routedUnread = takeRoutedUnreadForPrimary(profile: profile.name)
             var bot = Bot(
                 id: profile.name,
@@ -457,13 +571,14 @@ extension AppModel {
                 status: .idle,
                 task: existing?.task,
                 minutesElapsed: existing?.minutesElapsed ?? 0,
-                preview: fresh.isEmpty ? (existing?.preview ?? "Ready when you are.") : fresh,
-                previewTime: Self.shortTime(profile.lastSession?.lastActive),
+                preview: rowPreview,
+                previewTime: Self.shortTime(activitySession?.lastActive),
                 unread: max(existing?.unread ?? 0, routedUnread),
                 mentionsYou: existing?.mentionsYou ?? false,
                 description: profile.description,
                 pinnedModel: profile.model,
-                title: deskMeta?.title)
+                title: deskMeta?.title,
+                rawDisplayName: profile.displayName)
             // A look whose write is still in flight keeps the value the user
             // just picked — this answer was composed before it.
             if let existing, writing.contains(profile.name) {
@@ -1091,6 +1206,26 @@ extension AppModel {
         case failed
     }
 
+    /// c1e25 accepts a busy prompt in place as either a steer or redirect.
+    /// Those statuses are as authoritative as streaming/queued and must never
+    /// enter the offline replay path.
+    enum LivePromptSubmitReceipt {
+        static func requireAccepted(_ value: JSONValue, operation: String) throws {
+            if value["ok"]?.boolValue == false
+                || ["error", "rejected", "refused"].contains(
+                    value["status"]?.stringValue ?? "") {
+                throw GatewayError(code: 409,
+                                   message: "Hermes refused \(operation.lowercased()).")
+            }
+            guard let status = value["status"]?.stringValue,
+                  ["streaming", "queued", "steered", "redirected"].contains(status) else {
+                throw AckValidationError(
+                    operation: operation,
+                    detail: "Hermes did not return an accepted prompt status.")
+            }
+        }
+    }
+
     /// Fire-and-forget entry point used by normal compose paths. The actual
     /// work is awaitable so offline flush can remove one queue row only after
     /// that exact operation has settled.
@@ -1169,27 +1304,17 @@ extension AppModel {
             guard owns(sid) else { return retainComposeItem() }
             submitStarted = true
             let receipt = try await client.submitPrompt(sessionID: sid, text: text)
+            // Validate the wire receipt before consulting mutable UI ownership.
+            // If Hermes authoritatively steered/redirected a busy turn and the
+            // view changed in the same instant, replaying this text would run it
+            // twice against a later turn.
+            try LivePromptSubmitReceipt.requireAccepted(receipt, operation: "Prompt")
             guard owns(sid) else {
-                // The gateway may have accepted while the route changed. Do
-                // not append a duplicate queue row or remove the visible
-                // optimistic bubble; authoritative reattach owns recovery.
-                if let storedID = expectedStoredID {
-                    ChatRuntime.shared.offlineComposeFences[operationComposeID] =
-                        OfflineComposeFence(itemID: operationComposeID, botID: botID, text: text,
-                                            route: route, sessionID: sid, storedID: storedID,
-                                            chatID: chatID)
-                }
-                return retainComposeItem()
-            }
-            try PromptSubmitReceipt.requireAccepted(receipt, operation: "Prompt")
-            guard owns(sid) else {
-                if let storedID = expectedStoredID {
-                    ChatRuntime.shared.offlineComposeFences[operationComposeID] =
-                        OfflineComposeFence(itemID: operationComposeID, botID: botID, text: text,
-                                            route: route, sessionID: sid, storedID: storedID,
-                                            chatID: chatID)
-                }
-                return retainComposeItem()
+                // The gateway accepted while the local binding changed. Leave
+                // the optimistic row to transcript reconciliation, but never
+                // enqueue an accepted message for replay.
+                ChatRuntime.shared.offlineComposeFences[operationComposeID] = nil
+                return .accepted
             }
             ChatRuntime.shared.offlineComposeFences[operationComposeID] = nil
             return .accepted

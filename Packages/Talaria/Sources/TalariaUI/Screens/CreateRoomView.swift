@@ -24,6 +24,7 @@ public struct CreateRoomView: View {
         guard !needle.isEmpty else { return model.unionRosterBots }
         return model.unionRosterBots.filter {
             TalariaVoice.displayName(for: $0, model.theme.themeID).lowercased().contains(needle)
+                || ($0.rawDisplayName?.lowercased().contains(needle) ?? false)
                 || $0.handle.lowercased().contains(needle)
                 || ($0.remoteSource?.connectionLabel.lowercased().contains(needle) ?? false)
         }
@@ -72,10 +73,10 @@ public struct CreateRoomView: View {
             guard let route else { return }
             if checked { selected.removeAll { $0.route == route } }
             else if !disabled {
-                selected.append(RoomMember(
-                    route: route, title: TalariaVoice.displayName(for: bot, model.theme.themeID),
-                    handle: bot.handle,
-                    sourceLabel: bot.remoteSource?.connectionLabel ?? model.activeConnectionLabel))
+                selected.append(model.capturedRoomMember(
+                    for: bot, route: route,
+                    sourceLabel: bot.remoteSource?.connectionLabel
+                        ?? model.activeConnectionLabel))
             }
         } label: {
             HStack(spacing: 10) {

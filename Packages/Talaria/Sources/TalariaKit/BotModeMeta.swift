@@ -39,6 +39,10 @@ public struct BotModeMeta: Sendable, Equatable {
     /// A plain boolean that rides ui_meta to every machine, so a laptop pin
     /// pins here too.
     public var pinned: Bool
+    /// Per-profile roster visibility. This is deliberately independent from a
+    /// hidden *session*: hiding a roster row must not remove the bot from
+    /// mention resolution, rooms, unread, or activity polling.
+    public var hidden: Bool
     /// Canonical room memberships. Current Hermes stores an ordered `groups`
     /// array; the older scalar `group` is only a projection of its first item.
     public var groups: [String]
@@ -46,10 +50,10 @@ public struct BotModeMeta: Sendable, Equatable {
     public init(title: String? = nil, shape: String? = nil,
                 colorHex: String? = nil, pinnedChat: String? = nil,
                 imageKind: String? = nil, created: Double? = nil,
-                pinned: Bool = false, groups: [String] = []) {
+                pinned: Bool = false, hidden: Bool = false, groups: [String] = []) {
         self.title = title; self.shape = shape
         self.colorHex = colorHex; self.pinnedChat = pinnedChat
-        self.imageKind = imageKind; self.created = created; self.pinned = pinned
+        self.imageKind = imageKind; self.created = created; self.pinned = pinned; self.hidden = hidden
         self.groups = Self.normalizedGroups(groups)
     }
 
@@ -71,6 +75,7 @@ public struct BotModeMeta: Sendable, Equatable {
         imageKind = block["imageKind"]?.stringValue
         created = block["created"]?.doubleValue
         pinned = block["pinned"]?.boolValue == true
+        hidden = block["hidden"]?.boolValue == true
         // A canonical array is authoritative, including an empty array.
         // Current Hermes falls back to the legacy scalar only when `groups`
         // is absent or not an array (`botGroups`, plugin.js), so malformed
@@ -106,6 +111,13 @@ public struct BotModeMeta: Sendable, Equatable {
             "groups": .array(groups.map(JSONValue.string)),
             "group": groups.first.map(JSONValue.string) ?? .null,
         ]
+    }
+
+    /// Roster visibility patch shape. Unhide must write a literal `false`, not
+    /// omit/delete the key: omission means legacy/default rather than an
+    /// explicit cross-device user choice.
+    public static func hiddenProjection(_ hidden: Bool) -> [String: JSONValue] {
+        ["hidden": .bool(hidden)]
     }
 
     /// Rename a canonical membership without moving its seat in the ordered

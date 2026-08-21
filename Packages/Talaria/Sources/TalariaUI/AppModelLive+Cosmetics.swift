@@ -77,25 +77,38 @@ public enum CosmeticsWrite: Sendable, Equatable {
 public final class RosterSignals {
     public static let shared = RosterSignals()
 
-    /// `ACTIVE_WINDOW_S = 90` (plugin.js:3823) — "active in the last 90s"
-    /// drives the pulse dot and, upstream, the avatar's work pose.
+    /// Conversation activity remains a 90-second presence signal. The newer
+    /// `worker_session` window is kept separately below: a background worker
+    /// can make a row look alive, but it must never become a conversation
+    /// stamp, unread watermark, or ranking key.
     static let activeWindow: TimeInterval = 90
 
-    /// Unix seconds of each bot's newest session activity.
+    /// Unix seconds of each bot's freshest *conversation* activity. This is
+    /// the newer of preferred and last session, never worker activity.
     private(set) var lastActive: [String: Double] = [:]
-    /// The same row's `last_session.preview`, raw. Restated on every answer
-    /// alongside `lastActive` and read by exactly one caller: the opt-in
-    /// activity toast, which needs the words that go with the stamp that moved
-    /// (plugin.js:146). Kept apart from `Bot.preview` — that one is flattened
-    /// for a roster row (`stripPreviewMarkdown`) and can fall back to the
-    /// previous answer's text when this one is empty, neither of which is what
-    /// a notification about THIS delivery should say.
+    /// Unix seconds from the optional worker-session projection. Hermes keeps
+    /// it on its own 150-second live window; it is intentionally absent from
+    /// `activity(of:)` and every unread path.
+    private(set) var workerActive: [String: Double] = [:]
+    /// Keep the typed worker projection as well as its stamp. `isLive` owns
+    /// the future-skew bound; reducing this to a timestamp alone would let a
+    /// wildly future `last_active` hold a row in the rail forever.
+    private(set) var workerSessions: [String: HermesProfile.WorkerSessionRef] = [:]
+    /// Raw preview for the preferred/click identity. This stays aligned with
+    /// the roster row even when a different session is the freshest activity.
     private(set) var previews: [String: String] = [:]
+    /// Raw preview belonging to `lastActive`'s freshest conversation. Activity
+    /// notifications must quote this session, never the older preferred row.
+    private(set) var activityPreviews: [String: String] = [:]
     /// `ui_meta["hermes-bots"].created`, ms epoch (plugin.js:5400).
     private(set) var created: [String: Double] = [:]
     /// `ui_meta["hermes-bots"].pinned` — a plain boolean that rides ui_meta to
     /// every machine, so a laptop pin pins here too.
     private(set) var pinned: Set<String> = []
+    /// Profiles whose Bot Mode metadata has `hidden: true`. This is a roster
+    /// display preference, not session hiding: it never removes the bot from
+    /// the union roster used by rooms or mentions.
+    private(set) var hidden: Set<String> = []
     /// `has_avatar` from the same roster row. Consulting it is what keeps the
     /// first roster paint from firing one `profiles.get_asset` per bot for
     /// faces the gateway has already said do not exist.
@@ -157,9 +170,13 @@ public final class RosterSignals {
         guard next != scope else { return }
         scope = next
         lastActive.removeAll()
+        workerActive.removeAll()
+        workerSessions.removeAll()
         previews.removeAll()
+        activityPreviews.removeAll()
         created.removeAll()
         pinned.removeAll()
+        hidden.removeAll()
         hasAvatar.removeAll()
         imageKind.removeAll()
         entered.removeAll()
@@ -198,21 +215,44 @@ public final class RosterSignals {
                     // (plugin.js:441-470).
                     pinned.remove(profile.name)
                 }
+                if block?.hidden == true {
+                    hidden.insert(profile.name)
+                } else {
+                    // The absence of a truthy bit is the default visible
+                    // state. Unlike a canonical pin, hidden has no legacy
+                    // local authority to retain after a server answer.
+                    hidden.remove(profile.name)
+                }
             }
 
-            // A bot with no `last_session` at all reads 0 here, which is both
-            // "never active" for the liveness window and "can never badge" for
-            // the watermark diff downstream.
-            lastActive[profile.name] = profile.lastSession?.lastActive ?? 0
-            previews[profile.name] = profile.lastSession?.preview ?? ""
+            // Preview follows click identity: a resolved preferred Bot Chat
+            // always supplies the row text. Activity/unread independently use
+            // the fresher of preferred and visible last_session, so a newer
+            // scratch/cron delivery still advances recency without replacing
+            // the forever-chat preview with unrelated text.
+            lastActive[profile.name] = profile.freshestConversationSession?.lastActive ?? 0
+            previews[profile.name] = profile.previewSession?.preview ?? ""
+            activityPreviews[profile.name] =
+                profile.freshestConversationSession?.preview ?? ""
+            if let worker = profile.workerSession {
+                workerSessions[profile.name] = worker
+                workerActive[profile.name] = worker.lastActive ?? 0
+            } else {
+                workerSessions.removeValue(forKey: profile.name)
+                workerActive[profile.name] = 0
+            }
         }
 
         // A profile deleted elsewhere leaves no row to badge or rank.
         lastActive = lastActive.filter { seen.contains($0.key) }
+        workerActive = workerActive.filter { seen.contains($0.key) }
+        workerSessions = workerSessions.filter { seen.contains($0.key) }
         previews = previews.filter { seen.contains($0.key) }
+        activityPreviews = activityPreviews.filter { seen.contains($0.key) }
         created = created.filter { seen.contains($0.key) }
         imageKind = imageKind.filter { seen.contains($0.key) }
         pinned = pinned.intersection(seen)
+        hidden = hidden.intersection(seen)
         hasAvatar = hasAvatar.intersection(seen)
     }
 
@@ -234,19 +274,43 @@ public final class RosterSignals {
 
     func isPinned(_ botID: String) -> Bool { pinned.contains(botID) }
 
+    func isHidden(_ botID: String) -> Bool { hidden.contains(botID) }
+
     func setPinned(_ botID: String, _ on: Bool) {
         if on { pinned.insert(botID) } else { pinned.remove(botID) }
     }
 
-    /// True while the bot's newest activity is inside the 90 s window.
-    func activeNow(_ botID: String, now: Date = .now) -> Bool {
-        guard let ts = lastActive[botID], ts > 0 else { return false }
-        return now.timeIntervalSince1970 - ts < Self.activeWindow
+    func setHidden(_ botID: String, _ on: Bool) {
+        if on { hidden.insert(botID) } else { hidden.remove(botID) }
     }
 
-    func lastActiveDate(_ botID: String) -> Date? {
-        guard let ts = lastActive[botID], ts > 0 else { return nil }
-        return Date(timeIntervalSince1970: ts)
+    /// True while the bot's newest activity is inside the 90 s window.
+    func activeNow(_ botID: String, now: Date = .now) -> Bool {
+        let nowSeconds = now.timeIntervalSince1970
+        let conversationLive: Bool
+        if let ts = lastActive[botID], ts > 0 {
+            conversationLive = nowSeconds - ts < Self.activeWindow
+        } else {
+            conversationLive = false
+        }
+        guard !conversationLive else { return true }
+        guard let worker = workerSessions[botID] else { return false }
+        return worker.isLive(at: nowSeconds)
+    }
+
+    /// Timestamp displayed on the row. Conversation time remains the only
+    /// ranking/unread input, but a currently live worker can make the row read
+    /// as "now" when it is newer. Once its 150 s window expires, it vanishes
+    /// from this presentation projection too.
+    func lastActiveDate(_ botID: String, now: Date = .now) -> Date? {
+        var timestamp = lastActive[botID] ?? 0
+        let nowSeconds = now.timeIntervalSince1970
+        if let worker = workerSessions[botID], worker.isLive(at: nowSeconds),
+           let workerStamp = worker.lastActive, workerStamp > timestamp {
+            timestamp = workerStamp
+        }
+        guard timestamp > 0 else { return nil }
+        return Date(timeIntervalSince1970: timestamp)
     }
 
     func flush() {
@@ -312,9 +376,15 @@ extension AppModel {
         // Sampled before the await for the same reason `refreshRoster` samples
         // it: a pin written while this call was in flight must not be read back
         // out of a staler answer.
+        let snapshotIssuedAt = Date().timeIntervalSinceReferenceDate
         let pinWrites = CanonicalChatRuntime.shared.writeCount
+        let requestedPins = CanonicalChatRuntime.shared.pins.filter {
+            GatewayBotRoute(qualifiedID: $0.key) == nil && !$0.value.isEmpty
+        }
+        await client.notePreferredSessions(requestedPins)
         guard let profiles = try? await client.listProfiles() else { return }
-        applyRosterAnswer(profiles, pinWrites: pinWrites)
+        applyRosterAnswer(profiles, pinWrites: pinWrites, requestedPins: requestedPins,
+                          snapshotIssuedAt: snapshotIssuedAt)
     }
 
     // The unread half of the roster answer lives in AppModelLive+Unread.swift:
@@ -350,6 +420,13 @@ extension AppModel {
 
     public func isPinned(_ botID: String) -> Bool { RosterSignals.shared.isPinned(botID) }
 
+    /// Whether this primary roster row is hidden by Bot Mode metadata. Callers
+    /// that build the union for rooms or @mentions must deliberately *not* use
+    /// this as a membership filter; it is display-only roster state.
+    public func isRosterHidden(_ botID: String) -> Bool {
+        RosterSignals.shared.isHidden(botID)
+    }
+
     public func isActiveNow(_ botID: String, now: Date = .now) -> Bool {
         RosterSignals.shared.activeNow(botID, now: now)
     }
@@ -372,7 +449,7 @@ extension AppModel {
     /// better on a chat roster than a wall clock, and a never-chatted bot gets
     /// nothing at all rather than a placeholder (plugin.js:4011-4016).
     public func rosterTimeLabel(_ botID: String, now: Date = .now) -> String {
-        guard let date = RosterSignals.shared.lastActiveDate(botID) else { return "" }
+        guard let date = RosterSignals.shared.lastActiveDate(botID, now: now) else { return "" }
         let seconds = max(0, now.timeIntervalSince(date))
         switch seconds {
         case ..<60: return "now"
@@ -461,6 +538,24 @@ extension AppModel {
         // that did not land undoes itself: the row sliding back is the message,
         // and it beats a phone that says pinned while the laptop disagrees.
         if outcome == .failed { RosterSignals.shared.setPinned(botID, !pinned) }
+        return outcome
+    }
+
+    /// Desktop's roster Hide/Unhide is a Bot Mode metadata preference, not a
+    /// session mutation.  `false` is intentionally written as a literal: an
+    /// omitted key only means the legacy default and cannot carry an explicit
+    /// unhide to another machine.
+    @discardableResult
+    public func setBotHidden(botID: String, hidden: Bool) async -> CosmeticsWrite {
+        RosterSignals.shared.setHidden(botID, hidden)
+        let outcome = await writeBotModeMeta(
+            botID: botID,
+            patch: BotModeMeta.hiddenProjection(hidden).mapValues { Optional($0) },
+            alsoTalaria: nil)
+        // This surface has no useful local fallback: it is specifically the
+        // cross-device display setting. Avoid stranding a row invisibly hidden
+        // on a gateway that rejected the mutation.
+        if outcome != .persisted { RosterSignals.shared.setHidden(botID, !hidden) }
         return outcome
     }
 

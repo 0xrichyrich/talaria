@@ -12,9 +12,31 @@ enum RosterRoomPolicy {
         room.name.lowercased().contains(needle)
             || room.members.contains { member in
                 (member.title ?? "").lowercased().contains(needle)
+                    || (member.friendlyName ?? "").lowercased().contains(needle)
                     || member.handle.lowercased().contains(needle)
                     || (member.sourceLabel ?? "").lowercased().contains(needle)
             }
+    }
+}
+
+/// Visibility is a view policy, deliberately separate from `RosterSignals`.
+/// A hidden profile still participates in rooms, mentions, unread, and normal
+/// roster ranking; this tiny gate is the sole place the primary list elects
+/// not to paint it until this particular view's Show Hidden state says so.
+enum RosterVisibilityPolicy {
+    static func includesPrimary(hidden: Bool, showingHidden: Bool) -> Bool {
+        !hidden || showingHidden
+    }
+
+    static func rowOpacity(hidden: Bool, showingHidden: Bool) -> Double {
+        hidden && showingHidden ? 0.48 : 1
+    }
+
+    /// Hidden is display-only: unread remains live and needs one visible escape
+    /// hatch on the control that reveals those rows.
+    static func hiddenUnreadCount(bots: [Bot], hiddenIDs: Set<String>) -> Int {
+        bots.lazy.filter { hiddenIDs.contains($0.id) }
+            .reduce(0) { $0 + max(0, $1.unread) }
     }
 }
 
@@ -59,8 +81,8 @@ struct RosterDeleteCandidate: Identifiable, Equatable {
 //     tops the list until someone else gets a message, and the primary bot
 //     competes on recency like everyone else.
 //   * **Two dots, two meanings.** Solid + bigger = you have something to read;
-//     smaller + breathing = active in the last 90 seconds. They coexist and
-//     are never merged.
+//     smaller + breathing = a fresh conversation (90 seconds) or worker
+//     signal (150 seconds). They coexist and are never merged.
 //   * **Presence never reorders.** A bot waking up lights its dot; it does not
 //     move under a thumb mid-tap.
 //   * **Motion.** Idle faces sway (±1.5°); a working face leans into its work,
@@ -79,6 +101,10 @@ public struct RosterView: View {
     /// before this the only way in was to open the bot first.
     @State private var editing: Bot?
     @State private var deleting: RosterDeleteCandidate?
+    /// This is deliberately view-local. Hiding a Bot Mode row is durable
+    /// metadata; choosing to inspect those rows is a momentary roster choice
+    /// and must not follow the user onto another device or another launch.
+    @State private var showHidden = false
     /// The in-place roster filter (plugin.js:7831-7842). Deliberately NOT the
     /// palette's query: the palette is a cross-surface jump (bots, sessions,
     /// artifacts, actions) and replaces the screen, where this narrows the list
@@ -134,6 +160,36 @@ public struct RosterView: View {
         .frame(maxWidth: .infinity)
     }
 
+    /// A roster consisting only of hidden primary rows must not collapse into
+    /// a blank scroll view. This is not the create-first empty state: the
+    /// profiles still exist and their unread/room identities remain live, so
+    /// the only honest action is to reveal them for this view session.
+    private var hiddenOnlyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "eye.slash")
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(theme.faint)
+            Text("Hidden bots")
+                .font(theme.body(15, weight: .semibold))
+                .foregroundStyle(theme.ink)
+            Text("Hidden bots still receive messages and can participate in rooms.")
+                .font(theme.body(12))
+                .foregroundStyle(theme.sub)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 280)
+            Button("Show Hidden") { showHidden = true }
+                .buttonStyle(.plain)
+                .font(theme.body(12, weight: .bold))
+                .foregroundStyle(theme.accent)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(theme.accent.opacity(0.1), in: Capsule())
+                .accessibilityHint(Text("Shows hidden bots only for this roster view"))
+        }
+        .padding(.top, 60)
+        .frame(maxWidth: .infinity)
+    }
+
     private var listGap: CGFloat {
         switch theme.rowStyle {
         case .ledger: 0
@@ -170,8 +226,25 @@ public struct RosterView: View {
     /// filter is applied to the array in the order it is already painted, so
     /// pinned-then-recency survives typing (plugin.js:2961-2962, 7657-7668).
     private var visibleBots: [Bot] {
-        model.rankedBots.filterBots(needle: needle,
-                                    connectionLabel: model.activeConnectionLabel)
+        let narrowed = model.rankedBots.filterBots(
+            needle: needle, connectionLabel: model.activeConnectionLabel)
+        guard !showHidden else { return narrowed }
+        // Primary Bot Mode metadata affects only these primary display rows.
+        // Do not apply it to rooms, foreign rows, or the union that supplies
+        // mention resolution: a hidden profile remains a participant there.
+        return narrowed.filter {
+            RosterVisibilityPolicy.includesPrimary(hidden: model.isRosterHidden($0.id),
+                                                   showingHidden: showHidden)
+        }
+    }
+
+    private var hiddenBotCount: Int {
+        model.bots.lazy.filter { model.isRosterHidden($0.id) }.count
+    }
+
+    private var hiddenUnreadCount: Int {
+        let hidden = Set(model.bots.lazy.filter { model.isRosterHidden($0.id) }.map(\.id))
+        return RosterVisibilityPolicy.hiddenUnreadCount(bots: model.bots, hiddenIDs: hidden)
     }
 
     private var visibleRooms: [RoomRecord] {
@@ -232,6 +305,11 @@ public struct RosterView: View {
         isSearching && visibleBots.isEmpty && visibleForeign.isEmpty && visibleRooms.isEmpty
     }
 
+    private var showsOnlyHiddenPrimary: Bool {
+        !isSearching && !showHidden && hiddenBotCount > 0
+            && visibleBots.isEmpty && visibleForeign.isEmpty && visibleRooms.isEmpty
+    }
+
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScreenHeader(theme: theme, kicker: copy.kickerHome, title: copy.titleHome) {
@@ -267,12 +345,20 @@ public struct RosterView: View {
                                                    isSearching: isSearching) {
                         emptyState
                             .padding(.top, 60)
+                    } else if showsOnlyHiddenPrimary {
+                        hiddenOnlyState
                     } else {
                         let ranked = visibleHomeItems
                         ForEach(Array(ranked.enumerated()), id: \.element.id) { index, item in
                             switch item {
                             case .bot(let bot):
                                 row(for: bot, index: index)
+                                    // Showing hidden is an inspection state,
+                                    // not an unhide. Keep those rows visibly
+                                    // secondary while their server metadata
+                                    // remains `hidden: true`.
+                                    .opacity(RosterVisibilityPolicy.rowOpacity(
+                                        hidden: model.isRosterHidden(bot.id), showingHidden: showHidden))
                                     // Keyed by id, never by index: the entrance is
                                     // arrival, and a re-rank must not replay it.
                                     .modifier(RosterEntrance(botID: bot.id,
@@ -315,9 +401,10 @@ public struct RosterView: View {
         .background(theme.bg)
         // The second clause of the work-pose rule (plugin.js:3852-3856). The
         // faces below can see `Bot.status == .working` — a turn THIS app
-        // watched start — but not the 90 s liveness window, which is the only
-        // way a cron run, the laptop or the CLI ever reaches an avatar; it
-        // lives in `AppModel`, which `TalariaTheme` cannot import. Without
+        // watched start — but not the conversation/worker liveness windows,
+        // which are the only way a cron run, the laptop or the CLI ever
+        // reaches an avatar; they live in `AppModel`, which `TalariaTheme`
+        // cannot import. Without
         // this line `talariaLiveBots` keeps its empty default and the whole
         // second clause is inert: the row's sway and its 6 pt dot say "alive"
         // while the face beside them stares idle.
@@ -456,6 +543,27 @@ public struct RosterView: View {
             HeaderIconButton(theme: theme, action: { model.requestSettings() }) { settingsGlyph }
                 .accessibilityLabel(Text("Settings"))
             HeaderIconButton(theme: theme, action: onSearch) { searchGlyph }
+            if hiddenBotCount > 0 {
+                HeaderIconButton(theme: theme, action: { showHidden.toggle() }) {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: showHidden ? "eye.slash" : "eye")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(theme.ink)
+                        if hiddenUnreadCount > 0 {
+                            Circle()
+                                .fill(theme.accent)
+                                .frame(width: 6, height: 6)
+                                .offset(x: 4, y: -4)
+                                .accessibilityHidden(true)
+                        }
+                    }
+                }
+                .accessibilityLabel(Text(hiddenUnreadCount > 0
+                    ? "\(showHidden ? "Hide Hidden" : "Show Hidden"), \(hiddenUnreadCount) unread"
+                    : (showHidden ? "Hide Hidden" : "Show Hidden")))
+                .accessibilityHint(Text("Does not change hidden bot settings"))
+                .accessibilityAddTraits(showHidden ? .isSelected : [])
+            }
             netChip
             plusButton
         }
@@ -836,6 +944,7 @@ public struct RosterView: View {
     /// session sidebar.
     @ViewBuilder private func rowMenu(for bot: Bot) -> some View {
         let pinned = model.isPinned(bot.id)
+        let hidden = model.isRosterHidden(bot.id)
         Button {
             Task { await model.pinBotWithFeedback(botID: bot.id, pinned: !pinned) }
         } label: {
@@ -846,6 +955,11 @@ public struct RosterView: View {
             NotificationCenter.default.post(name: .talariaOpenSessions, object: bot.id)
         } label: {
             Label(CopyPack.rosterSessions(theme.id), systemImage: "clock.arrow.circlepath")
+        }
+        Button {
+            Task { _ = await model.setBotHidden(botID: bot.id, hidden: !hidden) }
+        } label: {
+            Label(hidden ? "Unhide" : "Hide", systemImage: hidden ? "eye" : "eye.slash")
         }
         Button {
             editing = bot

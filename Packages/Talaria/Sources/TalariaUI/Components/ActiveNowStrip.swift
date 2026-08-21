@@ -11,9 +11,10 @@ import AppKit
 // ── "Active now" ─────────────────────────────────────────────────────────────
 //
 // A rail of small faces above the roster for the bots that are working right
-// now: the ones mid-turn, plus anything whose last message landed inside the
-// 90-second liveness window (`AppModel.activeNowBots`, desktop's `activeBots`
-// at plugin.js:3831-3839). Each face opens that bot's canonical chat by the
+// now: the ones mid-turn, plus a fresh conversation (90 seconds) or an
+// independently fresh worker-session signal (150 seconds). The worker signal
+// reaches this visual rail only; it never changes conversation recency,
+// unread state, or roster order. Each face opens that bot's canonical chat by the
 // same door a roster row uses.
 //
 // Three rules carried over from `ActiveNowStrip` (plugin.js:6888-6937), and
@@ -26,7 +27,7 @@ import AppKit
 //    the list, and its own order is `rankedBots` order, so the rail and the
 //    list read the same way top-to-bottom. A bot waking up lights up in place;
 //    nothing moves under a thumb mid-tap.
-// 3. **Additive.** It layers over the row-level signals (the pulsing 90 s dot,
+// 3. **Additive.** It layers over the row-level signals (the pulsing live dot,
 //    the working ring) rather than replacing them — the row answers "is this
 //    one alive", the rail answers "who is alive at all", which is the question
 //    you have when you come back to the phone after ten minutes away.
@@ -60,7 +61,7 @@ public struct ActiveNowStrip: View {
         VStack(spacing: 0) {
             if !active.isEmpty {
                 // Membership has to decay on its own once the strip is
-                // populated: nothing about a bot *changes* when its 90 s
+                // populated: nothing about a bot *changes* when its live
                 // window closes, so without a tick the last face would sit
                 // there until the next roster answer happened to land. The
                 // driver exists only while the strip does, which keeps the

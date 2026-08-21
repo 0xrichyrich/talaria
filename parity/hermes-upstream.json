@@ -2,29 +2,29 @@
   "schemaVersion": 1,
   "repository": "https://github.com/nousresearch/hermes-agent.git",
   "ref": "HEAD",
-  "commit": "b5455fdd16fe608214f91149233660e1836b067c",
-  "auditedAt": "2026-08-19",
-  "talariaBaseline": "1c4d04f547dad1e045efa4ecf6fa65f1cd890e8e",
+  "commit": "c1e25cadffe539b058816be5fdfc9127d7199fa4",
+  "auditedAt": "2026-08-20",
+  "talariaBaseline": "9c9015644cb57883dda49c5d709779ec0f50414b",
   "authorityFiles": [
     {
       "path": "apps/desktop/src/plugins/hermes-bots/plugin.js",
-      "sha256": "6f5192d4022ab557208052ddb5b61b00487ab7bc081e3ac7790b17271951c8f1"
+      "sha256": "400a731d5263ef47927bcb261560fb626d7e285299c8a532319b73c5a5f9df22"
     },
     {
       "path": "website/docs/user-guide/bot-mode.md",
-      "sha256": "d0c9bf1d46fdb80adb5db0d069f6754f31dc9250b38befa69cb99ce3866cd701"
+      "sha256": "d13ab467217d464cb7403c2cde6258fa560bc8b6550c09c5b735511a48fa3848"
     },
     {
       "path": "website/docs/user-guide/desktop.md",
-      "sha256": "99a1f60777ca70d5353cd4355544ac7d9a4adfc2b75117b4797876af1fed45c5"
+      "sha256": "0d69317f4b78160b5f747acbca8267e4a8025ebd2153d1c2e133d8b85d0e3e9c"
     },
     {
       "path": "website/docs/user-guide/multi-connection-desktop.md",
-      "sha256": "83b7a0046661eceaf550eb53ee9f1a0dd8eec1acce5019755e7ceecaf700a67c"
+      "sha256": "ef5cb45bee0ace82bcad61f8a94db00ea6ec95bc56218b434ed7e28bd09ec422"
     },
     {
       "path": "apps/desktop/DESIGN.md",
-      "sha256": "27d7c123ba9e8dc18c6dde94df360309357788705cd4de88b241b679a4bd11b2"
+      "sha256": "5967f00ea0b44928c6f88736658e9d3d2bf6ad9fdd790cb3fa635910c5d1c27d"
     }
   ]
 }

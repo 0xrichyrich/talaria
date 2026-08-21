@@ -106,6 +106,10 @@ public struct ChatView: View {
     private var botColor: Color { theme.color(for: bot.hue) }
     private var chat: ChatState? { model.chats[botID] }
     private var messages: [ChatMessage] { chat?.messages ?? [] }
+    private var pendingSlashPrefill: SlashPrefillBinding? {
+        guard let route = model.stateRoute(for: botID) ?? model.gatewayRoute(for: botID) else { return nil }
+        return CommandsRuntime.shared.slashPrefills[route]
+    }
 
     /// A turn is in flight: the send button is a stop control and typed text
     /// steers instead of submitting.
@@ -156,7 +160,10 @@ public struct ChatView: View {
             // background bots keep their chips; this is the safety net for a
             // chat opened before that ran.
             model.attachChatEventRouter()
+            consumeSlashPrefillIfSafe()
         }
+        .onChange(of: pendingSlashPrefill) { _, _ in consumeSlashPrefillIfSafe() }
+        .onChange(of: draft) { _, _ in consumeSlashPrefillIfSafe() }
         .confirmationDialog(copy.rewindConfirmTitle(theme.id),
                             isPresented: Binding(
                                 get: { pendingRestore != nil },
@@ -174,6 +181,43 @@ public struct ChatView: View {
         } message: {
             Text(copy.rewindConfirmMessage(theme.id))
         }
+    }
+
+    /// `slash.exec` can return a prefill after this view has been replaced or
+    /// after the user has started typing. Consume only for this selected,
+    /// current chat and never replace a nonempty draft; the source-qualified
+    /// runtime entry remains recoverable until a later safe opportunity.
+    private func consumeSlashPrefillIfSafe() {
+        guard let binding = pendingSlashPrefill,
+              let currentChat = chat,
+              let route = model.stateRoute(for: botID) ?? model.gatewayRoute(for: botID)
+        else { return }
+        let connectionGeneration = CommandsRuntime.shared
+            .connectionGenerations[route.gatewayID]
+        guard SlashPrefillPolicy.identityMatches(
+            binding, currentRoute: route,
+            currentConnectionGeneration: connectionGeneration,
+            currentChatID: ObjectIdentifier(currentChat),
+            currentStoredID: currentChat.storedSessionID,
+            currentRuntimeID: currentChat.sessionID) else {
+            if CommandsRuntime.shared.slashPrefills[route] == binding {
+                CommandsRuntime.shared.slashPrefills.removeValue(forKey: route)
+            }
+            return
+        }
+        guard
+              SlashPrefillPolicy.mayApply(
+                binding, draft: draft, selectedBotID: model.openBotID,
+                currentRoute: route,
+                currentConnectionGeneration: connectionGeneration,
+                currentChatID: ObjectIdentifier(currentChat),
+                currentStoredID: currentChat.storedSessionID,
+                currentRuntimeID: currentChat.sessionID),
+              let prefill = model.takeSlashPrefill(for: botID, chat: currentChat,
+                                                   draft: draft) else { return }
+        draft = prefill
+        editingMessage = nil
+        composerFocused = true
     }
 
     /// Demo bots without history open on their roster preview, like the

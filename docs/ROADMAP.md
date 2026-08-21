@@ -209,15 +209,24 @@ correct *with* one.
 
 ---
 
-## Never (the mobile ceiling)
+## Mobile ceiling and mobile equivalents
 
-From the audit's 189 n/a-mobile rows — recorded so nobody re-opens them:
-embedded shell/PTY terminals, HUD/quick-entry/pet-overlay windows, global
-shortcuts, git operations, external-terminal launch, find-in-page,
-auto-update, local backend spawning, VS Code theme import. iOS has no
-`fork`/`exec` and no multi-window desktop; where an analogue exists (Shortcuts
-for automation, share sheet for export) it is named in
-[PARITY.md](../PARITY.md#mobile-ceiling).
+The current Hermes gateway changed this boundary. iOS still cannot `fork` or
+`exec` a local shell, launch a desktop terminal emulator, reveal files in
+Finder/Explorer, replace its own signed binary, install VS Code themes, or
+reproduce Electron HUD/always-on-top/titlebar behavior. Those remain genuinely
+desktop-local.
+
+Remote operator capabilities are **not** n/a merely because their Desktop UI
+is local. Hermes `c1e25cad` exposes an authenticated `/api/pty` WebSocket with
+profile/session binding, opaque reattach tokens, bounded replay, resize, and
+native TUI approvals; a mobile advanced terminal is therefore portable. The
+gateway also exposes guarded Git, Projects, Files, and maintenance APIs. iOS
+must present those as source-qualified remote controls with explicit safety
+boundaries, while App Store/TestFlight—not Hermes—owns Talaria app updates.
+
+The remaining true exceptions and their closest mobile equivalents are tracked
+row by row in [PARITY.md](../PARITY.md#mobile-ceiling).
 
 ---
 

@@ -14,13 +14,10 @@ public struct HermesProfile: Sendable, Identifiable {
     public var provider: String?
     public var description: String?
     public var skillCount: Int
-    /// The row summary a roster paints. Identity and stamps stay
-    /// `last_session`'s — liveness, ranking and the row timestamp are
-    /// last_session semantics by design (plugin.js:3852-3858: *any* recent
-    /// activity, from any client, means the bot is alive) — while the preview
-    /// text comes from the resolved canonical-chat pin when the gateway
-    /// answered one. See `foldingCanonicalPreview()`; `rawLastSession` keeps
-    /// the untouched wire value.
+    /// Compatibility projection for older callers. New roster policy keeps
+    /// preview identity (`previewSession`) separate from activity/unread
+    /// identity (`freshestConversationSession`). `rawLastSession` keeps the
+    /// untouched wire value for callers that need to distinguish the inputs.
     public var lastSession: ProfileSessionRef?
     /// `last_session` exactly as the gateway sent it, before any preview fold.
     public var rawLastSession: ProfileSessionRef?
@@ -28,6 +25,14 @@ public struct HermesProfile: Sendable, Identifiable {
     /// session this client asked about (its canonical-chat pin), as opposed to
     /// `last_session`'s "whatever is newest".
     public var preferredSession: PreferredSession
+    /// The worker's live turn, deliberately separate from conversation
+    /// activity. A fresh worker can animate an already-visible row, but it
+    /// must never advance unread watermarks or reorder the roster.
+    public var workerSession: WorkerSessionRef?
+    /// The raw core profile `display_name`. It is identity input for friendly
+    /// mentions, not the visual Bot Mode title and therefore must not be
+    /// reconstructed from a rendered roster label.
+    public var displayName: String?
     public var uiMeta: JSONValue?
     public var hasAvatar: Bool
 
@@ -39,21 +44,76 @@ public struct HermesProfile: Sendable, Identifiable {
         /// nil. `id` stays the caller's durable pin, which is why a compaction
         /// on the laptop does not orphan a phone's pin.
         public var resolvedID: String?
+        /// The lineage root's title. A compressed tip can have its own title,
+        /// so canonical-session checks use this when it is present rather than
+        /// guessing from the leaf title.
+        public var rootTitle: String?
         public var title: String?
         public var preview: String?
         public var startedAt: Double?
         public var lastActive: Double?
         public var messageCount: Int
 
+        /// The exact Bot Mode plumbing identity. A compressed tip may have a
+        /// renamed leaf, so an authoritative root title wins when present.
+        public var isCanonicalBotChat: Bool {
+            let trimmedRoot = rootTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Some gateway/store combinations serialize an absent root as an
+            // empty string. Empty is not authoritative evidence: treat it as
+            // absent so a legacy exact leaf title can still prove Bot Chat.
+            let root = trimmedRoot?.isEmpty == false ? trimmedRoot : nil
+            let trimmedLeaf = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let leaf = trimmedLeaf?.isEmpty == false ? trimmedLeaf : nil
+            return root == "Bot Chat" || (root == nil && leaf == "Bot Chat")
+        }
+
+        /// A resolved pin with history is durable user intent even when its
+        /// title drifted. Only an empty, non-Bot-Chat target is a stray draft.
+        public var isViableCanonicalPin: Bool {
+            isCanonicalBotChat || messageCount > 0
+        }
+
         init?(_ v: JSONValue?) {
             guard let id = v?["id"]?.stringValue else { return nil }
             self.id = id
             resolvedID = v?["resolved_id"]?.stringValue
+            rootTitle = v?["root_title"]?.stringValue
             title = v?["title"]?.stringValue
             preview = v?["preview"]?.stringValue
             startedAt = v?["started_at"]?.doubleValue
             lastActive = v?["last_active"]?.doubleValue
             messageCount = v?["message_count"]?.intValue ?? 0
+        }
+    }
+
+    /// Minimal worker-session data from `profiles.list`. Unlike a conversation
+    /// summary, a worker update is useful even when a gateway omits its id, so
+    /// it intentionally does not reuse `ProfileSessionRef`'s id-required
+    /// parser. The timestamp is policy data only: consumers use it for the
+    /// 150-second live window and never for unread or ranking.
+    public struct WorkerSessionRef: Sendable, Equatable {
+        public static let liveWindow: TimeInterval = 150
+
+        public var id: String?
+        public var lastActive: Double?
+
+        init?(_ v: JSONValue?) {
+            guard let object = v?.objectValue else { return nil }
+            id = object["id"]?.stringValue ?? object["session_id"]?.stringValue
+            lastActive = object["last_active"]?.doubleValue
+            // An arbitrary object is not evidence of a live worker. Preserve
+            // a valid partial answer (timestamp without id) but reject a
+            // shape with no usable worker identity or activity at all.
+            guard id != nil || lastActive != nil else { return nil }
+        }
+
+        /// Whether the worker is still inside Hermes' live-turn window. A
+        /// small future skew is tolerated, but an arbitrarily future timestamp
+        /// is not allowed to hold a row live forever; malformed/missing stamps
+        /// are never promoted into liveness.
+        public func isLive(at now: Double, within window: TimeInterval = liveWindow) -> Bool {
+            guard let lastActive, window >= 0 else { return false }
+            return abs(now - lastActive) <= window
         }
     }
 
@@ -87,6 +147,15 @@ public struct HermesProfile: Sendable, Identifiable {
             return nil
         }
 
+        /// The gateway omitted the key entirely. This is an inconclusive
+        /// compatibility answer, never permission to clear or replace a
+        /// durable pin. `notRequested` remains the source-compatible case
+        /// spelling; this property names its wire meaning directly.
+        public var isOmitted: Bool {
+            if case .notRequested = self { return true }
+            return false
+        }
+
         /// True only when a gateway that speaks the contract said so. An older
         /// gateway can never produce this, which is what keeps a pin alive
         /// across a downgrade.
@@ -110,35 +179,55 @@ public struct HermesProfile: Sendable, Identifiable {
         case .none: preferredSession = .notRequested
         case .some(.null): preferredSession = .gone
         case .some(let node): preferredSession = ProfileSessionRef(node).map(
-            PreferredSession.resolved) ?? .gone
+            PreferredSession.resolved) ?? .notRequested
         }
+        workerSession = WorkerSessionRef(v["worker_session"])
+        displayName = v["display_name"]?.stringValue
         uiMeta = v["ui_meta"]
         hasAvatar = v["has_avatar"]?.boolValue ?? false
     }
 
-    /// Desktop's `previewSession = bot.preferred_session || last`
-    /// (plugin.js:3867), applied at the one door every roster caller comes
-    /// through so the preview and the tap describe the same conversation
-    /// (hermes-agent#88200).
+    /// The session whose text a roster row previews. The preferred session is
+    /// the click identity and therefore wins even when an unrelated visible
+    /// scratch conversation is newer. Older gateways simply omit it and fall
+    /// back to `last_session`.
+    public var previewSession: ProfileSessionRef? {
+        preferredSession.session ?? rawLastSession ?? lastSession
+    }
+
+    /// The conversation activity source for unread, recency, liveness, and
+    /// ordinary relative-age policy. Hermes may return a pinned/preferred
+    /// session which is newer than `last_session`; activity chooses the fresher
+    /// of both while preview remains anchored to the preferred click identity.
     ///
-    /// Only the *text* moves. The row keeps `last_session`'s id, stamps and
-    /// message count because that is what the 90 s liveness window, the
-    /// recency ranking and the relative timestamp are built on — a bot that
-    /// just spoke in a scratch session is still awake. The one exception is a
-    /// profile with no `last_session` at all (a locked state.db, or a bot
-    /// whose only conversation is its hidden forever chat, which
-    /// `_latest_profile_session_row` cannot see): there the pin is the only
-    /// conversation the row knows about, and previewing it beats an empty row.
-    func foldingCanonicalPreview() -> HermesProfile {
-        guard let pinned = preferredSession.session else { return self }
-        var folded = self
-        guard var row = lastSession else {
-            folded.lastSession = pinned
-            return folded
+    /// This is pure. `rawLastSession` remains exactly what the wire carried,
+    /// while `lastSession` is retained as a compatibility projection by
+    /// `foldingCanonicalPreview()`.
+    public var freshestConversationSession: ProfileSessionRef? {
+        let last = rawLastSession ?? lastSession
+        let preferred = preferredSession.session
+        switch (preferred, last) {
+        case (nil, nil): return nil
+        case (let session?, nil): return session
+        case (nil, let session?): return session
+        case (let preferred?, let last?):
+            switch (preferred.lastActive, last.lastActive) {
+            case (let preferredStamp?, let lastStamp?):
+                return preferredStamp >= lastStamp ? preferred : last
+            case (.some, .none): return preferred
+            case (.none, .some): return last
+            case (.none, .none): return preferred
+            }
         }
-        if let preview = pinned.preview, !preview.isEmpty { row.preview = preview }
-        if let title = pinned.title, !title.isEmpty { row.title = title }
-        folded.lastSession = row
+    }
+
+    /// Compatibility projection for older preview call sites. It folds the
+    /// whole preferred row rather than splicing only its text into another
+    /// session's identity/stamp. Activity policy reads
+    /// `freshestConversationSession` directly.
+    func foldingCanonicalPreview() -> HermesProfile {
+        var folded = self
+        folded.lastSession = previewSession
         return folded
     }
 }

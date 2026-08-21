@@ -249,7 +249,12 @@ extension AppModel {
         for botID in moved {
             guard let index = bots.firstIndex(where: { $0.id == botID }) else { continue }
             if bots[index].unread == 0 { bots[index].unread = 1 }
-            if announcing { announceActivity(botID) }
+            // A hidden Bot Mode row still gets its durable unread badge — it
+            // may be unhidden later, opened through a room, or read on another
+            // client — but it must not leak activity through a toast while the
+            // user has chosen to keep it off the primary roster. Foreign rows
+            // never enter this primary-only path.
+            if announcing, !isRosterHidden(botID) { announceActivity(botID) }
         }
     }
 
@@ -362,7 +367,7 @@ extension AppModel {
         // The RAW preview, not `Bot.preview`: that one is flattened for a roster
         // row and falls back to the previous answer's text when this answer has
         // none, so it would put stale words in a notification about new ones.
-        let preview = RosterSignals.shared.previews[botID] ?? ""
+        let preview = RosterSignals.shared.activityPreviews[botID] ?? ""
         toast(kind: .info,
               title: ActivityNotice.isInbound(preview)
                   ? copy.activityToastInbound(label, themeID)
@@ -377,12 +382,13 @@ extension AppModel {
         let themeID = theme.themeID
         let botID = route.qualifiedID
         let label = botName(botID, themeID)
+        let preview = row.activityPreview ?? row.preview
         toast(kind: .info,
-              title: ActivityNotice.isInbound(row.preview)
+              title: ActivityNotice.isInbound(preview)
                   ? copy.activityToastInbound(label, themeID)
                   : copy.activityToastGeneric(label, themeID),
               message: ActivityNotice.body(
-                row.preview, fallback: copy.activityToastNoPreview(themeID)),
+                preview, fallback: copy.activityToastNoPreview(themeID)),
               botID: botID, ledger: false)
     }
 

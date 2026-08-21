@@ -81,6 +81,11 @@ public struct Bot: Identifiable, Codable, Sendable, Equatable {
     /// (`ui_meta["hermes-bots"].title`). Shared with desktop so a bot renamed
     /// there reads the same here.
     public var title: String?
+    /// Raw core-profile `display_name` from `profiles.list`. This is kept
+    /// distinct from `title`: the latter is Bot Mode metadata and can be
+    /// locally retained across a stale poll, while this is the gateway's own
+    /// identity input for friendly mentions.
+    public var rawDisplayName: String?
     /// Explicit @handle when the roster precomputed one (multi-gateway rosters
     /// disambiguate duplicates as `name-device`).
     public var handleOverride: String?
@@ -95,13 +100,14 @@ public struct Bot: Identifiable, Codable, Sendable, Equatable {
                 preview: String = "", previewTime: String = "", unread: Int = 0,
                 mentionsYou: Bool = false, description: String? = nil, pinnedModel: String? = nil,
                 title: String? = nil, handleOverride: String? = nil,
-                remoteSource: BotSource? = nil) {
+                remoteSource: BotSource? = nil, rawDisplayName: String? = nil) {
         self.id = id; self.job = job; self.shape = shape; self.hue = hue
         self.status = status; self.task = task; self.minutesElapsed = minutesElapsed
         self.preview = preview; self.previewTime = previewTime; self.unread = unread
         self.mentionsYou = mentionsYou; self.description = description; self.pinnedModel = pinnedModel
         self.title = title; self.handleOverride = handleOverride
         self.remoteSource = remoteSource
+        self.rawDisplayName = rawDisplayName
     }
 }
 
@@ -154,6 +160,10 @@ public extension Bot {
         if let title, !title.trimmingCharacters(in: .whitespaces).isEmpty {
             return title.trimmingCharacters(in: .whitespaces)
         }
+        if let rawDisplayName,
+           !rawDisplayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return rawDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         let name = profileName
         if name.trimmingCharacters(in: .whitespaces).lowercased() == "default" {
             return "Hermes"
@@ -190,6 +200,78 @@ public extension Bot {
     /// whose `id` is the source-qualified `botRosterKey` (plugin.js:2669) and
     /// therefore addresses nothing.
     var profileName: String { remoteSource?.profile ?? id }
+
+    /// The user-facing identity from which friendly @mentions are derived.
+    /// Bot Mode metadata wins because it is an explicit user choice; the core
+    /// `display_name` is the final wire fallback before visual presentation
+    /// humanizes the profile slug. Only the first two are actual rename
+    /// metadata: the generic `displayTitle` fallback must never manufacture a
+    /// second @-identity such as `codereview` for profile `code_review`.
+    var friendlyMentionName: String {
+        if let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return title.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let rawDisplayName,
+           !rawDisplayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return rawDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return displayTitle
+    }
+
+    /// Every retained friendly identity that can address this bot. A Bot Mode
+    /// title chooses the insertion spelling, but it does not erase the core
+    /// profile display name: both may have been visible to another client and
+    /// must remain accepted aliases.
+    var friendlyMentionNames: [String] {
+        let candidates = [title, rawDisplayName].compactMap {
+            $0?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }.filter { !$0.isEmpty }
+        var seen = Set<String>()
+        return candidates.filter { seen.insert($0.lowercased()).inserted }
+    }
+
+    /// The safe friendly insertion token, if this bot's display identity can
+    /// become one without claiming a reserved address. Completion falls back
+    /// to a non-reserved legacy handle when this is nil.
+    var friendlyMentionTag: String? {
+        friendlyMentionNames.lazy.compactMap(BotMention.friendlyTag(from:)).first
+    }
+
+    /// What completion inserts: the friendly tag whenever one is safe, then a
+    /// legacy handle. It is deliberately not `displayTitle`, which can contain
+    /// spaces or punctuation the mention grammar cannot route.
+    var mentionInsertionTag: String? {
+        if let friendlyMentionTag { return friendlyMentionTag }
+        let legacy = handle.lowercased()
+        return legacy.isEmpty ? nil : legacy
+    }
+
+    /// Every safe token that can reach this bot. The resolver builds one union
+    /// map from these forms and poisons collisions rather than guessing.
+    var mentionForms: Set<String> {
+        var forms = Set<String>()
+        for legacy in [handle, profileName, handleOverride].compactMap({ $0 }) {
+            let normalized = legacy.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !normalized.isEmpty else { continue }
+            forms.insert(normalized)
+        }
+        for name in friendlyMentionNames {
+            forms.formUnion(BotMention.friendlyForms(from: name))
+        }
+        return forms
+    }
+
+    /// Match forms completion may search without changing the inserted token.
+    /// The friendly string itself is included so a gateway's core
+    /// `display_name` can find a metadata-renamed bot (for example typing
+    /// `@writer` can offer insertion `@research-buddy`).
+    var mentionCompletionForms: Set<String> {
+        var forms = mentionForms
+        for display in friendlyMentionNames {
+            forms.formUnion(BotMention.searchForms(from: display))
+        }
+        return forms
+    }
 
     /// Desktop only shows the handle alongside the title when they differ.
     ///

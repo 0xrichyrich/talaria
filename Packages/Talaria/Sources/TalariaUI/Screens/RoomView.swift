@@ -59,6 +59,7 @@ public struct RoomView: View {
                     .font(theme.body(10)).foregroundStyle(theme.warn)
                     .padding(.horizontal, 14).background(theme.warn.opacity(0.06))
                 }
+                pendingPromptPanel(room)
                 unresolvedPanel(room)
                 activityPanel(room)
                 timeline(room)
@@ -190,6 +191,33 @@ public struct RoomView: View {
             .padding(.horizontal, 14).padding(.vertical, 9)
             .background(theme.warn.opacity(0.08))
             .overlay(alignment: .bottom) { Rectangle().fill(theme.warn.opacity(0.3)).frame(height: 1) }
+        }
+    }
+
+    /// A Hermes tool/clarify block is live session state, not a transcript
+    /// mention. Keep it visually distinct from delivery uncertainty so the
+    /// `needsUser` badge remains reserved for an explicit `@user` message.
+    @ViewBuilder private func pendingPromptPanel(_ room: RoomRecord) -> some View {
+        let prompts = model.roomPendingPrompts(room.id)
+        if !prompts.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(prompts.count == 1 ? "Waiting for your answer" : "Waiting for your answers")
+                    .font(theme.body(12, weight: .bold)).foregroundStyle(theme.accent)
+                Text("A room member is paused in Hermes. Your response stays on that member's source gateway.")
+                    .font(theme.body(10)).foregroundStyle(theme.faint)
+                ForEach(prompts, id: \.attemptID) { prompt in
+                    let member = (room.members + room.formerMembers)
+                        .first(where: { $0.route == prompt.route })
+                    RoomPendingPromptCard(prompt: prompt, member: member, theme: theme) { answers in
+                        try await model.respondToRoomPendingPrompt(prompt, answers: answers)
+                    }
+                }
+            }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .background(theme.accent.opacity(0.055))
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(theme.accent.opacity(0.22)).frame(height: 1)
+            }
         }
     }
 
@@ -393,10 +421,8 @@ private struct RoomSettingsView: View {
                                         selected.removeAll { $0.route == route }
                                     }
                                 } else if !cannotAdd {
-                                    selected.append(RoomMember(
-                                        route: route,
-                                        title: TalariaVoice.displayName(for: bot, model.theme.themeID),
-                                        handle: bot.handle,
+                                    selected.append(model.capturedRoomMember(
+                                        for: bot, route: route,
                                         sourceLabel: bot.remoteSource?.connectionLabel
                                             ?? model.activeConnectionLabel))
                                 }

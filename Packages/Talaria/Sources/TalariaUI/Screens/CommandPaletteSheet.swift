@@ -133,7 +133,7 @@ public struct CommandPaletteSheet: View {
         .presentationDetents([.large])
         .presentationBackground(theme.bg)
         .task {
-            catalog = await model.slashCatalog()
+            catalog = await model.slashCatalog(for: botID)
             loading = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { focused = true }
         }
@@ -229,7 +229,7 @@ public struct CommandPaletteSheet: View {
                         .foregroundStyle(theme.faint)
                 }
             }
-        } else if model.slashCatalogFailed {
+        } else if model.slashCatalogFailed(for: botID) {
             statusBlock {
                 VStack(spacing: 12) {
                     Text(copy.commandsCatalogFailed(theme.id))
@@ -237,8 +237,8 @@ public struct CommandPaletteSheet: View {
                         .italic(theme.id == .ink)
                         .foregroundStyle(theme.sub)
                         .multilineTextAlignment(.center)
-                    if !model.slashCatalogWarning.isEmpty {
-                        Text(model.slashCatalogWarning)
+                    if !model.slashCatalogWarning(for: botID).isEmpty {
+                        Text(model.slashCatalogWarning(for: botID))
                             .font(theme.mono(10))
                             .foregroundStyle(theme.faint)
                             .multilineTextAlignment(.center)
@@ -248,7 +248,7 @@ public struct CommandPaletteSheet: View {
                                         compact: true) {
                         loading = true
                         Task { @MainActor in
-                            catalog = await model.reloadSlashCatalog()
+                            catalog = await model.reloadSlashCatalog(for: botID)
                             loading = false
                         }
                     }
@@ -281,7 +281,7 @@ public struct CommandPaletteSheet: View {
     private var results: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: theme.rowStyle == .ledger ? 0 : 7) {
-                if !model.slashCatalogWarning.isEmpty {
+                if !model.slashCatalogWarning(for: botID).isEmpty {
                     warningBanner
                 }
                 ForEach(sections) { section in
@@ -303,7 +303,7 @@ public struct CommandPaletteSheet: View {
     /// Skill/quick-command discovery failed server-side but the rest of the
     /// catalog is good — a banner, never an error screen.
     private var warningBanner: some View {
-        Text(model.slashCatalogWarning)
+        Text(model.slashCatalogWarning(for: botID))
             .font(theme.mono(10))
             .foregroundStyle(theme.warn)
             .lineLimit(2)
@@ -321,8 +321,8 @@ public struct CommandPaletteSheet: View {
                 .font(theme.mono(theme.id == .soft ? 10 : 9.5, weight: .bold))
                 .tracking(theme.id == .soft ? 1.2 : 2)
                 .foregroundStyle(theme.id == .control ? theme.accent : theme.faint)
-            if section.isSkills, model.slashSkillCount > 0 {
-                Text(verbatim: "\(model.slashSkillCount)")
+            if section.isSkills, model.slashSkillCount(for: botID) > 0 {
+                Text(verbatim: "\(model.slashSkillCount(for: botID))")
                     .font(theme.mono(9.5))
                     .foregroundStyle(theme.faint)
                     .monospacedDigit()
@@ -441,11 +441,11 @@ public struct CommandPaletteSheet: View {
         completionTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(180))
             guard !Task.isCancelled else { return }
-            let result = await model.slashCompletions(for: text)
+            let result = await model.slashCompletions(for: text, botID: botID)
             guard !Task.isCancelled, normalized(query) == text else { return }
             completions = result.items
             guard result.items.isEmpty else { return }
-            let hit = await model.resolveSlashCommand(text)
+            let hit = await model.resolveSlashCommand(text, botID: botID)
             guard !Task.isCancelled, normalized(query) == text else { return }
             resolved = hit
         }

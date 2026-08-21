@@ -31,6 +31,10 @@ public struct CommandCenterView: View {
 
     private var theme: ThemePack { model.theme.pack }
     private var runtime: WorkspaceRuntime { .shared }
+    private var profileNeedsRecovery: Bool {
+        guard let profile = runtime.profile else { return false }
+        return !runtime.profiles.contains(where: { $0.profile == profile })
+    }
 
     public var body: some View {
         NavigationStack {
@@ -101,17 +105,38 @@ public struct CommandCenterView: View {
     }
 
     @ViewBuilder private var sourcePicker: some View {
-        if model.workspaceSources.count > 1 {
-            Picker("Gateway", selection: Binding(
-                get: { runtime.gatewayID ?? model.workspaceSources.first?.id ?? "" },
-                set: { model.selectWorkspaceGateway($0) }
-            )) {
-                ForEach(model.workspaceSources) { source in
-                    Text(source.isActive ? "\(source.name) · active" : source.name).tag(source.id)
+        if model.workspaceSources.count > 1 || runtime.profiles.count > 1 || profileNeedsRecovery {
+            VStack(spacing: 0) {
+                if model.workspaceSources.count > 1 {
+                    Picker("Gateway", selection: Binding(
+                        get: { runtime.gatewayID ?? model.workspaceSources.first?.id ?? "" },
+                        set: { model.selectWorkspaceGateway($0) }
+                    )) {
+                        ForEach(model.workspaceSources) { source in
+                            Text(source.isActive ? "\(source.name) · active" : source.name).tag(source.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
+                if runtime.profiles.count > 1 || profileNeedsRecovery {
+                    Picker("Projects profile", selection: Binding(
+                        get: { runtime.profile ?? runtime.profiles.first?.profile ?? "" },
+                        set: { model.selectWorkspaceProfile($0) }
+                    )) {
+                        if profileNeedsRecovery, let profile = runtime.profile {
+                            Text("Unavailable · @\(profile)").tag(profile)
+                        }
+                        ForEach(runtime.profiles) { source in
+                            Text(source.isDefault
+                                 ? "\(source.label) · @\(source.profile) · default"
+                                 : "\(source.label) · @\(source.profile)")
+                                .tag(source.profile)
+                        }
+                    }
+                    .pickerStyle(.menu)
                 }
             }
-            .pickerStyle(.menu)
-            .disabled(runtime.mutationBusy || runtime.systemActionRunning || runtime.commandRunning)
+            .disabled(runtime.loading || runtime.mutationBusy || runtime.systemActionRunning || runtime.commandRunning)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
@@ -130,19 +155,6 @@ enum WorkspaceCommandSurfacePolicy {
     static func ownsProcesses(selectedTargetID: String?, processesTargetID: String?) -> Bool {
         guard let selectedTargetID else { return false }
         return processesTargetID == selectedTargetID
-    }
-}
-
-enum WorkspaceProjectSessionNavigation {
-    @MainActor @discardableResult
-    static func open(_ session: HermesProjectSessionPreview, gatewayID: String,
-                     model: AppModel, close: () -> Void) -> Bool {
-        guard !gatewayID.isEmpty, !session.storedID.isEmpty else { return false }
-        let route = GatewayBotRoute(gatewayID: gatewayID, profile: session.profile)
-        let botID = gatewayID == LiveRuntime.shared.gatewayID ? route.profile : route.qualifiedID
-        model.openStoredSession(session.storedID, botID: botID)
-        close()
-        return true
     }
 }
 
@@ -214,9 +226,9 @@ private struct WorkspaceProjectsSection: View {
                         }
                     }
                 } header: {
-                    Text("Gateway launch-profile projects")
+                    Text("Projects · @\(runtime.profile ?? "unavailable")")
                 } footer: {
-                    Text("Hermes project writes are scoped to this gateway’s launch profile. All-profile project trees remain read-only upstream.")
+                    Text("Every Projects read and write uses this exact Hermes profile.")
                 }
                 Section {
                     Button { showCreate = true } label: { Label("New project", systemImage: "plus") }
@@ -240,7 +252,7 @@ private struct WorkspaceProjectsSection: View {
                     }
                 }
                 if !runtime.projectTree.isEmpty {
-                    Section("All-profile activity · read only") {
+                    Section("Profile activity · @\(runtime.profile ?? "unavailable") · read only") {
                         ForEach(runtime.projectTree) { project in
                             VStack(alignment: .leading, spacing: 5) {
                                 HStack {
@@ -250,10 +262,16 @@ private struct WorkspaceProjectsSection: View {
                                 }
                                 ForEach(project.previews.prefix(3)) { session in
                                     Button {
-                                        WorkspaceProjectSessionNavigation.open(
-                                            session, gatewayID: runtime.gatewayID ?? "",
-                                            model: model, close: close
-                                        )
+                                        Task {
+                                            do {
+                                                let opened = try await model.openAuthoritativeWorkspaceProjectSession(
+                                                    session, projectID: project.id
+                                                )
+                                                if opened { close() }
+                                            } catch {
+                                                runtime.error = error.localizedDescription
+                                            }
+                                        }
                                     } label: {
                                         VStack(alignment: .leading, spacing: 2) {
                                             Text(session.title).lineLimit(1)
@@ -270,7 +288,7 @@ private struct WorkspaceProjectsSection: View {
                                     }
                                 }
                                 if project.sessionCount > project.previews.count {
-                                    Text("The overview is preview-bounded. Entering the project requests Hermes’ largest all-profile window; Talaria rejects it if the response reaches the limit or otherwise appears partial.")
+                                    Text("The overview is preview-bounded. Entering the project requests Hermes’ largest profile-scoped window; Talaria rejects it if the response reaches the limit or otherwise appears partial.")
                                         .font(.caption2).foregroundStyle(.secondary)
                                 } else if project.sessionCount > 0, project.previews.count <= 3 {
                                     Text("No additional sessions are represented in this bounded overview.")
@@ -318,8 +336,7 @@ private struct WorkspaceProjectsSection: View {
             WorkspaceProjectEditor(model: model, project: project, roots: allowedRoots)
         }
         .sheet(item: $sessionProject) { project in
-            WorkspaceProjectSessionsSheet(model: model, project: project,
-                                          gatewayID: runtime.gatewayID ?? "", close: close)
+            WorkspaceProjectSessionsSheet(model: model, project: project, close: close)
         }
         .confirmationDialog("Permanently delete \(pendingDelete?.name ?? "project")?",
                             isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
@@ -334,6 +351,15 @@ private struct WorkspaceProjectsSection: View {
         } message: {
             Text("This deletes the Hermes project record. It does not delete the project folder or Git repository.")
         }
+        .onChange(of: runtime.projectRoute?.id) { _, _ in
+            // A profile switch invalidates the identities presented by any
+            // open project sheet. Close them instead of allowing an old row to
+            // target a same-named project in the newly selected profile.
+            showCreate = false
+            editingProject = nil
+            sessionProject = nil
+            pendingDelete = nil
+        }
     }
 
     private func archive(_ project: HermesProject, restore: Bool) {
@@ -347,7 +373,6 @@ private struct WorkspaceProjectsSection: View {
 private struct WorkspaceProjectSessionsSheet: View {
     let model: AppModel
     let project: HermesProjectTree
-    let gatewayID: String
     let close: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var hydrated: HermesProjectTree?
@@ -359,10 +384,16 @@ private struct WorkspaceProjectSessionsSheet: View {
                 if let hydrated {
                     ForEach(hydrated.previews) { session in
                         Button {
-                            WorkspaceProjectSessionNavigation.open(
-                                session, gatewayID: gatewayID, model: model,
-                                close: { dismiss(); close() }
-                            )
+                            Task {
+                                do {
+                                    let opened = try await model.openAuthoritativeWorkspaceProjectSession(
+                                        session, projectID: project.id
+                                    )
+                                    if opened { dismiss(); close() }
+                                } catch {
+                                    self.error = error.localizedDescription
+                                }
+                            }
                         } label: {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(session.title)
@@ -371,7 +402,7 @@ private struct WorkspaceProjectSessionsSheet: View {
                             }
                         }.buttonStyle(.plain)
                     }
-                    Text("\(hydrated.sessionCount) sessions shown from Hermes’ on-demand all-profile response. Talaria verified that the bounded response did not reach its truncation limit.")
+                    Text("\(hydrated.sessionCount) sessions shown from Hermes’ on-demand profile-scoped response. Talaria verified that the bounded response did not reach its truncation limit.")
                         .font(.footnote).foregroundStyle(.secondary)
                 } else if !error.isEmpty {
                     ContentUnavailableView("Project drill-in unavailable",
@@ -387,7 +418,12 @@ private struct WorkspaceProjectSessionsSheet: View {
             }
         }
         .task {
-            do { hydrated = try await model.loadAuthoritativeWorkspaceProjectSessions(projectID: project.id) }
+            do {
+                try await model.publishAuthoritativeWorkspaceProjectSessions(
+                    projectID: project.id,
+                    publish: { hydrated = $0 }
+                )
+            }
             catch is CancellationError { }
             catch { self.error = error.localizedDescription }
         }
@@ -450,7 +486,7 @@ private struct WorkspaceProjectEditor: View {
                         mutate { try await model.addWorkspaceProjectFolder(project, path: root) }
                     }.disabled(addRoot.isEmpty || busy)
                 }
-                Text("Project writes affect only this gateway’s launch profile. The all-profile activity overview is read-only.")
+                Text("Project writes affect only the selected Hermes profile (@\(runtime.profile ?? "unavailable")).")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             .navigationTitle("Manage Project").modifier(CommandInlineTitle())
