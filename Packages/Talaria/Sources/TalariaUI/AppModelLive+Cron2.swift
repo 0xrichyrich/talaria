@@ -247,11 +247,21 @@ enum CronCreateAddFailurePolicy {
             return [-5, -6, -7].contains(gateway.code)
         }
         if let url = error as? URLError {
-            return [.timedOut, .networkConnectionLost].contains(url.code)
+            return [.cancelled, .timedOut, .networkConnectionLost].contains(url.code)
         }
         // A response that reached the client but could not be decoded cannot
         // prove that the gateway rejected the irreversible add.
         return error is DecodingError
+    }
+
+    /// Only an ambiguous transport result can become a terminal partial. A
+    /// definite refusal must remain a thrown, retryable error even when the
+    /// source fence changed while the request was in flight.
+    static func ambiguousPartialReason(
+        for error: Error, sourceFenceStillCurrent: Bool
+    ) -> CronAcceptedPartialReason? {
+        guard isAmbiguousAfterSend(error) else { return nil }
+        return sourceFenceStillCurrent ? .addOutcomeUnknown : .sourceChangedBeforeACK
     }
 
     static func unresolvedPartial(reason: CronAcceptedPartialReason)
@@ -265,6 +275,12 @@ enum CronCreateAddFailurePolicy {
 /// callers must carry the accepted job forward as a typed partial result so a
 /// UI cannot turn an ambiguous follow-up into a duplicate create retry.
 public enum CronAcceptedPartialReason: Sendable, Equatable {
+    /// The add returned no authoritative acknowledgement. The job may exist,
+    /// but there is no id to claim or safely reconcile.
+    case addOutcomeUnknown
+    /// The source changed while the add was throwing, before an id was known.
+    case sourceChangedBeforeACK
+    /// A job id was known before a later source replacement.
     case sourceChanged
     case followUpUnavailable
     case followUpAmbiguous
@@ -1242,17 +1258,19 @@ public extension AppModel {
             // A timeout/socket loss can happen after Hermes accepted the add.
             // There is no job id to safely reconcile, so dismiss the editor
             // with a warning-shaped terminal outcome instead of inviting a
-            // duplicate retry. A source replacement takes precedence over
-            // transport classification; validation/tool refusals still throw.
-            guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
-                return .acceptedPartial(CronCreateAddFailurePolicy.unresolvedPartial(
-                    reason: .sourceChanged))
-            }
+            // duplicate retry. Classify the error before consulting the
+            // source fence: validation/tool refusals remain thrown even if a
+            // source replacement raced this call. Only ambiguous transport
+            // failures become unresolved partials.
             guard CronCreateAddFailurePolicy.isAmbiguousAfterSend(error) else {
                 throw error
             }
+            let reason = CronCreateAddFailurePolicy.ambiguousPartialReason(
+                for: error,
+                sourceFenceStillCurrent: cronMutationFenceAccepts(
+                    sourceFence, expectedClient: client)) ?? .addOutcomeUnknown
             return .acceptedPartial(CronCreateAddFailurePolicy.unresolvedPartial(
-                reason: .followUpAmbiguous))
+                reason: reason))
         }
 
         // `cronAdd` has committed an irreversible job.  Re-check the exact
@@ -1268,7 +1286,7 @@ public extension AppModel {
         guard !jobID.isEmpty else {
             return .acceptedPartial(CronAcceptedPartialOutcome(
                 jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
-                reason: .followUpAmbiguous))
+                reason: .addOutcomeUnknown))
         }
         let postAddDecision = CronCreatePostAddPolicy.decision(
             sourceFence: sourceFence,
@@ -2141,6 +2159,27 @@ public extension CopyPack {
         case .control: "JOB CREATED · FOLLOW-UP NOT CONFIRMED — OPEN TO VERIFY; DO NOT RETRY CREATE"
         case .ink: "The rite is inscribed, but its second witness did not arrive. "
             + "Open it to verify; do not inscribe another."
+        }
+    }
+
+    /// Used only when the socket add itself returned no authoritative
+    /// acknowledgement. This copy must never imply that the job was created,
+    /// scheduled, or safe to retry.
+    func toastRoutineOutcomeUnknown(_ title: String, _ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Couldn’t confirm “\(title)”"
+        case .control: "OUTCOME UNKNOWN — \(title.uppercased())"
+        case .ink: "The outcome of “\(title)” is unwitnessed"
+        }
+    }
+
+    func routineAddOutcomeUnknown(_ t: ThemeID) -> String {
+        switch t {
+        case .soft: "Talaria could not confirm whether this routine was added. "
+            + "Check the routine list; do not retry yet."
+        case .control: "OUTCOME UNKNOWN — CHECK ROUTINE LIST; DO NOT RETRY YET"
+        case .ink: "The rite’s outcome is unwitnessed. Check the routine list; "
+            + "do not retry yet."
         }
     }
 

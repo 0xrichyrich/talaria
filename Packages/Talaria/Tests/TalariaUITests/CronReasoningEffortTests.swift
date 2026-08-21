@@ -2,6 +2,7 @@
 import XCTest
 @testable import TalariaKit
 @testable import TalariaUI
+import TalariaTheme
 
 private actor DelayedCronAddGate {
     private var released = false
@@ -412,7 +413,11 @@ final class CronReasoningEffortTests: XCTestCase {
         XCTAssertTrue(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
             GatewayError(code: -5, message: "request timed out: cron.manage")))
         XCTAssertTrue(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
+            GatewayError(code: -6, message: "request cancelled after send")))
+        XCTAssertTrue(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
             GatewayError(code: -7, message: "connection lost")))
+        XCTAssertTrue(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
+            URLError(.cancelled)))
         XCTAssertTrue(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
             URLError(.networkConnectionLost)))
         XCTAssertFalse(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
@@ -420,22 +425,79 @@ final class CronReasoningEffortTests: XCTestCase {
         XCTAssertFalse(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
             GatewayError(code: -3, message: "not connected")))
 
+        XCTAssertEqual(
+            CronCreateAddFailurePolicy.ambiguousPartialReason(
+                for: GatewayError(code: -5, message: "request timed out"),
+                sourceFenceStillCurrent: true),
+            .addOutcomeUnknown)
+        XCTAssertEqual(
+            CronCreateAddFailurePolicy.ambiguousPartialReason(
+                for: URLError(.cancelled), sourceFenceStillCurrent: false),
+            .sourceChangedBeforeACK)
+        // A changed source never turns a definite tool refusal into an
+        // accepted partial; the editor must still receive the retryable error.
+        XCTAssertNil(
+            CronCreateAddFailurePolicy.ambiguousPartialReason(
+                for: GatewayError(code: 400, message: "cron tool refused add"),
+                sourceFenceStillCurrent: false))
+        XCTAssertNil(
+            CronCreateAddFailurePolicy.ambiguousPartialReason(
+                for: GatewayError(code: -3, message: "not connected"),
+                sourceFenceStillCurrent: false))
+
         let timeoutOutcome = CronCreateOutcome.acceptedPartial(
-            CronCreateAddFailurePolicy.unresolvedPartial(reason: .followUpAmbiguous))
+            CronCreateAddFailurePolicy.unresolvedPartial(reason: .addOutcomeUnknown))
         XCTAssertEqual(timeoutOutcome.acceptedPartial?.jobID, "")
         XCTAssertNil(timeoutOutcome.acceptedPartial?.gatewayID)
         XCTAssertNil(timeoutOutcome.acceptedPartial?.profile)
-        XCTAssertEqual(timeoutOutcome.acceptedPartial?.reason, .followUpAmbiguous)
+        XCTAssertEqual(timeoutOutcome.acceptedPartial?.reason, .addOutcomeUnknown)
         XCTAssertTrue(timeoutOutcome.needsWarningFeedback)
         XCTAssertTrue(timeoutOutcome.shouldDismissCreateEditor)
         XCTAssertFalse(CronCreateOutcome.completed.needsWarningFeedback)
         XCTAssertTrue(CronCreateOutcome.completed.shouldDismissCreateEditor)
 
         let sourceChanged = CronCreateOutcome.acceptedPartial(
-            CronCreateAddFailurePolicy.unresolvedPartial(reason: .sourceChanged))
+            CronCreateAddFailurePolicy.unresolvedPartial(reason: .sourceChangedBeforeACK))
         XCTAssertEqual(sourceChanged.acceptedPartial?.jobID, "")
-        XCTAssertEqual(sourceChanged.acceptedPartial?.reason, .sourceChanged)
+        XCTAssertNil(sourceChanged.acceptedPartial?.gatewayID)
+        XCTAssertNil(sourceChanged.acceptedPartial?.profile)
+        XCTAssertEqual(sourceChanged.acceptedPartial?.reason, .sourceChangedBeforeACK)
         XCTAssertTrue(sourceChanged.shouldDismissCreateEditor)
+    }
+
+    func testUnknownAddFeedbackNeverClaimsCreationAcrossThemes() {
+        for theme in ThemeID.allCases {
+            let copy = CopyPack.pack(for: theme)
+            let title = copy.toastRoutineOutcomeUnknown("daily", theme)
+            let body = copy.routineAddOutcomeUnknown(theme)
+            let text = (title + " " + body).lowercased()
+
+            XCTAssertTrue(text.contains("outcome") || text.contains("confirm"),
+                          "unknown feedback should name uncertainty for \(theme)")
+            XCTAssertTrue(text.contains("check"),
+                          "unknown feedback should direct a routine-list check for \(theme)")
+            XCTAssertTrue(text.contains("retry"),
+                          "unknown feedback should block an immediate retry for \(theme)")
+            XCTAssertFalse(text.contains("scheduled"),
+                           "unknown feedback must not claim scheduling for \(theme)")
+            XCTAssertFalse(text.contains("created"),
+                           "unknown feedback must not claim creation for \(theme)")
+            XCTAssertFalse(text.contains("open it"),
+                           "unknown feedback must not imply a known job to open for \(theme)")
+        }
+
+        for theme in ThemeID.allCases {
+            let copy = CopyPack.pack(for: theme)
+            XCTAssertTrue(copy.toastRoutineScheduled("daily", theme).lowercased()
+                .contains("daily"))
+            let knownPartial = copy.routineMadeFollowUpAmbiguous(theme)
+            let knownText = knownPartial.lowercased()
+            XCTAssertTrue(knownText.contains("created") || knownText.contains("inscribed")
+                || knownPartial.uppercased().contains("JOB CREATED"),
+                          "known-job partial feedback keeps the existing created copy")
+            XCTAssertTrue(knownText.contains("open"),
+                          "known-job partial feedback keeps the existing verification path")
+        }
     }
 
     func testRetainedMutationFenceRejectsReplacedClientGeneration() {

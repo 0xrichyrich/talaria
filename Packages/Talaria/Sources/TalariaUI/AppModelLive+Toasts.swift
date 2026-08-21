@@ -450,15 +450,21 @@ public extension AppModel {
                 model: model, provider: provider,
                 reasoningEffort: reasoningEffort)
             if let partial = outcome.acceptedPartial {
+                let title: String
                 let message: String
                 switch partial.reason {
+                case .addOutcomeUnknown, .sourceChangedBeforeACK:
+                    title = theme.copy.toastRoutineOutcomeUnknown(clean, theme.themeID)
+                    message = theme.copy.routineAddOutcomeUnknown(theme.themeID)
                 case .sourceChanged:
+                    title = theme.copy.toastRoutineScheduled(clean, theme.themeID)
                     message = theme.copy.routineMadeSourceChanged(theme.themeID)
                 case .followUpUnavailable, .followUpAmbiguous:
+                    title = theme.copy.toastRoutineScheduled(clean, theme.themeID)
                     message = theme.copy.routineMadeFollowUpAmbiguous(theme.themeID)
                 }
                 toast(kind: .warning,
-                      title: theme.copy.toastRoutineScheduled(clean, theme.themeID),
+                      title: title,
                       message: message, botID: botID, key: key)
             } else {
                 toast(kind: .success, title: theme.copy.toastRoutineScheduled(clean, theme.themeID),
