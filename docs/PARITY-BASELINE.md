@@ -140,9 +140,9 @@ standalone multi-member rooms, rich transcript interaction, and a guarded
 gateway-backed Command Center are implemented and automated-gate certified;
 they remain provisional until live-gateway and real-device certification. The
 largest remaining product gaps are richer transcript media/tool presentation,
-portable management depth (including auxiliary goal-judge controls and per-job
-cron reasoning), workspace and artifact completeness, and the authenticated
-gateway PTY:
+portable management depth (including auxiliary goal-judge controls), and
+workspace and artifact completeness. The authenticated gateway PTY is now
+implemented, with live-gateway and real-device certification still open:
 
 - Talaria retains authenticated clients for multiple gateways and routes chat,
   events, sessions, full approval recovery/prompts, and unread state by source.
@@ -247,7 +247,7 @@ partial until the unchecked certification gates are recorded.
 - [ ] Finish mobile management for providers, models, profiles, tools, skills,
       MCP, plugins, routines (including per-job reasoning effort), messaging,
       memory, auxiliary slots, and agents.
-- [ ] Finish gateway-backed files, artifacts, projects, git, authenticated PTY,
+- [ ] Finish gateway-backed files, artifacts, projects, git, authenticated PTY certification,
       and command-center UI.
 - [ ] Finish push, background, offline, reconciliation, and capability/version reliability.
       Push specifically remains implemented-but-uncertified until the Debug /

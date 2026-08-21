@@ -113,6 +113,7 @@ public final class GatewayPTYRuntime {
     private var connectTask: Task<Void, Never>?
     private var pumpTask: Task<Void, Never>?
     private var retryTask: Task<Void, Never>?
+    private var deliveryTail: Task<Bool, Never>?
 
     public convenience init(
         currentness: @escaping ExternalAuthority = { _ in true }
@@ -125,7 +126,7 @@ public final class GatewayPTYRuntime {
         self.operations = operations
         self.externalAuthority = externalAuthority
         var captured: AsyncStream<GatewayPTYRuntimeEvent>.Continuation!
-        events = AsyncStream(bufferingPolicy: .unbounded) {
+        events = AsyncStream(bufferingPolicy: .bufferingOldest(1)) {
             captured = $0
         }
         continuation = captured
@@ -284,7 +285,9 @@ public final class GatewayPTYRuntime {
                 case .opened:
                     continue
                 case .bytes(let bytes):
-                    self.continuation.yield(.bytes(bytes))
+                    let delivery = self.enqueueEvent(
+                        .bytes(bytes), expectedGeneration: expected)
+                    guard await delivery.value else { return }
                 case .closed(let close):
                     self.session = nil
                     self.pumpTask = nil
@@ -369,7 +372,45 @@ public final class GatewayPTYRuntime {
 
     private func publish(_ state: GatewayPTYRuntimeState) {
         self.state = state
-        continuation.yield(.state(state))
+        _ = enqueueEvent(.state(state))
+    }
+
+    @discardableResult
+    private func enqueueEvent(
+        _ event: GatewayPTYRuntimeEvent,
+        expectedGeneration: UInt64? = nil
+    ) -> Task<Bool, Never> {
+        let previous = deliveryTail
+        let continuation = self.continuation
+        let task = Task { @MainActor [weak self] in
+            if let previous {
+                let priorDelivered = await previous.value
+                if !priorDelivered { return false }
+            }
+            guard let self, !Task.isCancelled else { return false }
+            if let expectedGeneration, self.generation != expectedGeneration {
+                return true
+            }
+            return await Self.yieldLosslessly(event, to: continuation)
+        }
+        deliveryTail = task
+        return task
+    }
+
+    private static func yieldLosslessly(
+        _ event: GatewayPTYRuntimeEvent,
+        to continuation: AsyncStream<GatewayPTYRuntimeEvent>.Continuation
+    ) async -> Bool {
+        while !Task.isCancelled {
+            switch continuation.yield(event) {
+            case .enqueued: return true
+            case .terminated: return false
+            case .dropped:
+                try? await Task.sleep(for: .milliseconds(1))
+            @unknown default: return false
+            }
+        }
+        return false
     }
 
     private static func terminalClose(for error: Error) -> GatewayPTYClose? {

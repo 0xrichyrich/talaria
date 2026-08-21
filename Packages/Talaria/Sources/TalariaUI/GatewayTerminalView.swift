@@ -25,7 +25,7 @@ public struct GatewayTerminalChunk: Equatable, Sendable {
 
 /// Colors used by the terminal emulator. Transport and process concerns do not
 /// belong here; this is solely renderer configuration.
-public struct GatewayTerminalTheme: Sendable {
+public struct GatewayTerminalTheme: Equatable, Sendable {
     public let foreground: SwiftUI.Color
     public let background: SwiftUI.Color
     public let cursor: SwiftUI.Color
@@ -88,7 +88,8 @@ enum GatewayTerminalSoftKey: CaseIterable, Equatable {
 }
 
 struct GatewayTerminalInputPolicy {
-    static func softKeyBytes(_ key: GatewayTerminalSoftKey, controlArmed: Bool) -> [UInt8]? {
+    static func softKeyBytes(_ key: GatewayTerminalSoftKey, controlArmed: Bool,
+                             applicationCursor: Bool = false) -> [UInt8]? {
         switch key {
         case .control:
             return nil
@@ -97,13 +98,17 @@ struct GatewayTerminalInputPolicy {
         case .tab:
             return [0x09]
         case .arrowLeft:
-            return controlArmed ? [0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x44] : [0x1b, 0x5b, 0x44]
+            return controlArmed ? [0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x44]
+                : (applicationCursor ? EscapeSequences.moveLeftApp : EscapeSequences.moveLeftNormal)
         case .arrowDown:
-            return controlArmed ? [0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x42] : [0x1b, 0x5b, 0x42]
+            return controlArmed ? [0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x42]
+                : (applicationCursor ? EscapeSequences.moveDownApp : EscapeSequences.moveDownNormal)
         case .arrowUp:
-            return controlArmed ? [0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x41] : [0x1b, 0x5b, 0x41]
+            return controlArmed ? [0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x41]
+                : (applicationCursor ? EscapeSequences.moveUpApp : EscapeSequences.moveUpNormal)
         case .arrowRight:
-            return controlArmed ? [0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x43] : [0x1b, 0x5b, 0x43]
+            return controlArmed ? [0x1b, 0x5b, 0x31, 0x3b, 0x35, 0x43]
+                : (applicationCursor ? EscapeSequences.moveRightApp : EscapeSequences.moveRightNormal)
         }
     }
 
@@ -126,14 +131,23 @@ struct GatewayTerminalInputPolicy {
 }
 
 struct GatewayTerminalRendererState {
-    private(set) var lastChunkID: UUID?
+    private(set) var consumedChunkIDs: Set<UUID> = []
     private(set) var lastSize: (columns: Int, rows: Int)?
+    private(set) var appliedTheme: GatewayTerminalTheme?
+    private(set) var applicationCursor = false
+    private var modeTail: [UInt8] = []
 
-    mutating func bytesToFeed(for chunk: GatewayTerminalChunk?) -> ArraySlice<UInt8>? {
-        guard let chunk, chunk.id != lastChunkID else { return nil }
-        lastChunkID = chunk.id
-        let bytes = [UInt8](chunk.bytes)
-        return bytes[...]
+    mutating func chunksToFeed(from chunks: [GatewayTerminalChunk]) -> [GatewayTerminalChunk] {
+        consumedChunkIDs.formIntersection(Set(chunks.map(\.id)))
+        if chunks.isEmpty {
+            consumedChunkIDs.removeAll(keepingCapacity: true)
+            return []
+        }
+        return chunks.compactMap { chunk -> GatewayTerminalChunk? in
+            guard consumedChunkIDs.insert(chunk.id).inserted else { return nil }
+            observeModes(in: chunk.bytes)
+            return chunk
+        }
     }
 
     mutating func resizeToEmit(columns: Int, rows: Int) -> (Int, Int)? {
@@ -143,6 +157,32 @@ struct GatewayTerminalRendererState {
         lastSize = next
         return next
     }
+
+    mutating func shouldApply(_ theme: GatewayTerminalTheme) -> Bool {
+        guard appliedTheme != theme else { return false }
+        appliedTheme = theme
+        return true
+    }
+
+    private mutating func observeModes(in data: Data) {
+        let bytes = modeTail + [UInt8](data)
+        let enabled: [UInt8] = [0x1b, 0x5b, 0x3f, 0x31, 0x68]
+        let disabled: [UInt8] = [0x1b, 0x5b, 0x3f, 0x31, 0x6c]
+        if bytes.count >= enabled.count {
+            for start in 0...(bytes.count - enabled.count) {
+                let candidate = Array(bytes[start..<(start + enabled.count)])
+                if candidate == enabled { applicationCursor = true }
+                if candidate == disabled { applicationCursor = false }
+            }
+        }
+        modeTail = Array(bytes.suffix(enabled.count - 1))
+    }
+}
+
+@MainActor
+private final class GatewayTerminalInputController {
+    weak var terminal: SwiftTerm.TerminalView?
+    func send(_ bytes: [UInt8]) { terminal?.send(bytes) }
 }
 
 struct GatewayTerminalLinkPolicy {
@@ -159,41 +199,49 @@ struct GatewayTerminalLinkPolicy {
 /// A SwiftTerm-backed terminal renderer for an already-established PTY stream.
 /// It never creates a process, socket, or SSH session.
 public struct GatewayTerminalView: View {
-    private let receivedChunk: GatewayTerminalChunk?
+    private let receivedChunks: [GatewayTerminalChunk]
     private let terminalTheme: GatewayTerminalTheme
     private let allowsRemoteClipboardWrite: Bool
     private let onInput: (Data) -> Void
     private let onResize: (_ columns: Int, _ rows: Int) -> Void
     private let onOpenLink: (URL) -> Void
+    private let onConsume: ([UUID]) -> Void
 
     @State private var controlArmed = false
+    @State private var applicationCursor = false
+    @State private var inputController = GatewayTerminalInputController()
 
     public init(
-        receivedChunk: GatewayTerminalChunk?,
+        receivedChunks: [GatewayTerminalChunk],
         theme: GatewayTerminalTheme,
         allowsRemoteClipboardWrite: Bool = false,
         onInput: @escaping (Data) -> Void,
         onResize: @escaping (_ columns: Int, _ rows: Int) -> Void,
-        onOpenLink: @escaping (URL) -> Void
+        onOpenLink: @escaping (URL) -> Void,
+        onConsume: @escaping ([UUID]) -> Void = { _ in }
     ) {
-        self.receivedChunk = receivedChunk
+        self.receivedChunks = receivedChunks
         self.terminalTheme = theme
         self.allowsRemoteClipboardWrite = allowsRemoteClipboardWrite
         self.onInput = onInput
         self.onResize = onResize
         self.onOpenLink = onOpenLink
+        self.onConsume = onConsume
     }
 
     public var body: some View {
         VStack(spacing: 0) {
             GatewayTerminalRepresentable(
-                receivedChunk: receivedChunk,
+                receivedChunks: receivedChunks,
                 theme: terminalTheme,
                 allowsRemoteClipboardWrite: allowsRemoteClipboardWrite,
                 controlArmed: $controlArmed,
+                applicationCursor: $applicationCursor,
+                inputController: inputController,
                 onInput: onInput,
                 onResize: onResize,
-                onOpenLink: onOpenLink
+                onOpenLink: onOpenLink,
+                onConsume: onConsume
             )
             .accessibilityLabel("Gateway terminal")
             .accessibilityHint("Interactive remote terminal")
@@ -239,9 +287,10 @@ public struct GatewayTerminalView: View {
             controlArmed.toggle()
             return
         }
-        guard let bytes = GatewayTerminalInputPolicy.softKeyBytes(key, controlArmed: controlArmed) else { return }
+        guard let bytes = GatewayTerminalInputPolicy.softKeyBytes(
+            key, controlArmed: controlArmed, applicationCursor: applicationCursor) else { return }
         controlArmed = false
-        onInput(Data(bytes))
+        inputController.send(bytes)
     }
     #endif
 }
@@ -255,18 +304,24 @@ private typealias NativeTerminalFont = NSFont
 #endif
 
 private struct GatewayTerminalRepresentable {
-    let receivedChunk: GatewayTerminalChunk?
+    let receivedChunks: [GatewayTerminalChunk]
     let theme: GatewayTerminalTheme
     let allowsRemoteClipboardWrite: Bool
     @Binding var controlArmed: Bool
+    @Binding var applicationCursor: Bool
+    let inputController: GatewayTerminalInputController
     let onInput: (Data) -> Void
     let onResize: (Int, Int) -> Void
     let onOpenLink: (URL) -> Void
+    let onConsume: ([UUID]) -> Void
 
+    @MainActor
     func makeTerminal(context: Coordinator) -> SwiftTerm.TerminalView {
         let terminal = SwiftTerm.TerminalView(frame: .zero, font: .monospacedSystemFont(ofSize: 13, weight: .regular))
         terminal.terminalDelegate = context
+        inputController.terminal = terminal
         terminal.linkReporting = .implicit
+        terminal.allowMouseReporting = false
         terminal.optionAsMetaKey = true
         #if os(iOS)
         // SwiftTerm ships its own keyboard accessory. Talaria supplies the
@@ -275,15 +330,28 @@ private struct GatewayTerminalRepresentable {
             terminal.inputAccessoryView = nil
         }
         #endif
-        configure(terminal)
+        if context.state.shouldApply(theme) { configure(terminal) }
         return terminal
     }
 
+    @MainActor
     func update(_ terminal: SwiftTerm.TerminalView, coordinator: Coordinator) {
         coordinator.parent = self
-        configure(terminal)
-        if let bytes = coordinator.state.bytesToFeed(for: receivedChunk) {
-            terminal.feed(byteArray: bytes)
+        inputController.terminal = terminal
+        if coordinator.state.shouldApply(theme) { configure(terminal) }
+        let pending = coordinator.state.chunksToFeed(from: receivedChunks)
+        for chunk in pending {
+            let bytes = [UInt8](chunk.bytes)
+            terminal.feed(byteArray: bytes[...])
+        }
+        if !pending.isEmpty {
+            let consumed = pending.map(\.id)
+            let handler = coordinator.parent.onConsume
+            DispatchQueue.main.async { handler(consumed) }
+        }
+        let cursorMode = coordinator.state.applicationCursor
+        if applicationCursor != cursorMode {
+            DispatchQueue.main.async { applicationCursor = cursorMode }
         }
     }
 
@@ -344,7 +412,7 @@ private struct GatewayTerminalRepresentable {
 extension GatewayTerminalRepresentable: UIViewRepresentable {
     func makeUIView(context: Context) -> SwiftTerm.TerminalView {
         let terminal = makeTerminal(context: context.coordinator)
-        DispatchQueue.main.async { terminal.becomeFirstResponder() }
+        DispatchQueue.main.async { _ = terminal.becomeFirstResponder() }
         return terminal
     }
 

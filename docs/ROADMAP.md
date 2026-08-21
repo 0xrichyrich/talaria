@@ -218,11 +218,11 @@ reproduce Electron HUD/always-on-top/titlebar behavior. Those remain genuinely
 desktop-local.
 
 Remote operator capabilities are **not** n/a merely because their Desktop UI
-is local. Hermes `c1e25cad` exposes an authenticated `/api/pty` WebSocket with
+is local. Audited Hermes `40643cba` exposes an authenticated `/api/pty` WebSocket with
 profile/session binding, opaque reattach tokens, bounded replay, resize, and
 native TUI approvals; a mobile advanced terminal is therefore portable. The
 gateway also exposes guarded Git, Projects, Files, and maintenance APIs. iOS
-must present those as source-qualified remote controls with explicit safety
+Talaria presents these as source-qualified remote controls with explicit safety
 boundaries, while App Store/TestFlight—not Hermes—owns Talaria app updates.
 
 The remaining true exceptions and their closest mobile equivalents are tracked

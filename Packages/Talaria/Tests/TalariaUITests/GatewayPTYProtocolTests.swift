@@ -217,6 +217,32 @@ final class GatewayPTYProtocolTests: XCTestCase {
         await connection.close()
     }
 
+    func testConnectionBackpressurePreservesBurstBeyondBufferCapacity() async throws {
+        let socket = FakePTYWireSocket()
+        let target = GatewayPTYTarget(
+            gatewayID: "mini", connectionGeneration: 1, baseURL: baseURL,
+            credential: .sessionToken("token"), attach: "tab")
+        let connection = GatewayPTYConnection(
+            target: target, ticketTimeout: .seconds(1), connectTimeout: .seconds(1),
+            ticketMinter: { _, _ in "" }, socketFactory: { _ in socket })
+        var iterator = connection.events.makeAsyncIterator()
+        try await connection.connect()
+        let opened = await iterator.next()
+        XCTAssertEqual(opened, .opened)
+
+        for value in 0..<64 { await socket.yield(Data([UInt8(value)])) }
+        var received: [UInt8] = []
+        for _ in 0..<64 {
+            guard case .bytes(let data) = await iterator.next() else {
+                return XCTFail("burst ended before every byte was delivered")
+            }
+            received.append(data[0])
+            if received.count.isMultiple(of: 8) { try? await Task.sleep(for: .milliseconds(1)) }
+        }
+        XCTAssertEqual(received, Array(0..<64).map(UInt8.init))
+        await connection.close()
+    }
+
     func testOAuthMintsExactlyOneTicketPerConnection() async throws {
         let probe = PTYTicketProbe()
         let socket = FakePTYWireSocket()
@@ -260,6 +286,30 @@ final class GatewayPTYProtocolTests: XCTestCase {
             socketFactory: { url in
                 XCTAssertTrue(url.absoluteString.contains("ticket=fresh-ticket"))
                 XCTAssertFalse(url.absoluteString.contains("stale"))
+                return socket
+            })
+        try await connection.connect()
+        await connection.close()
+    }
+
+    func testSessionCredentialPreparationReloadsAuthoritativeToken() async throws {
+        let socket = FakePTYWireSocket()
+        let target = GatewayPTYTarget(
+            gatewayID: "mini", connectionGeneration: 2, baseURL: baseURL,
+            credential: .sessionToken("captured-old"), attach: "tab")
+        let connection = GatewayPTYConnection(
+            target: target, ticketTimeout: .seconds(1), connectTimeout: .seconds(1),
+            credentialPreparer: { _, credential in
+                XCTAssertEqual(credential, .sessionToken("captured-old"))
+                return .sessionToken("authoritative-new")
+            },
+            ticketMinter: { _, _ in
+                XCTFail("session auth must not mint a ticket")
+                return ""
+            },
+            socketFactory: { url in
+                XCTAssertTrue(url.absoluteString.contains("token=authoritative-new"))
+                XCTAssertFalse(url.absoluteString.contains("captured-old"))
                 return socket
             })
         try await connection.connect()
@@ -382,6 +432,8 @@ final class GatewayPTYProtocolTests: XCTestCase {
         XCTAssertEqual(GatewayPTYClose(code: 4410).kind, .processExited)
         XCTAssertEqual(GatewayPTYClose(code: 1011).kind, .serverFailure)
         XCTAssertTrue(GatewayPTYClose(code: 1006).kind.reconnectsAutomatically)
+        XCTAssertFalse(GatewayPTYClose(code: 1002).kind.reconnectsAutomatically)
+        XCTAssertEqual(GatewayPTYClose(code: 1008).kind, .ended)
         XCTAssertFalse(GatewayPTYClose(code: 1011).kind.reconnectsAutomatically)
     }
 
@@ -476,6 +528,46 @@ final class GatewayPTYProtocolTests: XCTestCase {
             .milliseconds(2_000), .milliseconds(3_000),
             .milliseconds(3_000), .milliseconds(3_000),
         ])
+    }
+
+    func testRuntimeBackpressurePreservesBytesAndStateFIFOThroughReconnect() async {
+        let backend = PTYRuntimeBackend()
+        let runtime = makeRuntime(backend)
+        var iterator = runtime.events.makeAsyncIterator()
+        runtime.start(legacyTarget(generation: 12))
+
+        var observed: [GatewayPTYRuntimeEvent] = []
+        var openCount = 0
+        while openCount < 1, let event = await iterator.next() {
+            observed.append(event)
+            if event == .state(.open) { openCount += 1 }
+        }
+        let first = await backend.session(0)
+        for value in 0..<32 { first?.emit(.bytes(Data([UInt8(value)]))) }
+        first?.emit(.closed(GatewayPTYClose(code: 1006, reason: "radio")))
+
+        while openCount < 2, let event = await iterator.next() {
+            observed.append(event)
+            if event == .state(.open) { openCount += 1 }
+            if observed.count.isMultiple(of: 5) {
+                try? await Task.sleep(for: .milliseconds(1))
+            }
+        }
+
+        let bytes = observed.compactMap { event -> UInt8? in
+            guard case .bytes(let data) = event else { return nil }
+            return data.first
+        }
+        XCTAssertEqual(bytes, Array(0..<32).map(UInt8.init))
+        XCTAssertEqual(observed.last, .state(.open))
+        let finalOpen = observed.lastIndex(of: .state(.open))
+        let finalReconnect = observed.lastIndex(where: {
+            if case .state(.reconnecting(_)) = $0 { return true }
+            return false
+        })
+        XCTAssertNotNil(finalOpen)
+        XCTAssertNotNil(finalReconnect)
+        if let finalOpen, let finalReconnect { XCTAssertLessThan(finalReconnect, finalOpen) }
     }
 
     private func legacyTarget(generation: UInt64) -> GatewayPTYTarget {

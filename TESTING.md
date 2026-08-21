@@ -375,3 +375,28 @@ commit `Talaria.xcodeproj`, and features should map to a row in the parity
 docs. Protocol changes belong upstream in
 [hermes-agent](https://github.com/NousResearch/hermes-agent) — Talaria speaks
 its `/api/ws` surface as-is.
+## Advanced Terminal live certification
+
+Automated tests cover PTY target validation, exact query encoding, session-token
+and OAuth-ticket authentication, ordered byte delivery, close-code recovery,
+resize frames, renderer input policy, and lifecycle detachment. Before marking
+Advanced Terminal certified, run this matrix against the pinned Hermes gateway
+and a real iPhone/iPad:
+
+- Sign in once with a dashboard session token and once with gated native OAuth;
+  prove each reconnect mints a fresh ticket and a near-expiry token refreshes.
+- Select a non-default profile, type and paste through the native TUI, exercise
+  an approval, rotate the device, and verify output, keyboard, copy, links, and
+  VoiceOver focus remain correct.
+- Background briefly and cross Wi-Fi/cellular boundaries; prove ordered replay
+  reattaches the same token without replaying uncertain input.
+- Leave the app detached for at least 30 minutes. Talaria must ask before
+  reconnecting because Hermes does not disclose whether the expired token will
+  reattach or create a new PTY.
+- Open the same attachment elsewhere and prove `4409` stops reconnecting; prove
+  child exit `4410`, auth `4401`, unavailable `4404`, and server `1011` states
+  require explicit recovery instead of looping.
+- Rename/delete the selected profile, switch/remove/sign out of the gateway,
+  and run privacy reset. Local sockets, transcript buffers, and attach tokens
+  must be gone. Record that Hermes has no remote terminate endpoint and may keep
+  a detached remote child until its server-side TTL.

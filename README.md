@@ -132,7 +132,7 @@ completions) and fully offline **on-device models** (MLX, in the optional
 
 | Path | What lives there |
 |---|---|
-| `Packages/Talaria/` | The Swift package: `TalariaKit` (gateway protocol client, auth, models, demo data), `TalariaTheme` (the three theme packs + avatar language), `TalariaUI` (screens + `AppModel` state tree + live wiring), `talaria-verify` (protocol checks). No third-party dependencies. |
+| `Packages/Talaria/` | The Swift package: `TalariaKit` (gateway protocol client, auth, models, demo data), `TalariaTheme` (the three theme packs + avatar language), `TalariaUI` (screens + `AppModel` state tree + live wiring), `talaria-verify` (protocol checks). `TalariaUI` pins SwiftTerm 1.15.0 for the gateway-backed Advanced Terminal. |
 | `Packages/TalariaLocal/` | Optional on-device inference (MLX + Hugging Face hub), deliberately quarantined in its own package so the main app stays dependency-free unless the user opts in. |
 | `ios/` | XcodeGen app shell: `project.yml` (app + `TalariaWidgets` Live-Activity extension + `TalariaNotificationService` extension), resources (app icon, bundled fonts). `Talaria.xcodeproj` is generated, never committed. |
 | `relay/` | Gateway-side APNs push-relay plugin (`talaria-push`): approvals as actionable Time Sensitive alerts plus routine, mention, long-task, and gateway pushes. Includes the device registry, APNs HTTP/2 fan-out, dashboard plugin, and standalone sidecar. |

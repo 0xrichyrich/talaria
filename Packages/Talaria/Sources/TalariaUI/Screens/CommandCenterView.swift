@@ -12,7 +12,10 @@ import AppKit
 public struct CommandCenterView: View {
     private let model: AppModel
     private let initialGatewayID: String?
+    private let initialProfile: String?
+    private let initialTerminalResume: String?
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @State private var section: Section = .projects
 
     enum Section: String, CaseIterable, Identifiable {
@@ -20,13 +23,19 @@ public struct CommandCenterView: View {
         case files = "Files"
         case review = "Review"
         case commands = "Commands"
+        case terminal = "Terminal"
         case system = "System"
         var id: String { rawValue }
     }
 
-    public init(model: AppModel, initialGatewayID: String? = nil) {
+    public init(model: AppModel, initialGatewayID: String? = nil,
+                initialProfile: String? = nil,
+                initialTerminalResume: String? = nil) {
         self.model = model
         self.initialGatewayID = initialGatewayID
+        self.initialProfile = initialProfile
+        self.initialTerminalResume = initialTerminalResume
+        _section = State(initialValue: initialTerminalResume == nil ? .projects : .terminal)
     }
 
     private var theme: ThemePack { model.theme.pack }
@@ -63,6 +72,8 @@ public struct CommandCenterView: View {
                             case .files: WorkspaceFilesSection(model: model)
                             case .review: WorkspaceGitSection(model: model)
                             case .commands: WorkspaceCommandsSection(model: model)
+                            case .terminal: AdvancedTerminalView(
+                                model: model, resume: initialTerminalResume)
                             case .system: WorkspaceSystemSection(model: model, close: { dismiss() })
                             }
                         }
@@ -82,7 +93,7 @@ public struct CommandCenterView: View {
             .modifier(CommandInlineTitle())
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
-                if model.mode == .live {
+                if model.mode == .live, section != .terminal {
                     ToolbarItem(placement: .primaryAction) {
                         Button { Task { await model.refreshWorkspace() } } label: {
                             Image(systemName: "arrow.clockwise")
@@ -96,12 +107,21 @@ public struct CommandCenterView: View {
         }
         .task(id: model.mode) {
             guard model.mode == .live else { return }
-            model.prepareWorkspace(gatewayID: initialGatewayID)
+            model.prepareWorkspace(gatewayID: initialGatewayID, profile: initialProfile)
         }
         .onChange(of: model.mode) { _, mode in
-            if mode != .live { runtime.endCommandCenter() }
+            if mode != .live {
+                AdvancedTerminalCoordinator.shared.stop()
+                runtime.endCommandCenter()
+            }
         }
-        .onDisappear { runtime.endCommandCenter() }
+        .onChange(of: scenePhase) { _, phase in
+            AdvancedTerminalCoordinator.shared.setForeground(phase == .active)
+        }
+        .onDisappear {
+            AdvancedTerminalCoordinator.shared.stop()
+            runtime.endCommandCenter()
+        }
     }
 
     @ViewBuilder private var sourcePicker: some View {

@@ -106,7 +106,7 @@ public struct GatewayPTYClose: Equatable, Sendable {
         case 1011: kind = .serverFailure
         case 1000: kind = .ended
         case 1001, 1006, nil: kind = .transient
-        default: kind = .transient
+        default: kind = .ended
         }
     }
 }
@@ -244,7 +244,7 @@ public actor GatewayPTYConnection {
         self.ticketMinter = ticketMinter
         self.socketFactory = socketFactory
         var captured: AsyncStream<GatewayPTYEvent>.Continuation!
-        events = AsyncStream(bufferingPolicy: .unbounded) {
+        events = AsyncStream(bufferingPolicy: .bufferingOldest(1)) {
             captured = $0
         }
         continuation = captured
@@ -274,7 +274,7 @@ public actor GatewayPTYConnection {
             }
             throw error
         }
-        continuation.yield(.opened)
+        _ = await Self.yieldLosslessly(.opened, to: continuation)
         receiveTask = Task { [weak self] in await self?.receiveLoop(candidate) }
     }
 
@@ -336,30 +336,25 @@ public actor GatewayPTYConnection {
     }
 
     private func authenticatedURL() async throws -> URL {
-        switch target.credential {
-        case .sessionToken:
-            return try Self.makeURL(target: target, ticket: nil,
-                                    credential: target.credential)
-        case .oauth:
-            let prepared = try await Self.withTimeout(
-                ticketTimeout, timeoutError: GatewayPTYError.ticketTimedOut
-            ) { [credentialPreparer, currentness, ticketMinter, target] in
-                let credential = try await credentialPreparer(
-                    target.baseURL, target.credential)
-                guard !Task.isCancelled, await currentness(target) else {
-                    throw CancellationError()
-                }
-                guard case .oauth = credential else {
-                    throw AuthError.protocolError(
-                        "OAuth PTY credential preparation changed auth mode")
-                }
-                let ticket = try await ticketMinter(target.baseURL, credential)
-                return (credential, ticket)
+        let prepared = try await Self.withTimeout(
+            ticketTimeout, timeoutError: GatewayPTYError.ticketTimedOut
+        ) { [credentialPreparer, currentness, ticketMinter, target] in
+            let credential = try await credentialPreparer(
+                target.baseURL, target.credential)
+            guard !Task.isCancelled, await currentness(target) else {
+                throw CancellationError()
             }
-            try await ensureCurrent()
-            return try Self.makeURL(target: target, ticket: prepared.1,
-                                    credential: prepared.0)
+            let ticket: String?
+            if case .oauth = credential {
+                ticket = try await ticketMinter(target.baseURL, credential)
+            } else {
+                ticket = nil
+            }
+            return (credential, ticket)
         }
+        try await ensureCurrent()
+        return try Self.makeURL(target: target, ticket: prepared.1,
+                                credential: prepared.0)
     }
 
     private func receiveLoop(_ socket: any GatewayPTYWireSocket) async {
@@ -367,7 +362,11 @@ public actor GatewayPTYConnection {
             while !Task.isCancelled {
                 let bytes = try await socket.receive()
                 try await ensureCurrent()
-                if !bytes.isEmpty { continuation.yield(.bytes(bytes)) }
+                if !bytes.isEmpty {
+                    let delivered = await Self.yieldLosslessly(
+                        .bytes(bytes), to: continuation)
+                    if !delivered { return }
+                }
             }
         } catch {
             guard !finished else { return }
@@ -381,7 +380,8 @@ public actor GatewayPTYConnection {
             let (code, reason) = await socket.closeDetails()
             finished = true
             self.socket = nil
-            continuation.yield(.closed(GatewayPTYClose(code: code, reason: reason)))
+            _ = await Self.yieldLosslessly(
+                .closed(GatewayPTYClose(code: code, reason: reason)), to: continuation)
             continuation.finish()
         }
     }
@@ -395,8 +395,12 @@ public actor GatewayPTYConnection {
     public static func prepareCredential(
         baseURL: URL, credential: GatewayCredential
     ) async throws -> GatewayCredential {
-        guard case .oauth(let tokens) = credential, tokens.needsRefresh else {
-            return credential
+        // A prior PTY attempt may have rotated OAuth refresh tokens. Always
+        // begin with the credential currently persisted for this gateway;
+        // falling back to the captured value is only for isolated/test use.
+        let authoritative = KeychainStore().load(for: baseURL) ?? credential
+        guard case .oauth(let tokens) = authoritative, tokens.needsRefresh else {
+            return authoritative
         }
         let auth = GatewayAuthClient(baseURL: baseURL)
         do {
@@ -407,7 +411,7 @@ public actor GatewayPTYConnection {
         } catch AuthError.providerUnreachable {
             // Match GatewayClient: a temporarily unreachable IdP does not erase
             // a possibly-still-valid access token.
-            return credential
+            return authoritative
         } catch AuthError.sessionExpired {
             KeychainStore().delete(for: baseURL)
             throw AuthError.sessionExpired
@@ -428,5 +432,21 @@ public actor GatewayPTYConnection {
             guard let result = try await group.next() else { throw CancellationError() }
             return result
         }
+    }
+
+    private static func yieldLosslessly(
+        _ event: GatewayPTYEvent,
+        to continuation: AsyncStream<GatewayPTYEvent>.Continuation
+    ) async -> Bool {
+        while !Task.isCancelled {
+            switch continuation.yield(event) {
+            case .enqueued: return true
+            case .terminated: return false
+            case .dropped:
+                try? await Task.sleep(for: .milliseconds(1))
+            @unknown default: return false
+            }
+        }
+        return false
     }
 }

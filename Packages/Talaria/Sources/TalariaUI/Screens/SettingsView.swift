@@ -722,17 +722,17 @@ extension CopyPack {
         case .soft:
             return [("Environment variables", "hermes config env — on the machine running the gateway"),
                     ("Raw config.yaml", "Provider keys and host paths stay on the gateway host"),
-                    ("Interactive terminal / PTY", "A phone is not a shell. Command Center provides bounded, noninteractive workspace controls."),
+                    ("Local terminal", "iOS cannot run a local shell. Command Center provides an authenticated terminal on supported gateway hosts."),
                     ("Electron windows and overlays", "Desktop chrome such as window placement has no mobile analogue")]
         case .control:
             return [("ENV VARS", "HERMES CONFIG ENV — GATEWAY HOST ONLY"),
                     ("RAW CONFIG.YAML", "HOST KEYS AND PATHS STAY ON THE GATEWAY"),
-                    ("PTY / TERMINAL", "NOT ON DEVICE. COMMAND CENTER PROVIDES BOUNDED, NONINTERACTIVE CONTROLS."),
+                    ("LOCAL TERMINAL", "NO LOCAL SHELL. COMMAND CENTER CONNECTS TO A SUPPORTED GATEWAY PTY."),
                     ("ELECTRON WINDOWS", "NO MOBILE ANALOGUE")]
         case .ink:
             return [("the environment", "set where the gateway itself runs"),
                     ("the raw config", "keys and paths remain with the house"),
-                    ("the terminal", "a pocket is no shell; Command Center keeps bounded workspace controls instead"),
+                    ("the local terminal", "a pocket runs no shell; Command Center can attend a supported gateway PTY"),
                     ("the windows", "desktop chrome has no counterpart here")]
         }
     }

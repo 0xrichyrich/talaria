@@ -30,6 +30,7 @@ import AppKit
 public struct SessionsSheet: View {
     private let model: AppModel
     private let botID: String
+    private let onOpenTerminal: ((String, String, String) -> Void)?
     private let onOpen: ((String) -> Void)?
 
     @Environment(\.dismiss) private var dismiss
@@ -50,9 +51,12 @@ public struct SessionsSheet: View {
 
     /// `onOpen` fires after the chat has been rebound onto the tapped
     /// session, so the host can bring the chat forward.
-    public init(model: AppModel, botID: String, onOpen: ((String) -> Void)? = nil) {
+    public init(model: AppModel, botID: String,
+                onOpenTerminal: ((String, String, String) -> Void)? = nil,
+                onOpen: ((String) -> Void)? = nil) {
         self.model = model
         self.botID = botID
+        self.onOpenTerminal = onOpenTerminal
         self.onOpen = onOpen
     }
 
@@ -384,6 +388,7 @@ public struct SessionsSheet: View {
         }
         Button(copy.sessShare(theme.id)) { share(row) }
         Button(copy.sessCopyID(theme.id)) { model.copySessionID(row.id) }
+        Button("Open in Advanced Terminal") { openInTerminal(row) }
         if canArchive(row) {
             Button(copy.sessArchive(theme.id)) { archive(row) }
         }
@@ -400,6 +405,27 @@ public struct SessionsSheet: View {
     private func canArchive(_ row: Row) -> Bool {
         guard model.sessionFlagsSupported, !row.remote else { return false }
         return !model.isCanonicalChat(row.id, botID: botID)
+    }
+
+    private func openInTerminal(_ row: Row) {
+        guard let route = model.profileRoute(for: botID) else { return }
+        if let onOpenTerminal {
+            onOpenTerminal(route.gatewayID, route.profile, row.id)
+            dismiss()
+            return
+        }
+        dismiss()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: .talariaOpenCommandCenter,
+                object: nil,
+                userInfo: [
+                    "gatewayID": route.gatewayID,
+                    "profile": route.profile,
+                    "terminalResume": row.id,
+                ]
+            )
+        }
     }
 
     private func metaLine(_ row: Row) -> String {
