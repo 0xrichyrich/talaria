@@ -264,6 +264,11 @@ enum CronCreateAddFailurePolicy {
         return sourceFenceStillCurrent ? .addOutcomeUnknown : .sourceChangedBeforeACK
     }
 
+    static func unresolvedAddReason(sourceFenceStillCurrent: Bool)
+        -> CronAcceptedPartialReason {
+        sourceFenceStillCurrent ? .addOutcomeUnknown : .sourceChangedBeforeACK
+    }
+
     static func unresolvedPartial(reason: CronAcceptedPartialReason)
         -> CronAcceptedPartialOutcome {
         CronAcceptedPartialOutcome(
@@ -1273,6 +1278,18 @@ public extension AppModel {
                 reason: reason))
         }
 
+        // An empty acknowledgement is not a known accepted job. Check it
+        // before the known-job source fence: if a source replacement raced
+        // this response, the outcome is still unresolved pre-ACK identity,
+        // never a known-job `.sourceChanged` partial.
+        if jobID.isEmpty {
+            let reason = CronCreateAddFailurePolicy.unresolvedAddReason(
+                sourceFenceStillCurrent: cronMutationFenceAccepts(
+                    sourceFence, expectedClient: client))
+            return .acceptedPartial(CronCreateAddFailurePolicy.unresolvedPartial(
+                reason: reason))
+        }
+
         // `cronAdd` has committed an irreversible job.  Re-check the exact
         // source before publishing activity, refreshing the list, or issuing
         // the REST half.  A retained pool client can be replaced while the
@@ -1282,11 +1299,6 @@ public extension AppModel {
             return .acceptedPartial(CronAcceptedPartialOutcome(
                 jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
                 reason: .sourceChanged))
-        }
-        guard !jobID.isEmpty else {
-            return .acceptedPartial(CronAcceptedPartialOutcome(
-                jobID: jobID, gatewayID: gatewayID, profile: launchProfile,
-                reason: .addOutcomeUnknown))
         }
         let postAddDecision = CronCreatePostAddPolicy.decision(
             sourceFence: sourceFence,

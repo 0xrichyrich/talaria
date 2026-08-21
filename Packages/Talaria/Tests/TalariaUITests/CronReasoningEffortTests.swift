@@ -434,6 +434,14 @@ final class CronReasoningEffortTests: XCTestCase {
             CronCreateAddFailurePolicy.ambiguousPartialReason(
                 for: URLError(.cancelled), sourceFenceStillCurrent: false),
             .sourceChangedBeforeACK)
+        XCTAssertEqual(
+            CronCreateAddFailurePolicy.unresolvedAddReason(
+                sourceFenceStillCurrent: true),
+            .addOutcomeUnknown)
+        XCTAssertEqual(
+            CronCreateAddFailurePolicy.unresolvedAddReason(
+                sourceFenceStillCurrent: false),
+            .sourceChangedBeforeACK)
         // A changed source never turns a definite tool refusal into an
         // accepted partial; the editor must still receive the retryable error.
         XCTAssertNil(
@@ -463,6 +471,19 @@ final class CronReasoningEffortTests: XCTestCase {
         XCTAssertNil(sourceChanged.acceptedPartial?.profile)
         XCTAssertEqual(sourceChanged.acceptedPartial?.reason, .sourceChangedBeforeACK)
         XCTAssertTrue(sourceChanged.shouldDismissCreateEditor)
+
+        // An empty successful response has no accepted job identity. Even if
+        // the source raced it, it must not use the known-job sourceChanged
+        // copy or retain a gateway/profile claim.
+        let emptyAfterSourceChange = CronCreateOutcome.acceptedPartial(
+            CronCreateAddFailurePolicy.unresolvedPartial(
+                reason: CronCreateAddFailurePolicy.unresolvedAddReason(
+                    sourceFenceStillCurrent: false)))
+        XCTAssertEqual(emptyAfterSourceChange.acceptedPartial?.jobID, "")
+        XCTAssertNil(emptyAfterSourceChange.acceptedPartial?.gatewayID)
+        XCTAssertNil(emptyAfterSourceChange.acceptedPartial?.profile)
+        XCTAssertEqual(emptyAfterSourceChange.acceptedPartial?.reason,
+                       .sourceChangedBeforeACK)
     }
 
     func testUnknownAddFeedbackNeverClaimsCreationAcrossThemes() {
