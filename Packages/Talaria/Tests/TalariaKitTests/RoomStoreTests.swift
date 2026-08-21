@@ -1378,6 +1378,39 @@ final class RoomStoreTests: XCTestCase {
         XCTAssertEqual(restarted.rooms.first?.name, "Renamed")
     }
 
+    func testAtomicProjectionIntentAdvancesPastAStalePreparedRevision() async throws {
+        let base = try temporaryBase()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let oldKey = "name:Legacy"
+        let store = RoomStore(baseDirectory: base)
+        let hydrated = try await store.reconcileRoomProjection(
+            RoomProjectionEnvelope(rooms: [
+                oldKey: RoomProjectionRoom(
+                    name: "Legacy",
+                    log: [RoomProjectionEntry(
+                        id: "message-1",
+                        from: RoomProjectionAuthor(kind: .user, name: "You"),
+                        text: "hello", at: 1, thread: "thread-1")],
+                    revision: 9, members: projectedMembers()),
+            ]), allowedGatewayIDs: projectedGatewayIDs)
+        let roomID = try XCTUnwrap(hydrated.rooms.first?.id)
+        let newKey = RoomProjectionEnvelope.idKey(roomID.description)
+
+        let renamed = try await store.mutate(
+            roomID: roomID,
+            projectionIntent: RoomProjectionMergeIntent(
+                changedRooms: [newKey], deletedRooms: [oldKey], writeRevision: 4)
+        ) { room in
+            room.rawProjectionRoomKey = newKey
+            room.name = "Renamed"
+        }
+
+        let ledger = try await store.roomProjection()
+        XCTAssertEqual(renamed.rawProjectionRevision, 10)
+        XCTAssertEqual(ledger.rooms[newKey]?.revision, 10)
+        XCTAssertEqual(ledger.deleted[oldKey], 10)
+    }
+
     func testProfileLifecycleAtomicallyAdvancesProjectionAcrossRestart() async throws {
         let base = try temporaryBase()
         defer { try? FileManager.default.removeItem(at: base) }

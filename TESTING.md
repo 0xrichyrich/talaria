@@ -281,11 +281,13 @@ This is not yet a passing live certification case. Exact Hermes publishes
 bounded version-3 room projections in default-profile
 `ui_meta["hermes-bots-groups"]` and exposes per-key `ui_meta_revisions`.
 Talaria now has bounded projection/ledger storage, safe protected-room
-hydration, all-credentialed-gateway fan-out, per-gateway serialization and
+hydration, reachable-credentialed-gateway fan-out, per-gateway serialization and
 bounded conflict retry, exact CAS read-back confirmation, feature-detected
-legacy fallback, and adoption/reconnect/foreground reseeding. Automated tests
-cover these contracts, including privacy cancellation and applying a cached
-disband tombstone before network recovery. Do not claim certified
+legacy fallback, and adoption/reconnect/foreground reseeding. Focused tests
+cover the storage and scheduler policies, including privacy cancellation and
+applying a cached disband tombstone before network recovery. Production target
+discovery, connection leasing, and lifecycle-hook wiring are source-reviewed;
+the live matrix below remains their certification gate. Do not claim certified
 Desktop/mobile shared-room convergence from automated tests alone.
 
 First pin the gateway protocol directly: two clients must read the same

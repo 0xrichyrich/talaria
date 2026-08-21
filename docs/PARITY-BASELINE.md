@@ -72,7 +72,7 @@ merge. Gateway profiles add per-key `ui_meta_revisions` and optional
 `ui_meta_expected_revisions` compare-and-swap writes. Talaria now has the
 typed CAS wire contract plus a bounded version-3 decoder, merger, tombstone
 model, separately persisted projection ledger, protected room hydration,
-all-credentialed-gateway publication, conflict retry/read-back, and reconnect
+reachable-credentialed-gateway publication, conflict retry/read-back, and reconnect
 reseeding. Its existing rooms remain full, durable local rooms. Cross-client
 convergence is implemented and automated-test covered but remains uncertified
 until the retained live matrix passes. The other net changes are host update receipts
@@ -160,7 +160,7 @@ gateway PTY:
   Membership convergence uses a source-qualified persistent outbox so an
   offline create/rename/disband can finish after reconnect.
   The bounded `hermes-bots-groups` projection now adds explicit shared
-  tombstones, safe protected hydration, all-credentialed-gateway fan-out, and
+  tombstones, safe protected hydration, reachable-credentialed-gateway fan-out, and
   per-key `ui_meta` compare-and-swap with retry/read-back. Cross-client room
   convergence remains provisional until the live conflict/reconnect matrix is
   retained.
@@ -225,7 +225,7 @@ partial until the unchecked certification gates are recorded.
       Local implementation merged; exact Hermes shared gateway projection and
       metadata CAS are implemented in the separately tracked item below.
 - [x] Implement shared `hermes-bots-groups` projection consumption/publication,
-      durable tombstones, all-gateway fan-out, per-key profile CAS conflict
+      durable tombstones, reachable-gateway fan-out, per-key profile CAS conflict
       recovery, read-back confirmation, and legacy-gateway feature detection.
       Automated implementation is complete; the six live certification cases
       in `TESTING.md` remain open.

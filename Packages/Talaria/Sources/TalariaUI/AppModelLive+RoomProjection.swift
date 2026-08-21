@@ -633,6 +633,12 @@ final class RoomProjectionRuntime {
         let runtime = RoomRuntime.shared
         let store = runtime.store
         let ledger = try await store.roomProjection()
+        let registry = ConnectionRegistry.shared
+        let allowedGatewayIDs: Set<String> = Set(registry.saved.compactMap { gateway in
+            guard gateway.baseURL != nil,
+                  registry.credential(for: gateway) != nil else { return nil }
+            return gateway.id
+        })
         var preservingRoomIDs = Set<RoomID>()
         for key in preservingKeys {
             if let roomID = RoomProjectionEnvelope.localRoomID(forProjectionKey: key) {
@@ -654,7 +660,8 @@ final class RoomProjectionRuntime {
         }
 
         let result = try await store.reconcileRoomProjection(
-            incoming, preservingRoomIDs: preservingRoomIDs)
+            incoming, preservingRoomIDs: preservingRoomIDs,
+            allowedGatewayIDs: allowedGatewayIDs)
         runtime.rooms = result.rooms.sorted {
             if $0.lastActivityAt != $1.lastActivityAt {
                 return $0.lastActivityAt > $1.lastActivityAt
@@ -674,8 +681,9 @@ final class RoomProjectionRuntime {
 }
 
 extension AppModel {
-    /// Queue a bounded room projection update for every configured gateway that
-    /// still has a credential. Durable id keys are preferred over display names.
+    /// Queue a bounded room projection update for every reachable configured
+    /// gateway that still has a credential. Durable id keys are preferred over
+    /// display names; disconnected lanes resume from reconnect reseeding.
     func scheduleRoomProjectionSync(allowEmpty: Bool = false,
                                     changedRooms: [String] = [],
                                     deletedRooms: [String] = []) {
@@ -685,7 +693,7 @@ extension AppModel {
     }
 
     /// Gateway adoption/reconnect hook: receive from this source immediately,
-    /// then reseed all configured credentialed gateways after coalescing.
+    /// then reseed all reachable credentialed gateways after coalescing.
     func pullAndReseedRoomProjection(gatewayID: String) async {
         await RoomProjectionRuntime.shared.pullAndReseed(
             model: self, gatewayID: gatewayID)

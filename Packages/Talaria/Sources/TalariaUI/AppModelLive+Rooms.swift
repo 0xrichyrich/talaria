@@ -1148,13 +1148,25 @@ public extension AppModel {
                                          oldName: before.name, newName: normalized)
                 }
             }
+            let previousProjectionKey = roomProjectionKey(before)
+            let promotesLegacyProjection = before.name != normalized
+                && previousProjectionKey.hasPrefix("name:")
+            let promotedProjectionKey = RoomProjectionEnvelope.idKey(
+                before.id.description)
+            let projectionIntent = promotesLegacyProjection
+                ? RoomProjectionMergeIntent(
+                    changedRooms: [promotedProjectionKey],
+                    deletedRooms: [previousProjectionKey],
+                    writeRevision: before.rawProjectionRevision == .max
+                        ? .max : before.rawProjectionRevision + 1)
+                : nil
             let result: RoomRecord
             do {
                 result = try await RoomRuntime.shared.store.mutate(
-                    roomID: roomID, metadataMutations: metadata
+                    roomID: roomID, metadataMutations: metadata,
+                    projectionIntent: projectionIntent
                 ) { current in
-                    if current.rawProjectionRoomKey?.hasPrefix("name:") == true,
-                       current.name != normalized {
+                    if promotesLegacyProjection {
                         // A legacy name-key maps its local UUID from the old
                         // name and therefore cannot be re-keyed to another
                         // name without changing protected RoomID. Promote the
@@ -1191,7 +1203,7 @@ public extension AppModel {
             RoomRuntime.shared.replace(result)
             scheduleRoomProjectionSync(
                 changedRooms: [roomProjectionKey(result)],
-                deletedRooms: before.name == result.name ? [] : [before.name]
+                deletedRooms: promotesLegacyProjection ? [previousProjectionKey] : []
             )
             await flushRoomMetadataOutboxAlreadyAdmitted()
         }
@@ -1211,11 +1223,22 @@ public extension AppModel {
             RoomMetadataMutation(route: $0.route, kind: .rename,
                                  oldName: oldName, newName: normalized)
         }
+        let previousProjectionKey = roomProjectionKey(room)
+        let promotesLegacyProjection = room.name != normalized
+            && previousProjectionKey.hasPrefix("name:")
+        let promotedProjectionKey = RoomProjectionEnvelope.idKey(room.id.description)
+        let projectionIntent = promotesLegacyProjection
+            ? RoomProjectionMergeIntent(
+                changedRooms: [promotedProjectionKey],
+                deletedRooms: [previousProjectionKey],
+                writeRevision: room.rawProjectionRevision == .max
+                    ? .max : room.rawProjectionRevision + 1)
+            : nil
         room = try await RoomRuntime.shared.store.mutate(
-            roomID: roomID, metadataMutations: metadata
+            roomID: roomID, metadataMutations: metadata,
+            projectionIntent: projectionIntent
         ) { current in
-            if current.rawProjectionRoomKey?.hasPrefix("name:") == true,
-               current.name != normalized {
+            if promotesLegacyProjection {
                 current.rawProjectionRoomKey = RoomProjectionEnvelope.idKey(
                     current.id.description)
             }
@@ -1224,7 +1247,8 @@ public extension AppModel {
         }
         RoomRuntime.shared.replace(room)
         scheduleRoomProjectionSync(
-            changedRooms: [roomProjectionKey(room)], deletedRooms: [oldName]
+            changedRooms: [roomProjectionKey(room)],
+            deletedRooms: promotesLegacyProjection ? [previousProjectionKey] : []
         )
     }
 

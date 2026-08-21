@@ -833,7 +833,7 @@ public actor RoomStore {
     /// atomic index replacement; a process death cannot lose the only evidence
     /// that the old identity was retired.
     private func applyProjectionIntent(
-        _ intent: RoomProjectionMergeIntent,
+        _ proposedIntent: RoomProjectionMergeIntent,
         to rooms: inout [RoomID: RoomRecord],
         updatedAt: UInt64?
     ) -> RoomProjectionEnvelope {
@@ -844,6 +844,34 @@ public actor RoomStore {
                 ($0.id, $0.rawProjectionRevision)
             }),
             updatedAt: updatedAt ?? previous.updatedAt)
+        var intent = proposedIntent
+        let affectedKeys = resolvedProjectionKeys(
+            intent.changedRooms + intent.deletedRooms, in: previous
+        ).union(resolvedProjectionKeys(
+            intent.changedRooms + intent.deletedRooms, in: local))
+        var observedRevision: UInt64 = 0
+        for key in affectedKeys {
+            observedRevision = max(
+                observedRevision,
+                previous.rooms[key]?.revision ?? 0,
+                previous.deleted[key] ?? 0,
+                local.rooms[key]?.revision ?? 0)
+        }
+        for room in rooms.values {
+            let key = room.rawProjectionRoomKey
+                ?? RoomProjectionEnvelope.idKey(room.id.description)
+            if affectedKeys.contains(key) {
+                observedRevision = max(observedRevision, room.rawProjectionRevision)
+            }
+        }
+        // This API represents a newly committed local rich mutation. If a
+        // gateway reconcile advanced the ledger after the caller prepared its
+        // intent but before this actor turn, lift the intent above that winner
+        // inside the same atomic write instead of publishing a stale revision.
+        if intent.writeRevision <= observedRevision {
+            intent.writeRevision = observedRevision == .max
+                ? .max : observedRevision + 1
+        }
         let merged = RoomProjectionEnvelope.merging(
             remote: previous, local: local, intent: intent,
             updatedAt: updatedAt)
