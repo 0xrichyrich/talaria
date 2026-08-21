@@ -70,6 +70,9 @@ final class ChatRuntime {
     /// a new prompt cannot race the unknown stop.
     var stopActions: [String: StopTurnLease] = [:]
     var stopFences: [String: StopTurnFence] = [:]
+    /// Lower-wire interrupt seam for focused admission/drain races.
+    var interruptForTesting:
+        (@MainActor (GatewayClient, String) async throws -> Void)?
 
     /// At most one authoritative retry may be in flight for a bot. Retained
     /// mutation/kickoff fences are deliberately not replayed; this coalescer
@@ -1303,7 +1306,9 @@ extension AppModel {
     /// that exact operation is accepted, rejected, or reconciled.
     func mutationIsFenced(botID: String) -> Bool {
         let runtime = ChatRuntime.shared
-        return runtime.transcriptFences[botID] != nil
+        return MessageBranchRuntime.shared.actionIDs[botID] != nil
+            || sessionControlMutationIsActive(botID: botID)
+            || runtime.transcriptFences[botID] != nil
             || runtime.transcriptActions[botID] != nil
             || runtime.steerFences[botID] != nil
             || runtime.steerActions[botID] != nil
@@ -1401,6 +1406,7 @@ extension AppModel {
               runtime.stopFences[botID] == nil,
               runtime.transcriptActions[botID] == nil,
               runtime.transcriptFences[botID] == nil,
+              !sessionControlMutationIsActive(botID: botID),
               CanonicalChatRuntime.shared.ambiguousKickoffs[botID] == nil else { return }
         runtime.pendingStopRequests[botID] = nil
         stopTurn(botID: botID)
@@ -2086,6 +2092,8 @@ extension AppModel {
             botID: botID, generation: LiveRuntime.shared.generation)
         guard chat.sessionID != nil, chat.storedSessionID?.isEmpty == false,
               !chat.isRunning, !chat.isTyping,
+              MessageBranchRuntime.shared.actionIDs[botID] == nil,
+              !sessionControlMutationIsActive(botID: botID),
               ChatRuntime.shared.transcriptActions[botID] == nil,
               ChatRuntime.shared.transcriptFences[botID] == nil else { return false }
         if message.author == .user {
@@ -2105,6 +2113,7 @@ extension AppModel {
         guard let sid = chat.sessionID, let storedID = chat.storedSessionID,
               let actionRoute = gatewayRoute(for: botID),
               !storedID.isEmpty, !chat.isRunning, !chat.isTyping,
+              !sessionControlMutationIsActive(botID: botID),
               runtime.transcriptActions[botID] == nil,
               runtime.transcriptFences[botID] == nil else { return }
         let baseline = chat.messages
@@ -2586,6 +2595,7 @@ extension AppModel {
             || runtime.steerFences[botID] != nil
             || runtime.transcriptActions[botID] != nil
             || runtime.transcriptFences[botID] != nil
+            || sessionControlMutationIsActive(botID: botID)
             || runtime.reconcilingBots.contains(botID)
             || runtime.reconciliationTasks[botID] != nil
             || CanonicalChatRuntime.shared.ambiguousKickoffs[botID] != nil
@@ -2707,7 +2717,11 @@ extension AppModel {
                 attempt.generation = active.generation
                 attempt.requestStarted = true
                 ChatRuntime.shared.stopActions[botID] = attempt
-                try await client.interruptSession(attempt.sessionID)
+                if let override = ChatRuntime.shared.interruptForTesting {
+                    try await override(client, attempt.sessionID)
+                } else {
+                    try await client.interruptSession(attempt.sessionID)
+                }
                 applyStopCompletion(attempt, note: note)
             } catch {
                 let ambiguous = attempt.requestStarted && PromptMutationFailure.isAmbiguous(error)

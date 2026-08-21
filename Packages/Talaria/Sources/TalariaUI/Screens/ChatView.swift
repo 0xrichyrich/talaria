@@ -684,6 +684,13 @@ public struct ChatView: View {
                 Label(copy.regenerateMessage(theme.id), systemImage: "arrow.clockwise")
             }
         }
+        if message.author == .bot, model.canBranchFromMessage(message, in: botID) {
+            Button {
+                model.branchFromMessage(message, in: botID)
+            } label: {
+                Label("Branch from here", systemImage: "arrow.triangle.branch")
+            }
+        }
         if model.canReact(to: message, in: botID) {
             Menu {
                 ForEach(Self.reactionEmojis, id: \.self) { emoji in
@@ -1242,7 +1249,8 @@ public struct ChatView: View {
     /// Attachments alone are a valid turn — the gateway supplies the implicit
     /// "what is this?" prompt for an image sent without words.
     private var canSend: Bool {
-        switch composerAction {
+        guard !model.isBranchingFromMessage(in: botID) else { return false }
+        return switch composerAction {
         case .disabled, .stop: false
         default: true
         }
