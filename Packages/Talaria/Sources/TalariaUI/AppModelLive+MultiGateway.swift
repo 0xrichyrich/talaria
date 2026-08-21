@@ -42,7 +42,138 @@ final class MultiGatewayRuntime {
     var routedUnread: [GatewayBotRoute: Int] = [:]
 }
 
+/// A secondary-source event intake that is invisible until exact session
+/// authority succeeds. The handler starts buffering immediately; publication
+/// installs its gated pump only after the authoritative snapshot is ready.
+@MainActor
+final class PreparedExactRoutedEvents {
+    let client: GatewayClient
+    let gatewayID: String
+    let handlerID: UUID
+    let stream: AsyncStream<GatewayEvent>
+    private let continuation: AsyncStream<GatewayEvent>.Continuation
+    private var committed = false
+    private var activation: AsyncStream<Void>.Continuation?
+
+    init(client: GatewayClient, gatewayID: String, handlerID: UUID,
+         stream: AsyncStream<GatewayEvent>,
+         continuation: AsyncStream<GatewayEvent>.Continuation) {
+        self.client = client
+        self.gatewayID = gatewayID
+        self.handlerID = handlerID
+        self.stream = stream
+        self.continuation = continuation
+    }
+
+    func markCommitted(_ activation: AsyncStream<Void>.Continuation) {
+        committed = true
+        self.activation = activation
+    }
+
+    func activate() {
+        activation?.yield(())
+        activation?.finish()
+        activation = nil
+    }
+
+    func finish() { continuation.finish() }
+
+    func discard() async {
+        guard !committed else { return }
+        continuation.finish()
+        await client.removeEventHandler(handlerID)
+    }
+
+    func yieldForTesting(_ event: GatewayEvent) { continuation.yield(event) }
+}
+
 public extension AppModel {
+
+    private func consumeRoutedEvent(_ event: GatewayEvent, gatewayID: String,
+                                    client: GatewayClient) async {
+        handle(event: event, sourceGatewayID: gatewayID)
+        await handleMCPSetupWireEvent(event, sourceGatewayID: gatewayID,
+                                      sourceClient: client)
+        handleBridgeEvent(event, sourceGatewayID: gatewayID)
+        routeToolEvent(event, sourceGatewayID: gatewayID)
+        routeSessionEvent(event, sourceGatewayID: gatewayID)
+        routePetEvent(event, sourceGatewayID: gatewayID)
+        routeA2AChange(event, sourceGatewayID: gatewayID)
+    }
+
+    /// Install a handler on a not-yet-published secondary client. Existing
+    /// routed state remains untouched until `commitExactRoutedEvents`.
+    internal func prepareExactRoutedEvents(client: GatewayClient,
+                                           gatewayID: String) async
+        -> PreparedExactRoutedEvents? {
+        guard gatewayID != activeGatewayID else { return nil }
+        if let existing = MultiGatewayRuntime.shared.routedEvents[gatewayID],
+           ObjectIdentifier(existing.client) == ObjectIdentifier(client) {
+            return nil
+        }
+        let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let handlerID = await client.addEventHandler { continuation.yield($0) }
+        let current = await ConnectionRegistry.shared.clientPool.client(for: gatewayID)
+        guard current.map(ObjectIdentifier.init) == ObjectIdentifier(client) else {
+            await client.removeEventHandler(handlerID)
+            continuation.finish()
+            return nil
+        }
+        return PreparedExactRoutedEvents(
+            client: client, gatewayID: gatewayID, handlerID: handlerID,
+            stream: stream, continuation: continuation)
+    }
+
+    /// Publish a prepared intake without starting delivery. The caller binds
+    /// the post-subscription snapshot first, then calls `activate()` so buffered
+    /// post-snapshot events replay against the correct runtime session.
+    internal func commitExactRoutedEvents(_ prepared: PreparedExactRoutedEvents,
+                                          snapshotSequence: UInt64,
+                                          snapshotSessionID: String) async throws {
+        let gatewayID = prepared.gatewayID
+        guard gatewayID != activeGatewayID,
+              await ConnectionRegistry.shared.clientPool.client(for: gatewayID)
+                .map(ObjectIdentifier.init) == ObjectIdentifier(prepared.client) else {
+            await prepared.discard()
+            throw CancellationError()
+        }
+        if MultiGatewayRuntime.shared.routedEvents[gatewayID] != nil {
+            await detachRoutedEvents(gatewayID: gatewayID)
+        } else {
+            await removeRoutedEventSubscription(gatewayID: gatewayID)
+        }
+        MultiGatewayRuntime.shared.routedEventGenerations[gatewayID, default: 0] &+= 1
+        let generation = MultiGatewayRuntime.shared
+            .routedEventGenerations[gatewayID, default: 0]
+        let (activationStream, activation) = AsyncStream.makeStream(of: Void.self)
+        let pump = Task { @MainActor [weak self] in
+            for await _ in activationStream { break }
+            guard let self else { return }
+            for await event in prepared.stream {
+                // The catch-up resume includes every target-session event at or
+                // before its response frame. Other sessions/global broadcasts
+                // were never represented by that snapshot and retain all rows.
+                if event.sessionID == snapshotSessionID,
+                   event.inboundSequence != 0,
+                   event.inboundSequence <= snapshotSequence {
+                    continue
+                }
+                await self.consumeRoutedEvent(
+                    event, gatewayID: gatewayID, client: prepared.client)
+            }
+        }
+        MultiGatewayRuntime.shared.routedEvents[gatewayID] = .init(
+            client: prepared.client, handlerID: prepared.handlerID, pump: pump)
+        prepared.markCommitted(activation)
+        // `remove` + install owns the current generation. A replacement racing
+        // this commit must not be mistaken for the prepared subscription.
+        guard MultiGatewayRuntime.shared.routedEventGenerations[gatewayID] == generation else {
+            pump.cancel()
+            throw CancellationError()
+        }
+        ApprovalBridges.shared.resetSweepScope(gatewayID: gatewayID)
+        Task { @MainActor [weak self] in await self?.replayPendingApprovals() }
+    }
 
     enum GatewayRouteError: LocalizedError {
         case noRoute
@@ -175,14 +306,7 @@ public extension AppModel {
         let pump = Task { @MainActor [weak self] in
             for await event in stream {
                 guard let self else { return }
-                self.handle(event: event, sourceGatewayID: gatewayID)
-                await self.handleMCPSetupWireEvent(event, sourceGatewayID: gatewayID,
-                                                   sourceClient: client)
-                self.handleBridgeEvent(event, sourceGatewayID: gatewayID)
-                self.routeToolEvent(event, sourceGatewayID: gatewayID)
-                self.routeSessionEvent(event, sourceGatewayID: gatewayID)
-                self.routePetEvent(event, sourceGatewayID: gatewayID)
-                self.routeA2AChange(event, sourceGatewayID: gatewayID)
+                await self.consumeRoutedEvent(event, gatewayID: gatewayID, client: client)
             }
         }
         runtime.routedEvents[gatewayID] = MultiGatewayRuntime.RoutedEvents(

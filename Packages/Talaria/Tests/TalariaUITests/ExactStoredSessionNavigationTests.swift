@@ -646,6 +646,8 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
             bot: route,
             session: GatewaySessionRoute(gatewayID: gatewayID, sessionID: "approval-runtime"),
             requestID: "approval-wire")
+        let pool = ConnectionRegistry.shared.clientPool
+        await pool.adopt(client, for: gatewayID)
         let previous = ChatState(messages: [
             ChatMessage(author: .bot, text: "keep the visible transcript"),
         ])
@@ -744,7 +746,41 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         XCTAssertEqual(eventRuntime.routedEventGenerations[gatewayID], 41)
         XCTAssertNotNil(LiveRuntime.shared.approvalTargets[approvalID])
 
+        do {
+            _ = try await model.openStoredSessionAwaiting(
+                "wanted-stored", botID: target, route: route, client: client,
+                validateBeforeBinding: {},
+                resumeForTesting: {
+                    LiveSession(.object([
+                        "session_id": .string("right-runtime"),
+                        "stored_session_id": .string("wanted-stored"),
+                        "info": .object(["profile_name": .string(profile)]),
+                    ]))
+                },
+                catchUpResumeForTesting: {
+                    (LiveSession(.object([
+                        "session_id": .string("wrong-runtime"),
+                        "stored_session_id": .string("wanted-stored"),
+                        "info": .object(["profile_name": .string("default")]),
+                    ])), 20)
+                })
+            XCTFail("a catch-up mismatch must reject transactionally")
+        } catch {
+            XCTAssertTrue(error is AckValidationError)
+        }
+        XCTAssertEqual(model.openBotID, "visible")
+        XCTAssertEqual(targetChat.messages.map(\.text), ["keep the target transcript too"])
+        XCTAssertEqual(targetChat.sessionID, "target-old-runtime")
+        XCTAssertEqual(targetChat.storedSessionID, "target-old-stored")
+        XCTAssertEqual(eventRuntime.routedUnread[route], 7)
+        XCTAssertTrue(eventRuntime.routedEvents[gatewayID].map {
+            ObjectIdentifier($0.client) == ObjectIdentifier(sentinelClient)
+        } == true)
+        XCTAssertEqual(eventRuntime.routedEventGenerations[gatewayID], 41)
+        XCTAssertNotNil(LiveRuntime.shared.approvalTargets[approvalID])
+
         await sentinelClient.removeEventHandler(sentinelHandler)
+        await pool.disconnect(gatewayID: gatewayID)
     }
 
     func testExactOpenRejectsMissingDurableAckWithoutBackfill() async throws {
@@ -807,14 +843,24 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         MultiGatewayRuntime.shared.routedUnread[route] = 5
         var observedBeforeResume = false
         var observedBeforeAuthority = false
+        var validationCount = 0
         let opened: Bool
         do {
             opened = try await model.openStoredSessionAwaiting(
                 "wanted-stored", botID: target, route: route, client: client,
                 validateBeforeBinding: {
+                    validationCount += 1
                     observedBeforeAuthority = model.openBotID == "visible"
                         && targetChat.messages.map(\.text) == ["old target transcript"]
                         && MultiGatewayRuntime.shared.routedUnread[route] == 5
+                    if validationCount == 2 {
+                        await client.emitEventForTesting(GatewayEvent(
+                            type: "message.complete", sessionID: "new-runtime",
+                            payload: .object([
+                                "text": .string("post-snapshot response"),
+                                "status": .string("complete"),
+                            ]), inboundSequence: 11))
+                    }
                 },
                 resumeForTesting: {
                     observedBeforeResume = model.openBotID == "visible"
@@ -825,10 +871,30 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
                         "stored_session_id": .string("wanted-stored"),
                         "messages": .array([
                             .object(["role": .string("assistant"),
-                                     "text": .string("authoritative response")]),
+                                     "text": .string("snapshot response")]),
                         ]),
                         "info": .object(["profile_name": .string(profile)]),
                     ]))
+                },
+                catchUpResumeForTesting: {
+                    // This frame precedes the response boundary and is already
+                    // represented by the returned snapshot, so replaying it
+                    // would duplicate the completed message.
+                    await client.emitEventForTesting(GatewayEvent(
+                        type: "message.complete", sessionID: "new-runtime",
+                        payload: .object([
+                            "text": .string("snapshot response"),
+                            "status": .string("complete"),
+                        ]), inboundSequence: 9))
+                    return (LiveSession(.object([
+                        "session_id": .string("new-runtime"),
+                        "stored_session_id": .string("wanted-stored"),
+                        "messages": .array([
+                            .object(["role": .string("assistant"),
+                                     "text": .string("snapshot response")]),
+                        ]),
+                        "info": .object(["profile_name": .string(profile)]),
+                    ])), 10)
                 })
         } catch {
             await model.removeRoutedEventSubscription(gatewayID: gatewayID)
@@ -845,7 +911,9 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         XCTAssertTrue(model.chats[target] === targetChat)
         XCTAssertEqual(targetChat.sessionID, "new-runtime")
         XCTAssertEqual(targetChat.storedSessionID, "wanted-stored")
-        XCTAssertEqual(targetChat.messages.map(\.text), ["authoritative response"])
+        for _ in 0..<20 where targetChat.messages.count < 2 { await Task.yield() }
+        XCTAssertEqual(targetChat.messages.map(\.text),
+                       ["snapshot response", "post-snapshot response"])
         XCTAssertNil(MultiGatewayRuntime.shared.routedUnread[route])
         XCTAssertEqual(previous.messages.map(\.text), ["old visible transcript"])
         XCTAssertEqual(

@@ -9,9 +9,14 @@ public struct GatewayEvent: Sendable {
     /// Runtime session id; empty string for global broadcasts.
     public var sessionID: String
     public var payload: JSONValue?
+    /// Monotonic frame position assigned by the transport. Zero is reserved
+    /// for synthetic/test events that predate sequencing.
+    public var inboundSequence: UInt64
 
-    public init(type: String, sessionID: String, payload: JSONValue?) {
+    public init(type: String, sessionID: String, payload: JSONValue?,
+                inboundSequence: UInt64 = 0) {
         self.type = type; self.sessionID = sessionID; self.payload = payload
+        self.inboundSequence = inboundSequence
     }
 
     public var isGlobal: Bool { sessionID.isEmpty }
