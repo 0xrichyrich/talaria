@@ -124,6 +124,136 @@ public struct ProfileSnapshot: Sendable, Equatable {
 
 // MARK: - Dirty diff
 
+/// A stale per-key `ui_meta` precondition reported by profiles.configure.
+public struct ProfileUIMetaConflict: Sendable, Equatable {
+    public var expected: Int
+    public var actual: Int
+
+    public init(expected: Int, actual: Int) {
+        self.expected = expected
+        self.actual = actual
+    }
+}
+
+/// Typed profiles.configure acknowledgement. Hermes nests the CAS fields in
+/// `result.applied` beside the ordinary per-section booleans.
+public struct ProfileConfigureResult: Sendable, Equatable {
+    public var applied: [String: Bool]
+    public var uiMetaRevisions: [String: Int]?
+    public var uiMetaConflicts: [String: ProfileUIMetaConflict]?
+
+    /// True when a present applied/CAS field had the wrong shape. Consumers
+    /// must not interpret a malformed authoritative response as legacy
+    /// silence or as a successful write.
+    public var hasMalformedUIMetaCASFields: Bool
+
+    init(_ result: JSONValue) {
+        applied = [:]
+        uiMetaRevisions = nil
+        uiMetaConflicts = nil
+        hasMalformedUIMetaCASFields = false
+
+        guard let appliedNode = result["applied"] else { return }
+        guard let fields = appliedNode.objectValue else {
+            hasMalformedUIMetaCASFields = true
+            return
+        }
+        // Preserve the legacy wrapper's exact compact-map behavior, including
+        // arbitrary future boolean section keys. Typed CAS parsing below is
+        // additive and never changes what existing callers receive.
+        applied = fields.compactMapValues(\.boolValue)
+
+        for (key, value) in fields {
+            switch key {
+            case "ui_meta_revisions":
+                let decoded = ProfileUIMetaRevisionWire.decodeMap(value)
+                uiMetaRevisions = decoded.value
+                hasMalformedUIMetaCASFields = hasMalformedUIMetaCASFields || !decoded.isValid
+            case "ui_meta_conflicts":
+                guard let rawConflicts = value.objectValue else {
+                    hasMalformedUIMetaCASFields = true
+                    continue
+                }
+                var conflicts: [String: ProfileUIMetaConflict] = [:]
+                for (metaKey, rawConflict) in rawConflicts {
+                    guard let conflict = rawConflict.objectValue,
+                          Set(conflict.keys) == ["expected", "actual"],
+                          let expected = ProfileUIMetaRevisionWire.decode(conflict["expected"]),
+                          let actual = ProfileUIMetaRevisionWire.decode(conflict["actual"]) else {
+                        hasMalformedUIMetaCASFields = true
+                        conflicts.removeAll()
+                        break
+                    }
+                    conflicts[metaKey] = ProfileUIMetaConflict(
+                        expected: expected, actual: actual)
+                }
+                if !hasMalformedUIMetaCASFields { uiMetaConflicts = conflicts }
+            default:
+                guard value.boolValue != nil else {
+                    hasMalformedUIMetaCASFields = true
+                    continue
+                }
+            }
+        }
+    }
+
+    fileprivate static let empty = ProfileConfigureResult(.object(["applied": .object([:])]))
+}
+
+/// The fail-closed commit fence for a CAS ui_meta write. A successful RPC is
+/// insufficient: Hermes must affirm the section, report no conflict field,
+/// and return exactly the requested keys advanced by exactly one revision.
+public enum ProfileUIMetaCASPolicy {
+    public static func confirmsCommit(expectedRevisions: [String: Int],
+                                      result: ProfileConfigureResult) -> Bool {
+        guard !expectedRevisions.isEmpty,
+              result.applied["ui_meta"] == true,
+              !result.hasMalformedUIMetaCASFields,
+              result.uiMetaConflicts == nil,
+              let returned = result.uiMetaRevisions,
+              Set(returned.keys) == Set(expectedRevisions.keys) else {
+            return false
+        }
+        return expectedRevisions.allSatisfy { key, expected in
+            guard ProfileUIMetaRevisionWire.isRequestSafe(expected) else { return false }
+            let (next, overflow) = expected.addingReportingOverflow(1)
+            return !overflow && returned[key] == next
+        }
+    }
+}
+
+private enum ProfileUIMetaRevisionWire {
+    static func decode(_ value: JSONValue?) -> Int? {
+        guard let number = value?.doubleValue,
+              number.isFinite,
+              let revision = Int(exactly: number),
+              revision >= 0 else { return nil }
+        return revision
+    }
+
+    static func decodeMap(_ value: JSONValue?)
+        -> (value: [String: Int]?, isValid: Bool) {
+        guard let value else { return (nil, true) }
+        guard let object = value.objectValue else { return (nil, false) }
+        var revisions: [String: Int] = [:]
+        revisions.reserveCapacity(object.count)
+        for (key, raw) in object {
+            guard let revision = decode(raw) else { return (nil, false) }
+            revisions[key] = revision
+        }
+        return (revisions, true)
+    }
+
+    /// JSONValue encodes integers through Double. Refuse a value whose exact
+    /// integer identity (or the required +1 acknowledgement) would be lost.
+    static func isRequestSafe(_ revision: Int) -> Bool {
+        guard revision >= 0,
+              Int(exactly: Double(revision)) == revision else { return false }
+        let (next, overflow) = revision.addingReportingOverflow(1)
+        return !overflow && Int(exactly: Double(next)) == next
+    }
+}
+
 /// The sections of a profiles.configure call the user actually changed.
 /// Anything left nil is never sent, so the gateway leaves it alone.
 public struct ProfileEdit: Sendable, Equatable {
@@ -136,24 +266,41 @@ public struct ProfileEdit: Sendable, Equatable {
     public var disabledSkills: [String]?
     public var enabledToolsets: [String]?
     public var uiMeta: JSONValue?
+    /// Per-top-level-key compare-and-swap preconditions. Omit for the bounded
+    /// legacy best-effort path; when present, the key set must exactly match
+    /// the `uiMeta` patch so no key can slip through without a precondition.
+    public var uiMetaExpectedRevisions: [String: Int]?
 
     public init(description: String? = nil, soul: String? = nil,
                 model: String? = nil, provider: String? = nil,
                 disabledSkills: [String]? = nil, enabledToolsets: [String]? = nil,
-                uiMeta: JSONValue? = nil) {
+                uiMeta: JSONValue? = nil,
+                uiMetaExpectedRevisions: [String: Int]? = nil) {
         self.description = description; self.soul = soul
         self.model = model; self.provider = provider
         self.disabledSkills = disabledSkills; self.enabledToolsets = enabledToolsets
         self.uiMeta = uiMeta
+        self.uiMetaExpectedRevisions = uiMetaExpectedRevisions
     }
 
     public var isEmpty: Bool {
         description == nil && soul == nil && model == nil && disabledSkills == nil
-            && enabledToolsets == nil && uiMeta == nil
+            && enabledToolsets == nil && uiMeta == nil && uiMetaExpectedRevisions == nil
     }
 
     public var isWireValid: Bool {
-        model == nil || provider?.isEmpty == false
+        (model == nil || provider?.isEmpty == false) && hasValidUIMetaCASRequest
+    }
+
+    /// Local request fence. The exact Hermes server checks every incoming
+    /// ui_meta key independently, while extra expectation keys are ignored;
+    /// exact equality here avoids both unprotected and misleading keys.
+    var hasValidUIMetaCASRequest: Bool {
+        guard let expected = uiMetaExpectedRevisions else { return true }
+        guard let patch = uiMeta?.objectValue,
+              !patch.isEmpty,
+              Set(patch.keys) == Set(expected.keys) else { return false }
+        return expected.values.allSatisfy(ProfileUIMetaRevisionWire.isRequestSafe)
     }
 
     /// Per-section acknowledgements profiles.configure must return for this
@@ -191,6 +338,10 @@ public struct ProfileEdit: Sendable, Equatable {
             params["enabled_toolsets"] = .array(enabledToolsets.map(JSONValue.string))
         }
         if let uiMeta { params["ui_meta"] = uiMeta }
+        if let uiMetaExpectedRevisions, hasValidUIMetaCASRequest {
+            params["ui_meta_expected_revisions"] = .object(
+                uiMetaExpectedRevisions.mapValues { .number(Double($0)) })
+        }
         return .object(params)
     }
 }
@@ -237,8 +388,31 @@ extension GatewayClient {
     @discardableResult
     func applyProfileEdit(name: String, _ edit: ProfileEdit) async throws -> [String: Bool] {
         guard !edit.isEmpty else { return [:] }
+        // CAS callers need revisions/conflicts and must use the detailed path;
+        // returning only booleans would make a bare ui_meta=true look safe.
+        guard edit.uiMetaExpectedRevisions == nil else {
+            throw GatewayError(code: -8,
+                               message: "ui_meta CAS requires the detailed configure result")
+        }
         let result = try await rpc("profiles.configure", edit.params(name: name))
+        // Kept byte-for-byte equivalent to the pre-CAS projection for every
+        // existing caller and every legacy/future applied section.
         return (result["applied"]?.objectValue ?? [:]).compactMapValues(\.boolValue)
+    }
+
+    /// Detailed profiles.configure result for CAS-aware callers. Existing
+    /// callers intentionally retain the compact per-section map above; only a
+    /// caller that checks `ProfileUIMetaCASPolicy` may treat a CAS write as
+    /// committed.
+    func applyProfileEditResult(name: String, _ edit: ProfileEdit) async throws
+        -> ProfileConfigureResult {
+        guard !edit.isEmpty else { return .empty }
+        guard edit.hasValidUIMetaCASRequest else {
+            throw GatewayError(code: -8,
+                               message: "ui_meta CAS revisions were invalid or incomplete")
+        }
+        return ProfileConfigureResult(
+            try await rpc("profiles.configure", edit.params(name: name)))
     }
 
     /// model.options flattened to (model, provider) pairs. Provider rows are
