@@ -383,6 +383,10 @@ resize frames, renderer input policy, and lifecycle detachment. Before marking
 Advanced Terminal certified, run this matrix against the pinned Hermes gateway
 and a real iPhone/iPad:
 
+Informal app use is not a certification artifact. Response-ready and approval
+pushes have been observed on-device, but no retained terminal matrix is recorded
+yet; every item below remains open.
+
 - Sign in once with a dashboard session token and once with gated native OAuth;
   prove each reconnect mints a fresh ticket and a near-expiry token refreshes.
 - Select a non-default profile, type and paste through the native TUI, exercise

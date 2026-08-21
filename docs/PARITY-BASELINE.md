@@ -210,7 +210,9 @@ Reviewed follow-up work now includes transcript edit/rewind/regenerate,
 Gateway Operations maintenance, files/git/projects, live pet presentation,
 Bot Mode kickoff, response-ready APNs delivery, native motion, the
 attachment-source redesign, and the current-Hermes contract corrections merged
-in PR #31. Granular-ledger regeneration, remaining portable surfaces, App Store
+in PR #31; later reviewed slices add notification/session authority, cron
+reasoning effort, shared-room projection/CAS, and authenticated Advanced
+Terminal. Granular-ledger regeneration, remaining portable surfaces, App Store
 release, and independent live-gateway/device certification remain outstanding.
 
 Every item below ships as one or more independently reviewable PRs. A checked
@@ -240,15 +242,18 @@ partial until the unchecked certification gates are recorded.
       remains open row by row.
 - [ ] Finish rich transcripts and full session interaction controls.
       Default working presentation is an animated agent avatar; tool activity
-      and gateway-exposed reasoning summaries are opt-in advanced views. The
-      mobile composer must give multiline drafts the full available width,
-      keep accessory/send controls stable, and scroll internally after its
-      height cap instead of squeezing text into a narrow center column.
+      and gateway-exposed reasoning summaries are opt-in advanced views.
+      Multiline full-width capped composition and edit/rewind/regenerate are
+      implemented; remaining work includes branch navigation, persistent rich
+      media, grouped tool runs, advanced renderers, per-message TTS/timing, and
+      a durable prompt queue.
 - [ ] Finish mobile management for providers, models, profiles, tools, skills,
-      MCP, plugins, routines (including per-job reasoning effort), messaging,
-      memory, auxiliary slots, and agents.
-- [ ] Finish gateway-backed files, artifacts, projects, git, authenticated PTY certification,
-      and command-center UI.
+      MCP, plugins, messaging, learned-memory curation/import/export, auxiliary
+      slots, and subagent depth. Routine per-job reasoning effort is implemented
+      but remains live-certification pending.
+- [ ] Finish retained-gateway artifact completeness and deeper Git/System UI;
+      certify the implemented gateway-backed Files, Projects, Git, Command
+      Center, and authenticated Advanced Terminal against their live matrices.
 - [ ] Finish push, background, offline, reconciliation, and capability/version reliability.
       Push specifically remains implemented-but-uncertified until the Debug /
       TestFlight, real-event, filter, and sidecar matrix in TESTING.md is
