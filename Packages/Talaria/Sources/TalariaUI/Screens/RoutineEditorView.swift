@@ -1051,11 +1051,10 @@ public struct RoutineEditorView: View {
                     provider: restAvailable ? providerPin : nil,
                     reasoningEffort: restAvailable && !reasoningEffort.isEmpty
                         ? reasoningEffort : nil)
-                // Both outcomes leave the create form. A partial result means
-                // the socket already accepted the job; keeping this form open
-                // would make its primary action a duplicate-create invitation.
-                switch outcome {
-                case .completed, .acceptedPartial:
+                // A partial result means the socket may already have accepted
+                // the job; keeping this form open would make its primary
+                // action a duplicate-create invitation.
+                if outcome.shouldDismissCreateEditor {
                     onBack()
                 }
             } catch {

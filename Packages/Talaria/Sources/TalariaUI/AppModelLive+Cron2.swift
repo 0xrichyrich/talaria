@@ -235,6 +235,32 @@ enum CronCreatePostAddPolicy {
     }
 }
 
+/// `cron.manage add` is irreversible once the frame is sent. These are the
+/// same transport outcomes the mutation surfaces treat as ambiguous-after-
+/// send; a timeout or lost socket response must become a terminal partial
+/// result rather than a retryable validation error. Tool/auth/route refusals
+/// remain definite failures and are still thrown to the editor.
+enum CronCreateAddFailurePolicy {
+    static func isAmbiguousAfterSend(_ error: Error) -> Bool {
+        if let gateway = error as? GatewayError {
+            // GatewayTransport: timeout, cancellation-after-send, socket loss.
+            return [-5, -6, -7].contains(gateway.code)
+        }
+        if let url = error as? URLError {
+            return [.timedOut, .networkConnectionLost].contains(url.code)
+        }
+        // A response that reached the client but could not be decoded cannot
+        // prove that the gateway rejected the irreversible add.
+        return error is DecodingError
+    }
+
+    static func unresolvedPartial(reason: CronAcceptedPartialReason)
+        -> CronAcceptedPartialOutcome {
+        CronAcceptedPartialOutcome(
+            jobID: "", gatewayID: nil, profile: nil, reason: reason)
+    }
+}
+
 /// A socket add is irreversible. If its REST completion is not authoritative,
 /// callers must carry the accepted job forward as a typed partial result so a
 /// UI cannot turn an ambiguous follow-up into a duplicate create retry.
@@ -246,11 +272,11 @@ public enum CronAcceptedPartialReason: Sendable, Equatable {
 
 public struct CronAcceptedPartialOutcome: Sendable, Equatable {
     public var jobID: String
-    public var gatewayID: String
+    public var gatewayID: String?
     public var profile: String?
     public var reason: CronAcceptedPartialReason
 
-    public init(jobID: String, gatewayID: String, profile: String?,
+    public init(jobID: String, gatewayID: String?, profile: String?,
                 reason: CronAcceptedPartialReason) {
         self.jobID = jobID; self.gatewayID = gatewayID; self.profile = profile
         self.reason = reason
@@ -265,6 +291,14 @@ public enum CronCreateOutcome: Sendable, Equatable {
         guard case .acceptedPartial(let outcome) = self else { return nil }
         return outcome
     }
+
+    /// Both a completed add and an accepted/ambiguous add must leave the
+    /// create form. Keeping it open after an irreversible socket attempt
+    /// would turn the primary button into a duplicate-create invitation.
+    var shouldDismissCreateEditor: Bool { true }
+
+    /// Partial outcomes are terminal warnings, not ordinary retryable errors.
+    var needsWarningFeedback: Bool { acceptedPartial != nil }
 }
 
 /// The only REST cron acknowledgement accepted for publication. The job id is
@@ -1193,15 +1227,33 @@ public extension AppModel {
             launchProfile: launchProfile, deliver: deliver, model: model,
             provider: provider, reasoningEffort: canonicalEffort)
 
-        let jobID = try await client.cronAdd(
-            name: Self.namespacedTitle(botID: botProfile, title: cleanTitle),
-            schedule: normalized,
-            prompt: Self.delegatedPrompt(botID: botProfile, title: cleanTitle,
-                                         instruction: cleanInstruction,
-                                         launchProfile: launchProfile),
-            profile: launchProfile,
-            repeatCount: repeatForever ? nil : 1,
-            continuity: continuity)
+        let jobID: String
+        do {
+            jobID = try await client.cronAdd(
+                name: Self.namespacedTitle(botID: botProfile, title: cleanTitle),
+                schedule: normalized,
+                prompt: Self.delegatedPrompt(botID: botProfile, title: cleanTitle,
+                                             instruction: cleanInstruction,
+                                             launchProfile: launchProfile),
+                profile: launchProfile,
+                repeatCount: repeatForever ? nil : 1,
+                continuity: continuity)
+        } catch {
+            // A timeout/socket loss can happen after Hermes accepted the add.
+            // There is no job id to safely reconcile, so dismiss the editor
+            // with a warning-shaped terminal outcome instead of inviting a
+            // duplicate retry. A source replacement takes precedence over
+            // transport classification; validation/tool refusals still throw.
+            guard cronMutationFenceAccepts(sourceFence, expectedClient: client) else {
+                return .acceptedPartial(CronCreateAddFailurePolicy.unresolvedPartial(
+                    reason: .sourceChanged))
+            }
+            guard CronCreateAddFailurePolicy.isAmbiguousAfterSend(error) else {
+                throw error
+            }
+            return .acceptedPartial(CronCreateAddFailurePolicy.unresolvedPartial(
+                reason: .followUpAmbiguous))
+        }
 
         // `cronAdd` has committed an irreversible job.  Re-check the exact
         // source before publishing activity, refreshing the list, or issuing

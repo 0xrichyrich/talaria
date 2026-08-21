@@ -408,6 +408,36 @@ final class CronReasoningEffortTests: XCTestCase {
         XCTAssertNil(CronCreateOutcome.completed.acceptedPartial)
     }
 
+    func testCronAddTimeoutLostACKIsTerminalPartialButDefiniteRefusalThrows() {
+        XCTAssertTrue(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
+            GatewayError(code: -5, message: "request timed out: cron.manage")))
+        XCTAssertTrue(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
+            GatewayError(code: -7, message: "connection lost")))
+        XCTAssertTrue(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
+            URLError(.networkConnectionLost)))
+        XCTAssertFalse(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
+            GatewayError(code: 400, message: "cron tool refused add")))
+        XCTAssertFalse(CronCreateAddFailurePolicy.isAmbiguousAfterSend(
+            GatewayError(code: -3, message: "not connected")))
+
+        let timeoutOutcome = CronCreateOutcome.acceptedPartial(
+            CronCreateAddFailurePolicy.unresolvedPartial(reason: .followUpAmbiguous))
+        XCTAssertEqual(timeoutOutcome.acceptedPartial?.jobID, "")
+        XCTAssertNil(timeoutOutcome.acceptedPartial?.gatewayID)
+        XCTAssertNil(timeoutOutcome.acceptedPartial?.profile)
+        XCTAssertEqual(timeoutOutcome.acceptedPartial?.reason, .followUpAmbiguous)
+        XCTAssertTrue(timeoutOutcome.needsWarningFeedback)
+        XCTAssertTrue(timeoutOutcome.shouldDismissCreateEditor)
+        XCTAssertFalse(CronCreateOutcome.completed.needsWarningFeedback)
+        XCTAssertTrue(CronCreateOutcome.completed.shouldDismissCreateEditor)
+
+        let sourceChanged = CronCreateOutcome.acceptedPartial(
+            CronCreateAddFailurePolicy.unresolvedPartial(reason: .sourceChanged))
+        XCTAssertEqual(sourceChanged.acceptedPartial?.jobID, "")
+        XCTAssertEqual(sourceChanged.acceptedPartial?.reason, .sourceChanged)
+        XCTAssertTrue(sourceChanged.shouldDismissCreateEditor)
+    }
+
     func testRetainedMutationFenceRejectsReplacedClientGeneration() {
         let fence = CronSourceMutationFence(
             gatewayID: "homelab", profile: nil, generation: .retained(4))
