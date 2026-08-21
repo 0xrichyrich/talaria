@@ -4,8 +4,328 @@ import XCTest
 @testable import TalariaUI
 import TalariaTheme
 
+private actor CommandAcceptanceGate {
+    private var isOpen = false
+    private var hasArrival = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        hasArrival = true
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func arrived() -> Bool { hasArrival }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+private actor CommandTaskProbe {
+    private var value = false
+    func mark() { value = true }
+    func marked() -> Bool { value }
+}
+
 @MainActor
 final class SourceQualifiedRoutingTests: XCTestCase {
+    func testSlashExecutionDecodesHermesTypedResults() throws {
+        XCTAssertEqual(try SlashExecutionResult(result: ["type": .string("send"), "message": .string("retry")]),
+                       .send(message: "retry", notice: nil, display: nil))
+        XCTAssertEqual(try SlashExecutionResult(result: ["type": .string("skill"), "message": .string("goal"), "name": .string("plan")]),
+                       .skill(message: "goal", name: "plan", display: nil))
+        XCTAssertEqual(try SlashExecutionResult(result: ["type": .string("prefill"), "message": .string("undo 2")]),
+                       .prefill(message: "undo 2", notice: nil))
+        XCTAssertEqual(try SlashExecutionResult(result: ["type": .string("alias"), "target": .string("/status")]), .alias(target: "/status"))
+        XCTAssertEqual(try SlashExecutionResult(result: ["type": .string("exec"), "output": .string("ok")]), .exec("ok"))
+        XCTAssertEqual(try SlashExecutionResult(result: ["output": .string("worker")]), .output("worker", warning: nil))
+    }
+
+    func testSlashExecutionRejectsUnknownOrPartialTypedResults() {
+        XCTAssertThrowsError(try SlashExecutionResult(result: ["type": .string("send")]))
+        XCTAssertThrowsError(try SlashExecutionResult(result: ["type": .string("mystery")]))
+    }
+
+    func testLivePromptSubmitAcceptsBusySteerAndRedirectWithoutReplay() throws {
+        for status in ["streaming", "queued", "steered", "redirected"] {
+            XCTAssertNoThrow(try AppModel.LivePromptSubmitReceipt.requireAccepted(
+                .object(["status": .string(status)]), operation: "Prompt"))
+        }
+        XCTAssertThrowsError(try AppModel.LivePromptSubmitReceipt.requireAccepted(
+            .object(["status": .string("rejected")]), operation: "Prompt"))
+        XCTAssertThrowsError(try AppModel.LivePromptSubmitReceipt.requireAccepted(
+            .object(["status": .string("unknown")]), operation: "Prompt"))
+    }
+
+    func testSlashPrefillPolicyRequiresExactConnectionChatAndSessionIdentity() {
+        let route = GatewayBotRoute(gatewayID: "homelab", profile: "worker")
+        let chat = ChatState()
+        let otherChat = ChatState()
+        let binding = SlashPrefillBinding(
+            botID: route.qualifiedID, route: route, connectionGeneration: 7,
+            chatID: ObjectIdentifier(chat), storedSessionID: "stored-a",
+            runtimeSessionID: "runtime-a", message: "undo 2")
+        func applies(draft: String = "", selected: String? = nil,
+                     currentRoute: GatewayBotRoute? = nil, generation: UInt64? = nil,
+                     chatID: ObjectIdentifier? = nil, stored: String? = nil,
+                     runtime: String? = nil) -> Bool {
+            SlashPrefillPolicy.mayApply(
+                binding, draft: draft, selectedBotID: selected ?? route.qualifiedID,
+                currentRoute: currentRoute ?? route,
+                currentConnectionGeneration: generation ?? 7,
+                currentChatID: chatID ?? ObjectIdentifier(chat),
+                currentStoredID: stored ?? "stored-a",
+                currentRuntimeID: runtime ?? "runtime-a")
+        }
+
+        XCTAssertTrue(applies())
+        XCTAssertFalse(applies(draft: "newer"))
+        XCTAssertFalse(applies(selected: "another"))
+        XCTAssertFalse(applies(generation: 8))
+        XCTAssertFalse(applies(chatID: ObjectIdentifier(otherChat)))
+        XCTAssertFalse(applies(stored: "stored-b"))
+        XCTAssertFalse(applies(runtime: "runtime-b"))
+    }
+
+    func testCatalogHidesOnlyStandaloneSkillsAndExplainsUnsafeBoundary() {
+        let result: [String: JSONValue] = [
+            "pairs": .array([
+                .array([.string("/status"), .string("Show status")]),
+                .array([.string("/research"), .string("Standalone skill")]),
+                .array([.string("/quick"), .string("User command")]),
+            ]),
+            "categories": .array([
+                .object(["name": .string("Session"),
+                         "pairs": .array([.array([.string("/status"),
+                                                   .string("Show status")])])]),
+            ]),
+            "skills": .object(["/research": .object([:])]),
+            "skill_count": .number(1),
+            "warning": .string(""),
+        ]
+
+        let catalog = SlashCatalog(result: result)
+
+        XCTAssertEqual(catalog.commands.map(\.name), ["/status", "/quick"])
+        XCTAssertEqual(catalog.skillCount, 0)
+        XCTAssertEqual(catalog.unsupportedStandaloneSkillNames, ["/research"])
+        XCTAssertTrue(catalog.warning.contains("slash.exec refuses"))
+        let completions = SlashCompletions(items: [
+            SlashCommand(name: "/research", description: "", category: "", kind: .skill),
+            // A bundle has kind=skill in complete.slash but is absent from the
+            // catalog's standalone `skills` map, so it remains executable.
+            SlashCommand(name: "/backend", description: "", category: "", kind: .skill),
+            SlashCommand(name: "/status", description: "", category: ""),
+        ], replaceFrom: 0).hidingStandaloneSkills(catalog.unsupportedStandaloneSkillNames)
+        XCTAssertEqual(completions.items.map(\.name), ["/backend", "/status"])
+    }
+
+    func testResolvedExactOrAliasedStandaloneSkillRemainsHidden() {
+        let unsupported: Set<String> = ["/research"]
+        let exact = SlashCommand(name: "/research", description: "", category: "")
+        // command.resolve returns the canonical target for an alias, so this is
+        // also the shape produced by resolving (for example) `/deep-research`.
+        let aliasedCanonical = SlashCommand(
+            name: "research", description: "", category: "", kind: .command)
+        let bundle = SlashCommand(name: "/backend", description: "", category: "")
+
+        XCTAssertNil(SlashResolvedCommandPolicy.visible(
+            exact, unsupportedStandaloneSkillNames: unsupported))
+        XCTAssertNil(SlashResolvedCommandPolicy.visible(
+            aliasedCanonical, unsupportedStandaloneSkillNames: unsupported))
+        XCTAssertEqual(SlashResolvedCommandPolicy.visible(
+            bundle, unsupportedStandaloneSkillNames: unsupported), bundle)
+    }
+
+    func testMCPResponseReceiptDistinguishesAcceptedExpiredAndUncertain() throws {
+        XCTAssertEqual(try MCPSetupResponseReceipt(result: .object(["status": .string("ok")])),
+                       .accepted)
+        XCTAssertEqual(try MCPSetupResponseReceipt(result: .object(["status": .string("expired")])),
+                       .expired)
+        XCTAssertThrowsError(try MCPSetupResponseReceipt(
+            result: .object(["status": .string("mystery")])))
+    }
+
+    func testGeneratedSlashLeaseBlocksG2UntilSecondAcceptanceSettles() async throws {
+        let url = try XCTUnwrap(URL(string: "https://slash-lease.example"))
+        let credential = GatewayCredential.sessionToken("test")
+        let first = GatewayClient(baseURL: url, credential: credential)
+        let second = GatewayClient(baseURL: url, credential: credential)
+        let pool = GatewayClientPool { _, _ in first }
+        await pool.adopt(first, for: "gateway")
+        let snapshot = try await pool.connectWithGeneration(
+            gatewayID: "gateway", baseURL: url, credential: credential)
+        let acceptance = CommandAcceptanceGate()
+        let replacementStarted = CommandTaskProbe()
+
+        let generated = Task { @MainActor in
+            await pool.withCommandConnectionLease(snapshot, for: "gateway") {
+                await acceptance.wait()
+                return ObjectIdentifier(snapshot.client)
+            }
+        }
+        for _ in 0..<100 {
+            if await acceptance.arrived() { break }
+            await Task.yield()
+        }
+        let generatedReachedAcceptance = await acceptance.arrived()
+        XCTAssertTrue(generatedReachedAcceptance)
+
+        let replacement = Task {
+            await replacementStarted.mark()
+            await pool.adopt(second, for: "gateway")
+        }
+        for _ in 0..<100 {
+            if await replacementStarted.marked() { break }
+            await Task.yield()
+        }
+        let replacementIsWaiting = await replacementStarted.marked()
+        XCTAssertTrue(replacementIsWaiting)
+        await Task.yield()
+        let currentDuringSecondAcceptance = await pool.isCurrent(snapshot, for: "gateway")
+        XCTAssertTrue(currentDuringSecondAcceptance,
+                      "G2 must wait while the generated prompt is settling on G1")
+
+        await acceptance.open()
+        let submittedClient = await generated.value
+        XCTAssertEqual(submittedClient, ObjectIdentifier(first),
+                       "the second prompt must use the captured G1 client")
+        await replacement.value
+        let oldWasReplaced = await pool.isCurrent(snapshot, for: "gateway")
+        XCTAssertFalse(oldWasReplaced)
+        await pool.disconnectAll()
+    }
+
+    func testGeneratedSlashTrafficLeaseBlocksProfileLifecycleBetweenBoundaries() async throws {
+        let gatewayID = "slash-lifecycle-lease"
+        let url = try XCTUnwrap(URL(string: "https://slash-lifecycle.example"))
+        let credential = GatewayCredential.sessionToken("test")
+        let client = GatewayClient(baseURL: url, credential: credential)
+        await client.setTrafficAdmission {
+            await MainActor.run {
+                ProfileLifecycleTrafficAdmission.acquire(gatewayID)
+            }
+        }
+        let pool = GatewayClientPool { _, _ in client }
+        await pool.adopt(client, for: gatewayID)
+        let snapshot = try await pool.connectWithGeneration(
+            gatewayID: gatewayID, baseURL: url, credential: credential)
+        let acceptance = CommandAcceptanceGate()
+
+        let generated = Task { @MainActor in
+            try await pool.withCommandConnectionAndTrafficLease(
+                snapshot, for: gatewayID
+            ) {
+                await acceptance.wait()
+                return true
+            }
+        }
+        for _ in 0..<100 {
+            if await acceptance.arrived() { break }
+            await Task.yield()
+        }
+        let reachedBoundary = await acceptance.arrived()
+        XCTAssertTrue(reachedBoundary)
+        XCTAssertFalse(ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID),
+                       "rename/delete must not enter between slash.exec and generated submit")
+
+        await acceptance.open()
+        let settled = try await generated.value
+        XCTAssertEqual(settled, true)
+        XCTAssertTrue(ProfileLifecycleTrafficAdmission.beginLifecycle(gatewayID),
+                      "the lifecycle fence must release after generated-submit settlement")
+        ProfileLifecycleTrafficAdmission.endLifecycle(gatewayID)
+        await pool.disconnectAll()
+    }
+
+    func testMCPStateFinalizesInsideLeaseBeforeReplacementPurgesG1() async throws {
+        let url = try XCTUnwrap(URL(string: "https://mcp-lease.example"))
+        let credential = GatewayCredential.sessionToken("test")
+        let first = GatewayClient(baseURL: url, credential: credential)
+        let second = GatewayClient(baseURL: url, credential: credential)
+        let pool = GatewayClientPool { _, _ in first }
+        await pool.adopt(first, for: "gateway")
+        let snapshot = try await pool.connectWithGeneration(
+            gatewayID: "gateway", baseURL: url, credential: credential)
+        let response = CommandAcceptanceGate()
+        let replacementStarted = CommandTaskProbe()
+        var settlement = "in-flight"
+
+        let answer = Task { @MainActor in
+            await pool.withCommandConnectionLease(snapshot, for: "gateway") {
+                await response.wait()
+                settlement = "retryable"
+                let stillG1 = await pool.isCurrent(snapshot, for: "gateway")
+                return stillG1 && settlement == "retryable"
+            }
+        }
+        for _ in 0..<100 {
+            if await response.arrived() { break }
+            await Task.yield()
+        }
+        let replacement = Task {
+            await replacementStarted.mark()
+            await pool.adopt(second, for: "gateway")
+        }
+        for _ in 0..<100 {
+            if await replacementStarted.marked() { break }
+            await Task.yield()
+        }
+        await Task.yield()
+        XCTAssertEqual(settlement, "in-flight")
+        let currentBeforeSettlement = await pool.isCurrent(snapshot, for: "gateway")
+        XCTAssertTrue(currentBeforeSettlement)
+
+        await response.open()
+        let settledBeforeRelease = await answer.value
+        XCTAssertEqual(settledBeforeRelease, true,
+                       "retry/uncertain state must settle while G1 still owns the slot")
+        await replacement.value
+        XCTAssertEqual(settlement, "retryable")
+        let currentAfterSettlement = await pool.isCurrent(snapshot, for: "gateway")
+        XCTAssertFalse(currentAfterSettlement)
+        await pool.disconnectAll()
+    }
+
+    func testGeneratedSlashRetainsDraftWhenCapturedGenerationWasReplaced() {
+        XCTAssertEqual(SlashGeneratedSubmissionPolicy.decision(
+            capturedGeneration: 7, observedGeneration: 8,
+            clientMatches: false, bindingMatches: true), .retainDraft)
+        XCTAssertEqual(SlashGeneratedSubmissionPolicy.decision(
+            capturedGeneration: 7, observedGeneration: 7,
+            clientMatches: true, bindingMatches: false), .retainDraft)
+        XCTAssertEqual(SlashGeneratedSubmissionPolicy.decision(
+            capturedGeneration: 7, observedGeneration: 7,
+            clientMatches: true, bindingMatches: true), .submit)
+    }
+
+    func testGeneratedSlashEveryNonAcceptedSettlementRetainsDraft() {
+        XCTAssertFalse(SlashGeneratedSettlementPolicy.requiresDraftRetention(.accepted))
+        XCTAssertTrue(SlashGeneratedSettlementPolicy.requiresDraftRetention(.retained))
+        XCTAssertTrue(SlashGeneratedSettlementPolicy.requiresDraftRetention(.failed),
+                      "a definitive second-boundary rejection must retain the generated prompt")
+    }
+
+    func testGeneratedSlashRetainedSettlementShowsUpstreamNoticeAndRecovery() {
+        let notice = "Goal resumed, continuing now."
+        let recovery = SlashGeneratedSettlementPolicy.retainedDraftNotice
+
+        XCTAssertEqual(SlashGeneratedSettlementPolicy.messages(
+            for: .accepted, notice: notice), [notice])
+        XCTAssertEqual(SlashGeneratedSettlementPolicy.messages(
+            for: .retained, notice: notice), [notice, recovery])
+        XCTAssertEqual(SlashGeneratedSettlementPolicy.messages(
+            for: .failed, notice: notice), [notice, recovery])
+        XCTAssertEqual(SlashGeneratedSettlementPolicy.messages(
+            for: .retained, notice: nil), [recovery])
+    }
+
     override func tearDown() {
         let runtime = LiveRuntime.shared
         runtime.gatewayID = nil
@@ -31,6 +351,19 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         ApprovalPolicyRuntime.shared.reset()
         ProfileAssetStore.shared.flush()
         PetRuntime.shared.reset()
+        CommandsRuntime.shared.mcpRequests.removeAll()
+        CommandsRuntime.shared.mcpClients.removeAll()
+        CommandsRuntime.shared.mcpResponsesInFlight.removeAll()
+        CommandsRuntime.shared.mcpResponseErrors.removeAll()
+        CommandsRuntime.shared.slashPrefills.removeAll()
+        CommandsRuntime.shared.connectionGenerations.removeAll()
+        CommandsRuntime.shared.catalogs.removeAll()
+        CommandsRuntime.shared.routerPump?.cancel()
+        CommandsRuntime.shared.routerPump = nil
+        CommandsRuntime.shared.routerOwner = nil
+        CommandsRuntime.shared.routerGatewayID = nil
+        CommandsRuntime.shared.routerClient = nil
+        CommandsRuntime.shared.routerHandlerID = nil
         SessionsRuntime.shared.resetPrimaryScope()
         SessionsRuntime.shared.resetRoutedScope(gatewayID: "homelab")
         A2ARuntime.shared.reset()
@@ -51,6 +384,106 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         XCTAssertEqual(model.botID(forSession: "deadbeef", sourceGatewayID: "homelab"),
                        "homelab::researcher")
         XCTAssertNil(model.botID(forSession: "deadbeef", sourceGatewayID: "unknown"))
+    }
+
+    func testMCPSetupRequestIdentityIncludesGatewayAndRequestID() {
+        let model = AppModel()
+        let event = GatewayEvent(
+            type: "mcp.setup.request", sessionID: "same-runtime-session",
+            payload: .object([
+                "request_id": .string("same-request"),
+                "server": .string("github"),
+                "action": .string("install"),
+            ])
+        )
+
+        model.handleMCPSetupRequest(event, sourceGatewayID: "primary")
+        model.handleMCPSetupRequest(event, sourceGatewayID: "homelab")
+        model.handleMCPSetupRequest(event, sourceGatewayID: "primary")
+
+        let requests = CommandsRuntime.shared.mcpRequests
+        XCTAssertEqual(requests.count, 2, "same-gateway duplicates must collapse only within that gateway")
+        XCTAssertEqual(Set(requests.map(\.id)).count, 2)
+        XCTAssertEqual(Set(requests.map(\.gatewayID)), Set(["primary", "homelab"]))
+
+        model.handleMCPSetupRequest(
+            GatewayEvent(type: "mcp.setup.expire", sessionID: "",
+                         payload: .object(["request_id": .string("same-request")])),
+            sourceGatewayID: "primary"
+        )
+        XCTAssertEqual(CommandsRuntime.shared.mcpRequests.map(\.gatewayID), ["homelab"],
+                       "an expiry must not remove a colliding request on another source")
+    }
+
+    func testMCPIdentityIncludesConnectionGenerationAndFailureRemainsRetryable() {
+        let state = CommandsRuntime.shared
+        let model = AppModel()
+        XCTAssertTrue(state.observeConnection(gatewayID: "primary", generation: 4))
+        let request = MCPSetupRequest(
+            gatewayID: "primary", connectionGeneration: 4,
+            requestID: "same-request", sessionID: "runtime", server: "github",
+            action: .install, reason: "needed")
+        let replacementRoute = GatewayMCPSetupRoute(
+            gatewayID: "primary", connectionGeneration: 5,
+            requestID: "same-request")
+        state.mcpRequests = [request]
+        state.mcpResponsesInFlight = [request.route]
+
+        XCTAssertNotEqual(request.route, replacementRoute)
+        XCTAssertTrue(state.retainFailedMCPResponse(route: request.route,
+                                                    detail: "transport closed"))
+        XCTAssertEqual(state.mcpRequests, [request],
+                       "a failed response must leave the card available to retry")
+        XCTAssertFalse(state.mcpResponsesInFlight.contains(request.route))
+        XCTAssertEqual(state.mcpResponseErrors[request.route], "transport closed")
+        XCTAssertTrue(model.mcpSetupPrompt?.reason.contains("still open") == true,
+                      "the retained card must explain the failure and retry path")
+        XCTAssertFalse(state.retainFailedMCPResponse(route: request.route,
+                                                     detail: "transport closed"),
+                       "the same visible failure should not be appended twice")
+    }
+
+    func testConnectionReplacementPurgesOldPrefillAndMCPAuthority() {
+        let state = CommandsRuntime.shared
+        let route = GatewayBotRoute(gatewayID: "primary", profile: "default")
+        let chat = ChatState()
+        let request = MCPSetupRequest(
+            gatewayID: "primary", connectionGeneration: 4,
+            requestID: "request", sessionID: "runtime", server: "github",
+            action: .install, reason: "needed")
+        let client = GatewayClient(baseURL: URL(string: "https://commands.example")!,
+                                   credential: .sessionToken("test"))
+        XCTAssertTrue(state.observeConnection(gatewayID: "primary", generation: 4))
+        state.slashPrefills[route] = SlashPrefillBinding(
+            botID: "default", route: route, connectionGeneration: 4,
+            chatID: ObjectIdentifier(chat), storedSessionID: "stored",
+            runtimeSessionID: "runtime", message: "draft")
+        state.mcpRequests = [request]
+        state.mcpClients[request.route] = MCPClientBinding(
+            client: client, connectionGeneration: 4)
+
+        XCTAssertTrue(state.observeConnection(gatewayID: "primary", generation: 5))
+
+        XCTAssertTrue(state.slashPrefills.isEmpty)
+        XCTAssertTrue(state.mcpRequests.isEmpty)
+        XCTAssertTrue(state.mcpClients.isEmpty)
+        XCTAssertEqual(state.connectionGenerations["primary"], 5)
+        XCTAssertFalse(state.observeConnection(gatewayID: "primary", generation: 4),
+                       "a late old-client callback must not downgrade authority")
+    }
+
+    func testCommandCatalogRuntimeIsPhysicallyGatewayScoped() {
+        let state = CommandsRuntime.shared
+        let primary = state.catalog(for: "primary", owner: nil)
+        let remote = state.catalog(for: "homelab", owner: nil)
+        primary.catalog = [SlashCommand(name: "/primary", description: "", category: "")]
+        remote.catalog = [SlashCommand(name: "/remote", description: "", category: "")]
+        primary.catalogLoaded = true
+        remote.catalogLoaded = true
+
+        XCTAssertNotEqual(ObjectIdentifier(primary), ObjectIdentifier(remote))
+        XCTAssertEqual(state.catalogs["primary"]?.catalog.map(\.name), ["/primary"])
+        XCTAssertEqual(state.catalogs["homelab"]?.catalog.map(\.name), ["/remote"])
     }
 
     func testRemoteDeltaCannotMutateCollidingPrimaryChat() {

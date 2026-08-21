@@ -31,15 +31,59 @@ public struct RoomMemberSessionSnapshot: Sendable {
     public var storedID: String
     public var messages: [JSONValue]
     public var running: Bool
+    /// `session.resume` replays a clarify that was raised while the room's
+    /// source socket was detached. It is raw because batch clarifies add
+    /// per-question fields that the general chat model intentionally does not
+    /// flatten.
+    public var pendingClarify: JSONValue?
+    /// The oldest unresolved approval replayed by `session.resume`. The room
+    /// prompt model keeps its runtime SID separate because approval responses
+    /// must target the current connection-local session id.
+    public var pendingApproval: ApprovalRequest?
 
-    public init(runtimeID: String, storedID: String, messages: [JSONValue], running: Bool) {
+    public init(runtimeID: String, storedID: String, messages: [JSONValue], running: Bool,
+                pendingClarify: JSONValue? = nil,
+                pendingApproval: ApprovalRequest? = nil) {
         self.runtimeID = runtimeID
         self.storedID = storedID
         self.messages = messages
         self.running = running
+        self.pendingClarify = pendingClarify
+        self.pendingApproval = pendingApproval
+    }
+
+    init(liveSession: LiveSession) {
+        self.init(runtimeID: liveSession.sessionID,
+                  storedID: liveSession.storedSessionID,
+                  messages: liveSession.messages,
+                  running: liveSession.running || liveSession.hasInflightTurn,
+                  pendingClarify: liveSession.pendingClarify,
+                  pendingApproval: liveSession.pendingApproval)
     }
 
     public var messageCount: Int { messages.count }
+
+    /// A valid replayed question or approval is a third state alongside idle
+    /// and running: the hidden member is waiting specifically for the human.
+    /// Invalid/missing request ids never hold a room driver open.
+    public var awaitingUser: Bool {
+        !runtimeID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && RoomPendingPrompt.isAwaitingUser(pendingClarify: pendingClarify,
+                                                 pendingApproval: pendingApproval)
+    }
+
+    /// Normalize this snapshot into the runtime-only room prompt model. The
+    /// caller supplies the durable attempt so a delayed poll cannot attach an
+    /// old prompt to a newer thread/epoch/member turn.
+    public func pendingPrompt(roomID: RoomID, route: GatewayBotRoute,
+                              attempt: RoomAttempt) -> RoomPendingPrompt? {
+        RoomPendingPrompt.normalize(roomID: roomID, route: route,
+                                    attempt: attempt, snapshot: self)
+    }
+
+    public func pendingPrompt(roomID: RoomID, attempt: RoomAttempt) -> RoomPendingPrompt? {
+        RoomPendingPrompt.normalize(roomID: roomID, attempt: attempt, snapshot: self)
+    }
 
     public func containsAttempt(_ attemptID: UUID) -> Bool {
         let marker = GatewayClient.roomAttemptMarker(attemptID)
@@ -131,17 +175,25 @@ public struct RoomPromptSubmission: Sendable, Equatable {
 
 enum RoomSessionResolver {
     /// Only Hermes' definitive durable-row absence (4007) permits moving to
-    /// the next target or creating. Transport/auth/lifecycle failures keep the
-    /// existing identity innocent and propagate to the caller.
-    static func resolve<T>(storedID: String?, title: String,
+    /// the next target or creating. Resolution order is durable id, immutable
+    /// RoomID title, then the exact captured legacy name title (legacy records
+    /// only). Transport/auth/lifecycle failures keep every remaining identity
+    /// innocent and propagate to the caller.
+    static func resolve<T>(storedID: String?, immutableTitle: String,
+                           legacyTitle: String? = nil,
                            resume: (String) async throws -> T,
                            create: () async throws -> T) async throws -> T {
-        if let storedID, !storedID.isEmpty {
-            do { return try await resume(storedID) }
-            catch let error as GatewayError where error.code == GatewayError.storedSessionGone {}
+        var targets: [String] = []
+        for target in [storedID, immutableTitle, legacyTitle] {
+            guard let target, !target.isEmpty, !targets.contains(target) else { continue }
+            targets.append(target)
         }
-        do { return try await resume(title) }
-        catch let error as GatewayError where error.code == GatewayError.storedSessionGone {}
+        for target in targets {
+            do { return try await resume(target) }
+            catch let error as GatewayError where error.code == GatewayError.storedSessionGone {
+                continue
+            }
+        }
         return try await create()
     }
 }
@@ -159,23 +211,32 @@ public extension GatewayClient {
         }.joined()
     }
 
-    /// Resume by the durable id first, then by the exact `Group: …` title;
-    /// create only when neither exists. Title fallback is required after a
-    /// local room record survives while its cached stored id is lost.
-    func ensureRoomSession(roomTitle: String, profile: String,
+    /// Resume by durable id first, then by the immutable RoomID title. A room
+    /// decoded from the old name-title format gets one additional lookup by
+    /// its captured (rename-stable) legacy name. Creation always uses RoomID,
+    /// so a disbanded and same-name recreated room cannot adopt old sessions.
+    func ensureRoomSession(roomID: RoomID, sessionTitleIdentityVersion: UInt8,
+                           legacySessionTitleName: String?, profile: String,
                            storedID: String?) async throws -> RoomMemberSessionSnapshot {
-        let title = "Group: \(roomTitle)"
+        let immutableTitle = "Group: \(roomID.description)"
+        let legacyTitle: String?
+        if sessionTitleIdentityVersion == RoomRecord.legacyNameSessionTitleVersion,
+           let legacyName = legacySessionTitleName,
+           !legacyName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            legacyTitle = "Group: \(legacyName)"
+        } else {
+            legacyTitle = nil
+        }
         let live = try await RoomSessionResolver.resolve(
-            storedID: storedID, title: title,
+            storedID: storedID, immutableTitle: immutableTitle, legacyTitle: legacyTitle,
             resume: { try await self.resumeSession($0, profile: profile) },
-            create: { try await self.createSession(profile: profile, title: title, hidden: true) })
+            create: {
+                try await self.createSession(profile: profile, title: immutableTitle, hidden: true)
+            })
         guard !live.sessionID.isEmpty, !live.storedSessionID.isEmpty else {
             throw GatewayError(code: -8, message: "Room session resolution returned no durable identity.")
         }
-        return RoomMemberSessionSnapshot(runtimeID: live.sessionID,
-                                         storedID: live.storedSessionID,
-                                         messages: live.messages,
-                                         running: live.running || live.inflight != nil)
+        return RoomMemberSessionSnapshot(liveSession: live)
     }
 
     func readRoomSession(storedID: String, profile: String) async throws -> RoomMemberSessionSnapshot {
@@ -183,10 +244,65 @@ public extension GatewayClient {
         guard !resumed.sessionID.isEmpty, !resumed.storedSessionID.isEmpty else {
             throw GatewayError(code: -8, message: "Room session read returned no durable identity.")
         }
-        return RoomMemberSessionSnapshot(runtimeID: resumed.sessionID,
-                                         storedID: resumed.storedSessionID,
-                                         messages: resumed.messages,
-                                         running: resumed.running || resumed.inflight != nil)
+        return RoomMemberSessionSnapshot(liveSession: resumed)
+    }
+
+    // MARK: - Hidden-room blocking prompts
+
+    /// Send the exact approval response shape for a room-member prompt. The
+    /// caller obtains this client from `routedClient(for: prompt.route)`;
+    /// accepting an explicit runtime SID here keeps that source-qualified
+    /// boundary visible instead of silently falling back to a foreground chat.
+    @discardableResult
+    func respondToRoomApproval(sessionID: String, requestID: String,
+                               choice: ApprovalChoice) async throws -> Int {
+        let params = try RoomPendingPrompt.approvalResponseParameters(
+            sessionID: sessionID, requestID: requestID, choice: choice)
+        let result = try await rpc("approval.respond", params, timeout: 30)
+        return RoomPendingPromptResponse.resolvedCount(in: result)
+    }
+
+    /// `clarify.respond` is keyed by request id, not by session id. Batch
+    /// calls add `question_id`; the ordinary clarify omits it entirely.
+    func respondToRoomClarify(requestID: String, answer: String,
+                              questionID: String? = nil) async throws {
+        let params = try RoomPendingPrompt.clarifyResponseParameters(
+            requestID: requestID, answer: answer, questionID: questionID)
+        _ = try await rpc("clarify.respond", params, timeout: 30)
+    }
+
+    /// Multi-select answers are JSON-array strings, never comma-joined text.
+    /// This preserves an individual choice label that itself contains commas.
+    func respondToRoomClarify(requestID: String, selections: [String],
+                              questionID: String? = nil) async throws {
+        let params = try RoomPendingPrompt.clarifyResponseParameters(
+            requestID: requestID,
+            answer: RoomPendingPrompt.multiSelectAnswer(selections), questionID: questionID)
+        _ = try await rpc("clarify.respond", params, timeout: 30)
+    }
+
+    /// Prompt-shaped convenience wrappers preserve the prompt's route in the
+    /// caller's value flow and reject a kind mismatch before any wire call.
+    @discardableResult
+    func respondToRoomPrompt(_ prompt: RoomPendingPrompt,
+                             choice: ApprovalChoice) async throws -> Int {
+        let response = try prompt.approvalResponse(choice: choice)
+        let result = try await rpc(response.method, response.params, timeout: 30)
+        return RoomPendingPromptResponse.resolvedCount(in: result)
+    }
+
+    func respondToRoomPrompt(_ prompt: RoomPendingPrompt, answer: String,
+                             questionID: String? = nil) async throws {
+        let response = try prompt.clarifyResponse(answer: answer, questionID: questionID)
+        _ = try await rpc(response.method, response.params, timeout: 30)
+    }
+
+    func respondToRoomPrompt(_ prompt: RoomPendingPrompt,
+                             selections: [String],
+                             questionID: String? = nil) async throws {
+        let response = try prompt.clarifyResponse(selections: selections,
+                                                  questionID: questionID)
+        _ = try await rpc(response.method, response.params, timeout: 30)
     }
 
     func detachRoomStagedImages(_ paths: [String], sessionID: String) async {

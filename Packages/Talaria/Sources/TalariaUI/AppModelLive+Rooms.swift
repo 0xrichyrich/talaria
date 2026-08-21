@@ -20,10 +20,21 @@ final class RoomRuntime {
     var metadataLastError: String?
     var profileLifecycleError: String?
     var isLoaded = false
+    /// Blocking prompts belong to the live hidden session, not to the durable
+    /// room transcript.  The compound key intentionally includes the source
+    /// gateway: two retained gateways can both expose a `default` profile.
+    var pendingPrompts: [RoomPendingPromptKey: RoomPendingPrompt] = [:]
 
     @ObservationIgnored var store = RoomStore.shared
     @ObservationIgnored var driveTasks: [RoomID: Task<Void, Never>] = [:]
     @ObservationIgnored var driveTokens: [RoomID: UUID] = [:]
+    /// A settled drive can still own accepted/uncertain/timed-out provider
+    /// work. Keep harvesting it for a bounded period without retaining the
+    /// serialized drive owner itself.
+    @ObservationIgnored var postSettleHarvestTasks: [RoomID: Task<Void, Never>] = [:]
+    @ObservationIgnored var postSettleHarvestTokens: [RoomID: UUID] = [:]
+    @ObservationIgnored var postSettleHarvestInterval: Duration = .seconds(5)
+    @ObservationIgnored var postSettleHarvestLimit = 60
     @ObservationIgnored var pollInterval: Duration = .seconds(2)
     @ObservationIgnored var baseTurnTimeout: TimeInterval = 180
     @ObservationIgnored var hardTurnTimeout: TimeInterval = 20 * 60
@@ -33,6 +44,25 @@ final class RoomRuntime {
         (@MainActor (RoomAttempt, RoomMemberSessionSnapshot, [RoomOutboundAttachment]) async -> RoomPromptSubmission)?
     @ObservationIgnored var metadataMutationOperation:
         (@MainActor (RoomMetadataMutation) async throws -> Void)?
+    /// Test seam for a successful `session.resume` read. Production always
+    /// uses the source-routed client below; keeping the seam at this narrow
+    /// boundary lets adversarial policy tests avoid inventing a gateway.
+    @ObservationIgnored var sessionReadOperation:
+        (@MainActor (RoomAttempt) async throws -> RoomMemberSessionSnapshot)?
+    /// Test seam for prompt answers. The value is the fully source-qualified
+    /// wire shape, so tests can prove an answer cannot borrow a foreground or
+    /// same-named member's client.
+    @ObservationIgnored var pendingPromptResponseOperation:
+        (@MainActor (RoomPendingPromptResponse) async throws -> JSONValue)?
+    /// Test seam immediately after room-name collision proof and before the
+    /// durable room/outbox commit. Production leaves it nil. Keeping the seam
+    /// at this boundary lets concurrency tests suspend the winning mutation
+    /// without weakening the namespace lock itself.
+    @ObservationIgnored var roomNameCommitBarrier: (@MainActor () async -> Void)?
+    /// A batch may partially succeed before a later question fails. Remember
+    /// only confirmed question ids for this live request so retrying the card
+    /// does not duplicate a response Hermes already acknowledged.
+    @ObservationIgnored var answeredPromptQuestions: [RoomPendingPromptKey: PromptProgress] = [:]
     /// Source-qualified lifecycle generations fence metadata flushes and room
     /// drive completions that outlive a profile rename/delete await.
     @ObservationIgnored var profileRouteGenerations: [GatewayBotRoute: UInt64] = [:]
@@ -49,8 +79,16 @@ final class RoomRuntime {
     }
 
     func remove(_ id: RoomID) {
+        cancelPostSettleHarvest(roomID: id)
         rooms.removeAll { $0.id == id }
+        clearPendingPrompts(roomID: id)
         if openRoomID == id { openRoomID = nil }
+    }
+
+    func cancelPostSettleHarvest(roomID: RoomID) {
+        postSettleHarvestTasks[roomID]?.cancel()
+        postSettleHarvestTasks[roomID] = nil
+        postSettleHarvestTokens[roomID] = nil
     }
 
     func profileRouteGeneration(_ route: GatewayBotRoute) -> UInt64 {
@@ -68,6 +106,161 @@ final class RoomRuntime {
         !retiredProfileRoutes.contains(route)
             && profileRouteGenerations[route, default: 0] == generation
     }
+
+    struct PromptProgress: Sendable {
+        var attemptID: RoomAttemptID
+        var threadID: RoomThreadID
+        var epoch: UInt64
+        var requestID: String
+        var fingerprint: RoomPendingPromptFingerprint
+        var answeredQuestionIDs: Set<String>
+        /// Server-replayed locks and locally confirmed partial batch answers.
+        /// Keeping their text live-only lets the card show "accepted" without
+        /// ever writing a human tool response into RoomRecord/transcript.
+        var lockedAnswersByQuestionID: [String: String] = [:]
+
+        init(prompt: RoomPendingPrompt, answeredQuestionIDs: Set<String> = [],
+             lockedAnswersByQuestionID: [String: String] = [:]) {
+            attemptID = prompt.attemptID
+            threadID = prompt.threadID
+            epoch = prompt.epoch
+            requestID = prompt.requestID
+            fingerprint = prompt.stableFingerprint
+            self.answeredQuestionIDs = answeredQuestionIDs
+            self.lockedAnswersByQuestionID = lockedAnswersByQuestionID
+        }
+
+        func matches(_ prompt: RoomPendingPrompt) -> Bool {
+            attemptID == prompt.attemptID
+                && threadID == prompt.threadID
+                && epoch == prompt.epoch
+                && requestID == prompt.requestID
+                && fingerprint == prompt.stableFingerprint
+        }
+    }
+
+    /// Publish a prompt only after a *successful* hidden-session resume. A
+    /// failed/transient read simply never reaches this function, preserving
+    /// the card and its SwiftUI draft. The same request can update its runtime
+    /// SID after reconnect without resetting draft/progress; a new request
+    /// atomically replaces both.
+    func synchronizePendingPrompt(roomID: RoomID, attempt: RoomAttempt,
+                                  snapshot: RoomMemberSessionSnapshot) {
+        let key = RoomPendingPromptKey(roomID: roomID, route: attempt.member)
+        guard let prompt = snapshot.pendingPrompt(roomID: roomID,
+                                                  route: attempt.member,
+                                                  attempt: attempt) else {
+            pendingPrompts.removeValue(forKey: key)
+            answeredPromptQuestions.removeValue(forKey: key)
+            return
+        }
+        var progress = answeredPromptQuestions[key]
+        if progress?.matches(prompt) != true {
+            progress = .init(prompt: prompt)
+        }
+        // Replayed locks are monotonic for one request. A delayed resume that
+        // lacks an already accepted question cannot make it editable or send
+        // it again; a newly replayed lock joins the existing progress.
+        for (questionID, answer) in prompt.lockedAnswersByQuestionID
+        where progress?.lockedAnswersByQuestionID[questionID] == nil {
+            progress?.lockedAnswersByQuestionID[questionID] = answer
+        }
+        progress?.answeredQuestionIDs.formUnion(prompt.lockedQuestionIDs)
+        if let progress { answeredPromptQuestions[key] = progress }
+
+        var merged = prompt
+        merged.lockedAnswersByQuestionID = progress?.lockedAnswersByQuestionID ?? [:]
+        pendingPrompts[key] = merged
+    }
+
+    func clearPendingPrompt(for attempt: RoomAttempt, roomID: RoomID) {
+        let key = RoomPendingPromptKey(roomID: roomID, route: attempt.member)
+        guard pendingPrompts[key]?.attemptID == attempt.id else { return }
+        pendingPrompts.removeValue(forKey: key)
+        answeredPromptQuestions.removeValue(forKey: key)
+    }
+
+    func clearPendingPrompts(roomID: RoomID) {
+        let keys = pendingPrompts.keys.filter { $0.roomID == roomID }
+        for key in keys {
+            pendingPrompts.removeValue(forKey: key)
+            answeredPromptQuestions.removeValue(forKey: key)
+        }
+    }
+
+    func clearPendingPrompts(route: GatewayBotRoute) {
+        let keys = pendingPrompts.keys.filter { $0.route == route }
+        for key in keys {
+            pendingPrompts.removeValue(forKey: key)
+            answeredPromptQuestions.removeValue(forKey: key)
+        }
+    }
+
+    /// Profile rename preserves a room's stable ids. Re-key only an
+    /// unambiguous live card; if a destination collision somehow exists, drop
+    /// the stale source instead of making either prompt answerable on the
+    /// wrong identity.
+    func migratePendingPrompts(from source: GatewayBotRoute, to destination: GatewayBotRoute) {
+        let sourceEntries = pendingPrompts.filter { $0.key.route == source }
+        for (oldKey, oldPrompt) in sourceEntries {
+            let newKey = RoomPendingPromptKey(roomID: oldKey.roomID, route: destination)
+            let progress = answeredPromptQuestions.removeValue(forKey: oldKey)
+            pendingPrompts.removeValue(forKey: oldKey)
+            guard pendingPrompts[newKey] == nil else { continue }
+            var prompt = oldPrompt
+            prompt.key = newKey
+            pendingPrompts[newKey] = prompt
+            if let progress { answeredPromptQuestions[newKey] = progress }
+        }
+    }
+}
+
+/// Answers stay typed until they cross the source-qualified room transport.
+/// A batch is represented by multiple values in the order of the normalized
+/// `RoomPendingPrompt.questions`, not by one lossy comma-joined payload.
+public enum RoomPendingPromptAnswer: Sendable {
+    case approval(ApprovalChoice)
+    case text(String, questionID: String? = nil)
+    case selections([String], questionID: String? = nil)
+
+    fileprivate var questionID: String? {
+        switch self {
+        case .approval: nil
+        case let .text(_, questionID), let .selections(_, questionID): questionID
+        }
+    }
+
+    fileprivate var questionKey: String {
+        switch self {
+        case .approval: "__approval__"
+        case let .text(_, questionID), let .selections(_, questionID):
+            questionID ?? "__single__"
+        }
+    }
+
+    fileprivate var lockedAnswer: String? {
+        switch self {
+        case .approval: nil
+        case let .text(value, _): value
+        case let .selections(values, _): RoomPendingPrompt.multiSelectAnswer(values)
+        }
+    }
+}
+
+enum RoomPendingPromptRuntimeError: LocalizedError, Equatable {
+    case stale
+    case malformedAnswer
+    case emptyAnswer
+    case unresolvedApproval
+
+    var errorDescription: String? {
+        switch self {
+        case .stale: "This request changed in Hermes. Check the latest prompt before answering."
+        case .malformedAnswer: "This answer no longer matches the pending request."
+        case .emptyAnswer: "Enter or choose an answer before sending."
+        case .unresolvedApproval: "Hermes did not confirm that approval was applied."
+        }
+    }
 }
 
 /// MainActor-side token captured before a profile lifecycle REST await. The
@@ -82,6 +275,11 @@ struct RoomProfileLifecycleToken: Equatable, Sendable {
 @MainActor
 final class RoomMutationGate {
     static let shared = RoomMutationGate()
+    /// Every operation which can claim a room display name acquires this key
+    /// first. Per-room mutation keys follow it in `withLocks`, giving the whole
+    /// name namespace one ordering without nesting admission scopes.
+    static let roomNameNamespaceKey = "room-name-namespace"
+    static let metadataOutboxKey = "metadata-outbox"
     private struct Waiter {
         let id: UUID
         let continuation: CheckedContinuation<Bool, Never>
@@ -95,16 +293,29 @@ final class RoomMutationGate {
     private var drainedWaiter: CheckedContinuation<Void, Never>?
 
     func queuedWaiterCount(for key: String) -> Int { waiters[key]?.count ?? 0 }
+    var quiescenceIsPending: Bool { quiescing }
 
     func withLock<T>(_ key: String, _ operation: () async throws -> T) async throws -> T {
+        try await withLocks([key], operation)
+    }
+
+    /// Acquire several keys under one admitted operation. Nested `withLock`
+    /// calls are unsafe here: quiescence can begin after the outer admission,
+    /// block the inner admission, and then wait forever for the outer owner.
+    /// One admission plus ordered acquisition avoids that cycle.
+    func withLocks<T>(_ keys: [String], _ operation: () async throws -> T) async throws -> T {
         guard await enterOperation() else { throw CancellationError() }
-        var ownsKey = false
+        var ownedKeys: [String] = []
+        var seen = Set<String>()
+        let orderedKeys = keys.filter { seen.insert($0).inserted }
         defer {
-            if ownsKey { release(key) }
+            for key in ownedKeys.reversed() { release(key) }
             leaveOperation()
         }
-        guard await acquire(key) else { throw CancellationError() }
-        ownsKey = true
+        for key in orderedKeys {
+            guard await acquire(key) else { throw CancellationError() }
+            ownedKeys.append(key)
+        }
         try Task.checkCancellation()
         return try await operation()
     }
@@ -286,8 +497,214 @@ public extension AppModel {
 
     func roomAvatarData(_ id: RoomID) -> Data? { RoomRuntime.shared.avatarData[id] }
 
+    /// Live, source-qualified prompts currently blocking this room. These are
+    /// deliberately separate from `RoomRecord.needsUser`, which remains the
+    /// transcript-only `@user` attention bit.
+    func roomPendingPrompts(_ roomID: RoomID) -> [RoomPendingPrompt] {
+        RoomRuntime.shared.pendingPrompts.values
+            .filter { $0.roomID == roomID }
+            .sorted { lhs, rhs in
+                if lhs.route.gatewayID != rhs.route.gatewayID {
+                    return lhs.route.gatewayID < rhs.route.gatewayID
+                }
+                return lhs.route.profile < rhs.route.profile
+            }
+    }
+
+    /// Answer a live hidden-session prompt through the client that owns its
+    /// exact source route. A card can disappear only after Hermes confirms an
+    /// approval (`resolved > 0`) or every sequential clarify response
+    /// succeeds; a transient error intentionally leaves the same card/draft
+    /// in place for retry.
+    func respondToRoomPendingPrompt(_ prompt: RoomPendingPrompt,
+                                    answers: [RoomPendingPromptAnswer]) async throws {
+        let roomID = prompt.roomID
+        try await RoomMutationGate.shared.withLock(roomID.description) {
+            let runtime = RoomRuntime.shared
+            guard runtime.pendingPrompts[prompt.key] == prompt,
+                  let room = try await runtime.store.room(id: roomID),
+                  let attempt = room.attempts.first(where: { $0.id == prompt.attemptID }),
+                  attempt.finishedAt == nil,
+                  attempt.member == prompt.route,
+                  attempt.threadID == prompt.threadID,
+                  attempt.epoch == prompt.epoch,
+                  runtime.acceptsProfileRoute(prompt.route,
+                                              generation: runtime.profileRouteGeneration(prompt.route))
+            else { throw RoomPendingPromptRuntimeError.stale }
+
+            let alreadyAnswered: Set<String>
+            if let progress = runtime.answeredPromptQuestions[prompt.key],
+               progress.matches(prompt) {
+                alreadyAnswered = progress.answeredQuestionIDs
+            } else {
+                alreadyAnswered = []
+            }
+            let ordered = try roomPendingPromptAnswerPlan(
+                prompt: prompt, answers: answers, alreadyAnswered: alreadyAnswered)
+
+            for answer in ordered {
+                let approvalResolved = try await sendRoomPendingPromptResponse(prompt, answer: answer)
+                if case .approval = answer, (approvalResolved ?? 0) <= 0 {
+                    // Do not echo, complete, or remove an approval card until
+                    // Hermes positively acknowledges that it resolved one.
+                    throw RoomPendingPromptRuntimeError.unresolvedApproval
+                }
+                guard runtime.acceptsProfileRoute(
+                    prompt.route, generation: runtime.profileRouteGeneration(prompt.route)
+                ), Self.roomPromptResponseIdentityMatches(
+                    runtime.pendingPrompts[prompt.key], expected: prompt)
+                else { throw RoomPendingPromptRuntimeError.stale }
+                var progress = runtime.answeredPromptQuestions[prompt.key]
+                if progress?.matches(prompt) != true {
+                    progress = .init(prompt: prompt)
+                }
+                progress?.answeredQuestionIDs.insert(answer.questionKey)
+                if prompt.isBatchClarify, let questionID = answer.questionID,
+                   let accepted = answer.lockedAnswer {
+                    progress?.lockedAnswersByQuestionID[questionID] = accepted
+                    if var visible = runtime.pendingPrompts[prompt.key],
+                       Self.roomPromptResponseIdentityMatches(visible, expected: prompt) {
+                        visible.lockedAnswersByQuestionID[questionID] = accepted
+                        runtime.pendingPrompts[prompt.key] = visible
+                    }
+                }
+                if let progress { runtime.answeredPromptQuestions[prompt.key] = progress }
+            }
+
+            // A newer attempt must remain visible even if an old response
+            // returned after a reconnect. Full durable producer identity is
+            // the narrow postcondition that permits removal here.
+            if Self.roomPromptResponseIdentityMatches(
+                runtime.pendingPrompts[prompt.key], expected: prompt) {
+                runtime.pendingPrompts.removeValue(forKey: prompt.key)
+                runtime.answeredPromptQuestions.removeValue(forKey: prompt.key)
+            }
+        }
+        // A confirmed answer can expose another nested prompt or the member's
+        // reply. Reconciliation is read-only and will re-mirror that result.
+        scheduleRoomReconciliation(roomID: roomID)
+    }
+
+    /// A request id is scoped by Hermes' live request table, not a durable
+    /// room identity. A reconnect/restart may reuse one for a different room
+    /// attempt, so an old response completion may mutate/remove a card only
+    /// when the whole durable producer identity still matches. The runtime SID
+    /// is intentionally excluded: the same logical request can acquire a new
+    /// connection-local SID after a successful `session.resume`.
+    private nonisolated static func roomPromptResponseIdentityMatches(
+        _ current: RoomPendingPrompt?, expected: RoomPendingPrompt
+    ) -> Bool {
+        guard let current else { return false }
+        return current.key == expected.key
+            && current.attemptID == expected.attemptID
+            && current.threadID == expected.threadID
+            && current.epoch == expected.epoch
+            && current.requestID == expected.requestID
+            && current.stableFingerprint == expected.stableFingerprint
+    }
+
     func reconcileRoom(_ roomID: RoomID) {
         scheduleRoomReconciliation(roomID: roomID)
+    }
+
+    private func roomPendingPromptAnswerPlan(
+        prompt: RoomPendingPrompt, answers: [RoomPendingPromptAnswer],
+        alreadyAnswered: Set<String>
+    ) throws -> [RoomPendingPromptAnswer] {
+        switch prompt.kind {
+        case .approval:
+            guard answers.count == 1, case let .approval(choice) = answers[0],
+                  prompt.approvalChoices.contains(where: { $0.rawValue == choice.rawValue })
+            else { throw RoomPendingPromptRuntimeError.malformedAnswer }
+            return answers
+
+        case .clarify:
+            guard !answers.isEmpty else { throw RoomPendingPromptRuntimeError.emptyAnswer }
+            if prompt.isBatchClarify {
+                let remaining = prompt.questions.filter {
+                    guard let questionID = $0.questionID else { return false }
+                    return !prompt.isQuestionLocked($0) && !alreadyAnswered.contains(questionID)
+                }
+                guard !remaining.isEmpty, answers.count == remaining.count else {
+                    throw RoomPendingPromptRuntimeError.malformedAnswer
+                }
+                var byQuestionID: [String: RoomPendingPromptAnswer] = [:]
+                for answer in answers {
+                    guard let questionID = answer.questionID,
+                          byQuestionID[questionID] == nil else {
+                        throw RoomPendingPromptRuntimeError.malformedAnswer
+                    }
+                    byQuestionID[questionID] = answer
+                }
+                return try remaining.map { question in
+                    guard let questionID = question.questionID,
+                          let answer = byQuestionID[questionID] else {
+                        throw RoomPendingPromptRuntimeError.malformedAnswer
+                    }
+                    try validateRoomPendingPrompt(answer, for: question)
+                    return answer
+                }
+            }
+
+            guard prompt.questions.count == 1, answers.count == 1,
+                  answers[0].questionID == nil else {
+                throw RoomPendingPromptRuntimeError.malformedAnswer
+            }
+            try validateRoomPendingPrompt(answers[0], for: prompt.questions[0])
+            return answers
+        }
+    }
+
+    private func validateRoomPendingPrompt(_ answer: RoomPendingPromptAnswer,
+                                           for question: RoomPendingClarifyQuestion) throws {
+        switch answer {
+        case let .text(value, _):
+            guard !question.multiSelect else { throw RoomPendingPromptRuntimeError.malformedAnswer }
+            guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw RoomPendingPromptRuntimeError.emptyAnswer
+            }
+        case let .selections(values, _):
+            guard question.multiSelect else { throw RoomPendingPromptRuntimeError.malformedAnswer }
+            guard !values.isEmpty else { throw RoomPendingPromptRuntimeError.emptyAnswer }
+        case .approval:
+            throw RoomPendingPromptRuntimeError.malformedAnswer
+        }
+    }
+
+    /// Build through the prompt helpers before choosing a transport. The
+    /// production branch deliberately calls the finalized GatewayClient
+    /// overloads rather than generic RPC, while the test seam observes the
+    /// same exact source-qualified wire value.
+    private func sendRoomPendingPromptResponse(
+        _ prompt: RoomPendingPrompt, answer: RoomPendingPromptAnswer
+    ) async throws -> Int? {
+        let runtime = RoomRuntime.shared
+        if let operation = runtime.pendingPromptResponseOperation {
+            let response: RoomPendingPromptResponse
+            switch answer {
+            case let .approval(choice): response = try prompt.approvalResponse(choice: choice)
+            case let .text(value, questionID):
+                response = try prompt.clarifyResponse(answer: value, questionID: questionID)
+            case let .selections(values, questionID):
+                response = try prompt.clarifyResponse(selections: values, questionID: questionID)
+            }
+            let result = try await operation(response)
+            if case .approval = answer {
+                return RoomPendingPrompt.resolvedApprovalCount(in: result)
+            }
+            return nil
+        }
+
+        let client = try await routedClient(for: prompt.route)
+        switch answer {
+        case let .approval(choice):
+            return try await client.respondToRoomPrompt(prompt, choice: choice)
+        case let .text(value, questionID):
+            try await client.respondToRoomPrompt(prompt, answer: value, questionID: questionID)
+        case let .selections(values, questionID):
+            try await client.respondToRoomPrompt(prompt, selections: values, questionID: questionID)
+        }
+        return nil
     }
 
     /// Explicit fail-closed resolution for a turn whose acceptance cannot be
@@ -323,7 +740,12 @@ public extension AppModel {
                                                        threadID: attempt.threadID), in: &room)
             }
         }
-        if let updated { RoomRuntime.shared.replace(updated) }
+        if let updated {
+            RoomRuntime.shared.replace(updated)
+            if let attempt = updated.attempts.first(where: { $0.id == attemptID }) {
+                RoomRuntime.shared.clearPendingPrompt(for: attempt, roomID: roomID)
+            }
+        }
     }
 
     func roomStorageUsage() async -> RoomStorageUsage? {
@@ -346,6 +768,7 @@ public extension AppModel {
         for id in affected {
             runtime.driveTasks[id]?.cancel()
             runtime.driveTokens[id] = UUID()
+            runtime.cancelPostSettleHarvest(roomID: id)
         }
         return RoomProfileLifecycleToken(source: route, generation: generation)
     }
@@ -365,6 +788,7 @@ public extension AppModel {
             runtime.retiredProfileRoutes.remove(token.source)
             runtime.retiredProfileRoutes.remove(destination)
             _ = runtime.bumpProfileRouteGeneration(destination)
+            runtime.migratePendingPrompts(from: token.source, to: destination)
             runtime.rooms = result.rooms.sorted { $0.lastActivityAt > $1.lastActivityAt }
             runtime.metadataPendingCount = (try? await runtime.store.metadataOutbox().count) ?? 0
             for room in result.rooms {
@@ -402,6 +826,7 @@ public extension AppModel {
                 throw CancellationError()
             }
             runtime.retiredProfileRoutes.insert(token.source)
+            runtime.clearPendingPrompts(route: token.source)
             runtime.rooms = result.rooms.sorted { $0.lastActivityAt > $1.lastActivityAt }
             runtime.metadataPendingCount = (try? await runtime.store.metadataOutbox().count) ?? 0
         }
@@ -421,6 +846,7 @@ public extension AppModel {
                 "Room state for \(route.qualifiedID) is fenced; retry reconciliation before reuse."
         }
         RoomRuntime.shared.retiredProfileRoutes.insert(route)
+        RoomRuntime.shared.clearPendingPrompts(route: route)
     }
 
     internal func abortRoomProfileLifecycle(_ token: RoomProfileLifecycleToken) async {
@@ -491,6 +917,7 @@ public extension AppModel {
         await RoomMutationGate.shared.withQuiescence {
             let runtime = RoomRuntime.shared
             let tasks = Array(runtime.driveTasks.values)
+                + Array(runtime.postSettleHarvestTasks.values)
             for task in tasks { task.cancel() }
             for task in tasks { await task.value }
             // Local-data deletion does not mutate Hermes. In particular, an
@@ -511,6 +938,8 @@ public extension AppModel {
                 // durable drive/attempt ledger—never by replaying a prompt.
                 runtime.driveTasks.removeAll()
                 runtime.driveTokens.removeAll()
+                runtime.postSettleHarvestTasks.removeAll()
+                runtime.postSettleHarvestTokens.removeAll()
                 roomsToResume = runtime.rooms
                 deletionError = error
             }
@@ -531,6 +960,8 @@ public extension AppModel {
     private func resetRoomRuntimeAfterDeletion(_ runtime: RoomRuntime) {
             runtime.driveTasks.removeAll()
             runtime.driveTokens.removeAll()
+            runtime.postSettleHarvestTasks.removeAll()
+            runtime.postSettleHarvestTokens.removeAll()
             runtime.rooms = []
             runtime.avatarData = [:]
             runtime.openRoomID = nil
@@ -539,6 +970,8 @@ public extension AppModel {
             runtime.metadataLastError = nil
             runtime.profileLifecycleError = nil
             runtime.isLoaded = false
+            runtime.pendingPrompts.removeAll()
+            runtime.answeredPromptQuestions.removeAll()
             runtime.profileRouteGenerations.removeAll()
             runtime.retiredProfileRoutes.removeAll()
             runtime.deferredProfileRearmRooms.removeAll()
@@ -585,8 +1018,13 @@ public extension AppModel {
     /// persistence, so duplicate profile names on two gateways never collide.
     @discardableResult
     func createRoom(name: String, members: [RoomMember]) async throws -> RoomID {
-        try await RoomMutationGate.shared.withLock("create") {
-            try await createRoomUnlocked(name: name, members: members)
+        try await RoomMutationGate.shared.withLocks([
+            RoomMutationGate.roomNameNamespaceKey,
+            RoomMutationGate.metadataOutboxKey,
+        ]) {
+            let roomID = try await createRoomUnlocked(name: name, members: members)
+            await flushRoomMetadataOutboxAlreadyAdmitted()
+            return roomID
         }
     }
 
@@ -599,6 +1037,7 @@ public extension AppModel {
         if let retired = unique.first(where: { RoomRuntime.shared.retiredProfileRoutes.contains($0.route) }) {
             throw RoomStoreError.retiredRoute(retired.route)
         }
+        await RoomRuntime.shared.roomNameCommitBarrier?()
         var record = RoomRecord(name: trimmed, members: unique)
         try RoomEngine.validate(record)
         record.updatedAt = Date()
@@ -608,20 +1047,26 @@ public extension AppModel {
         try await RoomRuntime.shared.store.upsert(record, metadataMutations: metadata)
         RoomRuntime.shared.replace(record)
         RoomRuntime.shared.openRoomID = record.id
-        await flushRoomMetadataOutbox()
         return record.id
     }
 
     func renameRoom(_ roomID: RoomID, name: String) async throws {
-        try await RoomMutationGate.shared.withLock(roomID.description) {
+        try await RoomMutationGate.shared.withLocks([
+            RoomMutationGate.roomNameNamespaceKey, roomID.description,
+            RoomMutationGate.metadataOutboxKey,
+        ]) {
             try await renameRoomUnlocked(roomID, name: name)
+            await flushRoomMetadataOutboxAlreadyAdmitted()
         }
     }
 
     func updateRoomSettings(_ roomID: RoomID, name: String, members proposedMembers: [RoomMember],
                             avatar: RoomOutboundAttachment? = nil,
                             removeAvatar: Bool = false) async throws {
-        try await RoomMutationGate.shared.withLock(roomID.description) {
+        try await RoomMutationGate.shared.withLocks([
+            RoomMutationGate.roomNameNamespaceKey, roomID.description,
+            RoomMutationGate.metadataOutboxKey,
+        ]) {
             guard let before = try await RoomRuntime.shared.store.room(id: roomID) else {
                 throw RoomStoreError.roomNotFound(roomID)
             }
@@ -629,6 +1074,7 @@ public extension AppModel {
             let otherNames = try await RoomRuntime.shared.store.loadAll()
                 .filter { $0.id != roomID }.map { $0.name.lowercased() }
             guard !otherNames.contains(normalized.lowercased()) else { throw RoomNameError.taken }
+            await RoomRuntime.shared.roomNameCommitBarrier?()
 
             let members = proposedMembers.reduce(into: [RoomMember]()) { result, member in
                 if !result.contains(where: { $0.route == member.route }) { result.append(member) }
@@ -644,6 +1090,12 @@ public extension AppModel {
             let removed = before.members.filter { !activeRoutes.contains($0.route) }
             if before.attempts.contains(where: { attempt in
                 removed.contains(where: { $0.route == attempt.member }) && attempt.finishedAt == nil
+            }) { throw RoomSettingsError.memberBusy }
+            // A prompt is live-only and can arrive a poll before the durable
+            // attempt state changes. Removing that seat would strand the
+            // source-qualified answer, so fail closed in either representation.
+            if RoomRuntime.shared.pendingPrompts.keys.contains(where: { key in
+                key.roomID == roomID && removed.contains(where: { $0.route == key.route })
             }) { throw RoomSettingsError.memberBusy }
 
             var storedAvatar: RoomAttachment?
@@ -699,7 +1151,7 @@ public extension AppModel {
             if let avatar { RoomRuntime.shared.avatarData[roomID] = avatar.data }
             else if removeAvatar { RoomRuntime.shared.avatarData[roomID] = nil }
             RoomRuntime.shared.replace(result)
-            await flushRoomMetadataOutbox()
+            await flushRoomMetadataOutboxAlreadyAdmitted()
         }
     }
 
@@ -712,6 +1164,7 @@ public extension AppModel {
         let otherNames = try await RoomRuntime.shared.store.loadAll()
             .filter { $0.id != roomID }.map { $0.name.lowercased() }
         guard !otherNames.contains(normalized.lowercased()) else { throw RoomNameError.taken }
+        await RoomRuntime.shared.roomNameCommitBarrier?()
         let metadata = room.members.map {
             RoomMetadataMutation(route: $0.route, kind: .rename,
                                  oldName: oldName, newName: normalized)
@@ -723,14 +1176,16 @@ public extension AppModel {
             current.updatedAt = Date()
         }
         RoomRuntime.shared.replace(room)
-        await flushRoomMetadataOutbox()
     }
 
     /// Invalidate/persist first, cancel and await the sole driver second,
     /// delete durable room+blobs third, retire navigation last.
     func disbandRoom(_ roomID: RoomID) async throws {
-        try await RoomMutationGate.shared.withLock(roomID.description) {
+        try await RoomMutationGate.shared.withLocks([
+            roomID.description, RoomMutationGate.metadataOutboxKey,
+        ]) {
             try await disbandRoomUnlocked(roomID)
+            await flushRoomMetadataOutboxAlreadyAdmitted()
         }
     }
 
@@ -752,8 +1207,11 @@ public extension AppModel {
         runtime.replace(room)
 
         let task = runtime.driveTasks[roomID]
+        let harvestTask = runtime.postSettleHarvestTasks[roomID]
         task?.cancel()
+        harvestTask?.cancel()
         await task?.value
+        await harvestTask?.value
         // Explicit disband proves these uncertain turns are abandoned. Undo
         // any queued image/PDF state before deleting the durable path ledger.
         for attempt in room.attempts where !attempt.stagedImagePaths.isEmpty {
@@ -768,8 +1226,10 @@ public extension AppModel {
         try await runtime.store.delete(roomID: roomID, metadataMutations: metadata)
         runtime.driveTasks[roomID] = nil
         runtime.driveTokens[roomID] = nil
+        runtime.postSettleHarvestTasks[roomID] = nil
+        runtime.postSettleHarvestTokens[roomID] = nil
+        runtime.clearPendingPrompts(roomID: roomID)
         runtime.remove(roomID)
-        await flushRoomMetadataOutbox()
     }
 
     /// Main composer mints a stable topic; a reply supplies its thread id.
@@ -798,6 +1258,12 @@ public extension AppModel {
         guard !body.isEmpty || !attachments.isEmpty else {
             throw GatewayError(code: -8, message: "A room message cannot be empty.")
         }
+
+        // Revoke an old post-settle owner before the epoch changes or blob
+        // staging suspends. Cancelling only from `scheduleRoomDrive` left a
+        // wide attachment-write window in which an E harvest could publish a
+        // reply into the new E+1 send.
+        runtime.cancelPostSettleHarvest(roomID: roomID)
 
         let target = threadID ?? RoomThreadID()
         let room = try await runtime.store.mutate(roomID: roomID) { current in
@@ -858,49 +1324,75 @@ public extension AppModel {
 // MARK: - Serialized driver
 
 extension AppModel {
+    /// Capture only durable identity supplied by Hermes/Bot Mode. A themed
+    /// roster label (for example Ink's uppercase alias or a remote-default
+    /// device label) is presentation and must never become a room mention.
+    func capturedRoomMember(for bot: Bot, route: GatewayBotRoute,
+                            sourceLabel: String?) -> RoomMember {
+        let title = bot.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let explicitTitle = title?.isEmpty == false ? title : nil
+        let display = bot.rawDisplayName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawDisplay = display?.isEmpty == false ? display : nil
+        return RoomMember(route: route, title: explicitTitle, handle: bot.handle,
+                          sourceLabel: sourceLabel,
+                          friendlyName: explicitTitle ?? rawDisplay,
+                          rawDisplayName: rawDisplay)
+    }
+
     func flushRoomMetadataOutbox() async {
-        _ = try? await RoomMutationGate.shared.withLock("metadata-outbox") {
-            let runtime = RoomRuntime.shared
-            let mutations: [RoomMetadataMutation]
-            do { mutations = try await runtime.store.metadataOutbox() }
-            catch {
-                runtime.metadataLastError = error.localizedDescription
-                return
+        _ = try? await RoomMutationGate.shared.withLock(
+            RoomMutationGate.metadataOutboxKey
+        ) {
+            await flushRoomMetadataOutboxAlreadyAdmitted()
+        }
+    }
+
+    /// Drain the durable FIFO while the caller already owns the metadata-outbox
+    /// key under one RoomMutationGate admission. Room create/rename/settings/
+    /// disband use this path so delete-all quiescence can wait for the outer
+    /// owner without blocking a nested admission that owner needs to finish.
+    private func flushRoomMetadataOutboxAlreadyAdmitted() async {
+        let runtime = RoomRuntime.shared
+        let mutations: [RoomMetadataMutation]
+        do { mutations = try await runtime.store.metadataOutbox() }
+        catch {
+            runtime.metadataLastError = error.localizedDescription
+            return
+        }
+        runtime.metadataPendingCount = mutations.count
+        if mutations.isEmpty { runtime.metadataLastError = nil; return }
+        var blockedRoutes = Set<GatewayBotRoute>()
+        for mutation in mutations {
+            guard !blockedRoutes.contains(mutation.route) else { continue }
+            let generation = runtime.profileRouteGeneration(mutation.route)
+            guard runtime.acceptsProfileRoute(mutation.route, generation: generation) else {
+                blockedRoutes.insert(mutation.route)
+                continue
             }
-            runtime.metadataPendingCount = mutations.count
-            if mutations.isEmpty { runtime.metadataLastError = nil; return }
-            var blockedRoutes = Set<GatewayBotRoute>()
-            for mutation in mutations {
-                guard !blockedRoutes.contains(mutation.route) else { continue }
-                let generation = runtime.profileRouteGeneration(mutation.route)
-                guard runtime.acceptsProfileRoute(mutation.route, generation: generation) else {
+            do {
+                if let operation = runtime.metadataMutationOperation {
+                    try await operation(mutation)
+                } else {
+                    try await applyRoomMetadataMutation(mutation)
+                }
+                // A committed profile rename may have rewritten this same id
+                // while the network request was suspended. Do not let the old
+                // completion remove the destination mutation.
+                guard runtime.acceptsProfileRoute(mutation.route,
+                                                  generation: generation) else {
                     blockedRoutes.insert(mutation.route)
                     continue
                 }
-                do {
-                    if let operation = runtime.metadataMutationOperation {
-                        try await operation(mutation)
-                    } else {
-                        try await applyRoomMetadataMutation(mutation)
-                    }
-                    // A committed profile rename may have rewritten this same
-                    // id while the network request was suspended. Do not let
-                    // the old completion remove the destination mutation.
-                    guard runtime.acceptsProfileRoute(mutation.route,
-                                                      generation: generation) else {
-                        blockedRoutes.insert(mutation.route)
-                        continue
-                    }
-                    try await runtime.store.removeMetadataMutation(
-                        id: mutation.id, matching: mutation)
-                    runtime.metadataPendingCount = max(0, runtime.metadataPendingCount - 1)
-                    runtime.metadataLastError = nil
-                } catch {
-                    // Keep the exact source-qualified mutation durable. A
-                    // later union-roster refresh/reconnect retries it in order.
-                    runtime.metadataLastError = error.localizedDescription
-                    blockedRoutes.insert(mutation.route)
-                }
+                try await runtime.store.removeMetadataMutation(
+                    id: mutation.id, matching: mutation)
+                runtime.metadataPendingCount = max(0, runtime.metadataPendingCount - 1)
+                runtime.metadataLastError = nil
+            } catch {
+                // Keep the exact source-qualified mutation durable. A later
+                // union-roster refresh/reconnect retries it in order.
+                runtime.metadataLastError = error.localizedDescription
+                blockedRoutes.insert(mutation.route)
             }
         }
     }
@@ -947,6 +1439,7 @@ extension AppModel {
 
     func scheduleRoomDrive(roomID: RoomID) {
         let runtime = RoomRuntime.shared
+        runtime.cancelPostSettleHarvest(roomID: roomID)
         let prior = runtime.driveTasks[roomID]
         let token = UUID()
         runtime.driveTokens[roomID] = token
@@ -968,6 +1461,7 @@ extension AppModel {
 
     func scheduleRoomReconciliation(roomID: RoomID) {
         let runtime = RoomRuntime.shared
+        runtime.cancelPostSettleHarvest(roomID: roomID)
         let prior = runtime.driveTasks[roomID]
         let token = UUID()
         runtime.driveTokens[roomID] = token
@@ -980,6 +1474,13 @@ extension AppModel {
                let refreshed = try? await RoomRuntime.shared.store.room(id: roomID),
                refreshed.drives.contains(where: { $0.epoch == refreshed.epoch }) {
                 await self.runRoomDrive(roomID: roomID)
+            } else if !Task.isCancelled,
+                      let refreshed = try? await RoomRuntime.shared.store.room(id: roomID),
+                      refreshed.epoch == room.epoch,
+                      Self.hasStrandedRoomAttempts(refreshed) {
+                // Relaunch/reconnect reconciliation has no drive to settle,
+                // but owns the same durable stranded-work obligation.
+                self.schedulePostSettleRoomHarvest(roomID: roomID, epoch: room.epoch)
             }
             if RoomRuntime.shared.driveTokens[roomID] == token {
                 RoomRuntime.shared.driveTasks[roomID] = nil
@@ -987,6 +1488,70 @@ extension AppModel {
             }
         }
         runtime.driveTasks[roomID] = next
+    }
+
+    /// c1e25-style background reconciliation for work that outlived the room
+    /// drive. It is bounded, source/epoch fenced, and independently
+    /// cancellable so a new user send or disband cannot race an old harvest.
+    func schedulePostSettleRoomHarvest(roomID: RoomID, epoch: UInt64) {
+        let runtime = RoomRuntime.shared
+        runtime.cancelPostSettleHarvest(roomID: roomID)
+        guard runtime.postSettleHarvestLimit > 0 else { return }
+        let token = UUID()
+        runtime.postSettleHarvestTokens[roomID] = token
+        let interval = runtime.postSettleHarvestInterval
+        let limit = runtime.postSettleHarvestLimit
+        let task = Task { @MainActor [weak self] in
+            defer {
+                if RoomRuntime.shared.postSettleHarvestTokens[roomID] == token {
+                    RoomRuntime.shared.postSettleHarvestTasks[roomID] = nil
+                    RoomRuntime.shared.postSettleHarvestTokens[roomID] = nil
+                }
+            }
+            for _ in 0..<limit {
+                do { try await Task.sleep(for: interval) }
+                catch { return }
+                guard !Task.isCancelled, let self,
+                      RoomRuntime.shared.postSettleHarvestTokens[roomID] == token,
+                      RoomRuntime.shared.driveTokens[roomID] == nil,
+                      let room = try? await RoomRuntime.shared.store.room(id: roomID),
+                      room.epoch == epoch else { return }
+                guard Self.hasStrandedRoomAttempts(room) else { return }
+                await self.harvestRoomAttempts(roomID: roomID, epoch: epoch,
+                                               harvestToken: token)
+            }
+        }
+        runtime.postSettleHarvestTasks[roomID] = task
+    }
+
+    /// Revalidate a reconciliation owner after every suspension. `epoch` is
+    /// the room snapshot the caller owns (not necessarily the attempt's epoch:
+    /// a new serialized drive may deliberately reconcile older accepted work).
+    /// A post-settle token additionally prevents an older task from publishing
+    /// after a same-epoch replacement scheduler took ownership.
+    private func roomHarvestOwnerIsCurrent(roomID: RoomID, epoch: UInt64,
+                                           harvestToken: UUID?) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        if let harvestToken,
+           RoomRuntime.shared.postSettleHarvestTokens[roomID] != harvestToken {
+            return false
+        }
+        guard let room = try? await RoomRuntime.shared.store.room(id: roomID),
+              room.epoch == epoch else { return false }
+        guard !Task.isCancelled else { return false }
+        if let harvestToken,
+           RoomRuntime.shared.postSettleHarvestTokens[roomID] != harvestToken {
+            return false
+        }
+        return true
+    }
+
+    private nonisolated static func hasStrandedRoomAttempts(_ room: RoomRecord) -> Bool {
+        room.attempts.contains {
+            $0.finishedAt == nil
+                && [.waiting, .accepted, .uncertain, .working, .timedOut]
+                    .contains($0.state)
+        }
     }
 
     private func roomRouteGenerationSnapshot(_ room: RoomRecord)
@@ -1157,7 +1722,10 @@ extension AppModel {
         let session: RoomMemberSessionSnapshot
         do {
             session = try await client.ensureRoomSession(
-                roomTitle: room.name, profile: member.route.profile,
+                roomID: room.id,
+                sessionTitleIdentityVersion: room.sessionTitleIdentityVersion,
+                legacySessionTitleName: room.legacySessionTitleName,
+                profile: member.route.profile,
                 storedID: room.memberSessions[member.route.qualifiedID])
         } catch {
             await persistRoomActivity(roomID: roomID, epoch: epoch, kind: .failed,
@@ -1275,6 +1843,18 @@ extension AppModel {
         return true
     }
 
+    /// A resume is the only authoritative observation of a hidden member
+    /// prompt. Tests may substitute the read itself, but production always
+    /// reacquires the client for the attempt's source-qualified route.
+    private func readRoomSession(for attempt: RoomAttempt) async throws -> RoomMemberSessionSnapshot {
+        if let operation = RoomRuntime.shared.sessionReadOperation {
+            return try await operation(attempt)
+        }
+        let client = try await routedClient(for: attempt.member)
+        return try await client.readRoomSession(storedID: attempt.storedSessionID,
+                                                profile: attempt.member.profile)
+    }
+
     func waitForRoomReply(roomID: RoomID, attemptID: RoomAttemptID) async {
         let runtime = RoomRuntime.shared
         let started = Date()
@@ -1289,17 +1869,35 @@ extension AppModel {
                   attempt.finishedAt == nil,
                   room.epoch == attempt.epoch,
                   let member = room.members.first(where: { $0.route == attempt.member }),
-                  let routeGeneration = Optional(runtime.profileRouteGeneration(attempt.member)),
-                  let client = try? await routedClient(for: attempt.member),
-                  let session = try? await client.readRoomSession(
-                    storedID: attempt.storedSessionID, profile: attempt.member.profile)
+                  let routeGeneration = Optional(runtime.profileRouteGeneration(attempt.member))
             else { return }
             guard runtime.acceptsProfileRoute(attempt.member,
                                               generation: routeGeneration) else { return }
+            let session: RoomMemberSessionSnapshot
+            do { session = try await readRoomSession(for: attempt) }
+            catch {
+                // A transient resume failure cannot dismiss a card or make a
+                // durable attempt appear complete.
+                return
+            }
+            guard await roomHarvestOwnerIsCurrent(roomID: roomID, epoch: attempt.epoch,
+                                                  harvestToken: nil),
+                  runtime.acceptsProfileRoute(attempt.member,
+                                              generation: routeGeneration) else { return }
+            runtime.synchronizePendingPrompt(roomID: roomID, attempt: attempt, snapshot: session)
+            if session.awaitingUser {
+                // A valid clarify/approval parks the member even when Hermes
+                // reports `running: false`. Keep sliding the normal 180 s
+                // window, bounded by the 20 minute hard cap.
+                deadline = min(started.addingTimeInterval(runtime.hardTurnTimeout),
+                               max(deadline, Date().addingTimeInterval(runtime.baseTurnTimeout)))
+                continue
+            }
             if let reply = session.assistantReply(for: attempt), !session.running {
                 await finishRoomAttempt(roomID: roomID, attemptID: attemptID,
                                         member: member, reply: reply, delivered: false,
-                                        routeGeneration: routeGeneration)
+                                        routeGeneration: routeGeneration,
+                                        expectedRoomEpoch: attempt.epoch)
                 return
             }
             if session.running {
@@ -1309,7 +1907,8 @@ extension AppModel {
                 // Accepted with no assistant row (tool-only/no output): pass.
                 await finishRoomAttempt(roomID: roomID, attemptID: attemptID,
                                         member: member, reply: nil, delivered: false,
-                                        routeGeneration: routeGeneration)
+                                        routeGeneration: routeGeneration,
+                                        expectedRoomEpoch: attempt.epoch)
                 return
             }
         }
@@ -1330,27 +1929,39 @@ extension AppModel {
         guard runtime.acceptsProfileRoute(timeoutAttempt.member,
                                           generation: runtime.profileRouteGeneration(timeoutAttempt.member)) else { return }
         runtime.replace(room)
+        // The timeout is durable stranded work, but its old live prompt is
+        // not. A later successful harvest can safely mirror it again.
+        runtime.clearPendingPrompt(for: timeoutAttempt, roomID: roomID)
     }
 
     /// Reconcile accepted/uncertain/timed-out work. Uncertainty becomes
     /// accepted only when the exact marker is present. Neither path submits.
     func harvestRoomAttempts(roomID: RoomID, epoch: UInt64,
-                             member: GatewayBotRoute? = nil) async {
+                             member: GatewayBotRoute? = nil,
+                             harvestToken: UUID? = nil) async {
         let runtime = RoomRuntime.shared
-        guard let room = try? await runtime.store.room(id: roomID) else { return }
+        guard await roomHarvestOwnerIsCurrent(roomID: roomID, epoch: epoch,
+                                              harvestToken: harvestToken),
+              let room = try? await runtime.store.room(id: roomID),
+              room.epoch == epoch else { return }
         let pending = room.attempts.filter {
             $0.finishedAt == nil && (member == nil || $0.member == member) &&
                 [.waiting, .accepted, .uncertain, .working, .timedOut].contains($0.state)
         }
         for attempt in pending {
-            guard !Task.isCancelled,
-                  let current = try? await runtime.store.room(id: roomID) else { continue }
+            guard await roomHarvestOwnerIsCurrent(roomID: roomID, epoch: epoch,
+                                                  harvestToken: harvestToken),
+                  let current = try? await runtime.store.room(id: roomID),
+                  current.epoch == epoch else { return }
             let routeGeneration = runtime.profileRouteGeneration(attempt.member)
             guard runtime.acceptsProfileRoute(attempt.member, generation: routeGeneration) else {
                 continue
             }
             if attempt.state == .waiting, current.epoch != attempt.epoch {
                 if let cancelled = try? await runtime.store.mutate(roomID: roomID, { value in
+                    guard !Task.isCancelled, value.epoch == epoch else {
+                        throw CancellationError()
+                    }
                     guard let index = value.attempts.firstIndex(where: { $0.id == attempt.id }),
                           value.attempts[index].state == .waiting else { throw CancellationError() }
                     value.attempts[index].state = .cancelled
@@ -1359,17 +1970,54 @@ extension AppModel {
                 }) { runtime.replace(cancelled) }
                 continue
             }
-            guard let seat = current.members.first(where: { $0.route == attempt.member }),
-                  let client = try? await routedClient(for: attempt.member),
-                  let session = try? await client.readRoomSession(
-                    storedID: attempt.storedSessionID, profile: attempt.member.profile)
-            else { continue }
-            guard runtime.acceptsProfileRoute(attempt.member,
+            guard let seat = current.members.first(where: { $0.route == attempt.member }) else { continue }
+            let session: RoomMemberSessionSnapshot
+            do { session = try await readRoomSession(for: attempt) }
+            catch {
+                // A transient resume error must retain an already mirrored
+                // card; only a successful resume owns prompt replacement.
+                continue
+            }
+            guard await roomHarvestOwnerIsCurrent(roomID: roomID, epoch: epoch,
+                                                  harvestToken: harvestToken),
+                  runtime.acceptsProfileRoute(attempt.member,
                                               generation: routeGeneration) else { continue }
+            // A successful resume with no pending request clears a card for
+            // this exact accepted attempt. A pre-submit `.waiting` attempt is
+            // excluded until its marker proves the hidden prompt is ours.
+            let ownsPrompt = ![.waiting, .working, .uncertain].contains(attempt.state)
+                || session.containsAttempt(attempt)
+            if ownsPrompt {
+                runtime.synchronizePendingPrompt(roomID: roomID, attempt: attempt, snapshot: session)
+            }
             if attempt.state == .waiting {
+                if session.awaitingUser {
+                    // A waiting attempt normally means the hidden session was
+                    // busy before its room turn crossed the wire. Only attach
+                    // a card if the exact durable marker proves this prompt is
+                    // now this room attempt rather than unrelated foreground
+                    // work in the same hidden session.
+                    guard session.containsAttempt(attempt) else { continue }
+                    runtime.synchronizePendingPrompt(roomID: roomID, attempt: attempt,
+                                                     snapshot: session)
+                    if let accepted = try? await runtime.store.mutate(roomID: roomID, { value in
+                        guard !Task.isCancelled, value.epoch == epoch else {
+                            throw CancellationError()
+                        }
+                        guard let index = value.attempts.firstIndex(where: { $0.id == attempt.id })
+                        else { throw CancellationError() }
+                        value.attempts[index].state = .accepted
+                    }) { runtime.replace(accepted) }
+                    continue
+                }
                 guard !session.running else { continue }
                 if session.containsAttempt(attempt) {
+                    runtime.synchronizePendingPrompt(roomID: roomID, attempt: attempt,
+                                                     snapshot: session)
                     if let accepted = try? await runtime.store.mutate(roomID: roomID, { value in
+                        guard !Task.isCancelled, value.epoch == epoch else {
+                            throw CancellationError()
+                        }
                         guard let index = value.attempts.firstIndex(where: { $0.id == attempt.id })
                         else { throw CancellationError() }
                         value.attempts[index].state = .accepted
@@ -1380,13 +2028,21 @@ extension AppModel {
                     }
                 } else {
                     await submitWaitingRoomAttempt(roomID: roomID, attempt: attempt,
-                                                   session: session, client: client)
+                                                   session: session,
+                                                   expectedRoomEpoch: epoch,
+                                                   harvestToken: harvestToken)
                     continue
                 }
             }
+            // A valid clarify/approval is neither a completed reply nor an
+            // idle tool-only pass, including when Hermes reports non-running.
+            if session.awaitingUser { continue }
             if !session.running, !session.containsAttempt(attempt),
                [.working, .uncertain, .timedOut].contains(attempt.state) {
                 if let unresolved = try? await runtime.store.mutate(roomID: roomID, { value in
+                    guard !Task.isCancelled, value.epoch == epoch else {
+                        throw CancellationError()
+                    }
                     guard let index = value.attempts.firstIndex(where: { $0.id == attempt.id }),
                           value.attempts[index].finishedAt == nil else { throw CancellationError() }
                     if value.attempts[index].state == .working {
@@ -1411,11 +2067,15 @@ extension AppModel {
             if let reply = session.assistantReply(for: attempt), !session.running {
                 await finishRoomAttempt(roomID: roomID, attemptID: attempt.id,
                                         member: seat, reply: reply, delivered: true,
-                                        routeGeneration: routeGeneration)
+                                        routeGeneration: routeGeneration,
+                                        expectedRoomEpoch: epoch,
+                                        harvestToken: harvestToken)
             } else if !session.running, session.containsAttempt(attempt) {
                 await finishRoomAttempt(roomID: roomID, attemptID: attempt.id,
                                         member: seat, reply: nil, delivered: true,
-                                        routeGeneration: routeGeneration)
+                                        routeGeneration: routeGeneration,
+                                        expectedRoomEpoch: epoch,
+                                        harvestToken: harvestToken)
             }
         }
     }
@@ -1425,12 +2085,21 @@ extension AppModel {
     /// reconcile the marker but can never enter this submit path again.
     func submitWaitingRoomAttempt(roomID: RoomID, attempt: RoomAttempt,
                                   session: RoomMemberSessionSnapshot,
-                                  client: GatewayClient) async {
+                                  client: GatewayClient? = nil,
+                                  expectedRoomEpoch: UInt64? = nil,
+                                  harvestToken: UUID? = nil) async {
         let runtime = RoomRuntime.shared
         let routeGeneration = runtime.profileRouteGeneration(attempt.member)
+        if let expectedRoomEpoch,
+           !(await roomHarvestOwnerIsCurrent(roomID: roomID, epoch: expectedRoomEpoch,
+                                             harvestToken: harvestToken)) { return }
         guard !session.running,
               runtime.acceptsProfileRoute(attempt.member, generation: routeGeneration),
               let claimed = try? await runtime.store.mutate(roomID: roomID, { value in
+                  guard !Task.isCancelled else { throw CancellationError() }
+                  if let expectedRoomEpoch, value.epoch != expectedRoomEpoch {
+                      throw CancellationError()
+                  }
                   guard let index = value.attempts.firstIndex(where: { $0.id == attempt.id }),
                         value.attempts[index].state == .waiting,
                         value.attempts[index].member == attempt.member,
@@ -1450,13 +2119,26 @@ extension AppModel {
         runtime.replace(claimed)
         guard claimedAttempt.state == .working else { return }
         guard runtime.acceptsProfileRoute(attempt.member, generation: routeGeneration) else { return }
+        if let expectedRoomEpoch,
+           !(await roomHarvestOwnerIsCurrent(roomID: roomID, epoch: expectedRoomEpoch,
+                                             harvestToken: harvestToken)) { return }
         let payloads = await roomOutboundAttachments(
             roomID: roomID, descriptors: claimedAttempt.outboundAttachments)
+        if let expectedRoomEpoch,
+           !(await roomHarvestOwnerIsCurrent(roomID: roomID, epoch: expectedRoomEpoch,
+                                             harvestToken: harvestToken)) { return }
         let submitted: RoomPromptSubmission
         if let operation = runtime.submitOperation {
             submitted = await operation(claimedAttempt, session, payloads)
         } else {
-            submitted = await client.submitRoomPrompt(
+            let sourceClient: GatewayClient
+            if let client { sourceClient = client }
+            else if let routed = try? await routedClient(for: claimedAttempt.member) {
+                sourceClient = routed
+            } else {
+                return
+            }
+            submitted = await sourceClient.submitRoomPrompt(
                 attempt: claimedAttempt, session: session,
                 profile: claimedAttempt.member.profile, attachments: payloads)
         }
@@ -1473,11 +2155,20 @@ extension AppModel {
 
     func finishRoomAttempt(roomID: RoomID, attemptID: RoomAttemptID,
                            member: RoomMember, reply: String?, delivered: Bool,
-                           routeGeneration: UInt64? = nil) async {
+                           routeGeneration: UInt64? = nil,
+                           expectedRoomEpoch: UInt64? = nil,
+                           harvestToken: UUID? = nil) async {
         let runtime = RoomRuntime.shared
         if let routeGeneration,
            !runtime.acceptsProfileRoute(member.route, generation: routeGeneration) { return }
+        if let expectedRoomEpoch,
+           !(await roomHarvestOwnerIsCurrent(roomID: roomID, epoch: expectedRoomEpoch,
+                                             harvestToken: harvestToken)) { return }
         guard let room = try? await runtime.store.mutate(roomID: roomID, { current in
+            guard !Task.isCancelled else { throw CancellationError() }
+            if let expectedRoomEpoch, current.epoch != expectedRoomEpoch {
+                throw CancellationError()
+            }
             guard let index = current.attempts.firstIndex(where: { $0.id == attemptID }),
                   current.attempts[index].finishedAt == nil,
                   current.attempts[index].member == member.route else { throw CancellationError() }
@@ -1505,7 +2196,13 @@ extension AppModel {
         }) else { return }
         if let routeGeneration,
            !runtime.acceptsProfileRoute(member.route, generation: routeGeneration) { return }
+        if let expectedRoomEpoch,
+           !(await roomHarvestOwnerIsCurrent(roomID: roomID, epoch: expectedRoomEpoch,
+                                             harvestToken: harvestToken)) { return }
         runtime.replace(room)
+        if let completed = room.attempts.first(where: { $0.id == attemptID }) {
+            runtime.clearPendingPrompt(for: completed, roomID: roomID)
+        }
     }
 
     func settleRoomDrive(roomID: RoomID, epoch: UInt64, threadID: RoomThreadID,
@@ -1522,6 +2219,9 @@ extension AppModel {
         if let routeGenerations,
            !acceptsRoomRouteGenerations(routeGenerations) { return }
         runtime.replace(room)
+        if Self.hasStrandedRoomAttempts(room) {
+            schedulePostSettleRoomHarvest(roomID: roomID, epoch: epoch)
+        }
     }
 
     func persistRoomActivity(roomID: RoomID, epoch: UInt64, kind: RoomActivityKind,

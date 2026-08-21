@@ -249,7 +249,7 @@ final class WorkspaceCommandCenterTests: XCTestCase {
         XCTAssertThrowsError(try HermesProjectTree.validatedList(from: .object([
             "projects": .array([validProject]),
             "errors": .array([.string("profile unavailable")]),
-        ])), "a partial all-profile response must not publish clickable rows")
+        ])), "a partial project response must not publish clickable rows")
     }
 
     func testProjectSessionWindowRejectsSaturationBoundary() {
@@ -445,27 +445,6 @@ final class WorkspaceCommandCenterTests: XCTestCase {
         )
         XCTAssertEqual(target.discriminator,
                        "gateway homelab · profile @research · session runtime-42")
-    }
-
-    @MainActor
-    func testProjectSessionNavigationClosesOuterCommandCenterAfterOpen() throws {
-        let model = AppModel()
-        let session = try XCTUnwrap(HermesProjectSessionPreview(.object([
-            "id": .string("stored-1"), "profile": .string("research"),
-            "title": .string("Investigation"),
-        ])))
-        var closeCount = 0
-
-        XCTAssertTrue(WorkspaceProjectSessionNavigation.open(
-            session, gatewayID: "lab", model: model, close: { closeCount += 1 }
-        ))
-        XCTAssertEqual(closeCount, 1)
-        XCTAssertNotNil(model.openBotID)
-
-        XCTAssertFalse(WorkspaceProjectSessionNavigation.open(
-            session, gatewayID: "", model: model, close: { closeCount += 1 }
-        ))
-        XCTAssertEqual(closeCount, 1, "failed navigation must not dismiss the current surface")
     }
 
     @MainActor

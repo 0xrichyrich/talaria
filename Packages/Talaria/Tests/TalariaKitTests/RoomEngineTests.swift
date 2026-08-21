@@ -131,6 +131,11 @@ final class RoomEngineTests: XCTestCase {
         XCTAssertThrowsError(try RoomEngine.validate(
             RoomRecord(name: "Unsafe", members: [alpha, unsafeHandle])
         )) { XCTAssertEqual($0 as? RoomValidationError, .invalidRoute) }
+        var unsafeFriendly = beta
+        unsafeFriendly.friendlyName = "all"
+        XCTAssertThrowsError(try RoomEngine.validate(
+            RoomRecord(name: "Unsafe friendly", members: [alpha, unsafeFriendly])
+        )) { XCTAssertEqual($0 as? RoomValidationError, .invalidRoute) }
         XCTAssertNoThrow(try RoomEngine.validate(RoomRecord(name: "Six", members: Array(seven.prefix(6)))))
         let overActivity = (0...RoomEngine.activityLimit).map {
             RoomActivity(epoch: 0, kind: .working, at: Date(timeIntervalSince1970: Double($0)))
@@ -153,11 +158,94 @@ final class RoomEngineTests: XCTestCase {
         let members = [alpha, beta, gamma]
         let exact = RoomEngine.parseMentions("Ask @research.lead and @ops", members: members)
         XCTAssertEqual(exact.mentioned, [beta.route, gamma.route])
-        XCTAssertEqual(RoomEngine.parseMentions("@research", members: members).mentioned, [beta.route])
         XCTAssertEqual(RoomEngine.parseMentions("@research-lead", members: members).mentioned, [beta.route])
+        XCTAssertEqual(RoomEngine.parseMentions("@researchlead", members: members).mentioned, [beta.route])
         XCTAssertTrue(RoomEngine.parseMentions("hello @everyone", members: members).everyone)
         XCTAssertTrue(RoomEngine.parseMentions("hello @all", members: members).everyone)
         XCTAssertTrue(RoomEngine.parseMentions("@user decide", members: members).mentioned.isEmpty)
+        XCTAssertEqual(RoomEngine.parseMentions("@default @hermes", members: members).mentioned,
+                       [alpha.route])
+    }
+
+    func testFriendlyRoomMentionIdentityPersistsAndLegacyRoomsDecode() throws {
+        let writer = RoomMember(
+            route: GatewayBotRoute(gatewayID: "lab", profile: "writer"),
+            title: "Writer", handle: "writer", sourceLabel: "Lab",
+            friendlyName: "Research Buddy", rawDisplayName: "Core Writer")
+        let restored = try JSONDecoder().decode(RoomMember.self,
+                                                 from: JSONEncoder().encode(writer))
+        XCTAssertEqual(restored.friendlyName, "Research Buddy")
+        XCTAssertEqual(RoomEngine.parseMentions(
+            "@research-buddy @researchbuddy @core-writer @corewriter @writer", members: [restored]
+        ).mentioned, [writer.route])
+        XCTAssertEqual(restored.rawDisplayName, "Core Writer")
+        XCTAssertEqual(RoomEngine.mentionInsertionTag(for: restored, among: [restored]),
+                       "research-buddy")
+        XCTAssertEqual(RoomEngine.mentionCompletionMembers(for: "writer", members: [restored])
+                        .map(\.route), [writer.route])
+
+        // If two seats share the friendly identity, completion must not insert
+        // the poisoned friendly slug. Their unique retained handles are the
+        // only safe escape hatches.
+        let editor = RoomMember(
+            route: GatewayBotRoute(gatewayID: "lab", profile: "editor"),
+            title: "Editor", handle: "editor", sourceLabel: "Lab",
+            friendlyName: "Research Buddy")
+        XCTAssertEqual(RoomEngine.mentionInsertionTag(for: restored, among: [restored, editor]),
+                       "writer")
+        XCTAssertEqual(RoomEngine.mentionInsertionTag(for: editor, among: [restored, editor]),
+                       "editor")
+        XCTAssertEqual(RoomEngine.mentionCompletionMembers(for: "research", members: [restored, editor])
+                        .map(\.route), [writer.route, editor.route])
+        XCTAssertTrue(RoomEngine.parseMentions("@research-buddy", members: [restored, editor]).ambiguous)
+
+        // Simulate records written before friendlyName existed. Existing
+        // required route/handle fields retain their ordinary strict decoder;
+        // only the additive field defaults safely to nil.
+        var legacyObject = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(writer)) as? [String: Any])
+        legacyObject.removeValue(forKey: "friendlyName")
+        let legacy = try JSONDecoder().decode(
+            RoomMember.self,
+            from: JSONSerialization.data(withJSONObject: legacyObject)
+        )
+        XCTAssertNil(legacy.friendlyName)
+        XCTAssertEqual(legacy.route, writer.route)
+        XCTAssertEqual(legacy.handle, writer.handle)
+        // The retained row title is the backward-compatible fallback when
+        // no friendly identity was captured yet.
+        XCTAssertEqual(RoomEngine.parseMentions("@writer", members: [legacy]).mentioned,
+                       [writer.route])
+
+        // Reserved/corrupt optional identities never gain a route merely by
+        // being decoded from local storage.
+        legacyObject["friendlyName"] = "all"
+        let reserved = try JSONDecoder().decode(
+            RoomMember.self,
+            from: JSONSerialization.data(withJSONObject: legacyObject)
+        )
+        XCTAssertNil(reserved.friendlyName)
+        XCTAssertFalse(RoomEngine.parseMentions("@all", members: [reserved]).mentioned.contains(writer.route))
+
+        // New identity fields are additive: a corrupt optional JSON value is
+        // ignored rather than making the entire stored room unreadable.
+        legacyObject["friendlyName"] = ["not": "a string"]
+        let malformedOptional = try JSONDecoder().decode(
+            RoomMember.self,
+            from: JSONSerialization.data(withJSONObject: legacyObject)
+        )
+        XCTAssertNil(malformedOptional.friendlyName)
+
+        // Exact hyphenated form wins before the compact fallback is inspected.
+        // `Foo Bar` and `Foobar` share compact `foobar`, but @foo-bar is still
+        // a unique explicit friendly alias for the first seat.
+        let spaced = RoomMember(route: GatewayBotRoute(gatewayID: "lab", profile: "spaced"),
+                                handle: "spaced", friendlyName: "Foo Bar")
+        let compact = RoomMember(route: GatewayBotRoute(gatewayID: "lab", profile: "compact"),
+                                 handle: "compact", friendlyName: "Foobar")
+        XCTAssertEqual(RoomEngine.parseMentions("@foo-bar", members: [spaced, compact]).mentioned,
+                       [spaced.route])
+        XCTAssertTrue(RoomEngine.parseMentions("@foobar", members: [spaced, compact]).ambiguous)
     }
 
     func testAmbiguousMentionFormsFailClosedButQualifiedHandlesResolve() {
@@ -190,7 +278,7 @@ final class RoomEngineTests: XCTestCase {
                                              threadID: thread.id).map(\.route),
                        members.map(\.route))
         let user = RoomEntry(threadID: thread.id, speaker: .user, speakerName: "You",
-                             text: "@research take this")
+                             text: "@research-lead take this")
         XCTAssertEqual(RoomEngine.responders(entries: [old, user], members: members,
                                              threadID: thread.id).map(\.route), [beta.route])
         let pull = RoomEntry(threadID: thread.id, speaker: .member, memberRoute: beta.route,

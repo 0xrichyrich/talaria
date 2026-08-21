@@ -142,14 +142,7 @@ public enum RoomEngine {
         var forms: [String: GatewayBotRoute] = [:]
         var ambiguous = Set<String>()
         for member in members {
-            let title = member.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let raw = [
-                member.route.profile.lowercased(), collapse(member.route.profile),
-                member.handle.lowercased(), collapse(member.handle),
-                title.lowercased(), collapse(title),
-                title.split(whereSeparator: { $0.isWhitespace }).first
-                    .map { String($0).lowercased() } ?? "",
-            ]
+            let raw = member.mentionForms
             // A same-named member on two gateways must never be selected by a
             // bare collision. Poison the shared form; each unique qualified
             // handle remains available as the explicit route.
@@ -173,15 +166,66 @@ public enum RoomEngine {
             let token = ns.substring(with: match.range(at: 1)).lowercased()
             if token == "everyone" || token == "all" { result.everyone = true; continue }
             if token == "user" { continue }
-            let collapsed = token.replacingOccurrences(of: #"[._-]+"#, with: "",
-                                                        options: .regularExpression)
-            if ambiguous.contains(token) || ambiguous.contains(collapsed) {
+            // Exact forms win before a collapsed fallback is considered. A
+            // unique @foo-bar must not be poisoned merely because another
+            // member owns the separate compact @foobar spelling.
+            if ambiguous.contains(token) {
                 result.ambiguous = true
                 continue
             }
-            if let route = forms[token] ?? forms[collapsed] { result.mentioned.insert(route) }
+            if let route = forms[token] {
+                result.mentioned.insert(route)
+                continue
+            }
+            let collapsed = collapse(token)
+            if ambiguous.contains(collapsed) {
+                result.ambiguous = true
+                continue
+            }
+            if let route = forms[collapsed] { result.mentioned.insert(route) }
         }
         return result
+    }
+
+    /// The token a room completion can safely insert for one member. Friendly
+    /// slugs win when they are unique across the durable room roster; otherwise
+    /// a unique legacy handle is the explicit escape hatch. Returning nil is
+    /// intentional when neither form can survive the parser's sticky
+    /// ambiguity poisoning.
+    public static func mentionInsertionTag(for member: RoomMember,
+                                           among members: [RoomMember]) -> String? {
+        var claims: [String: Int] = [:]
+        for candidate in members {
+            for form in candidate.mentionForms {
+                claims[form, default: 0] += 1
+            }
+        }
+        if let friendly = BotMention.friendlyTag(from: member.friendlyMentionName),
+           claims[friendly] == 1 {
+            return friendly
+        }
+        let legacy = member.handle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // Room broadcasts/reserved user addressing win over a member's legacy
+        // handle, but default/hermes remain valid unique room identities.
+        guard !legacy.isEmpty, !["all", "everyone", "user"].contains(legacy),
+              claims[legacy] == 1 else {
+            return nil
+        }
+        return legacy
+    }
+
+    /// Prefix completion over durable room member forms. `forms` includes the
+    /// friendly slug/compact slug and legacy profile/handle spellings; the
+    /// returned member may be found through any of them, but insertion is
+    /// gated by `mentionInsertionTag(for:among:)` so a poisoned alias is never
+    /// offered as if it were deliverable.
+    public static func mentionCompletionMembers(for query: String,
+                                                members: [RoomMember]) -> [RoomMember] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return members.filter { member in
+            guard mentionInsertionTag(for: member, among: members) != nil else { return false }
+            return needle.isEmpty || member.mentionForms.contains { $0.hasPrefix(needle) }
+        }
     }
 
     public static func responders(entries: [RoomEntry], members: [RoomMember],
@@ -308,7 +352,7 @@ public enum RoomEngine {
     }
 
     private static func collapse(_ value: String) -> String {
-        value.lowercased().replacingOccurrences(of: #"[\s_-]+"#, with: "",
+        value.lowercased().replacingOccurrences(of: #"[\s._-]+"#, with: "",
                                                 options: .regularExpression)
     }
 
@@ -324,11 +368,21 @@ public enum RoomEngine {
         let gateway = member.route.gatewayID.trimmingCharacters(in: .whitespacesAndNewlines)
         let profile = member.route.profile.trimmingCharacters(in: .whitespacesAndNewlines)
         let handle = member.handle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let friendly = member.friendlyName
+        let friendlyIsSafe = friendly.map { value in
+            value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+                && BotMention.friendlyTag(from: value) != nil
+        } ?? true
+        let rawDisplayIsSafe = member.rawDisplayName.map { value in
+            value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+                && BotMention.friendlyTag(from: value) != nil
+        } ?? true
         return !gateway.isEmpty && gateway == member.route.gatewayID
             && !profile.isEmpty && profile == member.route.profile
             && GatewayBotRoute(qualifiedID: member.route.qualifiedID) == member.route
             && handle == member.handle
             && handle.range(of: #"^[a-z0-9][a-z0-9._-]*$"#,
                             options: [.regularExpression, .caseInsensitive]) != nil
+            && friendlyIsSafe && rawDisplayIsSafe
     }
 }

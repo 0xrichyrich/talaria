@@ -26,9 +26,10 @@ import Foundation
 // And one more in the completion provider, which is the same class of rule
 // pointed the other way:
 //
-//   * Completion is PREFIX, on the HANDLE alone (8029), while search is
-//     substring across four fields. Loosening it to match the way search
-//     matches would offer rows whose inserted token resolves to nobody.
+//   * Completion is PREFIX on safe friendly forms, legacy handles, and stored
+//     display text, but it inserts the friendly slug only when that form is
+//     unambiguous. Loosening it to raw display text without normalizing it
+//     would offer rows whose inserted token resolves to nobody.
 
 extension ProtocolChecks {
 
@@ -97,8 +98,10 @@ extension ProtocolChecks {
     // MARK: The form map and its refusals (plugin.js:2437-2468)
 
     private static func mentionFormMap() throws {
-        func bot(_ id: String, title: String? = nil, handle: String? = nil) -> Bot {
-            Bot(id: id, job: "", shape: .circle, hue: .teal, title: title, handleOverride: handle)
+        func bot(_ id: String, title: String? = nil, handle: String? = nil,
+                 rawDisplayName: String? = nil) -> Bot {
+            Bot(id: id, job: "", shape: .circle, hue: .teal, title: title,
+                handleOverride: handle, rawDisplayName: rawDisplayName)
         }
         let roster = [bot("default", title: "Hermes"), bot("ops"), bot("ci")]
 
@@ -106,12 +109,76 @@ extension ProtocolChecks {
         try expect(hit.bots.map(\.id) == ["ops"], "a unique bare name resolves")
         try expect(hit.unknown.isEmpty && hit.ambiguous.isEmpty, "…and nothing else is reported")
 
-        // The primary profile is named `default` and is addressed @hermes, so
-        // both forms have to reach it (botHandle, 2406).
+        // Reserved words only reject derived FRIENDLY aliases. The legacy
+        // primary handles remain wire-compatible direct destinations.
         try expect(MentionResolver.resolve("@hermes ping", roster: roster, speaking: "ops")
-                    .bots.map(\.id) == ["default"], "@hermes resolves to the default profile")
+                    .bots.map(\.id) == ["default"], "legacy @hermes still resolves the default profile")
         try expect(MentionResolver.resolve("@default ping", roster: roster, speaking: "ops")
-                    .bots.map(\.id) == ["default"], "so does its raw profile name")
+                    .bots.map(\.id) == ["default"], "so does its raw legacy profile handle")
+
+        // A renamed identity adds a canonical slug and punctuation-free form
+        // while retaining the legacy profile handle. A lower-precedence core
+        // display name remains a completion/search form too.
+        let friendly = bot("writer", title: "Research Buddy", rawDisplayName: "Writer")
+        let friendlyForms = MentionResolver.resolve(
+            "@research-buddy @researchbuddy @writer", roster: [friendly], speaking: nil)
+        try expect(friendlyForms.bots.map(\.id) == ["writer"],
+                   "friendly slug, compact slug, and legacy handle dedupe to one bot")
+        try expect(BotMention.friendlyTag(from: "Research Buddy") == "research-buddy"
+                    && BotMention.friendlyForms(from: "Research Buddy") == ["research-buddy", "researchbuddy"],
+                   "friendly forms are safe deterministic slugs")
+        try expect(BotMention.friendlyTag(from: "Code_Review-2") == "code_review-2"
+                    && BotMention.friendlyForms(from: "Code_Review-2")
+                        == ["code_review-2"],
+                   "friendly aliases preserve user-authored underscore and hyphen spelling")
+        try expect(BotMention.friendlyTag(from: "Hermes") == nil
+                    && BotMention.friendlyForms(from: "all").isEmpty
+                    && BotMention.friendlyForms(from: "A ll") == ["a-ll"]
+                    && BotMention.friendlyForms(from: "Her mes") == ["her-mes"]
+                    && BotMention.friendlyForms(from: "_private").isEmpty,
+                   "every emitted and collapsed friendly form is reserved-checked")
+        let generic = bot("code_review")
+        try expect(generic.friendlyMentionNames.isEmpty
+                    && !generic.mentionForms.contains("codereview"),
+                   "a humanized profile slug does not manufacture rename aliases")
+        let rawOnly = bot("writer-core", rawDisplayName: "Research Buddy")
+        try expect(rawOnly.displayTitle == "Research Buddy"
+                    && rawOnly.friendlyMentionTag == "research-buddy",
+                   "raw core display_name remains a real friendly-identity fallback")
+        let dual = bot("writer-dual", title: "Research Buddy", rawDisplayName: "Core Writer")
+        try expect(MentionResolver.resolve("@research-buddy @core-writer @corewriter", roster: [dual], speaking: nil)
+                    .bots.map(\.id) == ["writer-dual"],
+                   "both Bot Mode title and raw display_name remain resolver aliases")
+
+        let friendlyCollision = MentionResolver.resolve(
+            "@research-buddy", roster: [
+                bot("writer", title: "Research Buddy"),
+                bot("editor", title: "Research Buddy"),
+                bot("third", title: "Research Buddy"),
+            ], speaking: nil)
+        try expect(friendlyCollision.bots.isEmpty
+                    && friendlyCollision.ambiguous == ["research-buddy"]
+                    && friendlyCollision.collisions.first?.bots.map(\.id) == ["writer", "editor", "third"],
+                   "friendly-form ambiguity is sticky and never guesses a recipient")
+
+        let spaced = RoomMember(route: GatewayBotRoute(gatewayID: "g", profile: "spaced"),
+                                 handle: "spaced", friendlyName: "Foo Bar")
+        let compact = RoomMember(route: GatewayBotRoute(gatewayID: "g", profile: "compact"),
+                                  handle: "compact", friendlyName: "Foobar")
+        let exactRoom = RoomEngine.parseMentions("@foo-bar", members: [spaced, compact])
+        let compactRoom = RoomEngine.parseMentions("@foobar", members: [spaced, compact])
+        try expect(exactRoom.mentioned == [spaced.route] && !exactRoom.ambiguous
+                    && compactRoom.mentioned.isEmpty && compactRoom.ambiguous,
+                   "a unique exact friendly slug wins before an ambiguous compact fallback")
+
+        let malformedFriendly = """
+        {"route":{"gatewayID":"g","profile":"writer"},"title":"Writer",
+         "friendlyName":{"unexpected":true},"handle":"writer"}
+        """
+        let decodedMember = try JSONDecoder().decode(RoomMember.self,
+                                                      from: Data(malformedFriendly.utf8))
+        try expect(decodedMember.friendlyName == nil && decodedMember.handle == "writer",
+                   "a malformed additive friendlyName decodes as nil without losing the room seat")
 
         // A bot never @s itself (2414, 2440) — otherwise a bot could hand its
         // own turn to itself and loop.
@@ -139,7 +206,8 @@ extension ProtocolChecks {
         let duped = [bot("ops"), bot("ops-2", handle: "ops"), bot("ci")]
         let refused = MentionResolver.resolve("@ops deploy", roster: duped, speaking: "default")
         try expect(refused.bots.isEmpty, "an ambiguous handle sends to NOBODY — it never guesses")
-        try expect(refused.ambiguous == ["ops"], "…and is reported as ambiguous")
+        try expect(refused.ambiguous == ["ops"],
+                   "…and is reported as ambiguous (got \(refused.ambiguous))")
         try expect(refused.collisions.first?.bots.map(\.id) == ["ops", "ops-2"],
                    "the refusal names both bots, in roster order")
 
@@ -179,35 +247,43 @@ extension ProtocolChecks {
     // MARK: The @-autocomplete provider (plugin.js:8006-8043)
 
     private static func mentionCompletions() throws {
-        func bot(_ id: String, title: String? = nil, handle: String? = nil) -> Bot {
+        func bot(_ id: String, title: String? = nil, handle: String? = nil,
+                 rawDisplayName: String? = nil) -> Bot {
             Bot(id: id, job: "audio", shape: .circle, hue: .teal, preview: "shipped it",
-                title: title, handleOverride: handle)
+                title: title, handleOverride: handle, rawDisplayName: rawDisplayName)
         }
         let roster = [bot("default", title: "Hermes"), bot("researcher"),
+                      bot("writer", title: "Research Buddy", rawDisplayName: "Writer"),
                       bot("res-copy", title: "Researcher Two"), bot("ci")]
 
-        // PREFIX, on the handle. Both halves have a wrong version that looks
-        // right: substring would offer every row containing the letters, and
-        // matching the title would offer a row whose inserted token is not a
-        // handle at all.
+        // Completion is prefix-only, but its searchable forms include the
+        // friendly slug, compact slug, legacy handle, and core display name.
+        // It still inserts a valid friendly slug rather than raw display text.
         try expect(roster.mentionSuggestions(for: "res", speaking: "default")
-                    .map(\.handle) == ["researcher", "res-copy"],
-                   "the query is a PREFIX of the handle (8029)")
+                    .map(\.handle) == ["researcher", "research-buddy", "researcher-two"],
+                   "friendly completion remains a prefix match in roster order")
         try expect(roster.mentionSuggestions(for: "copy", speaking: "default").isEmpty,
                    "a mid-handle substring does NOT complete — search is the forgiving one")
-        try expect(roster.mentionSuggestions(for: "researcher t", speaking: "default").isEmpty,
-                   "the display title is not a match field")
-        try expect(roster.mentionSuggestions(for: "RES", speaking: "default").count == 2,
+        let writer = roster.mentionSuggestions(for: "writer", speaking: "default").first
+        try expect(writer?.handle == "research-buddy",
+                   "a core display_name match inserts the higher-precedence friendly slug")
+        try expect(roster.mentionSuggestions(for: "researchbuddy", speaking: "default")
+                    .map(\.handle) == ["research-buddy"],
+                   "the compact friendly form completes to the canonical slug")
+        try expect(roster.mentionSuggestions(for: "RES", speaking: "default").count == 3,
                    "the prefix match is case-insensitive")
+        guard let active = BotMention.activeToken(in: "ask @writer") else {
+            throw CheckFailure(description: "FAILED: a friendly completion draft must have an active token")
+        }
+        try expect(BotMention.complete("ask @writer", range: active.range,
+                                       with: writer?.handle ?? "") == "ask @research-buddy ",
+                   "completion replaces display text with the friendly insertion slug")
 
-        // The primary profile completes as @hermes and ONLY as @hermes: the
-        // handle is the one field consulted, so its raw name does not find it
-        // — which is exactly where completion and search part company
-        // (`default` DOES match in filterBots, ProtocolChecks+RosterSearch).
         try expect(roster.mentionSuggestions(for: "her", speaking: "ci")
-                    .map(\.handle) == ["hermes"], "'default' surfaces as @hermes (8027 → 2406)")
-        try expect(roster.mentionSuggestions(for: "def", speaking: "ci").isEmpty,
-                   "…and its raw profile name completes to nothing, unlike in search")
+                    .map(\.handle) == ["hermes"]
+                    && roster.mentionSuggestions(for: "def", speaking: "ci")
+                        .map(\.handle) == ["hermes"],
+                   "legacy default/hermes handles remain completable")
 
         // A multi-gateway duplicate offers its precomputed @name-device form,
         // because that is the token that still resolves (connection-registry.ts:137).
@@ -216,10 +292,8 @@ extension ProtocolChecks {
                     .map(\.handle) == ["ops-homelab", "ops-laptop"],
                    "disambiguated rows offer their @name-device handles (8027)")
 
-        // An empty query offers the whole roster — upstream's filter is
-        // guarded by `q &&` (8029), which is what makes a bare "@" a roster.
         try expect(roster.mentionSuggestions(for: "", speaking: nil).count == roster.count,
-                   "an empty query offers everyone (8029)")
+                   "an empty query retains legacy destinations")
         try expect([Bot]().mentionSuggestions(for: "a", speaking: nil).isEmpty,
                    "an empty roster returns [], never an error (8010-8012)")
 
@@ -235,21 +309,20 @@ extension ProtocolChecks {
         // THE META LINE (8033-8039). `Bot · ` is a literal, the separator is
         // U+00B7 with a space on each side, and the connection label is a tail
         // — not a replacement for the display name, and never the bot's job.
-        let hermes = roster.mentionSuggestions(for: "her", speaking: nil).first
-        try expect(hermes?.meta == "Bot · Hermes", "meta is `Bot · <display name>` (8035)")
-        try expect(roster.mentionSuggestions(for: "her", speaking: nil,
+        let research = roster.mentionSuggestions(for: "research-b", speaking: nil).first
+        try expect(research?.meta == "Bot · Research Buddy", "meta is `Bot · <display name>` (8035)")
+        try expect(roster.mentionSuggestions(for: "research-b", speaking: nil,
                                              connectionLabel: "Homelab").first?.meta
-                    == "Bot · Hermes · Homelab",
+                    == "Bot · Research Buddy · Homelab",
                    "a connection label is APPENDED, not substituted (8034)")
-        try expect(roster.mentionSuggestions(for: "her", speaking: nil,
+        try expect(roster.mentionSuggestions(for: "research-b", speaking: nil,
                                              connectionLabel: "   ").first?.meta
-                    == "Bot · Hermes",
+                    == "Bot · Research Buddy",
                    "a blank label leaves no dangling separator")
-        try expect(hermes?.meta.contains("audio") == false,
+        try expect(research?.meta.contains("audio") == false,
                    "the job line is NOT the meta line — it is the display name's slot")
-        // The row's label is the handle, not the display name: what you pick
-        // has to be what gets inserted.
-        try expect(hermes?.handle == "hermes", "the row is identified by its handle (8037)")
+        try expect(research?.handle == "research-buddy",
+                   "the row is identified by the safe friendly insertion tag")
 
         // CAP 8, applied after the loop (8043) — a truncation of roster order,
         // not a top-8 ranking. `zulu` sorts last and is offered; `alpha` sorts

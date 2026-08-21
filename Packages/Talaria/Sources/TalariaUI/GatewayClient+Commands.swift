@@ -12,9 +12,12 @@ import TalariaKit
 //   mcp.setup.respond  tui_gateway/methods_prompt.py:1435
 //
 // The catalog is the interesting one: `pairs` is the flat universe (registry
-// commands + quick_commands + skill commands), `categories` covers everything
-// EXCEPT skill commands, and `skills` names the skill commands. So a row's
-// kind is decided by membership in `skills`, not by its category.
+// commands + quick_commands + standalone skill commands), `categories` covers
+// everything EXCEPT standalone skills, and `skills` names those skills. Hermes
+// c1e25 deliberately rejects that last class from slash.exec with 4018 and asks
+// callers to use command.dispatch. Talaria cannot safely retry across that
+// boundary because a quick/plugin collision may resolve differently, so those
+// rows are retained only as an unsupported-name fence and never advertised.
 
 /// One row of the gateway's slash catalog — a registry command, a user
 /// quick-command, or a skill command.
@@ -73,17 +76,61 @@ public struct SlashCommand: Identifiable, Sendable, Equatable {
     }
 }
 
+/// The complete typed `slash.exec` contract. Hermes may return a raw worker
+/// output or a result passed through from command.dispatch; callers must not
+/// infer that a second dispatch is safe.
+public enum SlashExecutionResult: Sendable, Equatable {
+    case output(String, warning: String?)
+    case exec(String)
+    case send(message: String, notice: String?, display: String?)
+    case skill(message: String, name: String, display: String?)
+    case prefill(message: String, notice: String?)
+    case alias(target: String)
+
+    init(result: [String: JSONValue]) throws {
+        let type = result["type"]?.stringValue
+        func required(_ key: String) throws -> String {
+            guard let value = result[key]?.stringValue, !value.isEmpty else {
+                throw GatewayError(code: 502, message: "Malformed slash.exec result: missing \(key).")
+            }
+            return value
+        }
+        switch type {
+        case nil, "output", "plugin":
+            self = .output(result["output"]?.stringValue ?? "", warning: result["warning"]?.stringValue)
+        case "exec": self = .exec(try required("output"))
+        case "send": self = .send(message: try required("message"), notice: result["notice"]?.stringValue,
+                                  display: result["display"]?.stringValue)
+        case "skill": self = .skill(message: try required("message"), name: try required("name"), display: result["display"]?.stringValue)
+        case "prefill": self = .prefill(message: try required("message"), notice: result["notice"]?.stringValue)
+        case "alias": self = .alias(target: try required("target"))
+        default: throw GatewayError(code: 502, message: "Unsupported slash.exec result type: \(type ?? "unknown").")
+        }
+    }
+}
+
 /// The whole `commands.catalog` payload, flattened for the palette.
 public struct SlashCatalog: Sendable {
-    /// Commands in catalog order (categories first, skill commands last).
+    /// Commands in catalog order. Standalone skills rejected by slash.exec are
+    /// deliberately absent.
     public var commands: [SlashCommand]
+    /// Number of executable skill rows. This remains zero until Hermes exposes
+    /// a source-safe slash.exec path for standalone skills.
     public var skillCount: Int
     /// Non-empty when skill or quick-command discovery failed server-side —
     /// the rest of the catalog is still good, so this is a banner, not an error.
     public var warning: String
+    /// Canonical lowercased slash names hidden from discovery and direct
+    /// dispatch. This lets completion filter only unsupported standalone
+    /// skills while preserving skill bundles that slash.exec routes safely.
+    public var unsupportedStandaloneSkillNames: Set<String>
 
-    public init(commands: [SlashCommand], skillCount: Int, warning: String) {
-        self.commands = commands; self.skillCount = skillCount; self.warning = warning
+    public init(commands: [SlashCommand], skillCount: Int, warning: String,
+                unsupportedStandaloneSkillNames: Set<String> = []) {
+        self.commands = commands
+        self.skillCount = skillCount
+        self.warning = warning
+        self.unsupportedStandaloneSkillNames = unsupportedStandaloneSkillNames
     }
 
     public static let empty = SlashCatalog(commands: [], skillCount: 0, warning: "")
@@ -100,19 +147,27 @@ public struct SlashCompletions: Sendable {
     }
 
     public static let empty = SlashCompletions(items: [], replaceFrom: 0)
+
+    func hidingStandaloneSkills(_ unsupported: Set<String>) -> SlashCompletions {
+        guard !unsupported.isEmpty else { return self }
+        return SlashCompletions(
+            items: items.filter { command in
+                !unsupported.contains(SlashCatalog.normalizedName(command.name))
+            },
+            replaceFrom: replaceFrom)
+    }
 }
 
-extension GatewayClient {
+extension SlashCatalog {
+    static func normalizedName(_ name: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmed.hasPrefix("/") ? trimmed : "/" + trimmed
+    }
 
-    // MARK: - Catalog
-
-    /// The backend slash catalog. Categories keep their server-side order;
-    /// skill commands are appended last with `kind == .skill`.
-    public func commandsCatalog() async throws -> SlashCatalog {
-        let result = try await rpc("commands.catalog", .object([:]))
-
-        // canon maps every spelling (lowercased, slash-prefixed) at its
-        // canonical name — invert it once so rows can carry their aliases.
+    /// Decode the verified c1e25 commands.catalog shape without opening a
+    /// socket. Kept separate from the RPC so the unsupported-skill boundary is
+    /// exhaustively testable.
+    init(result: [String: JSONValue]) {
         var aliases: [String: [String]] = [:]
         for (spelling, canonical) in result["canon"]?.objectValue ?? [:] {
             guard let canonical = canonical.stringValue,
@@ -121,8 +176,6 @@ extension GatewayClient {
         }
         for key in aliases.keys { aliases[key]?.sort() }
 
-        // sub: "/cmd" → ["sub1", …]. Only consulted when the description
-        // carried no usage tail, so an explicit hint always wins.
         var subcommands: [String: [String]] = [:]
         for (name, list) in result["sub"]?.objectValue ?? [:] {
             let subs = list.arrayValue?.compactMap(\.stringValue) ?? []
@@ -130,8 +183,9 @@ extension GatewayClient {
         }
 
         let skillEntries = result["skills"]?.objectValue ?? [:]
+        let unsupported = Set(skillEntries.keys.map(Self.normalizedName))
 
-        func row(_ pair: JSONValue, category: String, kind: SlashCommand.Kind) -> SlashCommand? {
+        func row(_ pair: JSONValue, category: String) -> SlashCommand? {
             guard let fields = pair.arrayValue, let name = fields.first?.stringValue,
                   !name.isEmpty else { return nil }
             let raw = fields.count > 1 ? (fields[1].stringValue ?? "") : ""
@@ -140,7 +194,7 @@ extension GatewayClient {
                 usage = subs.joined(separator: "|")
             }
             return SlashCommand(name: name, description: text, category: category,
-                                kind: kind, usage: usage, aliases: aliases[name] ?? [])
+                                kind: .command, usage: usage, aliases: aliases[name] ?? [])
         }
 
         var commands: [SlashCommand] = []
@@ -148,26 +202,64 @@ extension GatewayClient {
         for category in result["categories"]?.arrayValue ?? [] {
             let label = category["name"]?.stringValue ?? ""
             for pair in category["pairs"]?.arrayValue ?? [] {
-                guard let command = row(pair, category: label, kind: .command),
-                      !skillEntries.keys.contains(command.name),
+                guard let command = row(pair, category: label),
+                      !unsupported.contains(Self.normalizedName(command.name)),
                       placed.insert(command.name).inserted else { continue }
                 commands.append(command)
             }
         }
 
-        // Everything else in `pairs`: the skill commands, plus (defensively)
-        // any row the server left out of every category.
+        // Preserve uncategorized quick/registry commands, but never publish a
+        // standalone skill that c1e25 will reject from slash.exec.
         for pair in result["pairs"]?.arrayValue ?? [] {
-            guard let name = pair.arrayValue?.first?.stringValue, !placed.contains(name) else { continue }
-            let kind: SlashCommand.Kind = skillEntries.keys.contains(name) ? .skill : .command
-            guard let command = row(pair, category: "", kind: kind),
+            guard let name = pair.arrayValue?.first?.stringValue,
+                  !unsupported.contains(Self.normalizedName(name)),
+                  !placed.contains(name),
+                  let command = row(pair, category: ""),
                   placed.insert(name).inserted else { continue }
             commands.append(command)
         }
 
-        return SlashCatalog(commands: commands,
-                            skillCount: result["skill_count"]?.intValue ?? skillEntries.count,
-                            warning: result["warning"]?.stringValue ?? "")
+        let hiddenCount = result["skill_count"]?.intValue ?? skillEntries.count
+        let compatibility = hiddenCount > 0
+            ? "\(hiddenCount) standalone Hermes skill command\(hiddenCount == 1 ? " is" : "s are") hidden because slash.exec refuses them and Talaria will not retry through command.dispatch."
+            : ""
+        let serverWarning = result["warning"]?.stringValue ?? ""
+        let warning = [serverWarning, compatibility].filter { !$0.isEmpty }
+            .joined(separator: "\n")
+        self.init(commands: commands, skillCount: 0, warning: warning,
+                  unsupportedStandaloneSkillNames: unsupported)
+    }
+}
+
+public enum MCPSetupResponseReceipt: Sendable, Equatable {
+    case accepted
+    case expired
+
+    init(result: JSONValue) throws {
+        switch result["status"]?.stringValue {
+        case "ok": self = .accepted
+        case "expired": self = .expired
+        default:
+            throw GatewayError(code: 502,
+                               message: "Hermes returned an uncertain mcp.setup.respond status.")
+        }
+    }
+}
+
+extension GatewayClient {
+
+    // MARK: - Catalog
+
+    /// The backend slash catalog. Categories keep their server-side order;
+    /// rejected standalone-skill rows are recorded as a hidden safety fence.
+    public func commandsCatalog() async throws -> SlashCatalog {
+        let result = try await rpc("commands.catalog", .object([:]))
+        guard let object = result.objectValue else {
+            throw GatewayError(code: 502,
+                               message: "Malformed commands.catalog result: expected an object.")
+        }
+        return SlashCatalog(result: object)
     }
 
     /// Resolve an alias or partial spelling to its canonical command.
@@ -187,15 +279,18 @@ extension GatewayClient {
 
     // MARK: - Execution
 
-    /// Run a slash command against a live session. Worker-backed; the gateway
-    /// re-routes skill/bundle/pending-input commands to command.dispatch on our
-    /// behalf, so this one call covers the whole surface. Long timeout because
+    /// Run a slash command against a live session. Worker-backed; c1e25 routes
+    /// bundles/pending-input commands internally but rejects standalone skills.
+    /// Talaria filters those rows before this boundary. Long timeout because
     /// /compress and /refine drive the model.
-    public func execSlash(sessionID: String, command: String) async throws -> String {
+    public func execSlash(sessionID: String, command: String) async throws -> SlashExecutionResult {
         let result = try await rpc("slash.exec",
                                    ["session_id": .string(sessionID), "command": .string(command)],
                                    timeout: 300)
-        return result["output"]?.stringValue ?? ""
+        guard let object = result.objectValue else {
+            throw GatewayError(code: 502, message: "Malformed slash.exec result: expected an object.")
+        }
+        return try SlashExecutionResult(result: object)
     }
 
     // MARK: - Completion
@@ -227,13 +322,18 @@ extension GatewayClient {
     /// (tools/setup_mcp_tool.py:84). The respond leg is allow_expired, so a
     /// late answer resolves as {"status":"expired"} instead of erroring.
     public func respondToMCPSetup(requestID: String, status: String,
-                                  server: String, detail: String? = nil) async throws {
+                                  server: String, detail: String? = nil) async throws
+        -> MCPSetupResponseReceipt {
         var outcome: [String: JSONValue] = ["status": .string(status), "server": .string(server)]
         if let detail, !detail.isEmpty { outcome["detail"] = .string(detail) }
-        let encoded = (try? JSONEncoder().encode(JSONValue.object(outcome)))
-            .flatMap { String(data: $0, encoding: .utf8) }
-            ?? #"{"status":"declined"}"#
-        try await rpc("mcp.setup.respond",
-                      ["request_id": .string(requestID), "result": .string(encoded)])
+        let data = try JSONEncoder().encode(JSONValue.object(outcome))
+        guard let encoded = String(data: data, encoding: .utf8) else {
+            throw GatewayError(code: 500,
+                               message: "Could not encode the MCP setup response.")
+        }
+        let result = try await rpc("mcp.setup.respond",
+                                   ["request_id": .string(requestID),
+                                    "result": .string(encoded)])
+        return try MCPSetupResponseReceipt(result: result)
     }
 }

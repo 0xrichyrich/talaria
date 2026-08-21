@@ -7,15 +7,23 @@ are not current until they are regenerated against this baseline.
 ## Exact authority
 
 - Hermes repository: <https://github.com/nousresearch/hermes-agent>
-- Hermes commit: `b5455fdd16fe608214f91149233660e1836b067c`
-- Talaria baseline: `1c4d04f547dad1e045efa4ecf6fa65f1cd890e8e`
-- Audited: 2026-08-19
+- Hermes commit: `c1e25cadffe539b058816be5fdfc9127d7199fa4`
+- Talaria baseline: `9c9015644cb57883dda49c5d709779ec0f50414b`
+- Audited: 2026-08-20
 - Machine-readable pin and authority-file hashes:
   [`parity/hermes-upstream.json`](../parity/hermes-upstream.json)
+- Audited contract delta and remaining certification:
+  [`docs/HERMES-9EF9-AUDIT.md`](HERMES-9EF9-AUDIT.md)
 
-The final `13ce0c5c..b5455fdd` drift contained one additive curated-model row in
-`hermes_cli/models.py` (`nvidia/nemotron-3.5-lightning-30b-a3b`). None of the
-Bot Mode, Desktop, gateway, management, or hashed authority files changed.
+The `b5455fdd..c1e25cad` drift is material rather than mechanical. All five
+hashed authority files changed. The Bot Mode plugin added exact canonical-chat
+adoption rules, renamed-friendly mention forms, preferred/worker activity,
+roster hiding, and room-member clarification/approval mirroring. Hermes also
+made Projects profile-scoped, added remote repository scanning, and exposed a
+reattachable authenticated PTY contract. The final `9ef9b2d2..c1e25cad` step
+also made room member-session identity immutable across rename and same-name
+recreation, and tightened stranded-reply harvesting. Each change is audited as
+a behavioral dependency below; moving this pin does not by itself claim parity.
 
 Run the local check against an exact Hermes checkout:
 
@@ -66,11 +74,13 @@ older Hermes snapshot and current upstream expanded materially. There is no
 defensible newer percentage until the granular ledgers are regenerated.
 
 The current implementation is best described as a mobile Hermes client with
-substantial Bot Mode support, not yet a 1:1 client. Source-qualified A2A and
-standalone multi-member rooms are now implemented and automated-gate certified;
+substantial Bot Mode support, not yet a 1:1 client. Source-qualified A2A,
+standalone multi-member rooms, rich transcript interaction, and a guarded
+gateway-backed Command Center are implemented and automated-gate certified;
 they remain provisional until live-gateway and real-device certification. The
-largest remaining product gaps are rich transcript controls and gateway-backed
-workspace/command-center surfaces:
+largest remaining product gaps are the newly audited current Bot Mode contracts,
+room-member prompts, richer transcript media/tool presentation, profile-scoped
+Projects, and the portable gateway PTY:
 
 - Talaria retains authenticated clients for multiple gateways and routes chat,
   events, sessions, full approval recovery/prompts, and unread state by source.
@@ -124,10 +134,11 @@ before moving push rows from partial to complete.
 
 ## Delivery ledger
 
-Local combined follow-up (`codex/command-center-ops`, not yet on GitHub):
-transcript edit/rewind/regenerate, Gateway Operations maintenance, files/git,
-live pet face with staged Save, and the Bot Mode kickoff prompt. App Store push
-and independent live-gateway certification are still outstanding.
+Reviewed follow-up work now includes transcript edit/rewind/regenerate,
+Gateway Operations maintenance, files/git/projects, live pet presentation,
+Bot Mode kickoff, response-ready APNs delivery, native motion, and the
+attachment-source redesign. The current-Hermes contract corrections, App Store release,
+and independent live-gateway/device certification remain outstanding.
 
 Every item below ships as one or more independently reviewable PRs. A checked
 item means the behavior contract above is satisfied, not merely that code was

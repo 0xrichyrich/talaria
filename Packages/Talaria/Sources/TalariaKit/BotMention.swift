@@ -26,6 +26,78 @@ import Foundation
 /// word, the first character must be alphanumeric, dots are not part of a
 /// handle, and anything inside code never counts.
 public enum BotMention {
+    /// Tokens which have process-wide meaning (or identify the default Hermes
+    /// profile) and therefore cannot be claimed by a friendly display name.
+    /// Letting a renamed bot claim one would turn a broadcast, user reference,
+    /// or system identity into a handoff target.
+    public static let reservedForms: Set<String> = [
+        "all", "everyone", "user", "default", "hermes",
+    ]
+
+    /// Whether a normalized @token is reserved rather than bot-addressable.
+    public static func isReservedForm(_ form: String) -> Bool {
+        reservedForms.contains(
+            form.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    /// Turn a friendly display name into Hermes' canonical mention slug.
+    /// ASCII letters/digits plus existing `_` / `-` survive unchanged; other
+    /// punctuation and whitespace runs become one hyphen. We intentionally do
+    /// not transliterate arbitrary Unicode into an address — a lossy identity
+    /// transform is unsafe unless the collision map can see the exact result,
+    /// and an empty result simply falls back to a legacy handle.
+    public static func friendlyTag(from displayName: String?) -> String? {
+        guard let displayName else { return nil }
+        let slug = replace(displayName.lowercased(), pattern: "[^a-z0-9_-]+", with: "-")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        guard isValidFriendlyForm(slug), !isReservedForm(slug) else { return nil }
+        return slug
+    }
+
+    /// The exact friendly slug and the spelling formed by removing only text
+    /// outside the mention alphabet. Both are addressable: `Research Buddy`
+    /// accepts `@research-buddy` and `@researchbuddy`; authored `_` / `-`
+    /// remain present in both.
+    public static func friendlyForms(from displayName: String?) -> Set<String> {
+        guard let tag = friendlyTag(from: displayName) else { return [] }
+        let compact = friendlyCollapsedTag(from: displayName)
+        // Every emitted spelling is independently policy checked. A safe
+        // separator-preserving identity can compact into a process word
+        // (`A-ll` -> `all`, `Her_mes` -> `hermes`); filtering only `tag`
+        // quietly reintroduced the reserved address through its alias.
+        return Set([tag, compact].compactMap { $0 }).filter {
+            !isReservedForm($0)
+        }
+    }
+
+    /// Upstream's second friendly spelling removes punctuation/whitespace
+    /// that is *outside* the mention alphabet; it does not erase `_` or `-`
+    /// that the user actually named. Thus `Research Buddy` also answers to
+    /// `researchbuddy`, while `Code_Review-2` stays exactly
+    /// `code_review-2` instead of inventing a new `codereview2` identity.
+    private static func friendlyCollapsedTag(from displayName: String?) -> String? {
+        guard let displayName else { return nil }
+        let compact = replace(displayName.lowercased(), pattern: "[^a-z0-9_-]+", with: "")
+        guard isValidFriendlyForm(compact), !isReservedForm(compact) else { return nil }
+        return compact
+    }
+
+    private static func isValidFriendlyForm(_ form: String) -> Bool {
+        guard let regex = try? NSRegularExpression(pattern: "^[a-z0-9][a-z0-9_-]*$") else {
+            return false
+        }
+        let ns = form as NSString
+        return regex.firstMatch(in: form, range: NSRange(location: 0, length: ns.length)) != nil
+    }
+
+    /// Searchable spellings for completion. This deliberately shares the
+    /// friendly slug pipeline with routing so completion never offers a text
+    /// form that cannot be normalized safely, while still allowing a lower
+    /// precedence core display name to locate a higher-precedence title.
+    public static func searchForms(from displayName: String?) -> Set<String> {
+        friendlyForms(from: displayName)
+    }
+
     /// `[a-z0-9][a-z0-9_-]*` — the same namespace `NAME_RE` defines for a
     /// profile name (plugin.js:78), which is why the profile name IS the
     /// handle. Underscores are legal even though Talaria's creator does not
@@ -250,10 +322,7 @@ public enum MentionResolver {
             // live. The bare form is the whole mechanism.
             let name = bot.profileName.trimmingCharacters(in: .whitespaces)
             guard !name.isEmpty, !isSpeaker(bot, speaking: speaker) else { continue }
-            var forms: Set<String> = [bot.handle.lowercased(), name.lowercased()]
-            if let override = bot.handleOverride, !override.isEmpty {
-                forms.insert(override.lowercased())
-            }
+            let forms = bot.mentionForms
             for form in forms where !form.isEmpty {
                 if claims[form]?.contains(where: { $0.id == bot.id }) != true {
                     claims[form, default: []].append(bot)
@@ -340,9 +409,9 @@ public struct MentionSuggestion: Identifiable, Sendable, Equatable {
 ///
 /// Strict where roster search is forgiving, and the asymmetry is the point:
 /// search matches four fields on a substring because it is exploration
-/// (`RosterSearch`), completion matches ONE field on a prefix because the
-/// token it inserts has to resolve. A completion that offered a bot by its
-/// title would insert a string no resolver answers to.
+/// (`RosterSearch`), completion matches safe mention/display forms on a
+/// prefix because the token it inserts has to resolve. A display match still
+/// inserts the bot's safe friendly slug, never the raw human text.
 public enum MentionCompletions {
 
     /// `return items.slice(0, 8)` (plugin.js:8043). Applied AFTER the loop, so
@@ -361,6 +430,22 @@ public enum MentionCompletions {
         let label = connectionLabel?.trimmingCharacters(in: .whitespaces) ?? ""
         return label.isEmpty ? "Bot · \(display)" : "Bot · \(display) · \(label)"
     }
+
+    /// Pick a token completion can insert without offering an address the
+    /// resolver will poison. Friendly tags win when unique; a precomputed
+    /// source-qualified legacy handle is the escape hatch when two rows share
+    /// the same friendly name. The ownership map is built after speaker
+    /// exclusion, exactly like `MentionResolver`.
+    static func insertionTag(for bot: Bot, claims: [String: Int]) -> String? {
+        func uniquelyOwned(_ form: String?) -> String? {
+            guard let form, claims[form] == 1 else { return nil }
+            return form
+        }
+        if let friendly = uniquelyOwned(bot.friendlyMentionTag) { return friendly }
+        let legacy = bot.handle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !legacy.isEmpty else { return nil }
+        return uniquelyOwned(legacy)
+    }
 }
 
 public extension Array where Element == Bot {
@@ -368,12 +453,12 @@ public extension Array where Element == Bot {
     /// `provide(query)` (plugin.js:8006-8043) — synchronous, non-throwing, and
     /// cheap enough to answer per keystroke off the roster already in hand.
     ///
-    /// Per row, in upstream's order: skip nameless rows and the speaker
-    /// (8023 — a bot never @s itself), take `botHandle` (8027), and keep it
-    /// only when the handle STARTS WITH the query (8029). The match is against
-    /// the handle alone: never the display title, never the raw profile id
-    /// when it differs from the handle — which is why the primary profile is
-    /// found by "her" and not by "def" — and never the connection label.
+    /// Per row, skip nameless rows and the speaker (8023 — a bot never @s
+    /// itself), then match a prefix against any safe friendly tag, legacy
+    /// handle, or stored display-name form. The inserted spelling is always
+    /// the highest-precedence safe friendly tag. Thus `@writer` can locate a
+    /// bot whose display name is Writer but whose Bot Mode title is Research
+    /// Buddy, and inserts `@research-buddy`.
     ///
     /// An empty query offers everyone, because upstream's filter is guarded by
     /// `q &&` (8029); that is what makes a bare "@" list the roster.
@@ -393,12 +478,22 @@ public extension Array where Element == Bot {
     func mentionSuggestions(for query: String, speaking speaker: String?,
                             connectionLabel: String? = nil) -> [MentionSuggestion] {
         let needle = query.lowercased()
+        let eligible = filter {
+            !$0.profileName.trimmingCharacters(in: .whitespaces).isEmpty
+                && !MentionResolver.isSpeaker($0, speaking: speaker)
+        }
+        var claims: [String: Int] = [:]
+        for bot in eligible {
+            for form in bot.mentionForms {
+                claims[form, default: 0] += 1
+            }
+        }
         var out: [MentionSuggestion] = []
-        for bot in self {
-            guard !bot.profileName.trimmingCharacters(in: .whitespaces).isEmpty,
-                  !MentionResolver.isSpeaker(bot, speaking: speaker) else { continue }
-            let handle = bot.handle
-            guard needle.isEmpty || handle.lowercased().hasPrefix(needle) else { continue }
+        for bot in eligible {
+            guard let handle = MentionCompletions.insertionTag(for: bot, claims: claims) else { continue }
+            guard needle.isEmpty || bot.mentionCompletionForms.contains(where: {
+                $0.hasPrefix(needle)
+            }) else { continue }
             out.append(MentionSuggestion(
                 botID: bot.id, handle: handle,
                 meta: MentionCompletions.meta(

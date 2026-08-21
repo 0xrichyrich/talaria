@@ -95,6 +95,14 @@ public struct GatewayProject: Equatable, Identifiable, Sendable {
         archived = value["archived"]?.boolValue ?? false
         isActive = !id.isEmpty && id == activeID
     }
+
+    init(_ project: HermesProject, activeID: String?) {
+        id = project.id
+        name = project.name
+        path = project.primaryPath ?? project.folders.first?.path ?? ""
+        archived = project.isArchived
+        isActive = !id.isEmpty && id == activeID
+    }
 }
 
 public struct GatewayProjectList: Equatable, Sendable {
@@ -108,11 +116,25 @@ public struct GatewayProjectList: Equatable, Sendable {
     }
 
     init(_ value: JSONValue) {
-        let active = value["active_id"]?.stringValue
-        activeID = active
-        projects = (value["projects"]?.arrayValue ?? []).map {
-            GatewayProject($0, activeID: active)
+        let decoded = (value["projects"]?.arrayValue ?? []).map {
+            GatewayProject($0, activeID: nil)
         }
+        let reported = value["active_id"]?.stringValue
+        let active = reported.flatMap { candidate in
+            decoded.contains(where: { $0.id == candidate && !$0.archived })
+                ? candidate : nil
+        }
+        activeID = active
+        projects = decoded.map { project in
+            var project = project
+            project.isActive = project.id == active
+            return project
+        }
+    }
+
+    init(_ listing: HermesProjectListing) {
+        activeID = listing.activeID
+        projects = listing.projects.map { GatewayProject($0, activeID: listing.activeID) }
     }
 }
 
@@ -132,8 +154,8 @@ extension GatewayClient {
             timeout: 30))
     }
 
-    func listProjects() async throws -> GatewayProjectList {
-        GatewayProjectList(try await rpc("projects.list", timeout: 30))
+    func listProjects(in route: GatewayWorkspaceRoute) async throws -> GatewayProjectList {
+        GatewayProjectList(try await projects(in: route))
     }
 }
 
@@ -147,14 +169,23 @@ public struct WorkspaceSettingsSection: View {
     @State private var listing = GatewayFileListing.empty
     @State private var git = GatewayGitStatus.empty
     @State private var projects = GatewayProjectList.empty
+    @State private var projectProfiles: [WorkspaceProfileSource] = []
+    @State private var selectedProjectProfile = ""
     @State private var path: String?
     @State private var error: String?
     @State private var isLoading = false
     @State private var previewName = ""
     @State private var previewText = ""
+    @State private var loadRequest: UInt64 = 0
+
+    private var projectProfileNeedsRecovery: Bool {
+        !selectedProjectProfile.isEmpty
+            && !projectProfiles.contains(where: { $0.profile == selectedProjectProfile })
+    }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 22) {
+            projectProfileSection
             projectsSection
             filesSection
             gitSection
@@ -166,10 +197,45 @@ public struct WorkspaceSettingsSection: View {
         .task { await load(path: path) }
     }
 
+    @ViewBuilder private var projectProfileSection: some View {
+        if projectProfiles.count > 1 || projectProfileNeedsRecovery {
+            SettingsSection(theme: theme, title: "Projects profile",
+                            footnote: "Projects are read from exactly this Hermes profile.") {
+                SettingsGroup(theme: theme) {
+                    Picker("Profile", selection: Binding(
+                        get: { selectedProjectProfile },
+                        set: { profile in
+                            guard profile != selectedProjectProfile else { return }
+                            selectedProjectProfile = profile
+                            Task { await load(path: path) }
+                        }
+                    )) {
+                        if projectProfileNeedsRecovery {
+                            Text("Unavailable · @\(selectedProjectProfile)").tag(selectedProjectProfile)
+                        }
+                        ForEach(projectProfiles) { source in
+                            Text(source.isDefault ? "\(source.label) · default" : source.label)
+                                .tag(source.profile)
+                        }
+                    }
+                    .disabled(isLoading)
+                    .modifier(SettingsRowChrome(theme: theme, isLast: true))
+                }
+            }
+        }
+    }
+
     private var projectsSection: some View {
         SettingsSection(theme: theme, title: copy.settingsWorkspaceProjects(theme.id),
                         footnote: copy.settingsWorkspaceProjectsNote(theme.id)) {
             SettingsGroup(theme: theme) {
+                if let selected = projectProfiles.first(where: { $0.profile == selectedProjectProfile }) {
+                    Text("@\(selected.profile)")
+                        .font(theme.mono(10))
+                        .foregroundStyle(theme.faint)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .modifier(SettingsRowChrome(theme: theme, isLast: false))
+                }
                 if projects.projects.isEmpty {
                     Text(copy.settingsWorkspaceProjectsEmpty(theme.id))
                         .font(SettingsType.rowSubtitle(theme))
@@ -279,22 +345,106 @@ public struct WorkspaceSettingsSection: View {
 
     private func load(path next: String?) async {
         guard model.mode == .live, let client = model.client else { return }
+        loadRequest &+= 1
+        let request = loadRequest
         isLoading = true
-        defer { isLoading = false }
+        defer {
+            if loadRequest == request { isLoading = false }
+        }
         do {
-            let listed = try await client.listManagedFiles(path: next)
-            listing = listed
-            path = listed.path
-            previewText = ""
-            previewName = ""
-            error = nil
-            if !listed.path.isEmpty {
-                git = (try? await client.gitStatus(path: listed.path)) ?? .empty
+            guard let gatewayID = model.activeGatewayID ?? LiveRuntime.shared.gatewayID,
+                  !gatewayID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw GatewayError(code: 400,
+                                   message: "Choose a connected gateway before loading profile-scoped projects.")
             }
-            projects = (try? await client.listProjects()) ?? projects
+            let liveGeneration = LiveRuntime.shared.generation
+            let clientID = ObjectIdentifier(client)
+            await client.setTrafficAdmission {
+                await ProfileLifecycleTrafficAdmission.acquire(gatewayID)
+            }
+            let trafficLease = try await client.acquireTrafficLease()
+            do {
+                // This exact captured primary client must freshly prove the raw
+                // profile immediately before the project read. The outer lease
+                // prevents a local lifecycle mutation from entering between
+                // validation and `projects.list`.
+                let rows = try await client.listProfiles(includeSessions: false)
+                let sources = try Self.projectProfileSources(rows)
+                guard settingsSourceIsCurrent(clientID: clientID, gatewayID: gatewayID,
+                                              liveGeneration: liveGeneration,
+                                              request: request) else {
+                    throw CancellationError()
+                }
+                projectProfiles = sources
+                let rawProfile = selectedProjectProfile.isEmpty ? nil : selectedProjectProfile
+                let selected: String?
+                if let rawProfile {
+                    selected = rawProfile
+                } else {
+                    selected = sources.first(where: \.isDefault)?.profile ?? sources.first?.profile
+                }
+                guard let selected,
+                      let route = WorkspaceProjectScope.route(
+                        gatewayID: gatewayID, rawProfile: selected,
+                        knownProfiles: sources.map(\.profile)
+                      ) else {
+                    throw GatewayError(code: 409,
+                                       message: "The selected Projects profile was renamed or deleted.")
+                }
+                _ = try WorkspaceProjectScope.requireCurrent(route, in: rows)
+                selectedProjectProfile = selected
+
+                async let fileListing = client.listManagedFiles(path: next)
+                async let projectListing = client.listProjects(in: route)
+                let (listed, scopedProjects) = try await (fileListing, projectListing)
+                guard settingsSourceIsCurrent(clientID: clientID, gatewayID: gatewayID,
+                                              liveGeneration: liveGeneration,
+                                              request: request) else {
+                    throw CancellationError()
+                }
+                listing = listed
+                path = listed.path
+                projects = scopedProjects
+                previewText = ""
+                previewName = ""
+                error = nil
+                if !listed.path.isEmpty {
+                    let status = try? await client.gitStatus(path: listed.path)
+                    guard settingsSourceIsCurrent(clientID: clientID, gatewayID: gatewayID,
+                                                  liveGeneration: liveGeneration,
+                                                  request: request) else {
+                        throw CancellationError()
+                    }
+                    git = status ?? .empty
+                }
+                await trafficLease?.release()
+            } catch {
+                await trafficLease?.release()
+                throw error
+            }
+        } catch is CancellationError {
+            return
         } catch {
+            guard loadRequest == request else { return }
+            projects = .empty
             self.error = error.localizedDescription
         }
+    }
+
+    private static func projectProfileSources(_ rows: [HermesProfile]) throws -> [WorkspaceProfileSource] {
+        _ = try WorkspaceProjectScope.knownRawProfiles(from: rows)
+        return rows.map {
+            WorkspaceProfileSource(profile: $0.name, label: $0.displayName, isDefault: $0.isDefault)
+        }
+    }
+
+    private func settingsSourceIsCurrent(clientID: ObjectIdentifier, gatewayID: String,
+                                         liveGeneration: Int, request: UInt64) -> Bool {
+        loadRequest == request
+            && model.mode == .live
+            && (model.activeGatewayID ?? LiveRuntime.shared.gatewayID) == gatewayID
+            && LiveRuntime.shared.generation == liveGeneration
+            && model.client.map(ObjectIdentifier.init) == clientID
     }
 
     private func preview(_ entry: GatewayFileEntry) async {
@@ -326,7 +476,7 @@ public struct WorkspaceSettingsSection: View {
 public extension CopyPack {
     func settingsWorkspaceProjects(_ t: ThemeID) -> String { t == .control ? "PROJECTS" : "Projects" }
     func settingsWorkspaceProjectsNote(_ t: ThemeID) -> String {
-        t == .control ? "projects.list — TAP OPENS THE PRIMARY PATH IN FILES." : "Gateway projects. Tap one to browse its primary folder. Creating projects stays on desktop."
+        t == .control ? "PROFILE-SCOPED projects.list — TAP OPENS THE PRIMARY PATH IN FILES." : "Projects for the selected Hermes profile. Tap one to browse its primary folder. Creating projects stays on desktop."
     }
     func settingsWorkspaceProjectsEmpty(_ t: ThemeID) -> String {
         t == .control ? "NO PROJECTS" : "No projects on this gateway."

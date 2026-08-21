@@ -183,16 +183,156 @@ public enum WorkspaceRemotePath {
 
 public struct GatewayWorkspaceRoute: Hashable, Sendable, Identifiable {
     public var gatewayID: String
-    public var profile: String?
+    /// The exact profile name the user selected from Hermes' inventory.  This
+    /// is deliberately raw: display names and trimmed/fallback values are not
+    /// safe routing identities for a profile-scoped RPC.
+    public var profile: String
+
+    public var rawProfile: String { profile }
 
     public var id: String {
-        gatewayID + "\u{1f}" + (profile ?? "")
+        gatewayID + "\u{1f}" + profile
     }
 
-    public init(gatewayID: String, profile: String? = nil) {
+    public init(gatewayID: String, profile: String) {
         self.gatewayID = gatewayID
-        self.profile = profile?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.profile = profile
     }
+
+    /// Keep validation separate from construction so that a rejected raw value
+    /// is never silently rewritten to another profile (not even `default`).
+    public var isWellFormed: Bool {
+        !gatewayID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !profile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+/// The one profile-selection fence for the Projects namespace.  A profile is
+/// eligible only when it is an exact, nonblank member of the gateway inventory
+/// just observed by the caller.  In particular, a display label, a trimmed
+/// spelling, and an omitted profile are all rejected rather than falling back
+/// to the gateway's launch profile.
+public enum WorkspaceProjectScope {
+    public static func route(gatewayID: String, rawProfile: String,
+                             knownProfiles: [String]) -> GatewayWorkspaceRoute? {
+        let route = GatewayWorkspaceRoute(gatewayID: gatewayID, profile: rawProfile)
+        guard route.isWellFormed, knownProfiles.contains(route.profile) else { return nil }
+        return route
+    }
+
+    /// Normalize nothing: profile names are gateway routing identities, not
+    /// presentation strings.  Reject whitespace-only, padded, duplicate, and
+    /// case-ambiguous inventories before a caller can select one of them.
+    public static func knownRawProfiles(from rows: [HermesProfile]) throws -> [String] {
+        var exact = Set<String>()
+        var folded = Set<String>()
+        let values = try rows.map { row -> String in
+            let raw = row.name
+            guard raw == raw.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty,
+                  exact.insert(raw).inserted,
+                  folded.insert(raw.lowercased()).inserted else {
+                throw GatewayError(code: 502,
+                                   message: "Hermes returned an invalid or ambiguous profile inventory.")
+            }
+            return raw
+        }
+        guard !values.isEmpty else {
+            throw GatewayError(code: 404,
+                               message: "Hermes did not report a selectable profile for Projects.")
+        }
+        return values
+    }
+
+    /// Revalidate a previously selected route against a *fresh* gateway
+    /// inventory. Hermes deliberately falls back to its launch profile for an
+    /// unknown explicit profile, so membership in an older roster snapshot is
+    /// never enough authority for a `projects.*` request.
+    @discardableResult
+    public static func requireCurrent(_ route: GatewayWorkspaceRoute,
+                                      in rows: [HermesProfile]) throws -> [String] {
+        let names = try knownRawProfiles(from: rows)
+        guard self.route(gatewayID: route.gatewayID, rawProfile: route.rawProfile,
+                         knownProfiles: names) == route else {
+            throw GatewayError(
+                code: 409,
+                message: "The selected Hermes profile was renamed or deleted. Projects remain blocked to avoid launch-profile fallback."
+            )
+        }
+        return names
+    }
+}
+
+/// Exact 9ef9 JSON-RPC request envelopes for Hermes Projects.  Keeping the
+/// method and params together makes it difficult for a future caller to issue
+/// a `projects.*` request without the selected raw profile.
+public struct WorkspaceProjectRequest: Equatable, Sendable {
+    public static let overviewPreviewLimit = 3
+    public static let sessionLimit = 5_000
+
+    public var method: String
+    public var params: JSONValue
+
+    public static func list(in route: GatewayWorkspaceRoute) throws -> Self {
+        try make(method: "projects.list", route: route)
+    }
+
+    public static func discoverRepos(in route: GatewayWorkspaceRoute) throws -> Self {
+        try make(method: "projects.discover_repos", route: route,
+                 fields: ["scan": .bool(true)])
+    }
+
+    public static func tree(in route: GatewayWorkspaceRoute) throws -> Self {
+        try make(method: "projects.tree", route: route, fields: [
+            "preview_limit": .number(Double(overviewPreviewLimit)),
+            "session_limit": .number(Double(sessionLimit)),
+        ])
+    }
+
+    public static func projectSessions(id: String, in route: GatewayWorkspaceRoute) throws -> Self {
+        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw GatewayError(code: 400, message: "A nonblank Hermes project identity is required.")
+        }
+        return try make(method: "projects.project_sessions", route: route, fields: [
+            "project_id": .string(id),
+            "session_limit": .number(Double(sessionLimit)),
+        ])
+    }
+
+    static func write(_ method: String, fields: [String: JSONValue],
+                      in route: GatewayWorkspaceRoute) throws -> Self {
+        try make(method: method, route: route, fields: fields)
+    }
+
+    private static func make(method: String, route: GatewayWorkspaceRoute,
+                             fields: [String: JSONValue] = [:]) throws -> Self {
+        guard route.isWellFormed else {
+            throw GatewayError(code: 400,
+                               message: "Projects require a nonblank, explicitly selected Hermes profile.")
+        }
+        // Callers never control the profile key.  The route's raw value is the
+        // only profile spelling that can reach the wire.
+        var params = fields
+        params["profile"] = .string(route.profile)
+        return Self(method: method, params: .object(params))
+    }
+}
+
+/// The only permissible ordering for a full Projects refresh.  Discovery is
+/// first because Hermes folds its completed scan into `projects.tree`; list
+/// and tree then share the exact same verified raw profile route.
+public struct WorkspaceProjectSnapshotRequests: Equatable, Sendable {
+    public var discovery: WorkspaceProjectRequest
+    public var listing: WorkspaceProjectRequest
+    public var tree: WorkspaceProjectRequest
+
+    public init(in route: GatewayWorkspaceRoute) throws {
+        discovery = try .discoverRepos(in: route)
+        listing = try .list(in: route)
+        tree = try .tree(in: route)
+    }
+
+    public var ordered: [WorkspaceProjectRequest] { [discovery, listing, tree] }
 }
 
 public enum WorkspaceFileSource: String, Hashable, Sendable {
@@ -415,16 +555,60 @@ public struct HermesProjectListing: Sendable {
 
     init(_ value: JSONValue) {
         projects = value["projects"]?.arrayValue?.map(HermesProject.init) ?? []
-        activeID = value["active_id"]?.stringValue?.nilIfEmpty
+        let reportedActiveID = value["active_id"]?.stringValue?.nilIfEmpty
+        // c1e25 intentionally leaves the project_meta pointer untouched when
+        // its target is archived or deleted.  That pointer is history, not a
+        // selectable project: only a visible (non-archived) row can be active.
+        activeID = reportedActiveID.flatMap { candidate in
+            projects.contains(where: { $0.id == candidate && !$0.isArchived })
+                ? candidate : nil
+        }
     }
 
     init(validatingAcknowledgement value: JSONValue, operation: String) throws {
-        guard value["projects"]?.arrayValue != nil,
-              value["active_id"] == .null || value["active_id"]?.stringValue != nil else {
+        guard let rawProjects = value["projects"]?.arrayValue else {
+            throw AckValidationError(operation: operation,
+                                     detail: "Hermes did not return a valid authoritative project listing.")
+        }
+        switch value["active_id"] {
+        case .null:
+            break
+        case .string(let id) where !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+            break
+        default:
             throw AckValidationError(operation: operation,
                                      detail: "Hermes did not return a valid authoritative project listing.")
         }
         self.init(value)
+        guard projects.count == rawProjects.count,
+              projects.allSatisfy({ !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }),
+              Set(projects.map(\.id)).count == projects.count else {
+            throw AckValidationError(operation: operation,
+                                     detail: "Hermes returned malformed or partial project identities.")
+        }
+    }
+
+    init(validatingArchiveAcknowledgement value: JSONValue, id: String,
+         restore: Bool) throws {
+        let operation = restore ? "Restore project" : "Archive project"
+        try self.init(validatingAcknowledgement: value, operation: operation)
+        guard let target = projects.first(where: { $0.id == id }),
+              target.isArchived == !restore else {
+            throw AckValidationError(
+                operation: operation,
+                detail: restore
+                    ? "Hermes did not return the restored project as visible."
+                    : "Hermes did not return the target project as archived."
+            )
+        }
+    }
+
+    init(validatingDeleteAcknowledgement value: JSONValue, id: String) throws {
+        try self.init(validatingAcknowledgement: value, operation: "Delete project")
+        guard !projects.contains(where: { $0.id == id }) else {
+            throw AckValidationError(operation: "Delete project",
+                                     detail: "Hermes still returned the deleted project.")
+        }
     }
 }
 
@@ -438,6 +622,7 @@ public struct HermesProjectSessionPreview: Identifiable, Hashable, Sendable {
 
     init?(_ value: JSONValue) {
         guard let id = value["id"]?.stringValue?.nilIfEmpty,
+              !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let profile = value["profile"]?.stringValue,
               !profile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         storedID = id
@@ -445,6 +630,12 @@ public struct HermesProjectSessionPreview: Identifiable, Hashable, Sendable {
         title = value["title"]?.stringValue?.nilIfEmpty ?? "Untitled session"
         preview = value["preview"]?.stringValue ?? ""
         lastActive = value["last_active"]?.doubleValue ?? value["started_at"]?.doubleValue ?? 0
+    }
+
+    init?(_ value: JSONValue, expectedProfile: String) {
+        guard let decoded = HermesProjectSessionPreview(value),
+              decoded.profile == expectedProfile else { return nil }
+        self = decoded
     }
 }
 
@@ -459,6 +650,7 @@ public struct HermesProjectTree: Identifiable, Hashable, Sendable {
 
     init?(_ value: JSONValue) {
         guard let id = value["id"]?.stringValue?.nilIfEmpty,
+              !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let sessionCountValue = value["sessionCount"]?.doubleValue,
               let sessionCount = Int(exactly: sessionCountValue),
               sessionCount >= 0,
@@ -484,7 +676,7 @@ public struct HermesProjectTree: Identifiable, Hashable, Sendable {
             }
             guard errors.isEmpty else {
                 throw GatewayError(code: 502,
-                                   message: "Hermes returned only a partial all-profile project tree.")
+                                   message: "Hermes returned only a partial project tree.")
             }
         }
         guard let rawProjects = response["projects"]?.arrayValue else {
@@ -497,6 +689,301 @@ public struct HermesProjectTree: Identifiable, Hashable, Sendable {
                                message: "Hermes returned malformed nested project-session metadata.")
         }
         return projects
+    }
+
+    /// Decode the profile-scoped 9ef9 `projects.tree` payload.  Hermes keeps
+    /// profile ownership out of each stored-session row because one RPC already
+    /// selects the database.  Talaria adds the *already verified requested raw
+    /// profile* locally; it never trusts a response to nominate another route.
+    static func scopedList(from response: JSONValue, profile: String) throws -> [HermesProjectTree] {
+        try WorkspaceProjectPayload.treeProof(response, profile: profile).projects
+    }
+
+    /// Preserve the fresh profile-global `scoped_session_ids` witness for
+    /// drill-in completeness checks. The array-only compatibility decoder
+    /// above is sufficient for rendering but intentionally not for authority.
+    static func scopedProof(from response: JSONValue,
+                            profile: String) throws -> WorkspaceProjectTreeProof {
+        try WorkspaceProjectPayload.treeProof(response, profile: profile)
+    }
+
+    /// Decode the exact `projects.project_sessions` result for one selected
+    /// project.  `project: null` is not an empty session list: it is what the
+    /// gateway returns for a discovery-only / no-longer-hydratable project, and
+    /// presenting it as a completed drill-in would hide that distinction.
+    static func scopedProjectSessions(from response: JSONValue, projectID: String,
+                                      profile: String) throws -> HermesProjectTree {
+        try WorkspaceProjectPayload.projectSessions(response, projectID: projectID, profile: profile)
+    }
+}
+
+private enum WorkspaceProjectPayload {
+    static func treeProof(_ response: JSONValue,
+                          profile: String) throws -> WorkspaceProjectTreeProof {
+        try requireProfile(profile)
+        guard response["errors"] == nil else {
+            throw GatewayError(code: 502,
+                               message: "Hermes returned partial project-tree metadata.")
+        }
+        guard let rawProjects = response["projects"]?.arrayValue,
+              let rawScopedIDs = response["scoped_session_ids"]?.arrayValue else {
+            throw GatewayError(code: 502,
+                               message: "Hermes omitted required profile-scoped project-tree fields.")
+        }
+        // Decode the field strictly, but do not require the pointer to resolve:
+        // c1e25 can legally retain an archived/deleted project id here.  Tree
+        // membership remains authoritative for what is actually selectable.
+        _ = try activeProjectID(from: response)
+        let scopedIDs = try sessionIDs(rawScopedIDs)
+        let scopedIDSet = Set(scopedIDs)
+        guard scopedIDSet.count == scopedIDs.count else {
+            throw GatewayError(code: 502,
+                               message: "Hermes returned duplicate scoped-session identifiers.")
+        }
+
+        var authoritativePlacedCount = 0
+        let projects = try rawProjects.map { raw -> HermesProjectTree in
+            try validateRepositoryShape(raw, hydrated: false)
+            let rows = try injectedSessionRows(raw["previewSessions"], profile: profile)
+            guard rows.count <= WorkspaceProjectRequest.overviewPreviewLimit else {
+                throw GatewayError(code: 502,
+                                   message: "Hermes exceeded the requested profile-scoped preview window.")
+            }
+            guard let project = HermesProjectTree(scoped: raw, profile: profile, rows: rows) else {
+                throw GatewayError(code: 502,
+                                   message: "Hermes returned malformed profile-scoped project metadata.")
+            }
+            if !isDiscoveryOnlyProject(raw) {
+                authoritativePlacedCount = min(
+                    WorkspaceProjectSessionWindowPolicy.maximumRows,
+                    authoritativePlacedCount + min(
+                        WorkspaceProjectSessionWindowPolicy.maximumRows,
+                        project.sessionCount
+                    )
+                )
+            }
+            return project
+        }
+        guard Set(projects.map(\.id)).count == projects.count else {
+            throw GatewayError(code: 502, message: "Hermes returned duplicate project identities.")
+        }
+        let previewIDs = projects.flatMap(\.previews).map(\.storedID)
+        guard Set(previewIDs).count == previewIDs.count,
+              previewIDs.allSatisfy({ scopedIDSet.contains($0) }) else {
+            throw GatewayError(code: 502,
+                               message: "Hermes returned preview sessions outside its authoritative scoped-session set.")
+        }
+        // `scoped_session_ids` is the global witness for the bounded stored
+        // session query. Project counts may additionally describe discovered
+        // repositories whose historical rows are not hydrated and therefore
+        // are deliberately absent from this set; they cannot be substituted
+        // for the scoped count. Reaching the requested 5,000 ids is ambiguous.
+        guard scopedIDs.count == authoritativePlacedCount,
+              WorkspaceProjectSessionWindowPolicy.isUnsaturated(
+                totalReportedSessions: scopedIDs.count
+              ) else {
+            throw GatewayError(
+                code: 501,
+                message: "Hermes’ profile-scoped project tree is incomplete or reached its session window. Talaria will not present a partial project view as complete."
+            )
+        }
+        return WorkspaceProjectTreeProof(
+            projects: projects, scopedSessionCount: scopedIDs.count,
+            scopedSessionIDs: scopedIDSet
+        )
+    }
+
+    static func projectSessions(_ response: JSONValue, projectID: String,
+                                profile: String) throws -> HermesProjectTree {
+        try requireProfile(profile)
+        guard !projectID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw GatewayError(code: 400, message: "A nonblank Hermes project identity is required.")
+        }
+        guard let rawProject = response["project"] else {
+            throw GatewayError(code: 502,
+                               message: "Hermes omitted the profile-scoped project-session result.")
+        }
+        guard rawProject != .null else {
+            throw GatewayError(
+                code: 404,
+                message: "Hermes did not hydrate this project. Discovery-only projects do not have an authoritative session drill-in."
+            )
+        }
+        guard rawProject["id"]?.stringValue == projectID else {
+            throw GatewayError(code: 502,
+                               message: "Hermes returned sessions for a different project.")
+        }
+        guard let rawPreviews = rawProject["previewSessions"]?.arrayValue,
+              rawPreviews.isEmpty else {
+            throw GatewayError(code: 502,
+                               message: "Hermes returned an invalid profile-scoped project-session shape.")
+        }
+        try validateRepositoryShape(rawProject, hydrated: true)
+        let rows = try hydratedSessionRows(from: rawProject)
+        guard let project = HermesProjectTree(scoped: rawProject, profile: profile,
+                                              rows: try injectedSessionRows(rows, profile: profile)),
+              project.sessionCount == rows.count,
+              WorkspaceProjectSessionWindowPolicy.isProvablyComplete(
+                totalReportedSessions: project.sessionCount,
+                selectedReportedSessions: project.sessionCount,
+                selectedPreviewCount: project.previews.count
+              ) else {
+            throw GatewayError(
+                code: 501,
+                message: "Hermes’ profile-scoped project-session response is incomplete or reached its bounded window."
+            )
+        }
+        return project
+    }
+
+    private static func requireProfile(_ profile: String) throws {
+        guard !profile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw GatewayError(code: 400,
+                               message: "Projects require a nonblank, explicitly selected Hermes profile.")
+        }
+    }
+
+    private static func activeProjectID(from response: JSONValue) throws -> String? {
+        guard let value = response["active_id"] else {
+            throw GatewayError(code: 502, message: "Hermes omitted the active project identity.")
+        }
+        switch value {
+        case .null: return nil
+        case .string(let id) where !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+            return id
+        default:
+            throw GatewayError(code: 502, message: "Hermes returned an invalid active project identity.")
+        }
+    }
+
+    private static func sessionIDs(_ rows: [JSONValue]) throws -> [String] {
+        try rows.map { row in
+            guard let id = row.stringValue?.nilIfEmpty,
+                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw GatewayError(code: 502,
+                                   message: "Hermes returned malformed scoped-session metadata.")
+            }
+            return id
+        }
+    }
+
+    private static func injectedSessionRows(_ value: JSONValue?, profile: String) throws -> [JSONValue] {
+        guard let rawRows = value?.arrayValue else {
+            throw GatewayError(code: 502,
+                               message: "Hermes omitted project-session rows required by the Projects contract.")
+        }
+        return try injectedSessionRows(rawRows, profile: profile)
+    }
+
+    private static func injectedSessionRows(_ rows: [JSONValue], profile: String) throws -> [JSONValue] {
+        try rows.map { row in
+            guard var object = row.objectValue else {
+                throw GatewayError(code: 502,
+                                   message: "Hermes returned a malformed project-session row.")
+            }
+            // The profile is implicit in the scoped RPC. Overwrite any stray
+            // payload value so a malformed/cross-profile row cannot change the
+            // source route used when the user opens it.
+            object["profile"] = .string(profile)
+            return .object(object)
+        }
+    }
+
+    private static func hydratedSessionRows(from project: JSONValue) throws -> [JSONValue] {
+        guard let rawRepos = project["repos"]?.arrayValue else {
+            throw GatewayError(code: 502,
+                               message: "Hermes omitted the hydrated project repository lanes.")
+        }
+        var repoIDs = Set<String>()
+        var rows: [JSONValue] = []
+        for rawRepo in rawRepos {
+            guard let repoID = rawRepo["id"]?.stringValue?.nilIfEmpty,
+                  repoIDs.insert(repoID).inserted,
+                  let expectedCount = nonnegativeInteger(rawRepo["sessionCount"]),
+                  let rawGroups = rawRepo["groups"]?.arrayValue else {
+                throw GatewayError(code: 502,
+                                   message: "Hermes returned malformed hydrated project repository metadata.")
+            }
+            var groupIDs = Set<String>()
+            var repoRows: [JSONValue] = []
+            for rawGroup in rawGroups {
+                guard let groupID = rawGroup["id"]?.stringValue?.nilIfEmpty,
+                      groupIDs.insert(groupID).inserted,
+                      let groupRows = rawGroup["sessions"]?.arrayValue else {
+                    throw GatewayError(code: 502,
+                                       message: "Hermes returned malformed hydrated project lane metadata.")
+                }
+                repoRows.append(contentsOf: groupRows)
+            }
+            guard expectedCount == repoRows.count else {
+                throw GatewayError(code: 502,
+                                   message: "Hermes reported a partial hydrated project repository.")
+            }
+            rows.append(contentsOf: repoRows)
+        }
+        return rows
+    }
+
+    private static func validateRepositoryShape(_ project: JSONValue, hydrated: Bool) throws {
+        guard let rawRepos = project["repos"]?.arrayValue else {
+            throw GatewayError(code: 502,
+                               message: "Hermes omitted project repository metadata.")
+        }
+        var repoIDs = Set<String>()
+        for rawRepo in rawRepos {
+            guard let repoID = rawRepo["id"]?.stringValue?.nilIfEmpty,
+                  repoIDs.insert(repoID).inserted,
+                  nonnegativeInteger(rawRepo["sessionCount"]) != nil,
+                  let rawGroups = rawRepo["groups"]?.arrayValue else {
+                throw GatewayError(code: 502,
+                                   message: "Hermes returned malformed project repository metadata.")
+            }
+            var groupIDs = Set<String>()
+            for rawGroup in rawGroups {
+                guard let groupID = rawGroup["id"]?.stringValue?.nilIfEmpty,
+                      groupIDs.insert(groupID).inserted,
+                      let sessions = rawGroup["sessions"]?.arrayValue,
+                      !hydrated || sessions.allSatisfy({ $0.objectValue != nil }) else {
+                    throw GatewayError(code: 502,
+                                       message: "Hermes returned malformed project repository lanes.")
+                }
+                if !hydrated, !sessions.isEmpty {
+                    throw GatewayError(code: 502,
+                                       message: "Hermes returned hydrated rows in an overview-only project tree.")
+                }
+            }
+        }
+    }
+
+    /// Tier-3 auto projects are discovered from full history/disk after the
+    /// bounded stored-session query. They carry historical counts but no
+    /// hydrated lanes and correctly contribute no `scoped_session_ids`.
+    private static func isDiscoveryOnlyProject(_ project: JSONValue) -> Bool {
+        guard project["isAuto"]?.boolValue == true,
+              let repos = project["repos"]?.arrayValue,
+              !repos.isEmpty else { return false }
+        return repos.allSatisfy { repo in
+            guard let groups = repo["groups"]?.arrayValue else { return false }
+            return groups.isEmpty
+        }
+    }
+
+    private static func nonnegativeInteger(_ value: JSONValue?) -> Int? {
+        guard let number = value?.doubleValue, let integer = Int(exactly: number), integer >= 0 else {
+            return nil
+        }
+        return integer
+    }
+}
+
+private extension HermesProjectTree {
+    init?(scoped value: JSONValue, profile: String, rows: [JSONValue]) {
+        guard var object = value.objectValue else { return nil }
+        object["previewSessions"] = .array(rows)
+        guard let decoded = HermesProjectTree(.object(object)),
+              decoded.previews.allSatisfy({ $0.profile == profile }),
+              decoded.previews.count == rows.count else { return nil }
+        self = decoded
     }
 }
 
@@ -609,6 +1096,10 @@ public enum WorkspaceCommandPolicy {
 public enum WorkspaceProjectSessionWindowPolicy {
     public static let maximumRows = 5_000
 
+    public static func isUnsaturated(totalReportedSessions: Int) -> Bool {
+        totalReportedSessions >= 0 && totalReportedSessions < maximumRows
+    }
+
     /// Hermes derives project counts after applying a global per-profile row
     /// limit and returns neither a total nor a cursor. Any saturated aggregate
     /// is therefore ambiguous, even when the selected project's own previews
@@ -616,10 +1107,130 @@ public enum WorkspaceProjectSessionWindowPolicy {
     public static func isProvablyComplete(totalReportedSessions: Int,
                                           selectedReportedSessions: Int,
                                           selectedPreviewCount: Int) -> Bool {
-        totalReportedSessions >= 0
-            && totalReportedSessions < maximumRows
+        isUnsaturated(totalReportedSessions: totalReportedSessions)
             && selectedReportedSessions >= 0
+            && selectedReportedSessions <= totalReportedSessions
             && selectedPreviewCount >= selectedReportedSessions
+    }
+}
+
+/// A decoded `projects.tree` plus the count of its unique authoritative
+/// `scoped_session_ids`. Discovered-only repository counts are presentation
+/// metadata and do not inflate this global bounded-query witness.
+public struct WorkspaceProjectTreeProof: Sendable, Equatable {
+    public var projects: [HermesProjectTree]
+    public var scopedSessionCount: Int
+    /// Exact bounded-query witness returned by `projects.tree`. The count is
+    /// retained separately for compatibility and diagnostics, but stability
+    /// checks must compare the identifiers themselves so equal-sized swaps do
+    /// not make a stale hydrated response look current.
+    public var scopedSessionIDs: Set<String>
+
+    public init(projects: [HermesProjectTree], scopedSessionCount: Int,
+                scopedSessionIDs: Set<String> = []) {
+        self.projects = projects
+        self.scopedSessionCount = scopedSessionCount
+        self.scopedSessionIDs = scopedSessionIDs
+    }
+}
+
+/// Joins one freshly decoded `projects.tree` response with the subsequent
+/// `projects.project_sessions` response. The latter carries neither the
+/// profile-global total nor `scoped_session_ids`, so a cached overview can
+/// never supply this proof.
+public enum WorkspaceProjectDrillInProof {
+    /// Join the pre-hydration and post-hydration tree witnesses. The bounded
+    /// project-session response is publishable only when the exact tree proof
+    /// stayed unchanged across that RPC; otherwise the user can retry against
+    /// a single coherent snapshot.
+    public static func validate(
+        projectID: String,
+        beforeHydration: WorkspaceProjectTreeProof,
+        afterHydration: WorkspaceProjectTreeProof,
+        hydrated: HermesProjectTree
+    ) throws -> HermesProjectTree {
+        guard WorkspaceProjectSessionWindowPolicy.isUnsaturated(
+            totalReportedSessions: beforeHydration.scopedSessionCount
+        ), WorkspaceProjectSessionWindowPolicy.isUnsaturated(
+            totalReportedSessions: afterHydration.scopedSessionCount
+        ) else {
+            throw GatewayError(
+                code: 501,
+                message: "Hermes' profile-scoped project tree reached its bounded session window during drill-in."
+            )
+        }
+        guard beforeHydration == afterHydration else {
+            throw GatewayError(
+                code: 409,
+                message: "Hermes' profile-scoped project tree changed while sessions were loading. Try again."
+            )
+        }
+        return try validate(projectID: projectID, freshTree: afterHydration,
+                            hydrated: hydrated)
+    }
+
+    public static func validate(projectID: String,
+                                freshTree: WorkspaceProjectTreeProof,
+                                hydrated: HermesProjectTree) throws -> HermesProjectTree {
+        guard let overview = freshTree.projects.first(where: { $0.id == projectID }) else {
+            throw GatewayError(code: 404,
+                               message: "Hermes no longer reports this project in the selected profile.")
+        }
+        guard hydrated.id == overview.id,
+              hydrated.sessionCount == overview.sessionCount,
+              WorkspaceProjectSessionWindowPolicy.isProvablyComplete(
+                totalReportedSessions: freshTree.scopedSessionCount,
+                selectedReportedSessions: overview.sessionCount,
+                selectedPreviewCount: hydrated.previews.count
+              ) else {
+            throw GatewayError(
+                code: 501,
+                message: "Hermes' fresh profile-scoped project proof is incomplete or saturated."
+            )
+        }
+        return hydrated
+    }
+
+    /// Cached preview buttons are navigation hints, not authority. Resolve the
+    /// exact stored id/profile again from the freshly proven drill-in before
+    /// opening a conversation.
+    public static func validatedNavigation(
+        cached: HermesProjectSessionPreview,
+        in hydrated: HermesProjectTree
+    ) throws -> HermesProjectSessionPreview {
+        guard let current = hydrated.previews.first(where: {
+            $0.storedID == cached.storedID && $0.profile == cached.profile
+        }) else {
+            throw GatewayError(code: 404,
+                               message: "That project session moved or is no longer available.")
+        }
+        return current
+    }
+}
+
+/// One internally coherent profile-scoped Projects refresh.  The repository
+/// discovery result is deliberately carried with the list/tree so callers do
+/// not accidentally issue the tree before the remote scan has completed.
+public struct WorkspaceProjectSnapshot: Sendable {
+    public var listing: HermesProjectListing
+    public var tree: [HermesProjectTree]
+    public var discoveredRoots: [String]
+    public var scopedSessionCount: Int
+
+    public init(listing: HermesProjectListing, tree: [HermesProjectTree],
+                discoveredRoots: [String], scopedSessionCount: Int) {
+        var normalizedListing = listing
+        if let activeID = normalizedListing.activeID,
+           !tree.contains(where: { $0.id == activeID }) {
+            // The tree is the visible profile-scoped surface.  A list pointer
+            // which cannot be placed in that tree is the legal stale c1e25
+            // metadata case, not authority to select an invisible project.
+            normalizedListing.activeID = nil
+        }
+        self.listing = normalizedListing
+        self.tree = tree
+        self.discoveredRoots = discoveredRoots
+        self.scopedSessionCount = scopedSessionCount
     }
 }
 
@@ -771,11 +1382,26 @@ public extension GatewayClient {
         )
     }
 
-    func discoveredWorkspaceRoots() async throws -> [String] {
-        let response = try await rpc("projects.discover_repos")
-        return response["repos"]?.arrayValue?.compactMap {
-            $0.stringValue?.nilIfEmpty ?? $0["root"]?.stringValue?.nilIfEmpty
-        } ?? []
+    func discoveredWorkspaceRoots(in route: GatewayWorkspaceRoute) async throws -> [String] {
+        let request = try WorkspaceProjectRequest.discoverRepos(in: route)
+        return try Self.decodedDiscoveredWorkspaceRoots(
+            try await rpc(request.method, request.params)
+        )
+    }
+
+    private static func decodedDiscoveredWorkspaceRoots(_ response: JSONValue) throws -> [String] {
+        guard let repos = response["repos"]?.arrayValue else {
+            throw GatewayError(code: 502,
+                               message: "Hermes omitted the profile-scoped repository discovery result.")
+        }
+        return try repos.map { row in
+            guard let root = row.stringValue?.nilIfEmpty
+                    ?? row["root"]?.stringValue?.nilIfEmpty else {
+                throw GatewayError(code: 502,
+                                   message: "Hermes returned malformed profile-scoped repository metadata.")
+            }
+            return root
+        }
     }
 
     @discardableResult
@@ -824,57 +1450,67 @@ public extension GatewayClient {
         }
     }
 
-    func projects() async throws -> HermesProjectListing {
-        HermesProjectListing(try await rpc("projects.list"))
+    func projects(in route: GatewayWorkspaceRoute) async throws -> HermesProjectListing {
+        let request = try WorkspaceProjectRequest.list(in: route)
+        return try HermesProjectListing(validatingAcknowledgement:
+            try await rpc(request.method, request.params), operation: "List projects")
     }
 
-    func allProfileProjectTree() async throws -> [HermesProjectTree] {
-        let value = try await restJSON(path: "api/profiles/projects/tree", query: [
-            URLQueryItem(name: "preview_limit", value: "100"),
-            URLQueryItem(name: "session_limit", value: "5000"),
-        ], timeout: 60)
-        return try HermesProjectTree.validatedList(from: value)
+    func projectTree(in route: GatewayWorkspaceRoute) async throws -> [HermesProjectTree] {
+        let proof = try await projectTreeProof(in: route)
+        return proof.projects
     }
 
-    /// On-demand all-profile drill-in. Hermes' overview is preview-bounded;
-    /// request the protocol's maximum hydration window only when a user enters
-    /// a project. Never substitute Talaria's local session cache, and never
-    /// present a server-truncated list as complete.
-    func allProfileProjectSessions(id: String) async throws -> HermesProjectTree {
-        let value = try await restJSON(path: "api/profiles/projects/tree", query: [
-            URLQueryItem(name: "preview_limit", value: "5000"),
-            URLQueryItem(name: "session_limit", value: "5000"),
-        ], timeout: 120)
-        let projects = try HermesProjectTree.validatedList(from: value)
-        guard let project = projects.first(where: { $0.id == id }) else {
-            throw GatewayError(code: 404, message: "Hermes no longer reports this project.")
-        }
-        let totalReportedSessions = projects.reduce(0) { partial, item in
-            min(WorkspaceProjectSessionWindowPolicy.maximumRows,
-                partial + min(WorkspaceProjectSessionWindowPolicy.maximumRows,
-                              max(0, item.sessionCount)))
-        }
-        guard WorkspaceProjectSessionWindowPolicy.isProvablyComplete(
-            totalReportedSessions: totalReportedSessions,
-            selectedReportedSessions: project.sessionCount,
-            selectedPreviewCount: project.previews.count
-        ) else {
-            throw GatewayError(
-                code: 501,
-                message: "Hermes’ bounded project-session response may be truncated. Talaria requires an upstream total or cursor before it can present this drill-in as complete."
-            )
-        }
-        return project
+    func projectTreeProof(in route: GatewayWorkspaceRoute) async throws
+        -> WorkspaceProjectTreeProof {
+        let request = try WorkspaceProjectRequest.tree(in: route)
+        return try HermesProjectTree.scopedProof(
+            from: try await rpc(request.method, request.params, timeout: 60),
+            profile: route.rawProfile
+        )
+    }
+
+    func projectSessions(id: String, in route: GatewayWorkspaceRoute) async throws -> HermesProjectTree {
+        let request = try WorkspaceProjectRequest.projectSessions(id: id, in: route)
+        return try HermesProjectTree.scopedProjectSessions(
+            from: try await rpc(request.method, request.params, timeout: 120),
+            projectID: id, profile: route.rawProfile
+        )
+    }
+
+    /// Discovery must finish before the tree is built: 9ef9's tree folds the
+    /// just-scanned remote repositories into its explicit/auto project model.
+    /// This intentionally does not use an `async let` for discovery and tree.
+    func projectSnapshot(in route: GatewayWorkspaceRoute) async throws -> WorkspaceProjectSnapshot {
+        let requests = try WorkspaceProjectSnapshotRequests(in: route)
+        let discoveryResponse = try await rpc(requests.discovery.method, requests.discovery.params)
+        let discoveredRoots = try Self.decodedDiscoveredWorkspaceRoots(discoveryResponse)
+
+        // Do not move this tree call above the completed discovery response.
+        // The plan makes that dependency explicit and independently testable.
+        async let listingResponse = rpc(requests.listing.method, requests.listing.params)
+        let treeResponse = try await rpc(requests.tree.method, requests.tree.params, timeout: 60)
+        let projectListing = try HermesProjectListing(
+            validatingAcknowledgement: try await listingResponse,
+            operation: "List projects"
+        )
+        let tree = try HermesProjectTree.scopedProof(from: treeResponse,
+                                                     profile: route.rawProfile)
+        return WorkspaceProjectSnapshot(listing: projectListing, tree: tree.projects,
+                                        discoveredRoots: discoveredRoots,
+                                        scopedSessionCount: tree.scopedSessionCount)
     }
 
     func createProject(name: String, folders: [String], primaryPath: String?,
-                       description: String? = nil, use: Bool = false) async throws -> HermesProject {
+                       description: String? = nil, use: Bool = false,
+                       in route: GatewayWorkspaceRoute) async throws -> HermesProject {
         var body: [String: JSONValue] = [
             "name": .string(name), "folders": .array(folders.map(JSONValue.string)), "use": .bool(use),
         ]
         if let primaryPath = primaryPath?.nilIfEmpty { body["primary_path"] = .string(primaryPath) }
         if let description = description?.nilIfEmpty { body["description"] = .string(description) }
-        let response = try await rpc("projects.create", .object(body))
+        let request = try WorkspaceProjectRequest.write("projects.create", fields: body, in: route)
+        let response = try await rpc(request.method, request.params)
         guard let project = response["project"],
               let id = project["id"]?.stringValue?.nilIfEmpty else {
             throw AckValidationError(operation: "Create project",
@@ -888,13 +1524,15 @@ public extension GatewayClient {
     }
 
     func updateProject(id: String, name: String? = nil, description: String? = nil,
-                       icon: String? = nil, color: String? = nil) async throws -> HermesProject {
+                       icon: String? = nil, color: String? = nil,
+                       in route: GatewayWorkspaceRoute) async throws -> HermesProject {
         var body: [String: JSONValue] = ["id": .string(id)]
         if let name { body["name"] = .string(name) }
         if let description { body["description"] = .string(description) }
         if let icon { body["icon"] = .string(icon) }
         if let color { body["color"] = .string(color) }
-        let response = try await rpc("projects.update", .object(body))
+        let request = try WorkspaceProjectRequest.write("projects.update", fields: body, in: route)
+        let response = try await rpc(request.method, request.params)
         guard let project = response["project"], project["id"]?.stringValue == id else {
             throw AckValidationError(operation: "Update project",
                                      detail: "Hermes did not return the updated project identity.")
@@ -903,12 +1541,14 @@ public extension GatewayClient {
     }
 
     func addProjectFolder(id: String, path: String, label: String? = nil,
-                          isPrimary: Bool = false) async throws -> HermesProject {
+                          isPrimary: Bool = false,
+                          in route: GatewayWorkspaceRoute) async throws -> HermesProject {
         var body: [String: JSONValue] = [
             "id": .string(id), "path": .string(path), "is_primary": .bool(isPrimary),
         ]
         if let label = label?.nilIfEmpty { body["label"] = .string(label) }
-        let response = try await rpc("projects.add_folder", .object(body))
+        let request = try WorkspaceProjectRequest.write("projects.add_folder", fields: body, in: route)
+        let response = try await rpc(request.method, request.params)
         guard let project = response["project"], project["id"]?.stringValue == id else {
             throw AckValidationError(operation: "Add project folder",
                                      detail: "Hermes did not return the updated project identity.")
@@ -916,10 +1556,12 @@ public extension GatewayClient {
         return HermesProject(project)
     }
 
-    func removeProjectFolder(id: String, path: String) async throws -> HermesProject {
-        let response = try await rpc("projects.remove_folder", .object([
+    func removeProjectFolder(id: String, path: String,
+                             in route: GatewayWorkspaceRoute) async throws -> HermesProject {
+        let request = try WorkspaceProjectRequest.write("projects.remove_folder", fields: [
             "id": .string(id), "path": .string(path),
-        ]))
+        ], in: route)
+        let response = try await rpc(request.method, request.params)
         guard let project = response["project"], project["id"]?.stringValue == id else {
             throw AckValidationError(operation: "Remove project folder",
                                      detail: "Hermes did not return the updated project identity.")
@@ -927,10 +1569,12 @@ public extension GatewayClient {
         return HermesProject(project)
     }
 
-    func setPrimaryProjectFolder(id: String, path: String) async throws -> HermesProject {
-        let response = try await rpc("projects.set_primary", .object([
+    func setPrimaryProjectFolder(id: String, path: String,
+                                 in route: GatewayWorkspaceRoute) async throws -> HermesProject {
+        let request = try WorkspaceProjectRequest.write("projects.set_primary", fields: [
             "id": .string(id), "path": .string(path),
-        ]))
+        ], in: route)
+        let response = try await rpc(request.method, request.params)
         guard let project = response["project"], project["id"]?.stringValue == id else {
             throw AckValidationError(operation: "Set primary project folder",
                                      detail: "Hermes did not return the updated project identity.")
@@ -938,22 +1582,30 @@ public extension GatewayClient {
         return HermesProject(project)
     }
 
-    func archiveProject(id: String, restore: Bool = false) async throws -> HermesProjectListing {
-        try HermesProjectListing(validatingAcknowledgement: try await rpc("projects.archive", .object([
+    func archiveProject(id: String, restore: Bool = false,
+                        in route: GatewayWorkspaceRoute) async throws -> HermesProjectListing {
+        let request = try WorkspaceProjectRequest.write("projects.archive", fields: [
             "id": .string(id), "restore": .bool(restore),
-        ])), operation: restore ? "Restore project" : "Archive project")
+        ], in: route)
+        return try HermesProjectListing(
+            validatingArchiveAcknowledgement: try await rpc(request.method, request.params),
+            id: id, restore: restore
+        )
     }
 
-    func deleteProject(id: String) async throws -> HermesProjectListing {
-        try HermesProjectListing(validatingAcknowledgement:
-            try await rpc("projects.delete", .object(["id": .string(id)])),
-            operation: "Delete project")
+    func deleteProject(id: String, in route: GatewayWorkspaceRoute) async throws -> HermesProjectListing {
+        let request = try WorkspaceProjectRequest.write("projects.delete", fields: ["id": .string(id)], in: route)
+        return try HermesProjectListing(
+            validatingDeleteAcknowledgement: try await rpc(request.method, request.params),
+            id: id
+        )
     }
 
-    func setActiveProject(id: String?) async throws -> String? {
-        let response = try await rpc("projects.set_active", .object([
+    func setActiveProject(id: String?, in route: GatewayWorkspaceRoute) async throws -> String? {
+        let request = try WorkspaceProjectRequest.write("projects.set_active", fields: [
             "id": id.map(JSONValue.string) ?? .null,
-        ]))
+        ], in: route)
+        let response = try await rpc(request.method, request.params)
         let active = response["active_id"]?.stringValue?.nilIfEmpty
         if let id, active != id {
             throw AckValidationError(operation: "Select project",

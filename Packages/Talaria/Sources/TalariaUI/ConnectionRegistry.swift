@@ -43,29 +43,55 @@ public struct SavedGateway: Codable, Identifiable, Sendable, Equatable {
 
 /// One profile enumerated from a gateway that is not the live one. Carries the
 /// cosmetics that ride `ui_meta` (methods_profiles.py:212-226) so a foreign row
-/// wears the same face it will wear after the switch, and nothing else: the
-/// unread watermark, pinned chat and session bindings are per-gateway state
-/// that must not leak across sources.
+/// wears the same face it will wear after the switch. Canonical ids remain
+/// source-qualified and runtime-only (stripped before persistence); unread and
+/// live session bindings stay in their existing per-gateway stores.
 public struct SecondaryProfile: Codable, Sendable, Equatable, Identifiable {
     public var id: String { name }
     public var name: String
     /// `ui_meta["hermes-bots"].title` — the desktop-set display title.
     public var title: String?
+    /// Raw core `display_name`, intentionally separate from Bot Mode's title.
+    /// It is carried through to `Bot.rawDisplayName` for friendly mention and
+    /// room-member capture, rather than being reconstructed from a themed row.
+    public var rawDisplayName: String?
     /// The profile's one-line description (its "job" on the roster row).
     public var job: String
     public var shape: AvatarShape?
     public var hue: AvatarHue?
-    /// `last_session.preview` — the newest exchange on that gateway.
+    /// Preview of the resolved preferred/canonical session when available,
+    /// otherwise raw last_session. This matches the identity a row opens.
     public var preview: String
-    /// `last_session.last_active`, unix seconds.
+    /// Preview from the session that supplied `lastActive`. Optional for
+    /// persisted secondary rosters written by older Talaria builds.
+    public var activityPreview: String?
+    /// Freshest conversation activity, unix seconds.
     public var lastActive: Double?
+    /// Durable server pin from ui_meta["hermes-bots"].chat.
+    public var pinnedChat: String?
+    /// Precise preferred-session id returned by this secondary gateway. Kept
+    /// separately because older/partial metadata may resolve a locally known
+    /// pin even when the ui_meta block is unavailable.
+    public var preferredSessionID: String?
 
-    public init(name: String, title: String? = nil, job: String = "",
+    public var canonicalChatID: String? {
+        let pin = pinnedChat?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let pin, !pin.isEmpty { return pin }
+        let preferred = preferredSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return preferred?.isEmpty == false ? preferred : nil
+    }
+
+    public init(name: String, title: String? = nil, rawDisplayName: String? = nil, job: String = "",
                 shape: AvatarShape? = nil, hue: AvatarHue? = nil,
-                preview: String = "", lastActive: Double? = nil) {
+                preview: String = "", activityPreview: String? = nil,
+                lastActive: Double? = nil,
+                pinnedChat: String? = nil, preferredSessionID: String? = nil) {
         self.name = name; self.title = title; self.job = job
+        self.rawDisplayName = rawDisplayName
         self.shape = shape; self.hue = hue
-        self.preview = preview; self.lastActive = lastActive
+        self.preview = preview; self.activityPreview = activityPreview
+        self.lastActive = lastActive
+        self.pinnedChat = pinnedChat; self.preferredSessionID = preferredSessionID
     }
 }
 
@@ -74,7 +100,8 @@ public struct SecondaryRoster: Codable, Sendable, Equatable {
     public enum Freshness: String, Codable, Sendable {
         /// Enumerated from this gateway during this launch.
         case fresh
-        /// Last-known list; the gateway did not answer the most recent attempt.
+        /// Last-known list; the gateway did not answer the most recent attempt,
+        /// or answered without a self-consistent canonical-session projection.
         case stale
         /// Saved metadata with no Keychain credential — signed out here, or
         /// restored onto a new device. Nothing to list until sign-in.
@@ -90,6 +117,18 @@ public struct SecondaryRoster: Codable, Sendable, Equatable {
 
     public init(profiles: [SecondaryProfile], fetchedAt: Date, freshness: Freshness) {
         self.profiles = profiles; self.fetchedAt = fetchedAt; self.freshness = freshness
+    }
+}
+
+/// Pure result of turning one authenticated profiles.list answer into rows the
+/// union roster can safely publish. A response can still contribute cosmetics
+/// and independent activity while its canonical preview is quarantined.
+struct SecondaryRosterProjection: Sendable, Equatable {
+    var profiles: [SecondaryProfile]
+    var isCanonicalProjectionComplete: Bool
+
+    var freshness: SecondaryRoster.Freshness {
+        isCanonicalProjectionComplete ? .fresh : .stale
     }
 }
 
@@ -109,11 +148,24 @@ public struct ForeignRosterEntry: Sendable, Equatable, Identifiable {
     /// more than one source (`agentHandle`, connection-registry.ts:137).
     public var handle: String
     public var title: String?
+    /// Raw core `display_name` carried from the foreign gateway. It remains
+    /// distinct from the desktop cosmetics title for the same reason it is on
+    /// `SecondaryProfile`.
+    public var rawDisplayName: String?
     public var job: String
     public var shape: AvatarShape?
     public var hue: AvatarHue?
     public var preview: String
+    public var activityPreview: String?
     public var lastActive: Double?
+    public var pinnedChat: String?
+    public var preferredSessionID: String?
+    public var canonicalChatID: String? {
+        let pin = pinnedChat?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let pin, !pin.isEmpty { return pin }
+        let preferred = preferredSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return preferred?.isEmpty == false ? preferred : nil
+    }
     /// When this row's gateway was last successfully listed — the age of the
     /// picture, as distinct from when the bot itself last spoke.
     public var fetchedAt: Date
@@ -123,14 +175,20 @@ public struct ForeignRosterEntry: Sendable, Equatable, Identifiable {
     public var needsSignIn: Bool
 
     public init(gatewayID: String, connectionLabel: String, connectionKind: ConnectionKind,
-                profile: String, handle: String, title: String? = nil, job: String = "",
+                profile: String, handle: String, title: String? = nil,
+                rawDisplayName: String? = nil, job: String = "",
                 shape: AvatarShape? = nil, hue: AvatarHue? = nil, preview: String = "",
-                lastActive: Double? = nil, fetchedAt: Date = Date(),
+                activityPreview: String? = nil, lastActive: Double? = nil,
+                pinnedChat: String? = nil,
+                preferredSessionID: String? = nil, fetchedAt: Date = Date(),
                 isStale: Bool = false, needsSignIn: Bool = false) {
         self.gatewayID = gatewayID; self.connectionLabel = connectionLabel
         self.connectionKind = connectionKind; self.profile = profile; self.handle = handle
-        self.title = title; self.job = job; self.shape = shape; self.hue = hue
-        self.preview = preview; self.lastActive = lastActive; self.fetchedAt = fetchedAt
+        self.title = title; self.rawDisplayName = rawDisplayName
+        self.job = job; self.shape = shape; self.hue = hue
+        self.preview = preview; self.activityPreview = activityPreview
+        self.lastActive = lastActive; self.fetchedAt = fetchedAt
+        self.pinnedChat = pinnedChat; self.preferredSessionID = preferredSessionID
         self.isStale = isStale; self.needsSignIn = needsSignIn
     }
 }
@@ -165,8 +223,8 @@ private struct SecondaryRosterFetch: Sendable {
 public final class ConnectionRegistry {
     public static let shared = ConnectionRegistry()
     public static let defaultsKey = "talaria-gateways"
-    /// Cached secondary rosters. Names and cosmetics only — never credentials,
-    /// never transcript text.
+    /// Persisted secondary rosters: identity, cosmetics, and numeric recency
+    /// only — never credentials, canonical ids, or transcript text.
     public static let rostersKey = "talaria-gateway-rosters"
 
     /// Latest health-probe result for one saved gateway.
@@ -498,9 +556,30 @@ public final class ConnectionRegistry {
                 // round trip (methods_profiles.py:22-31); a foreign row is only
                 // worth painting if it can say when that machine last spoke.
                 await capture.record(connection)
-                return SecondaryRosterFetch(
-                    profiles: try await connection.client.listProfiles(includeSessions: true),
-                    connection: connection)
+                var profiles = try await connection.client.listProfiles(includeSessions: true)
+                // A new pooled client does not know the far gateway's pins
+                // until this first answer exposes ui_meta. Resolve them once
+                // on the SAME captured secondary client before publishing;
+                // otherwise the foreign row previews last_session and a cold
+                // tap has no canonical id, so it can mint a fork on the wrong
+                // side of the pool. Older gateways omit preferred_session;
+                // their rows remain useful for cosmetics/activity but publish
+                // stale, without pretending last_session is the pinned chat.
+                let pins = Self.secondaryPreferredSessionPins(in: profiles)
+                let precisionPins = Self.secondaryPrecisionRetryPins(
+                    in: profiles, harvestedPins: pins)
+                if !precisionPins.isEmpty {
+                    do {
+                        profiles = try await connection.client.listProfiles(
+                            includeSessions: true, preferredSessionIDs: precisionPins)
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        // The authenticated first answer is still useful. A
+                        // transient precision retry must not blank the source.
+                    }
+                }
+                return SecondaryRosterFetch(profiles: profiles, connection: connection)
             }
             // A replacement/adoption may have won while profiles.list was
             // suspended. Its answer must not overwrite the replacement's
@@ -518,14 +597,12 @@ public final class ConnectionRegistry {
                 await clientPool.release(lease)
                 return
             }
-            let profiles = fetched.profiles
-            let rows = profiles
-                .filter { !$0.name.isEmpty }
-                .map(Self.secondaryProfile(from:))
-            secondaryRosters[gateway.id] = SecondaryRoster(profiles: rows,
-                                                           fetchedAt: Date(),
-                                                           freshness: .fresh)
-            noteBotCountForSecondary(rows.count, gatewayID: gateway.id)
+            let projection = Self.secondaryRosterProjection(from: fetched.profiles)
+            secondaryRosters[gateway.id] = SecondaryRoster(
+                profiles: projection.profiles,
+                fetchedAt: Date(),
+                freshness: projection.freshness)
+            noteBotCountForSecondary(projection.profiles.count, gatewayID: gateway.id)
             await clientPool.release(lease)
         } catch let error as GatewayError where error.code == GatewayClient.methodNotFound {
             guard let expected = await capture.snapshot,
@@ -620,7 +697,7 @@ public final class ConnectionRegistry {
         secondaryRosters[gatewayID] = roster
     }
 
-    static func secondaryProfile(from profile: HermesProfile) -> SecondaryProfile {
+    nonisolated static func secondaryProfile(from profile: HermesProfile) -> SecondaryProfile {
         // The live roster's precedence, not a second copy of it: desktop Bot
         // Mode's own block wins over Talaria's mirror, so a bot titled or
         // recolored on desktop reads identically here (plugin.js
@@ -630,13 +707,101 @@ public final class ConnectionRegistry {
         let desk = BotModeMeta(uiMeta: profile.uiMeta)
         let shape = BotCosmetics.storedShape(for: profile)
         let hue = BotCosmetics.storedHue(for: profile)
+        let canonicalProjectionIsExact = secondaryCanonicalProjectionIsExact(profile)
         return SecondaryProfile(name: profile.name,
                                 title: desk?.title,
+                                rawDisplayName: profile.displayName,
                                 job: profile.description ?? "",
                                 shape: shape,
                                 hue: hue,
-                                preview: profile.lastSession?.preview ?? "",
-                                lastActive: profile.lastSession?.lastActive)
+                                // Never label authoritative pin B with session
+                                // A's words. The independently freshest activity
+                                // remains useful below, but canonical evidence is
+                                // publishable only when the response agrees with
+                                // its own current ui_meta pin.
+                                preview: canonicalProjectionIsExact
+                                    ? profile.previewSession?.preview ?? "" : "",
+                                activityPreview:
+                                    profile.freshestConversationSession?.preview ?? "",
+                                lastActive: profile.freshestConversationSession?.lastActive,
+                                pinnedChat: desk?.pinnedChat,
+                                preferredSessionID: canonicalProjectionIsExact
+                                    ? profile.preferredSession.session?.id : nil)
+    }
+
+    /// Convert a final profiles.list answer into publishable secondary rows.
+    /// This seam is deliberately transport-free: both a failed retry (where
+    /// the first mismatched answer remains) and a pin changed during the retry
+    /// are the same safety decision at publication time.
+    nonisolated static func secondaryRosterProjection(
+        from profiles: [HermesProfile]
+    ) -> SecondaryRosterProjection {
+        let candidates = profiles.filter { !$0.name.isEmpty }
+        return SecondaryRosterProjection(
+            profiles: candidates.map(Self.secondaryProfile(from:)),
+            isCanonicalProjectionComplete:
+                candidates.allSatisfy(Self.secondaryCanonicalProjectionIsExact))
+    }
+
+    /// Whether the preferred-session evidence exactly describes the current
+    /// authoritative ui_meta pin. Both ids identify the same returned lineage:
+    /// `id` is its durable root and `resolvedID` is its live compression tip.
+    /// No pin and no preferred row is also self-consistent legacy state.
+    nonisolated static func secondaryCanonicalProjectionIsExact(
+        _ profile: HermesProfile
+    ) -> Bool {
+        let pin = BotModeMeta(uiMeta: profile.uiMeta)?.pinnedChat?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let canonicalPin = pin?.isEmpty == false ? pin : nil
+        guard let canonicalPin else {
+            return profile.preferredSession.session == nil
+        }
+        return secondaryPreferredSession(in: profile, exactlyDescribes: canonicalPin)
+    }
+
+    nonisolated static func secondaryPreferredSession(
+        in profile: HermesProfile, exactlyDescribes canonicalPin: String
+    ) -> Bool {
+        guard case .resolved(let preferred) = profile.preferredSession else {
+            return false
+        }
+        return preferred.id == canonicalPin || preferred.resolvedID == canonicalPin
+    }
+
+    /// Pins learned from this exact profiles.list answer. Kept as a pure seam
+    /// so source-qualified cold-start behavior can be pinned without opening a
+    /// socket in tests; callers send the result only to the client that
+    /// produced `profiles`.
+    nonisolated static func secondaryPreferredSessionPins(
+        in profiles: [HermesProfile]
+    ) -> [String: String] {
+        var pins: [String: String] = [:]
+        for profile in profiles {
+            guard !profile.name.isEmpty,
+                  let pin = BotModeMeta(uiMeta: profile.uiMeta)?.pinnedChat?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !pin.isEmpty else { continue }
+            pins[profile.name] = pin
+        }
+        return pins
+    }
+
+    /// A pooled secondary client can begin a roster call with stale pin A and
+    /// learn pin B from that same answer's authoritative ui_meta. Retry B not
+    /// only when `preferred_session` was omitted, but whenever the returned
+    /// preferred identity does not describe B exactly.
+    nonisolated static func secondaryPrecisionRetryPins(
+        in profiles: [HermesProfile], harvestedPins: [String: String]
+    ) -> [String: String] {
+        var retry: [String: String] = [:]
+        for profile in profiles {
+            guard let pin = harvestedPins[profile.name], !pin.isEmpty else { continue }
+            guard secondaryPreferredSession(in: profile, exactlyDescribes: pin) else {
+                retry[profile.name] = pin
+                continue
+            }
+        }
+        return retry
     }
 
     /// Bound an await that has no deadline of its own. `GatewayClient.connect`
@@ -692,11 +857,15 @@ public final class ConnectionRegistry {
                                              connectionLabel: gateway.name,
                                              duplicated: duplicated.contains(name)),
                     title: profile.title,
+                    rawDisplayName: profile.rawDisplayName,
                     job: profile.job,
                     shape: profile.shape,
                     hue: profile.hue,
                     preview: profile.preview,
+                    activityPreview: profile.activityPreview,
                     lastActive: profile.lastActive,
+                    pinnedChat: profile.pinnedChat,
+                    preferredSessionID: profile.preferredSessionID,
                     fetchedAt: roster.fetchedAt,
                     isStale: stale,
                     needsSignIn: needsSignIn))
@@ -806,24 +975,36 @@ public final class ConnectionRegistry {
         }
     }
 
-    /// Names and cosmetics only — the preview line is dropped on the way to
-    /// disk, which is what makes the promise at `rostersKey` true.
+    /// Names, cosmetics, and numeric recency only — both preview channels are
+    /// dropped on the way to disk, which makes the promise at `rostersKey` true.
     ///
     /// It is not a trade either: a roster restored from disk is forced `.stale`
     /// (see `init`), and a stale row shows the age of the picture rather than
     /// its preview. So a persisted preview is never painted — it would only
     /// leave another machine's conversation sitting in plaintext UserDefaults,
     /// which is backed up off the device, to buy nothing.
-    private func persistRosters() {
-        let sanitized = secondaryRosters.mapValues { roster -> SecondaryRoster in
+    nonisolated static func sanitizedSecondaryRostersForPersistence(
+        _ rosters: [String: SecondaryRoster]
+    ) -> [String: SecondaryRoster] {
+        rosters.mapValues { roster -> SecondaryRoster in
             var row = roster
             row.profiles = row.profiles.map { profile in
                 var stripped = profile
                 stripped.preview = ""
+                stripped.activityPreview = nil
+                // Canonical ids are runtime routing state. Rehydrate them from
+                // their authenticated owner instead of persisting another
+                // gateway's conversation pointer in UserDefaults.
+                stripped.pinnedChat = nil
+                stripped.preferredSessionID = nil
                 return stripped
             }
             return row
         }
+    }
+
+    private func persistRosters() {
+        let sanitized = Self.sanitizedSecondaryRostersForPersistence(secondaryRosters)
         if let data = try? JSONEncoder().encode(sanitized) {
             defaults.set(data, forKey: Self.rostersKey)
         }

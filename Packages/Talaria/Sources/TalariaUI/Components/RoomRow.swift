@@ -99,7 +99,8 @@ public struct RoomAvatarView: View {
         Bot(id: member.route.qualifiedID, job: "Room member",
             shape: BotCosmetics.derivedShape(forName: member.route.qualifiedID),
             hue: BotCosmetics.derivedHue(forName: member.route.qualifiedID),
-            title: member.title, handleOverride: member.handle)
+            title: member.title, handleOverride: member.handle,
+            rawDisplayName: member.rawDisplayName)
     }
 
     private func platformImage(_ data: Data) -> Image? {

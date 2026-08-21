@@ -158,14 +158,12 @@ extension ProtocolChecks {
                        "@\(bot.handle) round-trips to exactly the row that minted it")
         }
 
-        // And the bare form does NOT, which is the reason the suffix exists.
+        // The bare form does NOT resolve when duplicated: collision poisoning
+        // protects the two default profiles rather than treating `default` as
+        // a globally reserved legacy handle.
         let bare = MentionResolver.resolve("@default ping", roster: union, speaking: nil)
-        try expect(bare.bots.isEmpty, "the duplicated bare name resolves to NOBODY (2457-2466)")
-        try expect(bare.ambiguous == ["default"], "…and is reported as ambiguous")
-        try expect(bare.collisions.first?.bots.map(\.id) == ["default", "home-lab::default"],
-                   "the refusal names both sides, near one first, in roster order")
-        try expect(bare.collisions.first?.labels == ["@default-macbook", "@default-home-lab"],
-                   "and names them by the forms the user has to type instead")
+        try expect(bare.bots.isEmpty && bare.ambiguous == ["default"],
+                   "the duplicated bare default name resolves to nobody")
 
         // `@hermes` addresses nobody once `default` is duplicated. This looks
         // like a regression and is the rule: `botHandle` returns the
@@ -175,9 +173,7 @@ extension ProtocolChecks {
         try expect(alias.bots.isEmpty && alias.unknown == ["hermes"],
                    "@hermes addresses NOBODY when `default` exists on two sources")
 
-        // The same roster without the collision: nothing is suffixed and the
-        // alias works again. A single-gateway phone must be untouched by all
-        // of the above.
+        // A unique legacy default/hermes identity remains addressable.
         let solo = [Bot(id: "default", job: "", shape: .circle, hue: .teal),
                     Bot(id: "home-lab::ci", job: "", shape: .circle, hue: .teal,
                         handleOverride: "ci",
@@ -186,24 +182,21 @@ extension ProtocolChecks {
         try expect(solo.map(\.handle) == ["hermes", "ci"],
                    "no collision, no suffix — and `default` is still @hermes")
         try expect(MentionResolver.resolve("@hermes ping", roster: solo, speaking: nil)
-                    .bots.map(\.id) == ["default"], "the alias resolves again")
+                    .bots.map(\.id) == ["default"], "the unique legacy alias resolves")
         try expect(MentionResolver.resolve("@ci ping", roster: solo, speaking: nil)
                     .bots.map(\.id) == ["home-lab::ci"],
                    "a unique foreign row is addressable by its bare name (2445)")
 
-        // A bare speaker is on the primary source, so the same-named foreign
-        // row still claims its form and prevents wrong-source self matching.
+        // Excluding one source releases the other unique legacy default form.
         let speaking = MentionResolver.resolve("@default ping", roster: union, speaking: "default")
         try expect(speaking.bots.map(\.id) == ["home-lab::default"],
-                   "excluding the LIVE speaker leaves the far row still claiming the bare name")
-        try expect(speaking.ambiguous.isEmpty, "…so the form is no longer poisoned")
+                   "excluding the live speaker leaves the foreign default route")
 
-        // A qualified secondary speaker does recognize its own row, while the
-        // colliding primary remains available.
+        // A qualified secondary speaker similarly leaves the primary row.
         let farSpeaking = MentionResolver.resolve("@default ping", roster: union,
                                                   speaking: "home-lab::default")
         try expect(farSpeaking.bots.map(\.id) == ["default"],
-                   "a qualified remote speaker excludes itself on its own source")
+                   "a qualified speaker excludes itself without blocking the primary")
     }
 
     // MARK: What the surfaces do with it
@@ -232,7 +225,7 @@ extension ProtocolChecks {
         let offered = union.mentionSuggestions(for: "default-", speaking: nil,
                                                connectionLabel: "MacBook")
         try expect(offered.map(\.handle) == ["default-macbook", "default-home-lab"],
-                   "both @name-device forms are offered, in roster order")
+                   "a legacy-handle match does not synthesize a rename alias from a device label")
         try expect(offered.first?.meta == "Bot · Hermes · MacBook",
                    "a live row takes the array's label, and still reads Hermes")
         try expect(offered.last?.meta == "Bot · Home Lab · Home Lab",

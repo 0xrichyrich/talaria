@@ -79,6 +79,21 @@ final class SessionsRuntime {
     }
 }
 
+private struct StoredSessionOpenSource {
+    var route: GatewayBotRoute
+    var client: GatewayClient
+    var validateBeforeBinding: @MainActor () async throws -> Void
+}
+
+private struct StoredSessionOpenAttempt {
+    var task: Task<String, Error>
+    var botID: String
+    var chat: ChatState
+    var lifecycle: ProfileLifecycleGenerationToken
+    var openGeneration: UInt64
+    var connectionGeneration: Int
+}
+
 /// The result of a session action, ready to render as one themed line plus an
 /// optional detail line.
 public struct SessionActionOutcome: Sendable, Equatable {
@@ -212,9 +227,42 @@ extension AppModel {
     /// durable key) and hydrate its transcript. Mirrors `openChat` but for a
     /// session the user picked instead of the profile's most recent one.
     public func openStoredSession(_ id: String, botID: String) {
-        guard !id.isEmpty else { return }
+        guard let attempt = try? beginStoredSessionOpen(
+            id, botID: botID, exactSource: nil
+        ) else { return }
+        Task { @MainActor in
+            _ = try? await finishStoredSessionOpen(attempt, presentsFailure: true)
+        }
+    }
+
+    /// Await one explicit durable-session selection on an already captured
+    /// route/client. Workspace Projects uses this while its pool and profile
+    /// lifecycle leases are still held, so no later task may re-resolve the
+    /// destination through mutable active-gateway state.
+    @discardableResult
+    func openStoredSessionAwaiting(
+        _ id: String, botID: String, route: GatewayBotRoute,
+        client: GatewayClient,
+        validateBeforeBinding: @escaping @MainActor () async throws -> Void
+    ) async throws -> Bool {
+        let attempt = try beginStoredSessionOpen(
+            id, botID: botID,
+            exactSource: StoredSessionOpenSource(
+                route: route, client: client,
+                validateBeforeBinding: validateBeforeBinding
+            )
+        )
+        return try await finishStoredSessionOpen(attempt, presentsFailure: false)
+    }
+
+    private func beginStoredSessionOpen(
+        _ id: String, botID: String, exactSource: StoredSessionOpenSource?
+    ) throws -> StoredSessionOpenAttempt {
+        guard !id.isEmpty else {
+            throw GatewayError(code: 400, message: "A stored session identity is required.")
+        }
         let lifecycle = mode == .live ? profileLifecycleGenerationToken(for: botID) : nil
-        if mode == .live, lifecycle == nil { return }
+        if mode == .live, lifecycle == nil { throw CancellationError() }
         openBotID = botID
         selectedTab = .home
         clearUnread(for: botID)
@@ -224,7 +272,13 @@ extension AppModel {
 
         let chat = chat(for: botID)
         let runtime = LiveRuntime.shared
-        guard mode == .live, let lifecycle else { return }
+        guard mode == .live, let lifecycle else { throw CancellationError() }
+        if let exactSource {
+            guard lifecycle.route == exactSource.route,
+                  stateRoute(for: botID) == exactSource.route else {
+                throw CancellationError()
+            }
+        }
 
         let sessionsRuntime = SessionsRuntime.shared
         let openGeneration = sessionsRuntime.beginOpen(botID: botID)
@@ -236,7 +290,7 @@ extension AppModel {
         // subsequent resume/bind proves the same ChatState and durable route.
         // A different durable row (or known route) retires the old intent so
         // it cannot drain into a reused profile id.
-        let reopenRoute = stateRoute(for: botID) ?? gatewayRoute(for: botID)
+        let reopenRoute = exactSource?.route ?? stateRoute(for: botID) ?? gatewayRoute(for: botID)
         let preservesPendingStop = ChatRuntime.shared.pendingStopMatchesReopen(
             botID: botID, storedID: id, chatID: ObjectIdentifier(chat), route: reopenRoute)
         if !preservesPendingStop {
@@ -278,7 +332,7 @@ extension AppModel {
         // exact selection instead of starting canonical resolution in parallel.
         runtime.attachTasks[botID]?.cancel()
         runtime.attachTasks[botID] = nil
-        if let old = chat.sessionID, let route = gatewayRoute(for: botID) {
+        if let old = chat.sessionID, let route = reopenRoute {
             if route.gatewayID == runtime.gatewayID {
                 runtime.sessionToBot.removeValue(forKey: old)
             } else {
@@ -314,13 +368,30 @@ extension AppModel {
                     self.profileLifecycleAccepts(lifecycle) else {
                     throw CancellationError()
                 }
+                if let exactSource {
+                    guard lifecycle.route == exactSource.route,
+                          self.stateRoute(for: botID) == exactSource.route,
+                          exactSource.route.gatewayID != LiveRuntime.shared.gatewayID
+                            || self.client.map(ObjectIdentifier.init)
+                                == ObjectIdentifier(exactSource.client) else {
+                        throw CancellationError()
+                    }
+                }
             }
 
             try requireCurrentOpen()
-            guard let route = self.gatewayRoute(for: botID) else {
-                throw GatewayRouteError.noRoute
+            let route: GatewayBotRoute
+            let client: GatewayClient
+            if let exactSource {
+                route = exactSource.route
+                client = exactSource.client
+            } else {
+                guard let resolvedRoute = self.gatewayRoute(for: botID) else {
+                    throw GatewayRouteError.noRoute
+                }
+                route = resolvedRoute
+                client = try await self.routedClient(for: resolvedRoute)
             }
-            let client = try await self.routedClient(for: route)
             try requireCurrentOpen()
             await self.attachRoutedEventsIfNeeded(client: client,
                                                   gatewayID: route.gatewayID)
@@ -335,6 +406,19 @@ extension AppModel {
                 throw GatewayError(code: -8, message: "session.resume returned no id")
             }
             let stored = live.storedSessionID.isEmpty ? id : live.storedSessionID
+            if exactSource != nil, stored != id {
+                throw AckValidationError(
+                    operation: "Resume session",
+                    detail: "Hermes returned a different durable session identity."
+                )
+            }
+            if let exactSource {
+                // The resume response can itself have crossed c1e25's
+                // unknown-profile fallback. Re-prove the captured profile
+                // after that response and before any chat/session binding.
+                try await exactSource.validateBeforeBinding()
+                try requireCurrentOpen()
+            }
             chat.storedSessionID = stored
             // Clear state from the session we left, then derive the selected
             // session's turn state before yielding to REST hydration. Events
@@ -388,41 +472,64 @@ extension AppModel {
             return live.sessionID
         }
         runtime.attachTasks[botID] = task
+        return StoredSessionOpenAttempt(
+            task: task, botID: botID, chat: chat,
+            lifecycle: lifecycle, openGeneration: openGeneration,
+            connectionGeneration: connectionGeneration
+        )
+    }
 
-        Task { @MainActor in
-            defer {
-                if LiveRuntime.shared.attachTasks[botID] == task {
-                    LiveRuntime.shared.attachTasks[botID] = nil
-                }
+    @discardableResult
+    private func finishStoredSessionOpen(
+        _ attempt: StoredSessionOpenAttempt, presentsFailure: Bool
+    ) async throws -> Bool {
+        defer {
+            if LiveRuntime.shared.attachTasks[attempt.botID] == attempt.task {
+                LiveRuntime.shared.attachTasks[attempt.botID] = nil
             }
-            do {
-                _ = try await task.value
-            } catch is CancellationError {
-                // A newer selection/reconnect owns the visible result.
-            } catch {
-                guard SessionsRuntime.shared.acceptsOpen(
-                    botID: botID, generation: openGeneration),
-                    LiveRuntime.shared.generation == connectionGeneration,
-                    self.profileLifecycleAccepts(lifecycle) else { return }
-                chat.isRunning = false
-                chat.isTyping = false
-                runtime.workingBotIDs.remove(botID)
-                if let idx = self.bots.firstIndex(where: { $0.id == botID }) {
-                    self.bots[idx].task = nil
-                    self.bots[idx].status = self.approvals.contains(where: { $0.botID == botID })
-                        ? .approval : .idle
-                }
-                chat.messages.append(ChatMessage(
-                    author: .system, text: Self.sessionFailure(error, theme: self.theme)))
+        }
+        do {
+            let sessionID = try await attempt.task.value
+            guard SessionsRuntime.shared.acceptsOpen(
+                botID: attempt.botID, generation: attempt.openGeneration),
+                LiveRuntime.shared.generation == attempt.connectionGeneration,
+                profileLifecycleAccepts(attempt.lifecycle),
+                attempt.chat.sessionID == sessionID else {
+                throw CancellationError()
+            }
+            return true
+        } catch is CancellationError {
+            // A newer selection/reconnect owns the visible result.
+            throw CancellationError()
+        } catch {
+            guard SessionsRuntime.shared.acceptsOpen(
+                botID: attempt.botID, generation: attempt.openGeneration),
+                LiveRuntime.shared.generation == attempt.connectionGeneration,
+                profileLifecycleAccepts(attempt.lifecycle) else {
+                throw CancellationError()
+            }
+            let runtime = LiveRuntime.shared
+            attempt.chat.isRunning = false
+            attempt.chat.isTyping = false
+            runtime.workingBotIDs.remove(attempt.botID)
+            if let idx = bots.firstIndex(where: { $0.id == attempt.botID }) {
+                bots[idx].task = nil
+                bots[idx].status = approvals.contains(where: { $0.botID == attempt.botID })
+                    ? .approval : .idle
+            }
+            if presentsFailure {
+                attempt.chat.messages.append(ChatMessage(
+                    author: .system, text: Self.sessionFailure(error, theme: theme)))
                 // …and out loud (plugin.js:6782 `notifyError(err, 'Could not
                 // open session')`). The system row above is the durable record,
                 // but this tap came from a sheet that has just dismissed onto an
                 // empty chat, and a blank screen with an explanation somewhere
                 // below the fold reads as the app having done nothing at all.
-                self.toast(kind: .failure,
-                           title: self.theme.copy.toastOpenSessionFailed(self.theme.themeID),
-                           message: Self.reason(error), botID: botID)
+                toast(kind: .failure,
+                      title: theme.copy.toastOpenSessionFailed(theme.themeID),
+                      message: Self.reason(error), botID: attempt.botID)
             }
+            throw error
         }
     }
 

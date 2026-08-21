@@ -37,6 +37,18 @@ final class CanonicalChatRuntime {
     /// (plugin.js:205-212).
     var pins: [String: String] = [:]
 
+    /// The one roster-provided history row a profile without any canonical
+    /// identity may grandfather on its first Bot Mode open. This is
+    /// intentionally NOT a session-list result: `session.list` is ordered by
+    /// whatever most recently touched the profile, so treating its first row as
+    /// canonical would let a cron or scratch session hijack a forever chat.
+    ///
+    /// The table is populated only when the profile had no pin and the
+    /// preferred-session reply was absent (legacy gateway/no prior request).
+    /// A resolved preferred session becomes a pin; an explicit `.gone` reply
+    /// clears this table. See `applyRosterAnswer` for the tri-state fold.
+    var grandfatherCandidates: [String: String] = [:]
+
     /// Bots with a pin write in flight. A roster poll that races the write
     /// still carries the OLD block, and mergeServerMeta's deletion rule would
     /// read the missing key as an authoritative clear of the pin just made.
@@ -51,6 +63,20 @@ final class CanonicalChatRuntime {
     /// common one, not a corner case. Comparing this counter across the poll's
     /// own await tells a stale answer from a current one.
     var writeCount: [String: Int] = [:]
+
+    /// Last local canonical-meta write stamp, sampled against a roster
+    /// snapshot's ISSUE time. Stamped once when local authority changes and
+    /// again when profiles.configure settles, matching Hermes Desktop's
+    /// `botMetaWriteAt`: a poll issued during the RPC still predates the write
+    /// even when it happens to return afterward.
+    var writeStamp: [String: Double] = [:]
+
+    @discardableResult
+    func noteWrite(_ botID: String, at stamp: Double = Date().timeIntervalSinceReferenceDate) -> Double {
+        let next = max(writeStamp[botID] ?? 0, stamp)
+        writeStamp[botID] = next
+        return next
+    }
 
     /// One resolution per bot at a time — a double tap must not mint two
     /// canonical chats (plugin.js:2742, `canonicalCreations`).
@@ -81,11 +107,16 @@ final class CanonicalChatRuntime {
                            retainLocalPins: Bool = false) {
         let primary = Set(pins.keys.filter { GatewayBotRoute(qualifiedID: $0) == nil })
             .union(dirtyPins.filter { GatewayBotRoute(qualifiedID: $0) == nil })
+            .union(grandfatherCandidates.keys.filter { GatewayBotRoute(qualifiedID: $0) == nil })
         if !retainLocalPins {
-            for key in primary { pins.removeValue(forKey: key) }
+            for key in primary {
+                pins.removeValue(forKey: key)
+                grandfatherCandidates.removeValue(forKey: key)
+            }
             dirtyPins.subtract(primary)
             writing = Set(writing.filter { GatewayBotRoute(qualifiedID: $0) != nil })
             writeCount = writeCount.filter { GatewayBotRoute(qualifiedID: $0.key) != nil }
+            writeStamp = writeStamp.filter { GatewayBotRoute(qualifiedID: $0.key) != nil }
         }
         let primaryOpens = opens.filter { GatewayBotRoute(qualifiedID: $0.key) == nil }
         for task in primaryOpens.values { task.cancel() }
@@ -115,10 +146,15 @@ final class CanonicalChatRuntime {
         let prefix = gatewayID + GatewayBotRoute.separator
         let keys = Set(pins.keys.filter { $0.hasPrefix(prefix) })
             .union(dirtyPins.filter { $0.hasPrefix(prefix) })
-        for key in keys { pins.removeValue(forKey: key) }
+            .union(grandfatherCandidates.keys.filter { $0.hasPrefix(prefix) })
+        for key in keys {
+            pins.removeValue(forKey: key)
+            grandfatherCandidates.removeValue(forKey: key)
+        }
         dirtyPins = Set(dirtyPins.filter { !$0.hasPrefix(prefix) })
         writing = Set(writing.filter { !$0.hasPrefix(prefix) })
         writeCount = writeCount.filter { !$0.key.hasPrefix(prefix) }
+        writeStamp = writeStamp.filter { !$0.key.hasPrefix(prefix) }
         let tasks = opens.filter { $0.key.hasPrefix(prefix) }
         for task in tasks.values { task.cancel() }
         for key in tasks.keys { opens.removeValue(forKey: key) }
@@ -234,6 +270,70 @@ private enum CanonicalAttach {
     /// Anything else — transport, backend restart, an older gateway. The pin
     /// is innocent until proven guilty (plugin.js:2864-2871).
     case failed(Error)
+}
+
+/// One literal owns the Bot Mode title across the nonisolated evidence check
+/// and AppModel's actor-isolated open path.
+private let canonicalBotChatTitle = "Bot Chat"
+
+/// Evidence carried by a roster summary is intentionally narrower than
+/// "whatever session happened most recently." A compression tip can have a
+/// different leaf title, so `rootTitle` is authoritative when present; only a
+/// legacy summary without it may use the leaf title. The id remains the
+/// durable pin — `session.resume` follows it to a resolved tip when necessary.
+enum CanonicalBotChatEvidence {
+    static func durableID(in session: HermesProfile.ProfileSessionRef?) -> String? {
+        guard let session, !session.id.isEmpty, session.isCanonicalBotChat else { return nil }
+        return session.id
+    }
+}
+
+/// Exact interpretation of the gateway's preferred-session answer for a
+/// canonical pin. Title drift is not data loss: a pinned conversation with
+/// real history remains the user's forever thread. Only a resolved, empty,
+/// non-Bot-Chat target is corrupt metadata and may be cleared.
+enum CanonicalPinnedSessionPolicy: Equatable {
+    case canonical
+    case historyBearingTitleDrift
+    case emptyNonCanonical
+    case gone
+    case inconclusive
+
+    static func classify(_ answer: HermesProfile.PreferredSession,
+                         requestedPin: String) -> Self {
+        switch answer {
+        case .notRequested:
+            return .inconclusive
+        case .gone:
+            return .gone
+        case .resolved(let session):
+            guard !requestedPin.isEmpty,
+                  session.id == requestedPin || session.resolvedID == requestedPin else {
+                return .inconclusive
+            }
+            if session.isCanonicalBotChat { return .canonical }
+            return session.messageCount > 0
+                ? .historyBearingTitleDrift : .emptyNonCanonical
+        }
+    }
+}
+
+/// A transcript REST read is safe to retry only when URLSession reports the
+/// typed timeout condition. In particular, a generic gateway failure, a
+/// cancelled task, or a missing stored row must not be "helped" by falling
+/// back through canonical resolution again: that can turn a read retry into a
+/// second chat birth.
+struct CanonicalHydrationTimeout: Error {
+    let storedID: String
+    /// Preserve the URLSession error byte-for-byte (code and userInfo). The
+    /// wrapper is retry control flow only and must never escape to callers.
+    let original: URLError
+
+    static func wraps(_ error: Error, storedID: String) -> CanonicalHydrationTimeout? {
+        guard let url = error as? URLError, url.code == .timedOut,
+              !storedID.isEmpty else { return nil }
+        return CanonicalHydrationTimeout(storedID: storedID, original: url)
+    }
 }
 
 /// Reconcile an authoritative stored page with UI rows that became newer
@@ -385,7 +485,7 @@ extension AppModel {
     /// hermes_state.py:8468), so this is how a phone finds a forever chat
     /// minted on the laptop when the pin never reached it — and why it can
     /// never mint a second one alongside it.
-    static var canonicalChatTitle: String { "Bot Chat" }
+    static var canonicalChatTitle: String { canonicalBotChatTitle }
     static var canonicalKickoffPrompt: String { BotModeStrings.canonicalKickoffPrompt }
 
     // MARK: The primary tap
@@ -529,20 +629,50 @@ extension AppModel {
             }
         }
 
-        // (a) The pin. `session.resume` IS the precise verification desktop
-        //     performs up front through profiles.list {preferred_session_ids}
-        //     (plugin.js:2841-2855): it reads the row directly — hidden rows
-        //     resolve — and follows a compression lineage to its live tip
-        //     (methods_session.py:346-380). One round trip instead of two, and
-        //     the answer describes the exact operation we care about.
+        // (a) The pin. Verify through the owning gateway's precise preferred
+        //     resolver before resume. A history-bearing session survives title
+        //     drift; an EMPTY non-Bot-Chat target is a stray draft and is
+        //     cleared before the exact-title adoption rung runs. A transient
+        //     lookup failure (or old gateway omitting preferred_session) keeps
+        //     the pin innocent and tries it as-is.
         if let pin = runtime.pins[botID], !pin.isEmpty, pin != chat.storedSessionID {
-            switch await attach(pin, botID: botID, route: route,
-                                hydrate: hydrate, client: client,
-                                lifecycleToken: lifecycleToken,
-                                gatewayGeneration: gatewayGeneration) {
-            case .attached(let sid, _): return sid
-            case .missing: break            // definitively gone → recover below
-            case .failed(let error): throw error
+            let policy: CanonicalPinnedSessionPolicy
+            do {
+                let profiles = try await client.listProfiles(
+                    includeSessions: true,
+                    preferredSessionIDs: [profile: pin])
+                try Task.checkCancellation()
+                guard acceptsSnapshot() else { throw CancellationError() }
+                if let row = profiles.first(where: { $0.name == profile }) {
+                    policy = CanonicalPinnedSessionPolicy.classify(
+                        row.preferredSession, requestedPin: pin)
+                } else {
+                    policy = .inconclusive
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                policy = .inconclusive
+            }
+
+            switch policy {
+            case .emptyNonCanonical, .gone:
+                // Clearing is source-qualified and guarded against a
+                // replacement pin. `create` below first resumes exact title
+                // "Bot Chat", so this cannot fork beside an existing chat.
+                forget(pin, botID: botID)
+                await clearPersistedCanonicalPinIfUnreplaced(
+                    storedID: pin, botID: botID, route: route, client: client)
+                guard acceptsSnapshot() else { throw CancellationError() }
+            case .canonical, .historyBearingTitleDrift, .inconclusive:
+                switch await attach(pin, botID: botID, route: route,
+                                    hydrate: hydrate, client: client,
+                                    lifecycleToken: lifecycleToken,
+                                    gatewayGeneration: gatewayGeneration) {
+                case .attached(let sid, _): return sid
+                case .missing: break        // definitively gone → recover below
+                case .failed(let error): throw error
+                }
             }
         }
 
@@ -567,61 +697,35 @@ extension AppModel {
         case .failed(let error): throw error
         }
 
-        // (c) Grandfather. First open of a bot that already has history adopts
-        //     the session the roster row was previewing, so continuity starts
-        //     from the chat in use rather than an empty one
-        //     (plugin.js:2822-2836; the row must open the session its preview
-        //     describes — hermes-agent#88200). This is also the migration path
-        //     for a profile that predates Bot Mode: its existing conversation
-        //     becomes the forever chat instead of being orphaned.
-        var candidates: [String] = []
-        if let previewed = LiveRuntime.shared.lastSessionByBot[botID], !previewed.isEmpty {
-            candidates.append(previewed)
-        }
-        // profiles.list's `last_session` is best-effort and degrades to null on
-        // a busy or locked state.db (methods_profiles.py:_latest_profile_session_row).
-        // Birth must never be reached for a bot that HAS history — that is the
-        // fork this phase exists to prevent — so confirm emptiness against
-        // session.list, which reads the same store through a different query
-        // and returns newest-first (methods_session.py:186-200).
+        // (c) Grandfather. A profile that predates Bot Mode gets one adoption
+        // opportunity: the exact conversation summary from the roster answer
+        // that described this row. That is continuity, not a recency search.
         //
-        // `include_hidden` is required, not incidental: Bot Mode sessions are
-        // always hidden and session.list excludes them by default
-        // (methods_session.py:180-186), so without it this "does the bot have
-        // history?" probe reads a desktop-born forever chat as no history at
-        // all — and answers by minting a second one.
-        let listedSessions: [StoredSession]
-        do {
-            listedSessions = try await client.listSessions(limit: 20, profile: profile,
-                                                            includeHidden: true)
-        } catch {
-            // A failed history probe is not authoritative emptiness. Do not
-            // birth a second canonical session behind a transient list error.
-            throw error
-        }
-        if let newest = listedSessions.first(where: { !$0.id.isEmpty })?.id,
-           !candidates.contains(newest) {
-            candidates.append(newest)
-        }
-        try Task.checkCancellation()
-        for candidate in candidates {
+        // Do NOT reach for `session.list.first` here. Its newest row can be a
+        // cron delivery, CLI scratch session, or room worker; adopting it would
+        // silently turn an arbitrary session into the one conversation a roster
+        // tap opens forever. `grandfatherCandidates` is populated only for a
+        // no-pin, preferred-session-absent row, so an explicit preferred null
+        // also cannot fall through to an unrelated newest session.
+        if let candidate = runtime.grandfatherCandidates[botID], !candidate.isEmpty {
             switch await attach(candidate, botID: botID, route: route,
                                 hydrate: hydrate, client: client,
                                 lifecycleToken: lifecycleToken,
                                 gatewayGeneration: gatewayGeneration) {
-        case .attached(let sid, let stored):
+            case .attached(let sid, let stored):
                 guard acceptsSnapshot() else {
                     throw CancellationError()
                 }
                 await pinCanonicalChat(stored, botID: botID)
                 return sid
             case .missing:
-                continue
+                // The roster summary was exact but disappeared before the tap.
+                // It is no longer adoption evidence; birth below is the only
+                // remaining safe outcome.
+                runtime.grandfatherCandidates[botID] = nil
             case .failed(let error):
-                // Desktop falls through to a fresh chat here (plugin.js:2884).
-                // Deliberately not ported: on a transient failure that mints a
-                // SECOND chat for a bot that demonstrably has history — exactly
-                // the silent fork this phase removes. Report and change nothing.
+                // A failed exact resume is not proof that a different session
+                // should become canonical. Keep the candidate for a later tap.
                 throw error
             }
         }
@@ -783,6 +887,9 @@ extension AppModel {
             chat.isTyping = false
         }
         if runtime.pins[lease.botID] == lease.storedID { runtime.pins[lease.botID] = nil }
+        if runtime.grandfatherCandidates[lease.botID] == lease.storedID {
+            runtime.grandfatherCandidates[lease.botID] = nil
+        }
         if LiveRuntime.shared.lastSessionByBot[lease.botID] == lease.storedID {
             LiveRuntime.shared.lastSessionByBot[lease.botID] = nil
         }
@@ -811,10 +918,14 @@ extension AppModel {
         let generation = LiveRuntime.shared.generation
         CanonicalChatRuntime.shared.dirtyPins.insert(botID)
         CanonicalChatRuntime.shared.writeCount[botID, default: 0] &+= 1
+        CanonicalChatRuntime.shared.noteWrite(botID)
         _ = try? await withBotModeMetaMutation(route: route) {
             let runtime = CanonicalChatRuntime.shared
             runtime.writing.insert(botID)
-            defer { runtime.writing.remove(botID) }
+            defer {
+                runtime.writing.remove(botID)
+                runtime.noteWrite(botID)
+            }
             let profiles = try await client.listProfiles(includeSessions: false)
             guard LiveRuntime.shared.generation == generation,
                   runtime.pins[botID] == nil,
@@ -822,10 +933,13 @@ extension AppModel {
             var block = row.uiMeta?["hermes-bots"]?.objectValue ?? [:]
             guard block["chat"]?.stringValue == storedID else { return }
             block["chat"] = nil
-            let applied = try await client.applyProfileEdit(
+            _ = try await client.applyProfileEdit(
                 name: route.profile,
                 ProfileEdit(uiMeta: .object(["hermes-bots": .object(block)])))
-            if applied["ui_meta"] == true { runtime.dirtyPins.remove(botID) }
+            // Do not clear dirty on the mutation receipt. A profiles.list
+            // issued while this configure was in flight may still return the
+            // old block after the receipt. Only applyRosterAnswer observing an
+            // authoritative matching server echo releases local authority.
         }
     }
 
@@ -1167,6 +1281,9 @@ extension AppModel {
         ChatRuntime.shared.clearPendingStopIfStored(storedID, botID: botID)
         let runtime = CanonicalChatRuntime.shared
         if runtime.pins[botID] == storedID { runtime.pins[botID] = nil }
+        if runtime.grandfatherCandidates[botID] == storedID {
+            runtime.grandfatherCandidates[botID] = nil
+        }
         if LiveRuntime.shared.lastSessionByBot[botID] == storedID {
             LiveRuntime.shared.lastSessionByBot[botID] = nil
         }
@@ -1191,14 +1308,20 @@ extension AppModel {
         let hydrationGeneration = LiveRuntime.shared.generation
         let sourceGatewayID = gatewayRoute(for: botID)?.gatewayID
         let storedID = live.storedSessionID.isEmpty ? chat.storedSessionID : live.storedSessionID
-        try await Self.hydrateTranscript(
+        // A resume projection is the primary history source.  When it is
+        // empty, the REST page is a read-only fallback for this exact durable
+        // key.  Its one permitted retry is deliberately kept inside hydration:
+        // it must never re-enter canonical resolution, where a timeout could
+        // otherwise choose a different title/recency candidate or mint a chat.
+        try await Self.hydrateCanonicalTranscript(
             chat: chat,
             resumeMessages: live.messages,
             clearWhenEmpty: clearWhenEmpty,
-            fallback: {
-                guard !live.storedSessionID.isEmpty else { return nil }
+            storedID: storedID,
+            fallback: { durableTarget in
+                guard !durableTarget.isEmpty else { return nil }
                 return try await client.latestSessionMessages(
-                    storedID: live.storedSessionID, profile: profile)
+                    storedID: durableTarget, profile: profile)
             },
             accepts: {
                 guard LiveRuntime.shared.generation == hydrationGeneration,
@@ -1263,6 +1386,56 @@ extension AppModel {
             clearWhenEmpty: clearWhenEmpty)
     }
 
+    /// Canonical hydration's narrowly-scoped retry policy.  The fallback
+    /// receives the durable key rather than a live session or title so a retry
+    /// is structurally unable to select a newer arbitrary session.  One
+    /// URLSession timeout gets one repeat read; every other failure remains the
+    /// original failure.
+    static func hydrateCanonicalTranscript(
+        chat: ChatState,
+        resumeMessages: [JSONValue],
+        clearWhenEmpty: Bool,
+        storedID: String?,
+        fallback: @MainActor (String) async throws -> JSONValue?,
+        accepts: @MainActor () -> Bool
+    ) async throws {
+        let durableTarget = storedID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var attempt = 0
+        while true {
+            do {
+                try await hydrateTranscript(
+                    chat: chat,
+                    resumeMessages: resumeMessages,
+                    clearWhenEmpty: clearWhenEmpty,
+                    fallback: {
+                        guard !durableTarget.isEmpty else { return nil }
+                        do {
+                            return try await fallback(durableTarget)
+                        } catch {
+                            if let timeout = CanonicalHydrationTimeout.wraps(
+                                error, storedID: durableTarget) {
+                                throw timeout
+                            }
+                            throw error
+                        }
+                    },
+                    accepts: accepts)
+                return
+            } catch let timeout as CanonicalHydrationTimeout {
+                if attempt == 0 && timeout.storedID == durableTarget {
+                    // There is no backoff or route re-resolution here. The
+                    // retry has exactly the same durable database target and
+                    // can happen at most once for this hydration operation.
+                    attempt += 1
+                    continue
+                }
+                // A persistent timeout is still the transport's original
+                // typed failure, not this internal retry sentinel.
+                throw timeout.original
+            }
+        }
+    }
+
     // MARK: The pin
 
     /// Write the canonical pin back so desktop opens the same chat
@@ -1285,11 +1458,13 @@ extension AppModel {
         // gateway cannot store it (older gateway, read-only profile), which is
         // exactly what desktop's plugin-local store buys (plugin.js:205-212).
         runtime.pins[botID] = storedID
+        runtime.grandfatherCandidates[botID] = nil
         if previous != storedID { runtime.dirtyPins.insert(botID) }
         // Counted before the early return too: a local-only pin (offline, or a
         // gateway that cannot store ui_meta) still has to outrank the stale
         // roster answer that a poll already in flight is about to deliver.
         runtime.writeCount[botID, default: 0] += 1
+        runtime.noteWrite(botID)
         guard mode == .live,
               let route = gatewayRoute(for: botID) else { return }
         let gatewayGeneration = LiveRuntime.shared.generation
@@ -1297,12 +1472,14 @@ extension AppModel {
         guard profileLifecycleAcceptsGatewaySnapshot(
             route: route, client: client, generation: gatewayGeneration) else { return }
 
-        var persisted = false
         _ = try? await withBotModeMetaMutation(route: route) {
             guard self.profileLifecycleAcceptsGatewaySnapshot(
                 route: route, client: client, generation: gatewayGeneration) else { return }
             runtime.writing.insert(botID)
-            defer { runtime.writing.remove(botID) }
+            defer {
+                runtime.writing.remove(botID)
+                runtime.noteWrite(botID)
+            }
             do {
                 // Fresh read: ui_meta rides every profiles.list, and desktop may
                 // have rewritten the block since the last roster poll. Sessions are
@@ -1313,10 +1490,9 @@ extension AppModel {
                 guard let row = profiles.first(where: { $0.name == route.profile }) else { return }
                 var block = row.uiMeta?["hermes-bots"]?.objectValue ?? [:]
                 block["chat"] = .string(storedID)
-                let applied = try await client.applyProfileEdit(
+                _ = try await client.applyProfileEdit(
                     name: route.profile,
                     ProfileEdit(uiMeta: .object(["hermes-bots": .object(block)])))
-                persisted = applied["ui_meta"] == true
             } catch {
                 // Desktop's three-valued outcome (plugin.js:250-270) exists so an
                 // older gateway that does not speak the contract produces no toast
@@ -1324,11 +1500,9 @@ extension AppModel {
                 // open and the pin holds locally, so nothing is surfaced.
             }
         }
-        if persisted,
-           self.profileLifecycleAcceptsGatewaySnapshot(
-               route: route, client: client, generation: gatewayGeneration) {
-            runtime.dirtyPins.remove(botID)
-        }
+        // A successful configure receipt is not a roster snapshot. Keep the
+        // pin dirty until applyRosterAnswer sees the matching server block;
+        // that closes the issue-before-write / answer-after-write race.
     }
 
     // MARK: Failure

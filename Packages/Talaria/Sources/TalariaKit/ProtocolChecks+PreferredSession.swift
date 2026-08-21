@@ -1,6 +1,7 @@
 import Foundation
 
-// The `preferred_session` tri-state, pinned to observed wire shapes.
+// The `preferred_session` tri-state plus the conversation/worker activity
+// split, pinned to observed wire shapes.
 //
 // This check exists because the distinction it guards cannot be exercised
 // against the gateway the app actually talks to today. Verified 2026-08-18
@@ -47,6 +48,8 @@ extension ProtocolChecks {
         if case .notRequested = absent.preferredSession {} else {
             throw CheckFailure(description: "FAILED: a missing preferred_session must read as notRequested")
         }
+        try expect(absent.preferredSession.isOmitted,
+                   "a missing preferred_session retains its explicit omitted state")
         try expect(!absent.preferredSession.isDefinitivelyGone,
                    "a gateway that ignores preferred_session_ids never declares a pin gone")
         // Nothing to fold: the row keeps last_session's own preview.
@@ -62,11 +65,13 @@ extension ProtocolChecks {
                          "last_active":1787078093.2499032,"message_count":132},
          "preferred_session":{"id":"20260815_133046_e88359",
                               "resolved_id":"20260815_133046_e88359",
+                              "root_title":"Bot Chat",
                               "title":"Find new bot option in Hermes",
                               "preview":"Message sent to **@ez-qa** with the full GitHub migration brief. I’ll relay its ...",
                               "started_at":1786818646.81803,"last_active":1787078075.3138812,
                               "message_count":132},
-         "has_avatar":true}
+         "worker_session":{"last_active":1787078120.0},
+         "display_name":"Hermes Prime","has_avatar":true}
         """
         let resolved = HermesProfile(try JSONDecoder().decode(JSONValue.self,
                                                               from: Data(resolvedRow.utf8)))
@@ -74,16 +79,46 @@ extension ProtocolChecks {
             throw CheckFailure(description: "FAILED: a preferred_session summary must read as resolved")
         }
         try expect(pinned.resolvedID == "20260815_133046_e88359", "resolved_id parses")
+        try expect(pinned.rootTitle == "Bot Chat", "root_title parses for compressed canonical checks")
+        try expect(resolved.displayName == "Hermes Prime", "raw core display_name parses separately")
+        try expect(resolved.workerSession?.id == nil
+                    && resolved.workerSession?.lastActive == 1787078120.0,
+                   "worker_session preserves a timestamp even when the gateway omits its id")
+        try expect(resolved.workerSession?.isLive(at: 1787078270.0) == true
+                    && resolved.workerSession?.isLive(at: 1787078270.1) == false,
+                   "worker liveness uses the exact 150-second policy window")
         let folded = resolved.foldingCanonicalPreview()
         try expect(folded.lastSession?.preview?.hasPrefix("Message sent") == true,
-                   "the pin's preview text folds onto the row")
-        // Stamps and ranking stay last_session's — any recent activity from any
-        // client means the bot is awake (plugin.js:3852-3858).
+                   "preferred_session owns preview identity even when scratch activity is newer")
+        // Activity remains separate: the newer visible scratch row advances
+        // unread/recency without replacing the click identity's preview.
         try expect(folded.lastSession?.id == "20260815_133046_e88359"
-                    && folded.lastSession?.lastActive == 1787078093.2499032,
-                   "the fold moves preview text only, never the row's identity or stamps")
+                    && resolved.freshestConversationSession?.lastActive == 1787078093.2499032,
+                   "preview identity and freshest activity remain independently coherent")
         try expect(resolved.rawLastSession?.preview == "a scratch session's newest line",
                    "rawLastSession keeps the untouched wire value")
+
+        // 2b. Preferred can be newer than last_session. It then becomes the
+        // coherent conversation source for unread/recency/relative age, not
+        // merely a replacement preview string.
+        let preferredFreshRow = """
+        {"name":"research","skill_count":1,
+         "last_session":{"id":"last","title":"Scratch","preview":"old scratch",
+                         "last_active":100.0,"message_count":9},
+         "preferred_session":{"id":"pin","resolved_id":"tip","root_title":"Bot Chat",
+                              "title":"Bot Chat continuation","preview":"new canonical",
+                              "last_active":101.0,"message_count":10},
+         "worker_session":{"id":"worker","last_active":849.0}}
+        """
+        let preferredFresh = HermesProfile(try JSONDecoder().decode(JSONValue.self,
+                                                                      from: Data(preferredFreshRow.utf8)))
+        try expect(preferredFresh.freshestConversationSession?.id == "pin"
+                    && preferredFresh.freshestConversationSession?.lastActive == 101.0,
+                   "a fresher preferred session wins conversation activity")
+        try expect(preferredFresh.foldingCanonicalPreview().lastSession?.preview == "new canonical",
+                   "the compatibility projection keeps a fresh preferred row coherent")
+        try expect(preferredFresh.workerSession?.isLive(at: 1_000) == false,
+                   "a stale worker never becomes live merely because it exists")
 
         // 3. Resolved onto a row with no `last_session` — the real
         //    `code-review` case, where the pin is the only conversation the row
@@ -117,15 +152,17 @@ extension ProtocolChecks {
         try expect(gone.foldingCanonicalPreview().lastSession == nil,
                    "a gone pin invents no preview")
 
-        // 5. A malformed summary (no `id`) is not evidence the pin survives.
-        //    Treated as gone rather than resolved, because `ProfileSessionRef`
-        //    could not name a session to open.
+        // 5. A malformed present object is inconclusive. Only literal JSON
+        //    null proves a pin is gone; a partial/newer gateway shape must not
+        //    authorize clearing or replacing a durable identity.
         let malformed = """
         {"name":"default","skill_count":0,"preferred_session":{"title":"no id here"}}
         """
         let broken = HermesProfile(try JSONDecoder().decode(JSONValue.self,
                                                             from: Data(malformed.utf8)))
-        try expect(broken.preferredSession.session == nil,
-                   "a summary with no id resolves to no session")
+        try expect(broken.preferredSession.session == nil
+                    && broken.preferredSession.isOmitted
+                    && !broken.preferredSession.isDefinitivelyGone,
+                   "a malformed present summary remains inconclusive, never gone")
     }
 }
