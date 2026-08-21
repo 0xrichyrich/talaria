@@ -747,6 +747,248 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
                        "the new unsequenced frame is still delivered once")
     }
 
+    func testPrepareIdentityMismatchRetiresStagingGateAfterPoolFlip() async throws {
+        let model = AppModel()
+        let gatewayID = "prepare-same-client-flip-\(UUID().uuidString)"
+        let oldClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(
+                string: "https://prepare-same-old-\(UUID().uuidString).example")),
+            credential: .sessionToken("prepare-same-old-token"))
+        let replacementClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(
+                string: "https://prepare-same-new-\(UUID().uuidString).example")),
+            credential: .sessionToken("prepare-same-new-token"))
+        let pool = ConnectionRegistry.shared.clientPool
+        await pool.adopt(oldClient, for: gatewayID)
+
+        let (oldStream, oldContinuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let oldHandler = await oldClient.addEventHandler { oldContinuation.yield($0) }
+        let oldGate = RoutedEventGate(client: oldClient, generation: 41)
+        let oldProbe = RoutedEventProbe()
+        let oldPump = Task { @MainActor in
+            for await event in oldStream {
+                guard oldGate.claimForPump(event) else { continue }
+                await oldProbe.record(event)
+            }
+        }
+        let runtime = MultiGatewayRuntime.shared
+        runtime.routedEventGenerations[gatewayID] = 41
+        runtime.routedEvents[gatewayID] = .init(
+            client: oldClient, handlerID: oldHandler, pump: oldPump,
+            continuation: oldContinuation, gate: oldGate, generation: 41)
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        LiveRuntime.shared.gatewayID = "primary-prepare-same-client-flip"
+        defer {
+            oldGate.retire()
+            oldPump.cancel()
+            oldContinuation.finish()
+            Task { await oldClient.removeEventHandler(oldHandler) }
+            runtime.routedEvents[gatewayID] = nil
+            runtime.routedEventGenerations[gatewayID] = nil
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            Task { await pool.disconnect(gatewayID: gatewayID) }
+        }
+
+        // This is the in-flight same-client handoff state when the pool slot
+        // is replaced by a newer client before the staged handler is checked.
+        oldGate.beginStaging()
+        await oldClient.emitEventForTesting(GatewayEvent(
+            type: "message.complete", sessionID: "queued-old-runtime",
+            payload: .object(["text": .string("queued before pool flip")]),
+            inboundSequence: 1))
+        await pool.adopt(replacementClient, for: gatewayID)
+
+        let prepared = await model.prepareExactRoutedEvents(
+            client: oldClient, gatewayID: gatewayID)
+        XCTAssertNil(prepared)
+        XCTAssertFalse(oldGate.isOpen,
+                       "a stale same-client gate must not be restored after the pool flip")
+        XCTAssertNil(runtime.routedEvents[gatewayID])
+        XCTAssertEqual(runtime.routedEventGenerations[gatewayID], 42)
+
+        for _ in 0..<20 { await Task.yield() }
+        let observed = await oldProbe.events
+        XCTAssertTrue(observed.isEmpty,
+                      "queued old frames must not replay after stale cleanup")
+    }
+
+    func testPrepareIdentityMismatchRetiresDifferentClientAndRejectsQueuedOldFrames()
+        async throws {
+        let model = AppModel()
+        let gatewayID = "prepare-different-client-flip-\(UUID().uuidString)"
+        let oldClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(
+                string: "https://prepare-different-old-\(UUID().uuidString).example")),
+            credential: .sessionToken("prepare-different-old-token"))
+        let attemptedClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(
+                string: "https://prepare-different-attempted-\(UUID().uuidString).example")),
+            credential: .sessionToken("prepare-different-attempted-token"))
+        let replacementClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(
+                string: "https://prepare-different-new-\(UUID().uuidString).example")),
+            credential: .sessionToken("prepare-different-new-token"))
+        let pool = ConnectionRegistry.shared.clientPool
+        await pool.adopt(oldClient, for: gatewayID)
+
+        let (oldStream, oldContinuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let oldHandler = await oldClient.addEventHandler { oldContinuation.yield($0) }
+        let oldGate = RoutedEventGate(client: oldClient, generation: 51)
+        let oldProbe = RoutedEventProbe()
+        let oldPump = Task { @MainActor in
+            for await event in oldStream {
+                guard oldGate.claimForPump(event) else { continue }
+                await oldProbe.record(event)
+            }
+        }
+        let runtime = MultiGatewayRuntime.shared
+        runtime.routedEventGenerations[gatewayID] = 51
+        runtime.routedEvents[gatewayID] = .init(
+            client: oldClient, handlerID: oldHandler, pump: oldPump,
+            continuation: oldContinuation, gate: oldGate, generation: 51)
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        LiveRuntime.shared.gatewayID = "primary-prepare-different-client-flip"
+        MultiGatewayRuntime.shared.prepareAfterHandlerInstallationForTesting = {
+            _, _, _ in
+            // The different-client path retires the old gate before this hook
+            // runs. This frame is therefore queued at the stale boundary and
+            // must never reach the old pump.
+            await oldClient.emitEventForTesting(GatewayEvent(
+                type: "message.complete", sessionID: "queued-different-old-runtime",
+                payload: .object(["text": .string("queued after retire")]),
+                inboundSequence: 2))
+            await Task.yield()
+        }
+        defer {
+            MultiGatewayRuntime.shared.prepareAfterHandlerInstallationForTesting = nil
+            oldGate.retire()
+            oldPump.cancel()
+            oldContinuation.finish()
+            Task { await oldClient.removeEventHandler(oldHandler) }
+            runtime.routedEvents[gatewayID] = nil
+            runtime.routedEventGenerations[gatewayID] = nil
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            Task { await pool.disconnect(gatewayID: gatewayID) }
+        }
+
+        await pool.adopt(replacementClient, for: gatewayID)
+        let prepared = await model.prepareExactRoutedEvents(
+            client: attemptedClient, gatewayID: gatewayID)
+        XCTAssertNil(prepared)
+        XCTAssertFalse(oldGate.isOpen,
+                       "a retired different-client gate must remain closed")
+        XCTAssertNil(runtime.routedEvents[gatewayID])
+        XCTAssertEqual(runtime.routedEventGenerations[gatewayID], 52)
+
+        for _ in 0..<20 { await Task.yield() }
+        let observed = await oldProbe.events
+        XCTAssertTrue(observed.isEmpty,
+                      "queued old frames must be rejected by the retired gate")
+    }
+
+    func testPrepareIdentityMismatchPreservesConcurrentNewerRuntimePublication()
+        async throws {
+        let model = AppModel()
+        let gatewayID = "prepare-newer-runtime-wins-\(UUID().uuidString)"
+        let oldClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(
+                string: "https://prepare-newer-old-\(UUID().uuidString).example")),
+            credential: .sessionToken("prepare-newer-old-token"))
+        let attemptedClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(
+                string: "https://prepare-newer-attempted-\(UUID().uuidString).example")),
+            credential: .sessionToken("prepare-newer-attempted-token"))
+        let newerClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(
+                string: "https://prepare-newer-current-\(UUID().uuidString).example")),
+            credential: .sessionToken("prepare-newer-current-token"))
+        let pool = ConnectionRegistry.shared.clientPool
+        await pool.adopt(oldClient, for: gatewayID)
+
+        let (oldStream, oldContinuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let oldHandler = await oldClient.addEventHandler { oldContinuation.yield($0) }
+        let oldGate = RoutedEventGate(client: oldClient, generation: 61)
+        let oldProbe = RoutedEventProbe()
+        let oldPump = Task { @MainActor in
+            for await event in oldStream {
+                guard oldGate.claimForPump(event) else { continue }
+                await oldProbe.record(event)
+            }
+        }
+
+        let (_, newContinuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let newerProbe = RoutedEventProbe()
+        let newerHandler = await newerClient.addEventHandler { event in
+            Task { await newerProbe.record(event) }
+            newContinuation.yield(event)
+        }
+        let newerGate = RoutedEventGate(client: newerClient, generation: 77)
+        let newerPump = Task<Void, Never> {}
+        let runtime = MultiGatewayRuntime.shared
+        runtime.routedEventGenerations[gatewayID] = 61
+        runtime.routedEvents[gatewayID] = .init(
+            client: oldClient, handlerID: oldHandler, pump: oldPump,
+            continuation: oldContinuation, gate: oldGate, generation: 61)
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        LiveRuntime.shared.gatewayID = "primary-prepare-newer-runtime-wins"
+        MultiGatewayRuntime.shared.prepareAfterHandlerInstallationForTesting = {
+            gatewayID, _, _ in
+            // Publish the newer owner before the stale prepare resumes its
+            // pool check. The failed attempt must not erase this entry.
+            runtime.routedEventGenerations[gatewayID] = 77
+            runtime.routedEvents[gatewayID] = .init(
+                client: newerClient, handlerID: newerHandler, pump: newerPump,
+                continuation: newContinuation, gate: newerGate, generation: 77)
+            await pool.adopt(newerClient, for: gatewayID)
+            await oldClient.emitEventForTesting(GatewayEvent(
+                type: "message.complete", sessionID: "queued-old-after-newer",
+                payload: .object(["text": .string("old must stay closed")]),
+                inboundSequence: 3))
+        }
+        defer {
+            MultiGatewayRuntime.shared.prepareAfterHandlerInstallationForTesting = nil
+            oldGate.retire()
+            newerGate.retire()
+            oldPump.cancel()
+            newerPump.cancel()
+            oldContinuation.finish()
+            newContinuation.finish()
+            Task { await oldClient.removeEventHandler(oldHandler) }
+            Task { await newerClient.removeEventHandler(newerHandler) }
+            runtime.routedEvents[gatewayID] = nil
+            runtime.routedEventGenerations[gatewayID] = nil
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            Task { await pool.disconnect(gatewayID: gatewayID) }
+        }
+
+        let prepared = await model.prepareExactRoutedEvents(
+            client: attemptedClient, gatewayID: gatewayID)
+        XCTAssertNil(prepared)
+        XCTAssertFalse(oldGate.isOpen)
+        XCTAssertEqual(runtime.routedEvents[gatewayID]?.handlerID, newerHandler,
+                       "a newer runtime publication must survive stale cleanup")
+        XCTAssertEqual(runtime.routedEvents[gatewayID].map {
+            ObjectIdentifier($0.client) == ObjectIdentifier(newerClient)
+        }, true)
+        XCTAssertEqual(runtime.routedEventGenerations[gatewayID], 77)
+
+        await newerClient.emitEventForTesting(GatewayEvent(
+            type: "message.complete", sessionID: "newer-runtime",
+            payload: .object(["text": .string("newer survives")]),
+            inboundSequence: 4))
+        for _ in 0..<100 {
+            let count = await newerProbe.events.count
+            if count > 0 { break }
+            await Task.yield()
+        }
+        let oldEvents = await oldProbe.events
+        let newerEvents = await newerProbe.events
+        XCTAssertTrue(oldEvents.isEmpty,
+                      "the captured old source must reject queued frames")
+        XCTAssertEqual(newerEvents.map(\.inboundSequence), [4],
+                       "the concurrent newer source remains live")
+    }
+
     func testForeignExactOpenStagesAlongsideExistingSameClientPump() async throws {
         let model = AppModel()
         let gatewayID = "foreign-existing-pump-(UUID().uuidString)"

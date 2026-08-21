@@ -53,6 +53,13 @@ final class MultiGatewayRuntime {
 
     var routedEvents: [String: RoutedEvents] = [:]
     var routedEventGenerations: [String: UInt64] = [:]
+    /// Focused preparation seam: tests use this to publish a newer routed
+    /// subscription while the staged handler is being installed. The source
+    /// identity check must preserve that newer owner when the older prepare
+    /// attempt subsequently fails closed.
+    var prepareAfterHandlerInstallationForTesting:
+        (@MainActor (_ gatewayID: String, _ client: GatewayClient,
+                     _ handlerID: UUID) async -> Void)?
     /// Unread counts for bots whose gateway is not currently primary.
     /// Primary rows keep the existing `Bot.unread` storage for compatibility;
     /// gateway switches move counts between the two representations.
@@ -586,6 +593,9 @@ public extension AppModel {
         }
         let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
         let handlerID = await client.addEventHandler { continuation.yield($0) }
+        if let hook = MultiGatewayRuntime.shared.prepareAfterHandlerInstallationForTesting {
+            await hook(gatewayID, client, handlerID)
+        }
         let current = await ConnectionRegistry.shared.clientPool.client(for: gatewayID)
         // A missing pool entry is tolerated for deterministic/test clients;
         // the caller's captured source fence remains authoritative in live
@@ -593,8 +603,31 @@ public extension AppModel {
         guard current == nil
             || current.map(ObjectIdentifier.init) == ObjectIdentifier(client) else {
             if let existing {
-                let replay = existing.gate?.restoreForRollback() ?? []
-                for event in replay { existing.continuation?.yield(event) }
+                // The pool has moved on while this attempt was suspended. Both
+                // the requested client and the captured routed owner are stale
+                // relative to that slot, so rollback must not resurrect the
+                // old source. Retire it before removing its handler; a queued
+                // frame must fail closed even while actor cleanup is pending.
+                existing.gate?.retire()
+                existing.continuation?.finish()
+                existing.pump.cancel()
+
+                // Do not clear a newer publication that won while the handler
+                // was being installed. This check and the removal are both
+                // synchronous on MainActor, so no newer owner can interleave.
+                let ownsCapturedRuntime = MultiGatewayRuntime.shared
+                    .routedEvents[gatewayID]
+                    .map {
+                        $0.handlerID == existing.handlerID
+                            && ObjectIdentifier($0.client)
+                                == ObjectIdentifier(existing.client)
+                    } == true
+                if ownsCapturedRuntime {
+                    MultiGatewayRuntime.shared.routedEvents[gatewayID] = nil
+                    MultiGatewayRuntime.shared.routedEventGenerations[gatewayID,
+                                                                        default: 0] &+= 1
+                }
+                await existing.client.removeEventHandler(existing.handlerID)
             }
             await client.removeEventHandler(handlerID)
             continuation.finish()
