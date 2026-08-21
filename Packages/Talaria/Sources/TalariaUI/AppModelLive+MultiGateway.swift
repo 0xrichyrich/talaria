@@ -504,8 +504,13 @@ final class PreparedExactRoutedEvents {
     let continuation: AsyncStream<GatewayEvent>.Continuation
     private var committed = false
     private var activation: AsyncStream<Void>.Continuation?
-    private var stagedPriorGate: RoutedEventGate?
-    private var stagedPriorContinuation: AsyncStream<GatewayEvent>.Continuation?
+    /// The exact routed owner that was present when preparation started. A
+    /// same-client owner can be restored if resume/authority fails before the
+    /// visible commit; a different-client owner is already stale once the
+    /// pool has published the replacement and must be retired permanently.
+    private var stagedPrior: MultiGatewayRuntime.RoutedEvents?
+    private var stagedPriorCanRestore = false
+    private var discarded = false
 
     init(client: GatewayClient, gatewayID: String, handlerID: UUID,
          stream: AsyncStream<GatewayEvent>,
@@ -522,25 +527,38 @@ final class PreparedExactRoutedEvents {
         self.activation = activation
     }
 
-    func rememberStagedPrior(_ gate: RoutedEventGate,
-                             continuation: AsyncStream<GatewayEvent>.Continuation?) {
-        stagedPriorGate = gate
-        stagedPriorContinuation = continuation
+    func rememberStagedPrior(_ prior: MultiGatewayRuntime.RoutedEvents,
+                             canRestore: Bool) {
+        stagedPrior = prior
+        stagedPriorCanRestore = canRestore
     }
 
     /// Resume/authority failure happens before a transaction exists. Restore
-    /// the old gate synchronously before removing the invisible handler.
-    func restoreStagedPrior() {
-        guard let stagedPriorGate else { return }
-        let replay = stagedPriorGate.restoreForRollback()
-        for event in replay { stagedPriorContinuation?.yield(event) }
-        self.stagedPriorGate = nil
-        stagedPriorContinuation = nil
+    /// only an exact same-client owner synchronously before removing the
+    /// invisible handler. A newer publication winning during the await must
+    /// never be overwritten by this stale attempt.
+    @discardableResult
+    func restoreStagedPrior() -> MultiGatewayRuntime.RoutedEvents? {
+        guard stagedPriorCanRestore, let prior = stagedPrior else { return nil }
+        defer {
+            stagedPrior = nil
+            stagedPriorCanRestore = false
+        }
+        let runtime = MultiGatewayRuntime.shared
+        guard ownsRuntime(prior, runtime: runtime) else {
+            prior.gate?.retire()
+            prior.continuation?.finish()
+            prior.pump.cancel()
+            return prior
+        }
+        let replay = prior.gate?.restoreForRollback() ?? []
+        for event in replay { prior.continuation?.yield(event) }
+        return nil
     }
 
     func forgetStagedPrior() {
-        stagedPriorGate = nil
-        stagedPriorContinuation = nil
+        stagedPrior = nil
+        stagedPriorCanRestore = false
     }
 
     /// Mark a published intake as abandoned during a synchronous transaction
@@ -562,16 +580,51 @@ final class PreparedExactRoutedEvents {
     func finish() { continuation.finish() }
 
     func discard() async {
-        guard !committed else { return }
-        restoreStagedPrior()
+        guard !committed, !discarded else { return }
+        discarded = true
+        let prior = stagedPrior
+        let canRestore = stagedPriorCanRestore
+        var stalePrior: MultiGatewayRuntime.RoutedEvents?
+        if canRestore {
+            stalePrior = restoreStagedPrior()
+        } else if let prior {
+            // The pool has already selected a different client. Retire every
+            // old delivery path synchronously, then remove only the captured
+            // handler. If a newer runtime publication won during resume, its
+            // slot and approval scope remain untouched.
+            prior.gate?.retire()
+            prior.continuation?.finish()
+            prior.pump.cancel()
+            let runtime = MultiGatewayRuntime.shared
+            if ownsRuntime(prior, runtime: runtime) {
+                runtime.routedEvents[gatewayID] = nil
+                runtime.routedEventGenerations[gatewayID,
+                                               default: prior.generation] &+= 1
+                ApprovalBridges.shared.resetSweepScope(gatewayID: gatewayID)
+            }
+            forgetStagedPrior()
+            await prior.client.removeEventHandler(prior.handlerID)
+        }
+        if let stalePrior {
+            await stalePrior.client.removeEventHandler(stalePrior.handlerID)
+        }
         continuation.finish()
         await client.removeEventHandler(handlerID)
     }
 
     func discardAfterRollback() async {
+        guard !discarded else { return }
+        discarded = true
         forgetStagedPrior()
         abandonCommitted()
         await client.removeEventHandler(handlerID)
+    }
+
+    private func ownsRuntime(_ candidate: MultiGatewayRuntime.RoutedEvents,
+                             runtime: MultiGatewayRuntime) -> Bool {
+        guard let current = runtime.routedEvents[gatewayID] else { return false }
+        return current.handlerID == candidate.handlerID
+            && ObjectIdentifier(current.client) == ObjectIdentifier(candidate.client)
     }
 
     func yieldForTesting(_ event: GatewayEvent) { continuation.yield(event) }
@@ -609,8 +662,9 @@ public extension AppModel {
             existing?.gate?.beginStaging()
         } else {
             // The pool has already selected this client as the source's
-            // current identity. Keep the old handler attached for rollback,
-            // but reject its stale frames while the exact resume is in flight.
+            // current identity. Keep the old handler attached only until the
+            // pre-commit resume settles, but reject its stale frames while the
+            // exact resume is in flight; a failure retires it permanently.
             existing?.gate?.retire()
         }
         let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
@@ -658,8 +712,11 @@ public extension AppModel {
         let prepared = PreparedExactRoutedEvents(
             client: client, gatewayID: gatewayID, handlerID: handlerID,
             stream: stream, continuation: continuation)
-        if let gate = existing?.gate {
-            prepared.rememberStagedPrior(gate, continuation: existing?.continuation)
+        if let existing {
+            prepared.rememberStagedPrior(
+                existing,
+                canRestore: ObjectIdentifier(existing.client)
+                    == ObjectIdentifier(client))
         }
         return prepared
     }
@@ -728,13 +785,17 @@ public extension AppModel {
             generation: generation)
         runtime.routedEventGenerations[gatewayID] = generation
         runtime.routedEvents[gatewayID] = replacement
-        prepared.forgetStagedPrior()
         prepared.markCommitted(activation)
-        return ExactRoutedEventsTransaction(
+        let transaction = ExactRoutedEventsTransaction(
             gatewayID: gatewayID, replacement: replacement, previous: previous,
             previousGeneration: previousGeneration,
             previousApprovalSweepEpoch: previousApprovalSweepEpoch,
             prepared: prepared)
+        // The transaction now owns the exact `previous` cleanup/rollback
+        // decision. Do not leave either prior record on the prepared intake to
+        // be considered by a later pre-commit discard.
+        prepared.forgetStagedPrior()
+        return transaction
     }
 
     enum GatewayRouteError: LocalizedError {

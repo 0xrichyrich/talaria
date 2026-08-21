@@ -1290,12 +1290,24 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         let sentinelClient = GatewayClient(
             baseURL: try XCTUnwrap(URL(string: "https://sentinel-events.example")),
             credential: .sessionToken("unused-sentinel-token"))
-        let sentinelHandler = await sentinelClient.addEventHandler { _ in }
-        let sentinelPump = Task<Void, Never> {}
+        let (sentinelStream, sentinelContinuation) =
+            AsyncStream.makeStream(of: GatewayEvent.self)
+        let sentinelHandler = await sentinelClient.addEventHandler {
+            sentinelContinuation.yield($0)
+        }
+        let sentinelGate = RoutedEventGate(client: sentinelClient, generation: 41)
+        let sentinelProbe = RoutedEventProbe()
+        let sentinelPump = Task { @MainActor in
+            for await event in sentinelStream {
+                guard sentinelGate.claimForPump(event) else { continue }
+                await sentinelProbe.record(event)
+            }
+        }
         let eventRuntime = MultiGatewayRuntime.shared
         eventRuntime.routedEventGenerations[gatewayID] = 41
         eventRuntime.routedEvents[gatewayID] = .init(
-            client: sentinelClient, handlerID: sentinelHandler, pump: sentinelPump)
+            client: sentinelClient, handlerID: sentinelHandler, pump: sentinelPump,
+            continuation: sentinelContinuation, gate: sentinelGate, generation: 41)
         eventRuntime.routedUnread[route] = 7
         let approvalID = "approval-exact-transaction"
         LiveRuntime.shared.approvalTargets[approvalID] = ApprovalResponseTarget(
@@ -1323,7 +1335,10 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         let oldGatewayID = LiveRuntime.shared.gatewayID
         LiveRuntime.shared.gatewayID = "primary-exact-transaction"
         defer {
+            sentinelGate.retire()
             sentinelPump.cancel()
+            sentinelContinuation.finish()
+            Task { await sentinelClient.removeEventHandler(sentinelHandler) }
             eventRuntime.routedEvents[gatewayID] = nil
             eventRuntime.routedEventGenerations[gatewayID] = nil
             eventRuntime.routedUnread[route] = nil
@@ -1361,11 +1376,19 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         XCTAssertEqual(targetChat.sessionID, "target-old-runtime")
         XCTAssertEqual(targetChat.storedSessionID, "target-old-stored")
         XCTAssertEqual(eventRuntime.routedUnread[route], 7)
-        XCTAssertTrue(eventRuntime.routedEvents[gatewayID].map {
-            ObjectIdentifier($0.client) == ObjectIdentifier(sentinelClient)
-        } == true)
-        XCTAssertEqual(eventRuntime.routedEventGenerations[gatewayID], 41)
+        XCTAssertFalse(sentinelGate.isOpen,
+                       "a different-client pre-commit failure must keep the old gate closed")
+        XCTAssertNil(eventRuntime.routedEvents[gatewayID],
+                     "a different-client pre-commit failure must not restore old runtime")
+        XCTAssertEqual(eventRuntime.routedEventGenerations[gatewayID], 42)
         XCTAssertNotNil(LiveRuntime.shared.approvalTargets[approvalID])
+        await sentinelClient.emitEventForTesting(GatewayEvent(
+            type: "message.complete", sessionID: "stale-runtime",
+            payload: .object(["text": .string("stale")]), inboundSequence: 1))
+        for _ in 0..<20 { await Task.yield() }
+        let staleEvents = await sentinelProbe.events
+        XCTAssertTrue(staleEvents.isEmpty,
+                      "queued old frames must be rejected after stale cleanup")
 
         do {
             _ = try await model.openStoredSessionAwaiting(
@@ -1396,10 +1419,8 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         XCTAssertEqual(targetChat.sessionID, "target-old-runtime")
         XCTAssertEqual(targetChat.storedSessionID, "target-old-stored")
         XCTAssertEqual(eventRuntime.routedUnread[route], 7)
-        XCTAssertTrue(eventRuntime.routedEvents[gatewayID].map {
-            ObjectIdentifier($0.client) == ObjectIdentifier(sentinelClient)
-        } == true)
-        XCTAssertEqual(eventRuntime.routedEventGenerations[gatewayID], 41)
+        XCTAssertNil(eventRuntime.routedEvents[gatewayID])
+        XCTAssertEqual(eventRuntime.routedEventGenerations[gatewayID], 42)
         XCTAssertNotNil(LiveRuntime.shared.approvalTargets[approvalID])
 
         do {
@@ -1429,14 +1450,199 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         XCTAssertEqual(targetChat.sessionID, "target-old-runtime")
         XCTAssertEqual(targetChat.storedSessionID, "target-old-stored")
         XCTAssertEqual(eventRuntime.routedUnread[route], 7)
-        XCTAssertTrue(eventRuntime.routedEvents[gatewayID].map {
-            ObjectIdentifier($0.client) == ObjectIdentifier(sentinelClient)
-        } == true)
-        XCTAssertEqual(eventRuntime.routedEventGenerations[gatewayID], 41)
+        XCTAssertNil(eventRuntime.routedEvents[gatewayID])
+        XCTAssertEqual(eventRuntime.routedEventGenerations[gatewayID], 42)
         XCTAssertNotNil(LiveRuntime.shared.approvalTargets[approvalID])
 
-        await sentinelClient.removeEventHandler(sentinelHandler)
         await pool.disconnect(gatewayID: gatewayID)
+    }
+
+    func testSameClientPreCommitDiscardRestoresParkedTargetEvents() async throws {
+        let model = AppModel()
+        let gatewayID = "same-client-precommit-discard-\(UUID().uuidString)"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: "researcher")
+        let target = route.qualifiedID
+        let client = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://same-client-discard-\(UUID().uuidString).example")),
+            credential: .sessionToken("same-client-discard-token"))
+        let pool = ConnectionRegistry.shared.clientPool
+        await pool.adopt(client, for: gatewayID)
+
+        let (oldStream, oldContinuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let oldHandler = await client.addEventHandler { oldContinuation.yield($0) }
+        let oldGate = RoutedEventGate(client: client, generation: 55)
+        let probe = RoutedEventProbe()
+        let oldPump = Task { @MainActor in
+            for await event in oldStream {
+                guard oldGate.claimForPump(event) else { continue }
+                await probe.record(event)
+            }
+        }
+        let runtime = MultiGatewayRuntime.shared
+        runtime.routedEventGenerations[gatewayID] = 55
+        runtime.routedEvents[gatewayID] = .init(
+            client: client, handlerID: oldHandler, pump: oldPump,
+            continuation: oldContinuation, gate: oldGate, generation: 55)
+        let oldApprovalEpoch = ApprovalBridges.shared.sweepEpochs[gatewayID]
+        ApprovalBridges.shared.sweepEpochs[gatewayID] = 33
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        let oldMode = model.mode
+        let oldBots = model.bots
+        let oldChat = model.chats[target]
+        LiveRuntime.shared.gatewayID = "primary-same-client-discard"
+        model.mode = .live
+        model.bots = [Bot(id: target, job: "", shape: .circle, hue: .violet)]
+        model.chats[target] = ChatState()
+        defer {
+            oldGate.retire()
+            oldPump.cancel()
+            oldContinuation.finish()
+            Task { await client.removeEventHandler(oldHandler) }
+            runtime.routedEvents[gatewayID] = nil
+            runtime.routedEventGenerations[gatewayID] = nil
+            ApprovalBridges.shared.sweepEpochs[gatewayID] = oldApprovalEpoch
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            model.mode = oldMode
+            model.bots = oldBots
+            if let oldChat { model.chats[target] = oldChat }
+            else { model.chats[target] = nil }
+            Task { await pool.disconnect(gatewayID: gatewayID) }
+        }
+
+        do {
+            _ = try await model.openStoredSessionAwaiting(
+                "same-client-stored", botID: target, route: route, client: client,
+                validateBeforeBinding: {
+                    XCTFail("authority validation must not run after a failed resume")
+                },
+                resumeForTesting: {
+                    await client.emitEventForTesting(GatewayEvent(
+                        type: "message.complete", sessionID: "same-client-runtime",
+                        payload: .object(["text": .string("parked")]),
+                        inboundSequence: 7))
+                    throw GatewayError(code: -7, message: "resume failed")
+                })
+            XCTFail("failed resume must not publish exact navigation")
+        } catch let error as GatewayError {
+            XCTAssertEqual(error.code, -7)
+        }
+
+        XCTAssertTrue(oldGate.isOpen,
+                      "same-client pre-commit failure restores the old gate")
+        XCTAssertEqual(runtime.routedEvents[gatewayID]?.handlerID, oldHandler)
+        XCTAssertEqual(runtime.routedEventGenerations[gatewayID], 55)
+        XCTAssertEqual(ApprovalBridges.shared.sweepEpochs[gatewayID], 33)
+        for _ in 0..<100 {
+            if await probe.events.count > 0 { break }
+            await Task.yield()
+        }
+        let replayedEvents = await probe.events
+        XCTAssertEqual(replayedEvents.map(\.inboundSequence), [7],
+                       "a parked same-client target frame replays exactly once")
+    }
+
+    func testDifferentClientPreCommitDiscardPreservesConcurrentNewerPublication()
+        async throws {
+        let model = AppModel()
+        let gatewayID = "different-client-concurrent-discard-\(UUID().uuidString)"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: "researcher")
+        let target = route.qualifiedID
+        let oldClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://discard-old-\(UUID().uuidString).example")),
+            credential: .sessionToken("discard-old-token"))
+        let attemptedClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://discard-attempted-\(UUID().uuidString).example")),
+            credential: .sessionToken("discard-attempted-token"))
+        let newerClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://discard-newer-\(UUID().uuidString).example")),
+            credential: .sessionToken("discard-newer-token"))
+        let pool = ConnectionRegistry.shared.clientPool
+        await pool.adopt(attemptedClient, for: gatewayID)
+
+        let (oldStream, oldContinuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let oldHandler = await oldClient.addEventHandler { oldContinuation.yield($0) }
+        let oldGate = RoutedEventGate(client: oldClient, generation: 61)
+        let oldProbe = RoutedEventProbe()
+        let oldPump = Task { @MainActor in
+            for await event in oldStream {
+                guard oldGate.claimForPump(event) else { continue }
+                await oldProbe.record(event)
+            }
+        }
+        let (_, newContinuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let newerHandler = await newerClient.addEventHandler { newContinuation.yield($0) }
+        let newerGate = RoutedEventGate(client: newerClient, generation: 77)
+        let newerPump = Task<Void, Never> {}
+        let runtime = MultiGatewayRuntime.shared
+        runtime.routedEventGenerations[gatewayID] = 61
+        runtime.routedEvents[gatewayID] = .init(
+            client: oldClient, handlerID: oldHandler, pump: oldPump,
+            continuation: oldContinuation, gate: oldGate, generation: 61)
+        let oldApprovalEpoch = ApprovalBridges.shared.sweepEpochs[gatewayID]
+        ApprovalBridges.shared.sweepEpochs[gatewayID] = 91
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        let oldMode = model.mode
+        let oldBots = model.bots
+        let oldChat = model.chats[target]
+        LiveRuntime.shared.gatewayID = "primary-concurrent-discard"
+        model.mode = .live
+        model.bots = [Bot(id: target, job: "", shape: .circle, hue: .violet)]
+        model.chats[target] = ChatState()
+        defer {
+            oldGate.retire()
+            oldPump.cancel()
+            oldContinuation.finish()
+            newerGate.retire()
+            newerPump.cancel()
+            newContinuation.finish()
+            Task { await oldClient.removeEventHandler(oldHandler) }
+            Task { await newerClient.removeEventHandler(newerHandler) }
+            runtime.routedEvents[gatewayID] = nil
+            runtime.routedEventGenerations[gatewayID] = nil
+            ApprovalBridges.shared.sweepEpochs[gatewayID] = oldApprovalEpoch
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            model.mode = oldMode
+            model.bots = oldBots
+            if let oldChat { model.chats[target] = oldChat }
+            else { model.chats[target] = nil }
+            Task { await pool.disconnect(gatewayID: gatewayID) }
+        }
+
+        do {
+            _ = try await model.openStoredSessionAwaiting(
+                "concurrent-discard-stored", botID: target, route: route,
+                client: attemptedClient,
+                validateBeforeBinding: {
+                    XCTFail("authority validation must not run after a failed resume")
+                },
+                resumeForTesting: {
+                    await pool.adopt(newerClient, for: gatewayID)
+                    runtime.routedEventGenerations[gatewayID] = 77
+                    runtime.routedEvents[gatewayID] = .init(
+                        client: newerClient, handlerID: newerHandler, pump: newerPump,
+                        continuation: newContinuation, gate: newerGate, generation: 77)
+                    throw GatewayError(code: -7, message: "resume failed")
+                })
+            XCTFail("failed resume must not publish exact navigation")
+        } catch let error as GatewayError {
+            XCTAssertEqual(error.code, -7)
+        }
+
+        XCTAssertFalse(oldGate.isOpen)
+        XCTAssertEqual(runtime.routedEvents[gatewayID]?.handlerID, newerHandler,
+                       "a concurrent newer publication must survive stale discard")
+        XCTAssertEqual(runtime.routedEvents[gatewayID].map {
+            ObjectIdentifier($0.client) == ObjectIdentifier(newerClient)
+        }, true)
+        XCTAssertEqual(runtime.routedEventGenerations[gatewayID], 77)
+        XCTAssertEqual(ApprovalBridges.shared.sweepEpochs[gatewayID], 91,
+                       "stale cleanup must not reset newer approval scope")
+        await oldClient.emitEventForTesting(GatewayEvent(
+            type: "message.complete", sessionID: "old-runtime",
+            payload: .object(["text": .string("stale")]), inboundSequence: 3))
+        for _ in 0..<20 { await Task.yield() }
+        let staleEvents = await oldProbe.events
+        XCTAssertTrue(staleEvents.isEmpty)
     }
 
     func testExactOpenRejectsMissingDurableAckWithoutBackfill() async throws {
