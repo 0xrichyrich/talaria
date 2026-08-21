@@ -54,6 +54,9 @@ public enum RoomEngine {
             }
         }
         let historicalRoutes = routes.union(formerRoutes)
+        let routableRoutes = Set(room.members.filter {
+            !$0.isFrozenProjection
+        }.map(\.route))
 
         guard Set(room.threads.map(\.id)).count == room.threads.count,
               Set(room.entries.map(\.id)).count == room.entries.count,
@@ -83,7 +86,7 @@ public enum RoomEngine {
         }
         if room.attempts.contains(where: {
             !threadIDs.contains($0.threadID)
-                || !($0.finishedAt == nil ? routes : historicalRoutes).contains($0.member)
+                || !($0.finishedAt == nil ? routableRoutes : historicalRoutes).contains($0.member)
                 || $0.baselineMessageCount < 0
                 || $0.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || $0.promptAnchor != RoomAttempt.anchor(for: $0.id)
@@ -105,7 +108,7 @@ public enum RoomEngine {
                 || $0.posted < 0 || $0.posted > maximumPosts
                 || $0.roundStartPosted < 0 || $0.roundStartPosted > $0.posted
                 || Set($0.roundMembers).count != $0.roundMembers.count
-                || !$0.roundMembers.allSatisfy(routes.contains)
+                || !$0.roundMembers.allSatisfy(routableRoutes.contains)
                 || $0.nextMemberIndex > $0.roundMembers.count
         }) { throw RoomValidationError.invalidDrive }
         if room.activity.contains(where: {
@@ -223,6 +226,7 @@ public enum RoomEngine {
                                                 members: [RoomMember]) -> [RoomMember] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return members.filter { member in
+            guard !member.isFrozenProjection else { return false }
             guard mentionInsertionTag(for: member, among: members) != nil else { return false }
             return needle.isEmpty || member.mentionForms.contains { $0.hasPrefix(needle) }
         }
@@ -230,9 +234,10 @@ public enum RoomEngine {
 
     public static func responders(entries: [RoomEntry], members: [RoomMember],
                                   threadID: RoomThreadID) -> [RoomMember] {
+        let routable = members.filter { !$0.isFrozenProjection }
         let log = entries.filter { $0.threadID == threadID }
         guard let boundary = log.lastIndex(where: { $0.speaker == .user }) else {
-            return members
+            return routable
         }
         var mentions = MentionResult()
         for entry in log[boundary...] {
@@ -241,9 +246,9 @@ public enum RoomEngine {
             mentions.ambiguous = mentions.ambiguous || parsed.ambiguous
             mentions.mentioned.formUnion(parsed.mentioned)
         }
-        if mentions.everyone { return members }
-        if mentions.mentioned.isEmpty { return mentions.ambiguous ? [] : members }
-        return members.filter { mentions.mentioned.contains($0.route) }
+        if mentions.everyone { return routable }
+        if mentions.mentioned.isEmpty { return mentions.ambiguous ? [] : routable }
+        return routable.filter { mentions.mentioned.contains($0.route) }
     }
 
     /// The only entry point a driver needs for its round boundary. Returning
@@ -377,12 +382,18 @@ public enum RoomEngine {
             value == value.trimmingCharacters(in: .whitespacesAndNewlines)
                 && BotMention.friendlyTag(from: value) != nil
         } ?? true
+        let rawConnectionIsSafe = member.rawProjectionConnectionID.map { value in
+            !value.isEmpty && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+                && value.count <= 128 && !value.contains(GatewayBotRoute.separator)
+        } ?? !member.isFrozenProjection
         return !gateway.isEmpty && gateway == member.route.gatewayID
             && !profile.isEmpty && profile == member.route.profile
             && GatewayBotRoute(qualifiedID: member.route.qualifiedID) == member.route
             && handle == member.handle
             && handle.range(of: #"^[a-z0-9][a-z0-9._-]*$"#,
                             options: [.regularExpression, .caseInsensitive]) != nil
-            && friendlyIsSafe && rawDisplayIsSafe
+            && friendlyIsSafe && rawDisplayIsSafe && rawConnectionIsSafe
+            && (!member.isFrozenProjection
+                || member.rawProjectionConnectionID == member.route.gatewayID)
     }
 }

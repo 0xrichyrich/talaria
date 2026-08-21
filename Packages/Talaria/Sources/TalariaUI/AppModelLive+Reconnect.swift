@@ -262,6 +262,9 @@ extension AppModel {
             }
             // The socket survived the suspension; the roster may not have.
             try? await refreshRoster()
+            if let gatewayID = LiveRuntime.shared.gatewayID {
+                await pullAndReseedRoomProjection(gatewayID: gatewayID)
+            }
         }
     }
 
@@ -442,6 +445,9 @@ extension AppModel {
         connections = ConnectionRegistry.shared.rows
         await flushComposeQueue()
         exactStoredSessionSourceDidReconnect()
+        if let gatewayID = runtime.gatewayID {
+            await pullAndReseedRoomProjection(gatewayID: gatewayID)
+        }
     }
 
     /// Supervised reconnect finishes after the foreground/network callbacks
@@ -589,6 +595,7 @@ extension AppModel {
     public func signOutGateway(_ gateway: SavedGateway) async {
         beginExactStoredSessionSourceTeardown(gatewayID: gateway.id)
         defer { finishExactStoredSessionSourceTeardown(gatewayID: gateway.id) }
+        cancelRoomProjectionSync(gatewayID: gateway.id)
         guard let base = gateway.baseURL else { return }
         if isActiveGateway(gateway) {
             await disconnectGateway()
@@ -612,6 +619,7 @@ extension AppModel {
     public func removeGateway(_ gateway: SavedGateway) async {
         beginExactStoredSessionSourceTeardown(gatewayID: gateway.id)
         defer { finishExactStoredSessionSourceTeardown(gatewayID: gateway.id) }
+        cancelRoomProjectionSync(gatewayID: gateway.id)
         if isActiveGateway(gateway) {
             await disconnectGateway()
             flushWorldForGatewaySwitch()

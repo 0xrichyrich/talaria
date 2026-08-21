@@ -50,11 +50,21 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
     public var rawDisplayName: String?
     public var handle: String
     public var sourceLabel: String?
+    /// Exact Desktop projection connection id. It is retained independently
+    /// from routing authority so a client-local source slug can round-trip
+    /// without being mistaken for a configured Talaria gateway.
+    public var rawProjectionConnectionID: String?
+    /// A projected seat whose source id is not an exact configured gateway on
+    /// this device. Frozen seats remain visible transcript identity but are
+    /// never eligible for responder scheduling or transport.
+    public var isFrozenProjection: Bool
     public var id: GatewayBotRoute { route }
 
     public init(route: GatewayBotRoute, title: String? = nil,
                 handle: String? = nil, sourceLabel: String? = nil,
-                friendlyName: String? = nil, rawDisplayName: String? = nil) {
+                friendlyName: String? = nil, rawDisplayName: String? = nil,
+                rawProjectionConnectionID: String? = nil,
+                isFrozenProjection: Bool = false) {
         self.route = route
         self.title = title?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.friendlyName = Self.normalizedFriendlyName(friendlyName)
@@ -64,6 +74,10 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
             ? (route.profile.lowercased() == "default" ? "hermes" : route.profile)
             : proposed
         self.sourceLabel = sourceLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawConnection = rawProjectionConnectionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.rawProjectionConnectionID = rawConnection?.isEmpty == false ? rawConnection : nil
+        self.isFrozenProjection = isFrozenProjection
     }
 
     /// The identity which produces room-friendly mention forms. New records
@@ -108,6 +122,7 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case route, title, friendlyName, rawDisplayName, handle, sourceLabel
+        case rawProjectionConnectionID, isFrozenProjection
     }
 
     /// `friendlyName` is additive. Decode all pre-existing identity fields
@@ -125,6 +140,13 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
             try? values.decodeIfPresent(String.self, forKey: .friendlyName))
         rawDisplayName = Self.normalizedFriendlyName(
             try? values.decodeIfPresent(String.self, forKey: .rawDisplayName))
+        let decodedRawConnection = try? values.decodeIfPresent(
+            String.self, forKey: .rawProjectionConnectionID)
+        let rawConnection = (decodedRawConnection ?? nil)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        rawProjectionConnectionID = rawConnection?.isEmpty == false ? rawConnection : nil
+        isFrozenProjection = (try? values.decodeIfPresent(
+            Bool.self, forKey: .isFrozenProjection)) ?? nil ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -135,6 +157,11 @@ public struct RoomMember: Codable, Hashable, Sendable, Identifiable {
         try values.encodeIfPresent(rawDisplayName, forKey: .rawDisplayName)
         try values.encode(handle, forKey: .handle)
         try values.encodeIfPresent(sourceLabel, forKey: .sourceLabel)
+        try values.encodeIfPresent(rawProjectionConnectionID,
+                                   forKey: .rawProjectionConnectionID)
+        if isFrozenProjection {
+            try values.encode(true, forKey: .isFrozenProjection)
+        }
     }
 
     private static func normalizedFriendlyName(_ value: String?) -> String? {
@@ -189,6 +216,13 @@ public enum RoomSpeakerKind: String, Codable, Sendable { case user, member }
 
 public struct RoomEntry: Codable, Hashable, Sendable, Identifiable {
     public let id: RoomEntryID
+    /// Exact Hermes projection identity. Opaque ids are deterministically
+    /// mapped into Talaria's UUID identity space, but this raw value remains
+    /// the wire authority so publishing never leaks the local mapped UUID.
+    public var rawProjectionEntryID: String?
+    /// Exact projected thread identity for the same reason. It lives on the
+    /// entry because the compact projection has no separate thread records.
+    public var rawProjectionThreadID: String?
     /// Optional only for decoding pre-thread room logs. RoomStore migrates it
     /// before returning the room and immediately persists the repaired record.
     public var threadID: RoomThreadID?
@@ -201,17 +235,23 @@ public struct RoomEntry: Codable, Hashable, Sendable, Identifiable {
     public var attachments: [RoomAttachment]
 
     public init(id: RoomEntryID = RoomEntryID(), threadID: RoomThreadID? = nil,
+                rawProjectionEntryID: String? = nil,
+                rawProjectionThreadID: String? = nil,
                 speaker: RoomSpeakerKind, memberRoute: GatewayBotRoute? = nil,
                 speakerName: String, sourceLabel: String? = nil, text: String,
                 at: Date = Date(), attachments: [RoomAttachment] = []) {
-        self.id = id; self.threadID = threadID; self.speaker = speaker
+        self.id = id; self.threadID = threadID
+        self.rawProjectionEntryID = rawProjectionEntryID
+        self.rawProjectionThreadID = rawProjectionThreadID
+        self.speaker = speaker
         self.memberRoute = memberRoute; self.speakerName = speakerName
         self.sourceLabel = sourceLabel; self.text = text; self.at = at
         self.attachments = attachments
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, threadID, speaker, memberRoute, speakerName, sourceLabel, text, at, attachments
+        case id, rawProjectionEntryID, rawProjectionThreadID, threadID
+        case speaker, memberRoute, speakerName, sourceLabel, text, at, attachments
     }
 
     /// Entries written before room attachments and threads shipped omitted
@@ -220,6 +260,10 @@ public struct RoomEntry: Codable, Hashable, Sendable, Identifiable {
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(RoomEntryID.self, forKey: .id)
+        rawProjectionEntryID = try values.decodeIfPresent(
+            String.self, forKey: .rawProjectionEntryID)
+        rawProjectionThreadID = try values.decodeIfPresent(
+            String.self, forKey: .rawProjectionThreadID)
         threadID = try values.decodeIfPresent(RoomThreadID.self, forKey: .threadID)
         speaker = try values.decode(RoomSpeakerKind.self, forKey: .speaker)
         memberRoute = try values.decodeIfPresent(GatewayBotRoute.self, forKey: .memberRoute)
@@ -391,6 +435,13 @@ public struct RoomRecord: Codable, Hashable, Sendable, Identifiable {
     public static let immutableIDSessionTitleVersion: UInt8 = 1
 
     public let id: RoomID
+    /// Exact `id:<opaque>` or migration-only `name:<legacy>` projection key
+    /// which introduced this rich protected room. Nil marks a local room.
+    public var rawProjectionRoomKey: String?
+    /// Last projection revision whose safe identity overlay was considered.
+    /// Message union is independent and may still accept missing rows from an
+    /// older bounded projection without replacing rich local state.
+    public var rawProjectionRevision: UInt64
     public var name: String
     /// Version 0 is an on-disk compatibility marker, never a request to title
     /// a newly created member session by the editable display name. The room
@@ -424,6 +475,8 @@ public struct RoomRecord: Codable, Hashable, Sendable, Identifiable {
     public var updatedAt: Date
 
     public init(id: RoomID = RoomID(), name: String, members: [RoomMember],
+                rawProjectionRoomKey: String? = nil,
+                rawProjectionRevision: UInt64 = 0,
                 sessionTitleIdentityVersion: UInt8 = Self.immutableIDSessionTitleVersion,
                 legacySessionTitleName: String? = nil,
                 formerMembers: [RoomMember] = [],
@@ -434,7 +487,8 @@ public struct RoomRecord: Codable, Hashable, Sendable, Identifiable {
                 memberSessions: [String: String] = [:], watermarks: [String: Int] = [:],
                 epoch: UInt64 = 0, needsUser: Bool = false,
                 createdAt: Date = Date(), updatedAt: Date? = nil) {
-        self.id = id; self.name = name
+        self.id = id; self.rawProjectionRoomKey = rawProjectionRoomKey
+        self.rawProjectionRevision = rawProjectionRevision; self.name = name
         self.sessionTitleIdentityVersion = sessionTitleIdentityVersion
         self.legacySessionTitleName = sessionTitleIdentityVersion
             == Self.legacyNameSessionTitleVersion ? (legacySessionTitleName ?? name) : nil
@@ -448,7 +502,8 @@ public struct RoomRecord: Codable, Hashable, Sendable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, sessionTitleIdentityVersion, legacySessionTitleName
+        case id, rawProjectionRoomKey, rawProjectionRevision, name
+        case sessionTitleIdentityVersion, legacySessionTitleName
         case members, formerMembers, avatar, threads, entries, attempts, drives
         case activity, memberSessions, watermarks, epoch, needsUser, createdAt, updatedAt
     }
@@ -460,6 +515,10 @@ public struct RoomRecord: Codable, Hashable, Sendable, Identifiable {
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(RoomID.self, forKey: .id)
+        rawProjectionRoomKey = try values.decodeIfPresent(
+            String.self, forKey: .rawProjectionRoomKey)
+        rawProjectionRevision = try values.decodeIfPresent(
+            UInt64.self, forKey: .rawProjectionRevision) ?? 0
         name = try values.decode(String.self, forKey: .name)
         sessionTitleIdentityVersion = try values.decodeIfPresent(
             UInt8.self, forKey: .sessionTitleIdentityVersion
@@ -619,12 +678,16 @@ public struct RoomProjectionMergeIntent: Equatable, Sendable {
     public var changedRooms: [String]
     public var deletedRooms: [String]
     public var writeRevision: UInt64
+    /// Local-only room keys whose image field must be emitted as the explicit
+    /// empty-string clear sentinel. Absence remains compaction/omission.
+    public var clearedImages: [String]
 
     public init(changedRooms: [String] = [], deletedRooms: [String] = [],
-                writeRevision: UInt64 = 0) {
+                writeRevision: UInt64 = 0, clearedImages: [String] = []) {
         self.changedRooms = Self.unique(changedRooms)
         self.deletedRooms = Self.unique(deletedRooms)
         self.writeRevision = writeRevision
+        self.clearedImages = Self.unique(clearedImages)
     }
 
     private static func unique(_ values: [String]) -> [String] {
@@ -700,6 +763,34 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
 
     public static func isRoomKey(_ value: String) -> Bool {
         keyParts(value) != nil
+    }
+
+    /// Deterministically bridge a Hermes room key into Talaria's UUID model.
+    /// A real id-keyed UUID remains byte-for-byte the same UUID. Opaque and
+    /// legacy keys use a namespaced UUIDv5 mapping which is stable across
+    /// devices and process launches without making the mapped value wire data.
+    public static func localRoomID(forProjectionKey key: String) -> RoomID? {
+        guard let parts = keyParts(key) else { return nil }
+        if parts.kind == .id, let uuid = UUID(uuidString: parts.value) {
+            return RoomID(rawValue: uuid)
+        }
+        return RoomID(rawValue: projectionUUID(namespace: "room", rawValue: key))
+    }
+
+    /// Deterministic local identity for an optional opaque projected thread.
+    /// Callers retain the raw value separately when they publish it again.
+    public static func localThreadID(forProjectionID rawValue: String) -> RoomThreadID? {
+        guard !rawValue.isEmpty, rawValue.count <= 128 else { return nil }
+        if let uuid = UUID(uuidString: rawValue) { return RoomThreadID(rawValue: uuid) }
+        return RoomThreadID(rawValue: projectionUUID(namespace: "thread", rawValue: rawValue))
+    }
+
+    /// Deterministic local identity for an optional opaque projected entry.
+    /// Real UUIDs are deliberately unchanged.
+    public static func localEntryID(forProjectionID rawValue: String) -> RoomEntryID? {
+        guard !rawValue.isEmpty, rawValue.count <= 160 else { return nil }
+        if let uuid = UUID(uuidString: rawValue) { return RoomEntryID(rawValue: uuid) }
+        return RoomEntryID(rawValue: projectionUUID(namespace: "entry", rawValue: rawValue))
     }
 
     /// Read the projection block out of a complete `ui_meta` object. Nil means
@@ -798,9 +889,10 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
         return Self(updatedAt: updatedAt, rooms: rooms, deleted: deleted)
     }
 
-    /// Build the bounded display projection of Talaria's protected rooms. The
-    /// local UUID becomes a durable id-key; stable local entry/thread UUIDs are
-    /// carried across clients, while attachment bytes remain local.
+    /// Build the bounded display projection of Talaria's protected rooms.
+    /// Local UUIDs become durable ids. Hydrated opaque ids retain their exact
+    /// raw room/message/thread strings instead of leaking mapped UUIDs back to
+    /// Hermes, while attachment bytes remain local.
     public static func projecting(
         _ records: [RoomRecord],
         revisions: [RoomID: UInt64] = [:],
@@ -814,28 +906,37 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
                 RoomProjectionMember(
                     name: member.route.profile,
                     handle: member.handle,
-                    connectionID: member.route.gatewayID,
+                    connectionID: member.rawProjectionConnectionID
+                        ?? member.route.gatewayID,
                     connectionLabel: member.sourceLabel,
                     sourceScoped: true
                 )
             }
             let entries = record.entries.suffix(Self.maximumMessagesPerRoom).map { entry in
                 RoomProjectionEntry(
-                    id: entry.id.rawValue.uuidString.lowercased(),
+                    id: entry.rawProjectionEntryID
+                        ?? entry.id.rawValue.uuidString.lowercased(),
                     from: RoomProjectionAuthor(
                         kind: entry.speaker,
                         name: entry.speakerName,
-                        source: entry.sourceLabel ?? entry.memberRoute?.gatewayID
+                        source: entry.memberRoute?.gatewayID ?? entry.sourceLabel
                     ),
                     text: entry.text,
                     at: milliseconds(entry.at),
-                    thread: entry.threadID?.rawValue.uuidString.lowercased()
+                    thread: entry.rawProjectionThreadID
+                        ?? entry.threadID?.rawValue.uuidString.lowercased()
                 )
             }
-            let roomID = record.id.description
-            rooms[idKey(roomID)] = RoomProjectionRoom(
+            let localKey = idKey(record.id.description)
+            let roomKey = record.rawProjectionRoomKey.flatMap {
+                isRoomKey($0) ? $0 : nil
+            } ?? localKey
+            let roomID = keyParts(roomKey).flatMap {
+                $0.kind == .id ? $0.value : nil
+            }
+            rooms[roomKey] = RoomProjectionRoom(
                 name: record.name, roomID: roomID, log: entries,
-                revision: revisions[record.id] ?? 0,
+                revision: revisions[record.id] ?? record.rawProjectionRevision,
                 members: members, image: images[record.id]
             )
         }
@@ -870,6 +971,11 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
         var changed = Set<String>()
         for label in intent.changedRooms {
             changed.formUnion(keys(for: label, in: local))
+        }
+        var clearedImages = Set<String>()
+        for label in intent.clearedImages {
+            clearedImages.formUnion(keys(for: label, in: remote))
+            clearedImages.formUnion(keys(for: label, in: local))
         }
 
         var deleted: [String: UInt64] = [:]
@@ -907,14 +1013,22 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
             let identity: RoomProjectionRoom
             let members: [RoomProjectionMember]
             let image: String?
-            if localRevision > remoteRevision {
+            if clearedImages.contains(key), localRevision >= remoteRevision {
+                identity = localRoom ?? remoteRoom!
+                members = localRevision > remoteRevision
+                    ? (localRoom?.members ?? [])
+                    : unionMembers(remoteRoom?.members ?? [], localRoom?.members ?? [])
+                image = ""
+            } else if localRevision > remoteRevision {
                 identity = localRoom ?? remoteRoom!
                 members = localRoom?.members ?? []
-                image = localRoom?.image
+                // Image is optional because envelope bounding may remove it.
+                // Absence is therefore omission, not an explicit clear.
+                image = localRoom?.image ?? remoteRoom?.image
             } else if remoteRevision > localRevision {
                 identity = remoteRoom ?? localRoom!
                 members = remoteRoom?.members ?? []
-                image = remoteRoom?.image
+                image = remoteRoom?.image ?? localRoom?.image
             } else {
                 identity = localRoom ?? remoteRoom!
                 members = unionMembers(remoteRoom?.members ?? [], localRoom?.members ?? [])
@@ -1188,6 +1302,26 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
         if value >= Double(Int64.max) { return Int64.max }
         if value <= Double(Int64.min) { return Int64.min }
         return Int64(value.rounded())
+    }
+
+    /// RFC 4122 UUIDv5 using the standard DNS namespace and a Talaria-specific
+    /// typed name. SHA-1 is required by UUIDv5; it is used only for stable
+    /// identity mapping, never for authentication or integrity.
+    private static func projectionUUID(namespace: String, rawValue: String) -> UUID {
+        let dnsNamespace = UUID(uuidString: "6ba7b810-9dad-11d1-80b4-00c04fd430c8")!
+        var input = Data()
+        var namespaceBytes = dnsNamespace.uuid
+        withUnsafeBytes(of: &namespaceBytes) { input.append(contentsOf: $0) }
+        input.append(contentsOf: "talaria.room-projection.\(namespace)\u{0}\(rawValue)".utf8)
+        var bytes = Array(Insecure.SHA1.hash(data: input).prefix(16))
+        bytes[6] = (bytes[6] & 0x0f) | 0x50
+        bytes[8] = (bytes[8] & 0x3f) | 0x80
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
     }
 }
 

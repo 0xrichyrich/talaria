@@ -71,11 +71,12 @@ stable message ids, explicit tombstones, reconnect fan-out, and conflict-safe
 merge. Gateway profiles add per-key `ui_meta_revisions` and optional
 `ui_meta_expected_revisions` compare-and-swap writes. Talaria now has the
 typed CAS wire contract plus a bounded version-3 decoder, merger, tombstone
-model, and separately persisted projection ledger. Its existing rooms remain
-full, durable local rooms. AppModel hydration, all-gateway publication,
-conflict retry/read-back, and reconnect reseeding remain open, so cross-client
-room convergence is still an explicit implementation gap and is not covered
-by the checked local room rows below. The other net changes are host update receipts
+model, separately persisted projection ledger, protected room hydration,
+reachable-credentialed-gateway publication, conflict retry/read-back, and reconnect
+reseeding. Its existing rooms remain full, durable local rooms. Cross-client
+storage/scheduler policy is automated-test covered, while production wiring
+and end-to-end convergence remain uncertified until the retained live matrix
+passes. The other net changes are host update receipts
 and fleet code identity, container first-boot key generation, Telegram final
 rendering, and Cloud MCP documentation; the current audit classifies their
 client impact file by file.
@@ -138,8 +139,7 @@ substantial Bot Mode support, not yet a 1:1 client. Source-qualified A2A,
 standalone multi-member rooms, rich transcript interaction, and a guarded
 gateway-backed Command Center are implemented and automated-gate certified;
 they remain provisional until live-gateway and real-device certification. The
-largest remaining product gaps are shared gateway room projection with
-profile-metadata CAS, richer transcript media/tool presentation,
+largest remaining product gaps are richer transcript media/tool presentation,
 portable management depth (including auxiliary goal-judge controls and per-job
 cron reasoning), workspace and artifact completeness, and the authenticated
 gateway PTY:
@@ -160,10 +160,12 @@ gateway PTY:
   gateway; accepted/uncertain sends are durable and never blindly replayed.
   Membership convergence uses a source-qualified persistent outbox so an
   offline create/rename/disband can finish after reconnect.
-  This local durability does not yet implement exact Hermes' bounded
-  `hermes-bots-groups` projection, explicit shared tombstones, all-gateway
-  fan-out, or `ui_meta` compare-and-swap. Cross-client room convergence remains
-  open until the implementation and conflict/reconnect matrix land.
+  The bounded `hermes-bots-groups` projection now adds explicit shared
+  tombstones, safe protected hydration, reachable-credentialed-gateway fan-out, and
+  per-key `ui_meta` compare-and-swap with retry/read-back. Cross-client room
+  descriptors from another client's local connection registry remain visible
+  as view-only frozen seats and are never routed by a guessed label. Convergence
+  remains provisional until the live conflict/reconnect matrix is retained.
 - Current Hermes also exposes agent-guided `tour.request` prompts and whole-turn
   activity across transcript gaps. Talaria's room work includes the bounded
   current-run activity feed; tours and transcript activity remain queued with
@@ -223,10 +225,12 @@ partial until the unchecked certification gates are recorded.
       source-qualified state, events, sessions, and mutations.
 - [x] Migrate group metadata to multiple memberships and standalone room identities.
       Local implementation merged; exact Hermes shared gateway projection and
-      metadata CAS remain a separate unchecked item.
-- [ ] Implement shared `hermes-bots-groups` projection consumption/publication,
-      durable tombstones, all-gateway fan-out, per-key profile CAS conflict
+      metadata CAS are implemented in the separately tracked item below.
+- [x] Implement shared `hermes-bots-groups` projection consumption/publication,
+      durable tombstones, reachable-gateway fan-out, per-key profile CAS conflict
       recovery, read-back confirmation, and legacy-gateway feature detection.
+      Automated implementation is complete; the six live certification cases
+      in `TESTING.md` remain open.
 - [x] Implement cross-machine room delivery, explicit failure semantics,
       attachments, threads, and stranded-reply recovery. Implementation merged;
       the room prompt/relaunch matrix remains open.

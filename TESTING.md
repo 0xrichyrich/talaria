@@ -280,10 +280,15 @@ completed answer per API family, and both tool calls.
 This is not yet a passing live certification case. Exact Hermes publishes
 bounded version-3 room projections in default-profile
 `ui_meta["hermes-bots-groups"]` and exposes per-key `ui_meta_revisions`.
-Talaria now has the bounded projection/ledger foundation and strict typed CAS
-wire support, but not AppModel hydration, all-gateway fan-out, conflict retry,
-read-back confirmation, or reconnect reseeding. Do not claim Desktop/mobile
-shared-room convergence from the foundation tests.
+Talaria now has bounded projection/ledger storage, safe protected-room
+hydration, reachable-credentialed-gateway fan-out, per-gateway serialization and
+bounded conflict retry, exact CAS read-back confirmation, feature-detected
+legacy fallback, and adoption/reconnect/foreground reseeding. Focused tests
+cover the storage and scheduler policies, including privacy cancellation and
+applying a cached disband tombstone before network recovery. Production target
+discovery, connection leasing, and lifecycle-hook wiring are source-reviewed;
+the live matrix below remains their certification gate. Do not claim certified
+Desktop/mobile shared-room convergence from automated tests alone.
 
 First pin the gateway protocol directly: two clients must read the same
 revision, then submit different `profiles.configure` writes with that expected
@@ -293,17 +298,21 @@ the current revision. Delete the key and prove its revision survives deletion
 so the stale client cannot recreate it. Also prove that omission of
 `ui_meta_expected_revisions` retains the documented legacy best-effort path.
 
-After Talaria support lands, retain a two-Desktop/one-phone report covering:
+Retain a two-Desktop/one-phone report covering:
 
 1. Hydration of name, picture, source-qualified members, and bounded recent
    transcript from each attached gateway without replacing Talaria's full
-   protected local transcript.
+   protected local transcript. A foreign client-local connection id must stay
+   visible as a view-only frozen seat, never route by label, and become live
+   only after an exact configured gateway identity exists.
 2. A concurrent Desktop/phone write conflict followed by reread, stable-id
    merge, CAS retry, exact revision increment, and read-back confirmation.
 3. Rename with the same immutable room id; disband with a final `id:`
    tombstone; and same-name recreation with a fresh id and fresh sessions.
 4. A truncated or missing remote projection that does **not** delete local
-   rooms/messages, plus explicit tombstone propagation that does.
+   rooms/messages, plus explicit tombstone propagation that does. Verify an
+   absent bounded image preserves the prior avatar while Talaria's present
+   empty-string clear removes it on a peer and does not resurrect after restart.
 5. One gateway offline during create/rename/disband, later reconnect and
    reseed, and fan-out to every other reachable default-profile gateway.
 6. Feature detection against an older gateway with no `ui_meta_revisions`,

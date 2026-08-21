@@ -63,14 +63,25 @@ public struct RoomView: View {
                 unresolvedPanel(room)
                 activityPanel(room)
                 timeline(room)
-                RoomComposer(theme: theme, members: room.members,
-                             placeholder: "New thread in \(room.name)…",
-                             submitLabel: "New Thread") { text, attachments in
-                    _ = try await model.sendRoomMessage(roomID: roomID, text: text,
-                                                        attachments: attachments)
+                let liveMembers = room.members.filter { !$0.isFrozenProjection }
+                if liveMembers.isEmpty {
+                    frozenRoomNotice
+                        .padding(10).background(theme.bg)
+                        .overlay(alignment: .top) {
+                            Rectangle().fill(theme.line).frame(height: 1)
+                        }
+                } else {
+                    RoomComposer(theme: theme, members: liveMembers,
+                                 placeholder: "New thread in \(room.name)…",
+                                 submitLabel: "New Thread") { text, attachments in
+                        _ = try await model.sendRoomMessage(roomID: roomID, text: text,
+                                                            attachments: attachments)
+                    }
+                    .padding(10).background(theme.bg)
+                    .overlay(alignment: .top) {
+                        Rectangle().fill(theme.line).frame(height: 1)
+                    }
                 }
-                .padding(10).background(theme.bg)
-                .overlay(alignment: .top) { Rectangle().fill(theme.line).frame(height: 1) }
             } else {
                 ContentUnavailableView("Room unavailable", systemImage: "person.3",
                                        description: Text("It may have been disbanded on this device."))
@@ -246,6 +257,14 @@ public struct RoomView: View {
         room.threads.sorted { $0.lastActivityAt < $1.lastActivityAt }
     }
 
+    private var frozenRoomNotice: some View {
+        Label("View only — connect an exact source gateway to reply",
+              systemImage: "lock")
+            .font(theme.body(11, weight: .semibold))
+            .foregroundStyle(theme.faint)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+    }
+
     @ViewBuilder private func threadBlock(_ thread: RoomThread, room: RoomRecord) -> some View {
         let entries = room.entries.filter { $0.threadID == thread.id }
         let isExpanded = !collapsed.contains(thread.id)
@@ -259,13 +278,18 @@ public struct RoomView: View {
                         .font(theme.body(10)).foregroundStyle(theme.faint)
                 }.buttonStyle(.plain)
                 ForEach(entries) { entry in entryRow(entry, room: room) }
-                RoomComposer(theme: theme, members: room.members,
-                             placeholder: "Reply in thread…", submitLabel: "Reply") { text, attachments in
-                    _ = try await model.sendRoomMessage(roomID: roomID, text: text,
-                                                        threadID: thread.id,
-                                                        attachments: attachments)
+                let liveMembers = room.members.filter { !$0.isFrozenProjection }
+                if liveMembers.isEmpty {
+                    frozenRoomNotice.padding(.top, 3)
+                } else {
+                    RoomComposer(theme: theme, members: liveMembers,
+                                 placeholder: "Reply in thread…", submitLabel: "Reply") { text, attachments in
+                        _ = try await model.sendRoomMessage(roomID: roomID, text: text,
+                                                            threadID: thread.id,
+                                                            attachments: attachments)
+                    }
+                    .padding(.top, 3)
                 }
-                .padding(.top, 3)
             }
             .padding(9).background(theme.ink.opacity(0.025), in: RoundedRectangle(cornerRadius: 12))
             .overlay(alignment: .leading) { Rectangle().fill(theme.accent.opacity(0.4)).frame(width: 2) }
@@ -489,19 +513,27 @@ private struct RoomSettingsView: View {
     private func unavailableMemberRow(_ member: RoomMember) -> some View {
         HStack(spacing: 9) {
             Circle().fill(theme.faint.opacity(0.15)).frame(width: 32, height: 32)
-                .overlay(Image(systemName: "moon.zzz").font(.system(size: 11)).foregroundStyle(theme.faint))
+                .overlay(Image(systemName: member.isFrozenProjection ? "lock" : "moon.zzz")
+                    .font(.system(size: 11)).foregroundStyle(theme.faint))
             VStack(alignment: .leading, spacing: 1) {
                 Text(member.title ?? member.route.profile)
-                Text("@\(member.handle) · \(member.sourceLabel ?? member.route.gatewayID) · offline")
+                Text("@\(member.handle) · \(member.sourceLabel ?? member.route.gatewayID) · \(member.isFrozenProjection ? "shared · view only" : "offline")")
                     .font(theme.mono(8)).foregroundStyle(theme.faint)
             }
             Spacer()
-            Button {
-                if selected.count > RoomEngine.minimumMembers {
-                    selected.removeAll { $0.route == member.route }
-                }
-            } label: { Image(systemName: "minus.circle").frame(width: 44, height: 44) }
-                .buttonStyle(.plain).foregroundStyle(theme.danger)
+            if member.isFrozenProjection {
+                Image(systemName: "lock.fill")
+                    .frame(width: 44, height: 44)
+                    .foregroundStyle(theme.faint)
+                    .accessibilityLabel("Shared member is view only")
+            } else {
+                Button {
+                    if selected.count > RoomEngine.minimumMembers {
+                        selected.removeAll { $0.route == member.route }
+                    }
+                } label: { Image(systemName: "minus.circle").frame(width: 44, height: 44) }
+                    .buttonStyle(.plain).foregroundStyle(theme.danger)
+            }
         }.frame(minHeight: 44)
     }
 }

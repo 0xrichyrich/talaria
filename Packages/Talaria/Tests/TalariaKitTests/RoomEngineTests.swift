@@ -296,6 +296,41 @@ final class RoomEngineTests: XCTestCase {
                                                      threadID: thread.id, round: 0, posted: 10).isEmpty)
     }
 
+    func testFrozenProjectedSeatsAreVisibleIdentityButNeverScheduled() throws {
+        let frozen = RoomMember(
+            route: GatewayBotRoute(gatewayID: "desktop-mini", profile: "reviewer"),
+            title: "Desktop Reviewer", handle: "reviewer-mini",
+            sourceLabel: "Joshua's Mini",
+            rawProjectionConnectionID: "desktop-mini",
+            isFrozenProjection: true)
+        let members = [alpha, frozen]
+        let thread = RoomThread()
+        let broad = RoomEntry(threadID: thread.id, speaker: .user,
+                              speakerName: "You", text: "review this")
+        let direct = RoomEntry(threadID: thread.id, speaker: .user,
+                               speakerName: "You", text: "@reviewer-mini review this")
+
+        XCTAssertEqual(RoomEngine.scheduledResponders(
+            entries: [broad], members: members, threadID: thread.id,
+            round: 0, posted: 0).map(\.route), [alpha.route])
+        XCTAssertTrue(RoomEngine.scheduledResponders(
+            entries: [direct], members: members, threadID: thread.id,
+            round: 0, posted: 0).isEmpty)
+        XCTAssertFalse(RoomEngine.mentionCompletionMembers(
+            for: "reviewer", members: members).contains(frozen))
+
+        let room = RoomRecord(name: "Portable", members: members,
+                              threads: [thread], entries: [broad])
+        XCTAssertNoThrow(try RoomEngine.validate(room))
+        var invalidDrive = room
+        invalidDrive.drives = [RoomDriveState(
+            threadID: thread.id, epoch: room.epoch,
+            roundMembers: [frozen.route])]
+        XCTAssertThrowsError(try RoomEngine.validate(invalidDrive)) {
+            XCTAssertEqual($0 as? RoomValidationError, .invalidDrive)
+        }
+    }
+
     func testLegacyThreadsUseFifteenMinuteLullAndStableEntryIdentity() throws {
         let base = Date(timeIntervalSince1970: 1_700_000_000)
         let firstID = RoomEntryID()
