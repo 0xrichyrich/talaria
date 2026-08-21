@@ -493,6 +493,704 @@ public struct RoomRecord: Codable, Hashable, Sendable, Identifiable {
     public var lastActivityAt: Date { entries.last?.at ?? createdAt }
 }
 
+// MARK: - Shared room projection
+
+/// The source-qualified member descriptor stored in Desktop Bot Mode's
+/// `ui_meta["hermes-bots-groups"]` room projection.  This is deliberately a
+/// wire/display model, not a replacement for `RoomMember`: the full local room
+/// keeps its richer, validated routing identity even when a bounded projection
+/// omits it.
+public struct RoomProjectionMember: Codable, Hashable, Sendable {
+    public var name: String
+    public var handle: String?
+    public var connectionID: String?
+    public var connectionKind: String?
+    public var connectionLabel: String?
+    public var sourceScoped: Bool
+
+    public init(name: String, handle: String? = nil,
+                connectionID: String? = nil, connectionKind: String? = nil,
+                connectionLabel: String? = nil, sourceScoped: Bool = false) {
+        self.name = Self.prefix(name, limit: 128)
+        self.handle = Self.optionalPrefix(handle, limit: 128)
+        self.connectionID = Self.optionalPrefix(connectionID, limit: 128)
+        self.connectionKind = Self.optionalPrefix(connectionKind, limit: 64)
+        self.connectionLabel = Self.optionalPrefix(connectionLabel, limit: 128)
+        self.sourceScoped = sourceScoped
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, handle, connectionID = "connectionId", connectionKind
+        case connectionLabel, sourceScoped
+    }
+
+    private static func prefix(_ value: String, limit: Int) -> String {
+        String(value.prefix(limit))
+    }
+
+    private static func optionalPrefix(_ value: String?, limit: Int) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        return prefix(value, limit: limit)
+    }
+}
+
+/// The compact `from` object on a projected log row.
+public struct RoomProjectionAuthor: Codable, Hashable, Sendable {
+    public var kind: RoomSpeakerKind
+    public var name: String
+    public var source: String?
+
+    public init(kind: RoomSpeakerKind, name: String, source: String? = nil) {
+        self.kind = kind
+        let fallback = kind == .member ? "Bot" : "You"
+        self.name = String((name.isEmpty ? fallback : name).prefix(128))
+        if let source, !source.isEmpty {
+            self.source = String(source.prefix(128))
+        } else {
+            self.source = nil
+        }
+    }
+}
+
+/// A stable-id display row in the shared projection. Attachment bytes and
+/// other orchestration state intentionally remain in protected local storage.
+public struct RoomProjectionEntry: Codable, Hashable, Sendable {
+    public var id: String?
+    public var from: RoomProjectionAuthor
+    public var text: String
+    /// Unix epoch milliseconds, matching Desktop's `Date.now()` wire value.
+    public var at: Int64
+    public var thread: String?
+
+    public init(id: String? = nil, from: RoomProjectionAuthor, text: String,
+                at: Int64, thread: String? = nil) {
+        if let id, !id.isEmpty { self.id = String(id.prefix(160)) }
+        else { self.id = nil }
+        self.from = from
+        self.text = String(text.prefix(RoomProjectionEnvelope.maximumTextCharacters))
+        self.at = at
+        if let thread, !thread.isEmpty { self.thread = String(thread.prefix(128)) }
+        else { self.thread = nil }
+    }
+}
+
+/// One compact room value under an `id:<roomId>` or migration-only
+/// `name:<legacy>` projection key.
+public struct RoomProjectionRoom: Codable, Hashable, Sendable {
+    public var name: String
+    /// Desktop room ids are opaque strings (not necessarily UUIDs), so the
+    /// exact value is retained separately from Talaria's local `RoomID`.
+    public var roomID: String?
+    public var log: [RoomProjectionEntry]
+    public var revision: UInt64
+    public var members: [RoomProjectionMember]
+    public var image: String?
+
+    public init(name: String, roomID: String? = nil,
+                log: [RoomProjectionEntry] = [], revision: UInt64 = 0,
+                members: [RoomProjectionMember] = [], image: String? = nil) {
+        self.name = String(name.prefix(64))
+        if let roomID, !roomID.isEmpty { self.roomID = String(roomID.prefix(128)) }
+        else { self.roomID = nil }
+        self.log = Array(log.suffix(RoomProjectionEnvelope.maximumMessagesPerRoom))
+        self.revision = revision
+        self.members = Array(members.prefix(RoomProjectionEnvelope.maximumMembersPerRoom))
+        if let image, image.count <= RoomProjectionEnvelope.maximumImageCharacters {
+            self.image = image
+        } else {
+            self.image = nil
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, roomID = "roomId", log, revision, members, image
+    }
+
+    fileprivate func bounded() -> Self {
+        Self(name: name, roomID: roomID, log: log, revision: revision,
+             members: members, image: image)
+    }
+}
+
+/// Local-writer information used while folding a CAS winner into a retry.
+/// The merge itself is gateway-independent: callers provide only the room
+/// fields changed by the local writer and the revision that write should own.
+public struct RoomProjectionMergeIntent: Equatable, Sendable {
+    public var changedRooms: [String]
+    public var deletedRooms: [String]
+    public var writeRevision: UInt64
+
+    public init(changedRooms: [String] = [], deletedRooms: [String] = [],
+                writeRevision: UInt64 = 0) {
+        self.changedRooms = Self.unique(changedRooms)
+        self.deletedRooms = Self.unique(deletedRooms)
+        self.writeRevision = writeRevision
+    }
+
+    private static func unique(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+}
+
+/// Version-3 value stored at `ui_meta["hermes-bots-groups"]`.
+///
+/// This ledger is purposefully independent from RoomStore's full transcript.
+/// A missing room or message is merely a bounded/partial projection; only an
+/// explicit tombstone can delete projection state. `id:` tombstones are final,
+/// while `name:` tombstones retain the revision-gated v1/v2 migration rule.
+public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
+    public static let metadataKey = "hermes-bots-groups"
+    public static let currentVersion = 3
+    public static let maximumGatewayJSONBytes = 48_000
+    public static let maximumMessagesPerRoom = 16
+    public static let maximumTextCharacters = 1_200
+    public static let maximumImageCharacters = 24_000
+    public static let maximumMembersPerRoom = 6
+    public static let maximumTombstones = 64
+
+    public var version: Int
+    /// Unix epoch milliseconds. The caller supplies it so projection building
+    /// and conflict resolution stay deterministic and easy to test.
+    public var updatedAt: UInt64
+    public var rooms: [String: RoomProjectionRoom]
+    /// Values are gateway metadata revisions, never device wall-clock order.
+    public var deleted: [String: UInt64]
+
+    public init(updatedAt: UInt64 = 0,
+                rooms: [String: RoomProjectionRoom] = [:],
+                deleted: [String: UInt64] = [:]) {
+        version = Self.currentVersion
+        self.updatedAt = updatedAt
+        self.rooms = rooms
+        self.deleted = deleted
+        canonicalizeAndBound()
+    }
+
+    private enum CodingKeys: String, CodingKey { case version, updatedAt, rooms, deleted }
+
+    /// Decode gateway data leniently at the room/row boundary while still
+    /// requiring a JSON object at the root. One malformed/truncated row cannot
+    /// turn the rest of a valid projection into an apparent empty deletion.
+    public init(from decoder: Decoder) throws {
+        let raw = try JSONValue(from: decoder)
+        guard raw.objectValue != nil else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath,
+                      debugDescription: "Room projection must be a JSON object"))
+        }
+        self = Self.normalized(raw)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(Self.currentVersion, forKey: .version)
+        try values.encode(updatedAt, forKey: .updatedAt)
+        try values.encode(rooms, forKey: .rooms)
+        if !deleted.isEmpty { try values.encode(deleted, forKey: .deleted) }
+    }
+
+    public static func idKey(_ roomID: String) -> String {
+        "id:\(String(roomID.prefix(128)))"
+    }
+
+    public static func legacyNameKey(_ name: String) -> String {
+        "name:\(String(name.prefix(64)))"
+    }
+
+    public static func isRoomKey(_ value: String) -> Bool {
+        keyParts(value) != nil
+    }
+
+    /// Read the projection block out of a complete `ui_meta` object. Nil means
+    /// the key is absent or not an object; callers must not reinterpret that as
+    /// an empty authoritative snapshot.
+    public init?(uiMeta: JSONValue?) {
+        guard let raw = uiMeta?.objectValue?[Self.metadataKey], raw.objectValue != nil else {
+            return nil
+        }
+        self = Self.normalized(raw)
+    }
+
+    /// The complete top-level patch accepted by profiles.configure.
+    public var uiMetaPatch: JSONValue {
+        // Public value fields make fixture construction and pure merges
+        // ergonomic, but outbound gateway data must always cross the bounds
+        // fence again after any caller mutation.
+        guard let raw = try? JSONValue.from(bounded()) else { return .object([:]) }
+        return .object([Self.metadataKey: raw])
+    }
+
+    /// RoomStore persists only the canonical v3 shape emitted by this build.
+    /// Gateway input deliberately normalizes malformed rows leniently, while
+    /// a present malformed on-disk ledger is corruption and must fail closed
+    /// rather than silently erasing rooms or tombstones on the next write.
+    static func strictlyDecodedPersisted(_ raw: JSONValue) -> Self? {
+        guard raw.objectValue != nil else { return nil }
+        let normalized = Self.normalized(raw)
+        guard let canonical = try? JSONValue.from(normalized),
+              canonical == raw else { return nil }
+        return normalized
+    }
+
+    /// Lift v1 wall-clock and v2 name-keyed snapshots into the v3 identity
+    /// space. V1 tombstone timestamps become revision zero so clocks can never
+    /// outrank a real gateway revision. An id-keyed v3 room always recovers its
+    /// `roomId` from the key, fixing the exact Desktop persistence omission.
+    public static func normalized(_ raw: JSONValue?) -> Self {
+        guard let object = raw?.objectValue else { return Self() }
+        let sourceVersion = nonnegativeInt(object["version"])
+        let updatedAt = nonnegativeUInt(object["updatedAt"])
+        let rawRooms = object["rooms"]?.objectValue ?? [:]
+        var rooms: [String: RoomProjectionRoom] = [:]
+
+        for rawKey in rawRooms.keys.sorted() {
+            guard let roomObject = rawRooms[rawKey]?.objectValue,
+                  let rawLog = roomObject["log"]?.arrayValue else { continue }
+
+            let key: String
+            let forcedName: String?
+            let forcedRoomID: String?
+            if sourceVersion >= Self.currentVersion {
+                guard let parts = keyParts(rawKey) else { continue }
+                key = rawKey
+                forcedName = parts.kind == .legacyName ? parts.value : nil
+                forcedRoomID = parts.kind == .id ? parts.value : nil
+            } else {
+                let legacyName = String(rawKey.prefix(64))
+                guard !legacyName.isEmpty else { continue }
+                key = legacyNameKey(legacyName)
+                forcedName = legacyName
+                forcedRoomID = nil
+            }
+
+            let name = string(roomObject["name"]) ?? forcedName ?? forcedRoomID ?? ""
+            guard !name.isEmpty else { continue }
+            let entries = rawLog.compactMap(parseEntry)
+            let members = (roomObject["members"]?.arrayValue ?? []).compactMap(parseMember)
+            let image = string(roomObject["image"])
+            let room = RoomProjectionRoom(
+                name: name,
+                roomID: forcedRoomID,
+                log: entries,
+                revision: nonnegativeUInt(roomObject["revision"]),
+                members: members,
+                image: image
+            )
+            rooms[key] = preferredRoom(existing: rooms[key], candidate: room)
+        }
+
+        var deleted: [String: UInt64] = [:]
+        for rawKey in (object["deleted"]?.objectValue ?? [:]).keys.sorted() {
+            let key: String
+            if sourceVersion >= Self.currentVersion {
+                guard keyParts(rawKey) != nil else { continue }
+                key = rawKey
+            } else {
+                let legacyName = String(rawKey.prefix(64))
+                guard !legacyName.isEmpty else { continue }
+                key = legacyNameKey(legacyName)
+            }
+            let revision = sourceVersion >= 2
+                ? nonnegativeUInt(object["deleted"]?.objectValue?[rawKey]) : 0
+            deleted[key] = max(deleted[key] ?? 0, revision)
+        }
+        return Self(updatedAt: updatedAt, rooms: rooms, deleted: deleted)
+    }
+
+    /// Build the bounded display projection of Talaria's protected rooms. The
+    /// local UUID becomes a durable id-key; stable local entry/thread UUIDs are
+    /// carried across clients, while attachment bytes remain local.
+    public static func projecting(
+        _ records: [RoomRecord],
+        revisions: [RoomID: UInt64] = [:],
+        images: [RoomID: String] = [:],
+        updatedAt: UInt64
+    ) -> Self {
+        var rooms: [String: RoomProjectionRoom] = [:]
+        for record in records {
+            guard !record.entries.isEmpty else { continue }
+            let members = record.members.map { member in
+                RoomProjectionMember(
+                    name: member.route.profile,
+                    handle: member.handle,
+                    connectionID: member.route.gatewayID,
+                    connectionLabel: member.sourceLabel,
+                    sourceScoped: true
+                )
+            }
+            let entries = record.entries.suffix(Self.maximumMessagesPerRoom).map { entry in
+                RoomProjectionEntry(
+                    id: entry.id.rawValue.uuidString.lowercased(),
+                    from: RoomProjectionAuthor(
+                        kind: entry.speaker,
+                        name: entry.speakerName,
+                        source: entry.sourceLabel ?? entry.memberRoute?.gatewayID
+                    ),
+                    text: entry.text,
+                    at: milliseconds(entry.at),
+                    thread: entry.threadID?.rawValue.uuidString.lowercased()
+                )
+            }
+            let roomID = record.id.description
+            rooms[idKey(roomID)] = RoomProjectionRoom(
+                name: record.name, roomID: roomID, log: entries,
+                revision: revisions[record.id] ?? 0,
+                members: members, image: images[record.id]
+            )
+        }
+        return Self(updatedAt: updatedAt, rooms: rooms)
+    }
+
+    /// Pure pull-before-push/CAS-retry merge. The first snapshot is the remote
+    /// winner and the second is the local writer. Omitted rooms and messages
+    /// are unioned, never deleted. Identity fields follow room revision; equal
+    /// revisions prefer local fields and union source-qualified members.
+    public static func merging(
+        remote: Self?,
+        local: Self?,
+        intent: RoomProjectionMergeIntent = RoomProjectionMergeIntent(),
+        updatedAt: UInt64? = nil
+    ) -> Self {
+        let remote = (remote ?? Self()).bounded()
+        let local = (local ?? Self()).bounded()
+
+        func keys(for label: String, in envelope: Self) -> Set<String> {
+            var matches = Set<String>()
+            for (key, room) in envelope.rooms {
+                if key == label || room.name == label || key == legacyNameKey(label) {
+                    matches.insert(key)
+                }
+            }
+            if isRoomKey(label) { matches.insert(label) }
+            else if matches.isEmpty { matches.insert(legacyNameKey(label)) }
+            return matches
+        }
+
+        var changed = Set<String>()
+        for label in intent.changedRooms {
+            changed.formUnion(keys(for: label, in: local))
+        }
+
+        var deleted: [String: UInt64] = [:]
+        for source in [remote, local] {
+            for (key, revision) in source.deleted where isRoomKey(key) {
+                deleted[key] = max(deleted[key] ?? 0, revision)
+            }
+        }
+        for label in intent.deletedRooms {
+            let resolved = keys(for: label, in: remote).union(keys(for: label, in: local))
+            for key in resolved where !changed.contains(key) {
+                deleted[key] = max(deleted[key] ?? 0, intent.writeRevision)
+            }
+        }
+
+        var rooms: [String: RoomProjectionRoom] = [:]
+        let roomKeys = Set(remote.rooms.keys).union(local.rooms.keys)
+        for key in roomKeys.sorted() {
+            let remoteRoom = remote.rooms[key]
+            let localRoom = local.rooms[key]
+            guard remoteRoom != nil || localRoom != nil else { continue }
+            let remoteRevision = remoteRoom?.revision ?? 0
+            let localRevision = changed.contains(key)
+                ? intent.writeRevision : (localRoom?.revision ?? 0)
+
+            var entriesByKey: [String: RoomProjectionEntry] = [:]
+            for entry in (remoteRoom?.log ?? []) + (localRoom?.log ?? []) {
+                entriesByKey[entryKey(entry)] = entry
+            }
+            let entries = entriesByKey.values.sorted {
+                if $0.at != $1.at { return $0.at < $1.at }
+                return entryKey($0) < entryKey($1)
+            }
+
+            let identity: RoomProjectionRoom
+            let members: [RoomProjectionMember]
+            let image: String?
+            if localRevision > remoteRevision {
+                identity = localRoom ?? remoteRoom!
+                members = localRoom?.members ?? []
+                image = localRoom?.image
+            } else if remoteRevision > localRevision {
+                identity = remoteRoom ?? localRoom!
+                members = remoteRoom?.members ?? []
+                image = remoteRoom?.image
+            } else {
+                identity = localRoom ?? remoteRoom!
+                members = unionMembers(remoteRoom?.members ?? [], localRoom?.members ?? [])
+                image = localRoom?.image ?? remoteRoom?.image
+            }
+
+            let keyRoomID = key.hasPrefix("id:") ? String(key.dropFirst(3)) : nil
+            rooms[key] = RoomProjectionRoom(
+                name: identity.name,
+                roomID: keyRoomID,
+                log: entries,
+                revision: max(remoteRevision, localRevision),
+                members: members,
+                image: image
+            )
+        }
+
+        for (key, revision) in deleted {
+            if key.hasPrefix("id:") {
+                // Ids are single-use. No revision can legitimately recreate
+                // the same id, so even a high-revision lagging copy stays dead.
+                rooms.removeValue(forKey: key)
+            } else if revision >= (rooms[key]?.revision ?? 0) {
+                rooms.removeValue(forKey: key)
+            } else {
+                // A higher-revision legacy room is an explicit recreation.
+                deleted.removeValue(forKey: key)
+            }
+        }
+
+        return Self(
+            updatedAt: updatedAt ?? max(remote.updatedAt, local.updatedAt),
+            rooms: rooms,
+            deleted: deleted
+        )
+    }
+
+    public func merging(
+        local: Self,
+        intent: RoomProjectionMergeIntent = RoomProjectionMergeIntent(),
+        updatedAt: UInt64? = nil
+    ) -> Self {
+        Self.merging(remote: self, local: local, intent: intent, updatedAt: updatedAt)
+    }
+
+    /// Return a canonical bounded copy after public-property mutation.
+    public func bounded() -> Self {
+        Self(updatedAt: updatedAt, rooms: rooms, deleted: deleted)
+    }
+
+    /// Conservative approximation of Python's default ensure-ascii JSON size,
+    /// including its separator spaces. This mirrors the exact Desktop guard.
+    public var gatewayJSONSize: Int {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(self),
+              let json = String(data: data, encoding: .utf8) else { return .max }
+        return json.unicodeScalars.reduce(into: 0) { size, scalar in
+            if scalar.value <= 0x7f {
+                size += 1
+                if scalar == "," || scalar == ":" { size += 1 }
+            } else {
+                size += scalar.value <= 0xffff ? 6 : 12
+            }
+        }
+    }
+
+    private enum ProjectionKeyKind { case id, legacyName }
+    private struct ProjectionKeyParts {
+        var kind: ProjectionKeyKind
+        var value: String
+    }
+
+    private static func keyParts(_ key: String) -> ProjectionKeyParts? {
+        if key.hasPrefix("id:") {
+            let value = String(key.dropFirst(3))
+            guard !value.isEmpty, value.count <= 128 else { return nil }
+            return ProjectionKeyParts(kind: .id, value: value)
+        }
+        if key.hasPrefix("name:") {
+            let value = String(key.dropFirst(5))
+            guard !value.isEmpty, value.count <= 64 else { return nil }
+            return ProjectionKeyParts(kind: .legacyName, value: value)
+        }
+        return nil
+    }
+
+    private mutating func canonicalizeAndBound() {
+        version = Self.currentVersion
+        var canonicalRooms: [String: RoomProjectionRoom] = [:]
+        for originalKey in rooms.keys.sorted() {
+            guard var room = rooms[originalKey]?.bounded() else { continue }
+            let key: String
+            if let parts = Self.keyParts(originalKey) {
+                key = originalKey
+                if parts.kind == .id { room.roomID = parts.value }
+                else { room.roomID = nil }
+            } else if let roomID = room.roomID, !roomID.isEmpty {
+                key = Self.idKey(roomID)
+                room.roomID = String(roomID.prefix(128))
+            } else if !room.name.isEmpty {
+                key = Self.legacyNameKey(room.name)
+                room.roomID = nil
+            } else {
+                continue
+            }
+            canonicalRooms[key] = Self.preferredRoom(
+                existing: canonicalRooms[key], candidate: room)
+        }
+        rooms = canonicalRooms
+
+        var canonicalDeleted: [String: UInt64] = [:]
+        for key in deleted.keys.sorted() where Self.isRoomKey(key) {
+            canonicalDeleted[key] = max(canonicalDeleted[key] ?? 0, deleted[key] ?? 0)
+        }
+        // A merge can legitimately union two already-bounded 64-tombstone
+        // gateway snapshots. Hermes applies every unioned tombstone before
+        // retaining the newest 64 for onward propagation; bounding first can
+        // resurrect a room whose lower-ranked tombstone was just dropped.
+        for (key, revision) in canonicalDeleted {
+            if key.hasPrefix("id:") || revision >= (rooms[key]?.revision ?? 0) {
+                rooms.removeValue(forKey: key)
+            } else {
+                canonicalDeleted.removeValue(forKey: key)
+            }
+        }
+        deleted = Dictionary(
+            uniqueKeysWithValues: canonicalDeleted.sorted {
+                if $0.value != $1.value { return $0.value > $1.value }
+                return $0.key < $1.key
+            }.prefix(Self.maximumTombstones).map { ($0.key, $0.value) }
+        )
+
+        let ranked = rooms.keys.sorted { leftKey, rightKey in
+            let left = rooms[leftKey]?.log.last?.at ?? 0
+            let right = rooms[rightKey]?.log.last?.at ?? 0
+            if left != right { return left < right }
+            return leftKey < rightKey
+        }
+        for key in ranked {
+            while (rooms[key]?.log.count ?? 0) > 1
+                    && gatewayJSONSize > Self.maximumGatewayJSONBytes {
+                rooms[key]?.log.removeFirst()
+            }
+            if rooms[key]?.image != nil && gatewayJSONSize > Self.maximumGatewayJSONBytes {
+                rooms[key]?.image = nil
+            }
+            if gatewayJSONSize > Self.maximumGatewayJSONBytes {
+                rooms.removeValue(forKey: key)
+            }
+        }
+        if gatewayJSONSize > Self.maximumGatewayJSONBytes {
+            for item in deleted.sorted(by: {
+                if $0.value != $1.value { return $0.value < $1.value }
+                return $0.key > $1.key
+            }) where gatewayJSONSize > Self.maximumGatewayJSONBytes {
+                deleted.removeValue(forKey: item.key)
+            }
+        }
+    }
+
+    private static func preferredRoom(existing: RoomProjectionRoom?,
+                                      candidate: RoomProjectionRoom) -> RoomProjectionRoom {
+        guard let existing else { return candidate }
+        if candidate.revision != existing.revision {
+            return candidate.revision > existing.revision ? candidate : existing
+        }
+        let left = (try? JSONEncoder().encode(existing)).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        let right = (try? JSONEncoder().encode(candidate)).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        return right > left ? candidate : existing
+    }
+
+    private static func parseEntry(_ value: JSONValue) -> RoomProjectionEntry? {
+        guard let object = value.objectValue else { return nil }
+        let kind: RoomSpeakerKind = string(object["from"]?["kind"])
+            == RoomSpeakerKind.member.rawValue ? .member : .user
+        let fallback = kind == .member ? "Bot" : "You"
+        let author = RoomProjectionAuthor(
+            kind: kind,
+            name: string(object["from"]?["name"]) ?? fallback,
+            source: string(object["from"]?["source"])
+        )
+        return RoomProjectionEntry(
+            id: string(object["id"]), from: author,
+            text: string(object["text"]) ?? "",
+            at: signedInteger(object["at"]),
+            thread: string(object["thread"])
+        )
+    }
+
+    private static func parseMember(_ value: JSONValue) -> RoomProjectionMember? {
+        guard let object = value.objectValue else { return nil }
+        return RoomProjectionMember(
+            name: string(object["name"]) ?? "",
+            handle: string(object["handle"]),
+            connectionID: string(object["connectionId"]),
+            connectionKind: string(object["connectionKind"]),
+            connectionLabel: string(object["connectionLabel"]),
+            sourceScoped: object["sourceScoped"]?.boolValue == true
+        )
+    }
+
+    private static func entryKey(_ entry: RoomProjectionEntry) -> String {
+        if let id = entry.id { return "id:\(id)" }
+        var thread = entry.thread ?? "legacy"
+        if thread.hasPrefix("legacy-"),
+           !thread.dropFirst("legacy-".count).isEmpty,
+           thread.dropFirst("legacy-".count).allSatisfy(\.isNumber) {
+            thread = "legacy"
+        }
+        return lengthKey([
+            String(entry.at), entry.from.kind.rawValue, entry.from.name,
+            entry.from.source ?? "", thread, entry.text,
+        ])
+    }
+
+    private static func memberKey(_ member: RoomProjectionMember) -> String {
+        lengthKey([
+            member.connectionID ?? "", member.connectionLabel ?? "",
+            member.handle ?? "", member.name,
+        ])
+    }
+
+    private static func lengthKey(_ values: [String]) -> String {
+        values.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+    }
+
+    private static func unionMembers(_ remote: [RoomProjectionMember],
+                                     _ local: [RoomProjectionMember]) -> [RoomProjectionMember] {
+        var ordered: [RoomProjectionMember] = []
+        var indices: [String: Int] = [:]
+        for member in remote + local {
+            let key = memberKey(member)
+            if let index = indices[key] { ordered[index] = member }
+            else {
+                indices[key] = ordered.count
+                ordered.append(member)
+            }
+        }
+        return Array(ordered.prefix(Self.maximumMembersPerRoom))
+    }
+
+    private static func string(_ value: JSONValue?) -> String? {
+        value?.stringValue
+    }
+
+    private static func nonnegativeInt(_ value: JSONValue?) -> Int {
+        let number = value?.doubleValue ?? 0
+        guard number.isFinite, number > 0 else { return 0 }
+        return number >= Double(Int.max) ? Int.max : Int(number.rounded(.towardZero))
+    }
+
+    private static func nonnegativeUInt(_ value: JSONValue?) -> UInt64 {
+        let number = value?.doubleValue ?? 0
+        guard number.isFinite, number > 0 else { return 0 }
+        if number >= Double(UInt64.max) { return UInt64.max }
+        return UInt64(number.rounded(.towardZero))
+    }
+
+    private static func signedInteger(_ value: JSONValue?) -> Int64 {
+        let number = value?.doubleValue ?? 0
+        guard number.isFinite else { return 0 }
+        if number >= Double(Int64.max) { return Int64.max }
+        if number <= Double(Int64.min) { return Int64.min }
+        return Int64(number.rounded(.towardZero))
+    }
+
+    private static func milliseconds(_ date: Date) -> Int64 {
+        let value = date.timeIntervalSince1970 * 1_000
+        guard value.isFinite else { return 0 }
+        if value >= Double(Int64.max) { return Int64.max }
+        if value <= Double(Int64.min) { return Int64.min }
+        return Int64(value.rounded())
+    }
+}
+
 public struct RoomMetadataMutation: Codable, Hashable, Sendable, Identifiable {
     public enum Kind: String, Codable, Sendable { case add, remove, rename }
 

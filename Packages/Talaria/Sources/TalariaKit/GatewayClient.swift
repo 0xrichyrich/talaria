@@ -34,7 +34,17 @@ public struct HermesProfile: Sendable, Identifiable {
     /// reconstructed from a rendered roster label.
     public var displayName: String?
     public var uiMeta: JSONValue?
+    /// Gateway-owned compare-and-swap revisions for the top-level `ui_meta`
+    /// keys. `nil` means the gateway omitted the field (legacy/no CAS);
+    /// an empty map is positive evidence that CAS is supported and every
+    /// untouched key is currently at revision zero.
+    public var uiMetaRevisions: [String: Int]?
     public var hasAvatar: Bool
+
+    /// A present revision field is authority, so malformed values cannot be
+    /// collapsed into `nil` and mistaken for a legacy gateway. The roster
+    /// decoder rejects the whole answer when this is false.
+    var hasValidUIMetaRevisionsWire: Bool
 
     public struct ProfileSessionRef: Sendable {
         public var id: String
@@ -184,7 +194,31 @@ public struct HermesProfile: Sendable, Identifiable {
         workerSession = WorkerSessionRef(v["worker_session"])
         displayName = v["display_name"]?.stringValue
         uiMeta = v["ui_meta"]
+        let revisionField = Self.decodeUIMetaRevisions(v["ui_meta_revisions"])
+        uiMetaRevisions = revisionField.revisions
+        hasValidUIMetaRevisionsWire = revisionField.isValid
         hasAvatar = v["has_avatar"]?.boolValue ?? false
+    }
+
+    /// Hermes accepts only real, nonnegative integers here. `JSONValue` keeps
+    /// numbers as `Double`, so `Int(exactly:)` is essential: `intValue` would
+    /// silently turn 1.5 into 1 and could authorize a stale writer.
+    private static func decodeUIMetaRevisions(_ value: JSONValue?)
+        -> (revisions: [String: Int]?, isValid: Bool) {
+        guard let value else { return (nil, true) }
+        guard let object = value.objectValue else { return (nil, false) }
+        var revisions: [String: Int] = [:]
+        revisions.reserveCapacity(object.count)
+        for (key, raw) in object {
+            guard let number = raw.doubleValue,
+                  number.isFinite,
+                  let revision = Int(exactly: number),
+                  revision >= 0 else {
+                return (nil, false)
+            }
+            revisions[key] = revision
+        }
+        return (revisions, true)
     }
 
     /// The session whose text a roster row previews. The preferred session is
@@ -506,12 +540,23 @@ public actor GatewayClient {
         guard let rawRows = result["profiles"]?.arrayValue else {
             throw GatewayError(code: -8, message: "profiles.list malformed response")
         }
+        let rows = try Self.decodeProfileRows(rawRows)
+        if !rows.isEmpty { rememberPins(from: rows) }
+        return rows.map { $0.foldingCanonicalPreview() }
+    }
+
+    /// Strict profiles.list row decoding kept separate from transport so the
+    /// compatibility/CAS boundary can be tested without a live gateway.
+    static func decodeProfileRows(_ rawRows: [JSONValue]) throws -> [HermesProfile] {
         let rows = rawRows.map(HermesProfile.init)
         guard rows.allSatisfy({ !$0.name.isEmpty }) else {
             throw GatewayError(code: -8, message: "profiles.list contained malformed profile")
         }
-        if !rows.isEmpty { rememberPins(from: rows) }
-        return rows.map { $0.foldingCanonicalPreview() }
+        guard rows.allSatisfy(\.hasValidUIMetaRevisionsWire) else {
+            throw GatewayError(code: -8,
+                               message: "profiles.list contained malformed ui_meta_revisions")
+        }
+        return rows
     }
 
     /// Canonical-chat pins to resolve on the NEXT roster call. Self-priming

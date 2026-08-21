@@ -58,21 +58,26 @@ public actor RoomStore {
         /// reused route.
         var ignoredMetadataMutationIDs: [UUID]
         var pendingLifecycleRoutes: [GatewayBotRoute]
+        /// Bounded cross-client mirror and tombstone ledger. This remains
+        /// separate from `rooms`: remote truncation can never prune the rich
+        /// protected transcript or its runtime reconciliation state.
+        var roomProjection: RoomProjectionEnvelope
 
         init(version: Int, rooms: [RoomRecord], metadataOutbox: [RoomMetadataMutation],
              retiredMetadataRoutes: [GatewayBotRoute],
              ignoredMetadataMutationIDs: [UUID],
-             pendingLifecycleRoutes: [GatewayBotRoute] = []) {
+             pendingLifecycleRoutes: [GatewayBotRoute] = [],
+             roomProjection: RoomProjectionEnvelope = RoomProjectionEnvelope()) {
             self.version = version; self.rooms = rooms; self.metadataOutbox = metadataOutbox
             self.retiredMetadataRoutes = retiredMetadataRoutes
             self.ignoredMetadataMutationIDs = ignoredMetadataMutationIDs
-            self.pendingLifecycleRoutes = []
             self.pendingLifecycleRoutes = pendingLifecycleRoutes
+            self.roomProjection = roomProjection.bounded()
         }
 
         private enum CodingKeys: String, CodingKey {
             case version, rooms, metadataOutbox, retiredMetadataRoutes,
-                 ignoredMetadataMutationIDs, pendingLifecycleRoutes
+                 ignoredMetadataMutationIDs, pendingLifecycleRoutes, roomProjection
         }
         init(from decoder: Decoder) throws {
             let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -86,6 +91,19 @@ public actor RoomStore {
                                                                      forKey: .ignoredMetadataMutationIDs) ?? []
             pendingLifecycleRoutes = try values.decodeIfPresent([GatewayBotRoute].self,
                                                                forKey: .pendingLifecycleRoutes) ?? []
+            if values.contains(.roomProjection) {
+                let raw = try values.decode(JSONValue.self, forKey: .roomProjection)
+                guard let projection = RoomProjectionEnvelope.strictlyDecodedPersisted(raw) else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .roomProjection,
+                        in: values,
+                        debugDescription: "Persisted room projection was not canonical"
+                    )
+                }
+                roomProjection = projection
+            } else {
+                roomProjection = RoomProjectionEnvelope()
+            }
         }
     }
 
@@ -103,6 +121,7 @@ public actor RoomStore {
     private var cachedRetiredMetadataRoutes: Set<GatewayBotRoute>?
     private var cachedIgnoredMetadataMutationIDs: Set<UUID>?
     private var cachedPendingLifecycleRoutes: Set<GatewayBotRoute>?
+    private var cachedRoomProjection: RoomProjectionEnvelope?
 
     public init(baseDirectory: URL? = nil, fileManager: FileManager = .default,
                 protectsFiles: Bool? = nil,
@@ -138,6 +157,7 @@ public actor RoomStore {
             cachedRetiredMetadataRoutes = []
             cachedIgnoredMetadataMutationIDs = []
             cachedPendingLifecycleRoutes = []
+            cachedRoomProjection = RoomProjectionEnvelope()
             return []
         }
         do {
@@ -176,6 +196,7 @@ public actor RoomStore {
         cachedRetiredMetadataRoutes = Set(envelope.retiredMetadataRoutes)
         cachedIgnoredMetadataMutationIDs = Set(envelope.ignoredMetadataMutationIDs)
         cachedPendingLifecycleRoutes = Set(envelope.pendingLifecycleRoutes)
+        cachedRoomProjection = envelope.roomProjection.bounded()
         if migrated {
             try persist(Array(rooms.values), outbox: envelope.metadataOutbox,
                         retiredRoutes: envelope.retiredMetadataRoutes,
@@ -187,6 +208,36 @@ public actor RoomStore {
 
     public func room(id: RoomID) throws -> RoomRecord? {
         try ensureLoaded()[id]
+    }
+
+    /// The durable bounded projection/tombstone ledger. This is never derived
+    /// from omission in a gateway response: an absent `ui_meta` block leaves
+    /// this value untouched.
+    public func roomProjection() throws -> RoomProjectionEnvelope {
+        _ = try ensureLoaded()
+        return cachedRoomProjection ?? RoomProjectionEnvelope()
+    }
+
+    /// Union an observed or locally-built projection with the durable ledger.
+    /// Missing rooms/messages are not deletion; only explicit tombstones in
+    /// either envelope (or `intent.deletedRooms`) remove projection rooms.
+    /// The rich RoomRecord array is persisted byte-for-byte independently.
+    @discardableResult
+    public func mergeRoomProjection(
+        _ incoming: RoomProjectionEnvelope,
+        intent: RoomProjectionMergeIntent = RoomProjectionMergeIntent(),
+        updatedAt: UInt64? = nil
+    ) throws -> RoomProjectionEnvelope {
+        let rooms = try ensureLoaded()
+        let merged = RoomProjectionEnvelope.merging(
+            remote: cachedRoomProjection,
+            local: incoming,
+            intent: intent,
+            updatedAt: updatedAt
+        )
+        try persist(Array(rooms.values), roomProjection: merged)
+        cachedRoomProjection = merged
+        return merged
     }
 
     public func metadataOutbox() throws -> [RoomMetadataMutation] {
@@ -440,13 +491,16 @@ public actor RoomStore {
         // it must not require decoding the data the user asked us to remove.
         do {
             try deleteFailure?(.beforeEmptyCommit)
-            try persist([], outbox: [], retiredRoutes: [], ignoredMutationIDs: [], pendingLifecycleRoutes: [])
+            try persist([], outbox: [], retiredRoutes: [], ignoredMutationIDs: [],
+                        pendingLifecycleRoutes: [],
+                        roomProjection: RoomProjectionEnvelope())
         } catch { throw RoomStoreError.deleteCommitFailed }
         cachedRooms = [:]
         cachedMetadataOutbox = []
         cachedRetiredMetadataRoutes = []
         cachedIgnoredMetadataMutationIDs = []
         cachedPendingLifecycleRoutes = []
+        cachedRoomProjection = RoomProjectionEnvelope()
         do {
             try deleteFailure?(.afterEmptyCommit)
             if fileManager.fileExists(atPath: rootURL.path) {
@@ -554,12 +608,14 @@ public actor RoomStore {
                          outbox: [RoomMetadataMutation]? = nil,
                          retiredRoutes: [GatewayBotRoute]? = nil,
                          ignoredMutationIDs: [UUID]? = nil,
-                         pendingLifecycleRoutes: [GatewayBotRoute]? = nil) throws {
+                         pendingLifecycleRoutes: [GatewayBotRoute]? = nil,
+                         roomProjection: RoomProjectionEnvelope? = nil) throws {
         try prepareDirectories()
         let metadataOutbox = outbox ?? cachedMetadataOutbox ?? []
         let routes = retiredRoutes ?? Array(cachedRetiredMetadataRoutes ?? [])
         let ignored = ignoredMutationIDs ?? Array(cachedIgnoredMetadataMutationIDs ?? [])
         let pending = pendingLifecycleRoutes ?? Array(cachedPendingLifecycleRoutes ?? [])
+        let projection = (roomProjection ?? cachedRoomProjection ?? RoomProjectionEnvelope()).bounded()
         try validateMetadataOutbox(metadataOutbox)
         try validateRetiredMetadataRoutes(routes)
         try validateRetiredMetadataRoutes(pending)
@@ -572,7 +628,7 @@ public actor RoomStore {
                                     $0.uuidString < $1.uuidString
                                 }, pendingLifecycleRoutes: pending.sorted {
                                     $0.qualifiedID < $1.qualifiedID
-                                })
+                                }, roomProjection: projection)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(envelope)
