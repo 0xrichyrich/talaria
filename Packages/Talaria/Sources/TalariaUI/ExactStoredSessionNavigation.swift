@@ -300,6 +300,59 @@ final class ExactStoredSessionRouteQueue {
 }
 
 extension AppModel {
+    /// Close the exact-session source authority before a user-initiated
+    /// gateway teardown crosses its first await.  Pool identity alone cannot
+    /// express that intent: the teardown deliberately waits on an in-flight
+    /// lease, while the saved row and pooled client remain visible until that
+    /// lease is released.
+    func beginExactStoredSessionSourceTeardown(gatewayID: String) {
+        exactStoredSessionSourceInvalidations.insert(gatewayID)
+        exactStoredSessionSourceTeardownCounts[gatewayID, default: 0] += 1
+    }
+
+    /// End one teardown scope.  Keep a failed/partial teardown fenced while a
+    /// durable row with a credential still exists; a later credentialed
+    /// reconnect can explicitly clear that transient invalidation.
+    func finishExactStoredSessionSourceTeardown(gatewayID: String) {
+        let remaining = exactStoredSessionSourceTeardownCounts[gatewayID, default: 1] - 1
+        if remaining > 0 {
+            exactStoredSessionSourceTeardownCounts[gatewayID] = remaining
+            return
+        }
+        exactStoredSessionSourceTeardownCounts.removeValue(forKey: gatewayID)
+        clearExactStoredSessionSourceInvalidationIfUnavailable(gatewayID: gatewayID)
+    }
+
+    /// A source that no longer has a durable row or credential is already
+    /// rejected by the route/credential fence. Removing the transient mark in
+    /// that state permits a later re-add/sign-in to establish fresh authority.
+    func clearExactStoredSessionSourceInvalidationIfUnavailable(gatewayID: String) {
+        guard exactStoredSessionSourceTeardownCounts[gatewayID] == nil else { return }
+        let registry = ConnectionRegistry.shared
+        guard let saved = registry.saved.first(where: { $0.id == gatewayID }) else {
+            exactStoredSessionSourceInvalidations.remove(gatewayID)
+            return
+        }
+        guard registry.credential(for: saved) == nil else { return }
+        exactStoredSessionSourceInvalidations.remove(gatewayID)
+    }
+
+    /// A successfully credentialed reconnect may recover a source whose
+    /// previous teardown could not prove durable removal. Never clear while a
+    /// user teardown is still in flight.
+    func clearExactStoredSessionSourceInvalidationIfCredentialed(gatewayID: String) {
+        guard exactStoredSessionSourceTeardownCounts[gatewayID] == nil,
+              let saved = ConnectionRegistry.shared.saved.first(where: {
+                  $0.id == gatewayID
+              }),
+              ConnectionRegistry.shared.credential(for: saved) != nil else { return }
+        exactStoredSessionSourceInvalidations.remove(gatewayID)
+    }
+
+    func exactStoredSessionSourceIsInvalidated(gatewayID: String) -> Bool {
+        exactStoredSessionSourceInvalidations.contains(gatewayID)
+    }
+
     /// Shared entry point for response-push taps and exact-session URLs. It
     /// never calls `openChat`; only the source-captured session.resume path may
     /// publish navigation after both authority checks pass.
@@ -454,6 +507,11 @@ extension AppModel {
             }
             await pool.release(candidatePoolLease)
             try await Task.sleep(for: .milliseconds(100))
+        }
+
+        clearExactStoredSessionSourceInvalidationIfCredentialed(gatewayID: route.gatewayID)
+        if let hook = SessionsRuntime.shared.exactOpenAfterPoolLeaseForTesting {
+            await hook(route.gatewayID)
         }
 
         do {

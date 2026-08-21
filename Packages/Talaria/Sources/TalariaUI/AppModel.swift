@@ -91,6 +91,12 @@ public final class AppModel {
     /// Out-of-process exact-session navigation is retained outside the visible
     /// chat tree until launch restore and source/profile authority are ready.
     let exactStoredSessionRouteQueue = ExactStoredSessionRouteQueue()
+    /// User-initiated gateway teardown invalidates exact-session source
+    /// authority synchronously, before the pool/client cleanup can suspend.
+    /// The count lets overlapping sign-out/remove actions retain the fence
+    /// until every teardown has crossed its durable row/credential boundary.
+    var exactStoredSessionSourceInvalidations: Set<String> = []
+    var exactStoredSessionSourceTeardownCounts: [String: Int] = [:]
     /// Focused integration-test seams around network/RPC boundaries. Queue,
     /// launch readiness, source/credential validation, and retry behavior stay
     /// on the production path.

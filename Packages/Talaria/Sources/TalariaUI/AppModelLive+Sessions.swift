@@ -53,6 +53,10 @@ final class SessionsRuntime {
     /// source/lifecycle fence. Tests use this to model a profile mutation
     /// winning during that actor hop.
     var sourceFenceAfterPoolCheckForTesting: (@MainActor () async -> Void)?
+    /// Holds an exact-open pool lease in deterministic teardown tests. The
+    /// production path has no pause here; the seam makes sign-out/remove race
+    /// ordering explicit without opening a real gateway socket.
+    var exactOpenAfterPoolLeaseForTesting: (@MainActor (String) async -> Void)?
 
     static func key(botID: String, sessionID: String) -> String {
         botID + "\u{0}" + sessionID
@@ -453,15 +457,20 @@ extension AppModel {
         // profile lifecycle mutation that wins the pool actor hop is rejected
         // here rather than publishing from the pre-await snapshot.
         try Task.checkCancellation()
+        guard !exactStoredSessionSourceIsInvalidated(gatewayID: fence.route.gatewayID) else {
+            throw CancellationError()
+        }
         guard mode == .live,
               stateRoute(for: fence.botID) == fence.route,
               profileLifecycleAccepts(fence.lifecycle) else {
             throw CancellationError()
         }
         if let expectedURL = fence.savedURLString {
-            guard ConnectionRegistry.shared.saved.contains(where: {
+            guard let saved = ConnectionRegistry.shared.saved.first(where: {
                 $0.id == fence.route.gatewayID && $0.urlString == expectedURL
-            }) else { throw CancellationError() }
+            }), ConnectionRegistry.shared.credential(for: saved) != nil else {
+                throw CancellationError()
+            }
         }
         if fence.route.gatewayID == activeGatewayID {
             guard LiveRuntime.shared.generation == fence.connectionGeneration,

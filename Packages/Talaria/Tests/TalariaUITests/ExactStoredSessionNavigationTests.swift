@@ -1681,6 +1681,178 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         await pool.disconnect(gatewayID: gatewayID)
     }
 
+    func testCredentialRemovalDuringFinalPoolFenceCannotPublish() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let profile = "researcher"
+        let baseURL = try XCTUnwrap(URL(
+            string: "https://credential-fence-\(UUID().uuidString).example"))
+        let saved = try XCTUnwrap(registry.upsert(
+            urlString: baseURL.absoluteString,
+            name: "Credential fence",
+            credential: .sessionToken("credential-fence-token")))
+        let gatewayID = saved.id
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: profile)
+        let target = route.qualifiedID
+        let client = GatewayClient(
+            baseURL: baseURL,
+            credential: .sessionToken("credential-fence-token"))
+        let pool = registry.clientPool
+        await pool.adopt(client, for: gatewayID)
+        let snapshot = try await pool.connectWithGeneration(
+            gatewayID: gatewayID, baseURL: baseURL,
+            credential: .sessionToken("credential-fence-token"))
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        let oldHook = SessionsRuntime.shared.sourceFenceAfterPoolCheckForTesting
+        model.mode = .live
+        model.bots = [Bot(id: target, job: "", shape: .circle, hue: .violet)]
+        model.chats[target] = ChatState()
+        LiveRuntime.shared.gatewayID = "primary-credential-fence"
+        SessionsRuntime.shared.sourceFenceAfterPoolCheckForTesting = {
+            ConnectionSupervisor.shared.keychain.delete(for: baseURL)
+        }
+        defer {
+            SessionsRuntime.shared.sourceFenceAfterPoolCheckForTesting = oldHook
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            registry.remove(id: saved.id)
+            Task { await pool.disconnect(gatewayID: gatewayID) }
+        }
+
+        do {
+            _ = try await model.openStoredSessionAwaiting(
+                "wanted-stored", botID: target, route: route, client: client,
+                validateBeforeBinding: {},
+                catchUpResumeForTesting: {
+                    (LiveSession(.object([
+                        "session_id": .string("credential-fence-runtime"),
+                        "stored_session_id": .string("wanted-stored"),
+                        "info": .object(["profile_name": .string(profile)]),
+                    ])), 10)
+                },
+                sourceSnapshot: snapshot)
+            XCTFail("missing current credential must reject the exact open")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        XCTAssertNil(model.openBotID)
+        XCTAssertNil(MultiGatewayRuntime.shared.routedEvents[gatewayID])
+        await pool.disconnect(gatewayID: gatewayID)
+    }
+
+    private func runExactOpenTeardownRace(remove: Bool) async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let primaryURL = try XCTUnwrap(URL(
+            string: "https://exact-teardown-primary-\(UUID().uuidString).example"))
+        let secondaryURL = try XCTUnwrap(URL(
+            string: "https://exact-teardown-secondary-\(UUID().uuidString).example"))
+        let primary = try XCTUnwrap(registry.upsert(
+            urlString: primaryURL.absoluteString,
+            name: "Exact teardown primary",
+            credential: .sessionToken("exact-teardown-primary-token")))
+        let secondary = try XCTUnwrap(registry.upsert(
+            urlString: secondaryURL.absoluteString,
+            name: "Exact teardown secondary",
+            credential: .sessionToken("exact-teardown-secondary-token")))
+        let route = try XCTUnwrap(ExactStoredSessionRoute(
+            gatewayID: secondary.id, profile: "researcher", storedSessionID: "wanted-stored"))
+        let target = route.botRoute.qualifiedID
+        let primaryClient = GatewayClient(
+            baseURL: primaryURL,
+            credential: .sessionToken("exact-teardown-primary-token"))
+        let secondaryClient = GatewayClient(
+            baseURL: secondaryURL,
+            credential: .sessionToken("exact-teardown-secondary-token"))
+        let pool = registry.clientPool
+        await pool.adopt(secondaryClient, for: secondary.id)
+
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        let oldBaseURL = LiveRuntime.shared.baseURL
+        let oldClient = model.client
+        let oldMode = model.mode
+        let oldLeaseHook = SessionsRuntime.shared.exactOpenAfterPoolLeaseForTesting
+        var leaseHeld = false
+        var releaseLease: (() -> Void)?
+        SessionsRuntime.shared.exactOpenAfterPoolLeaseForTesting = { gatewayID in
+            XCTAssertEqual(gatewayID, secondary.id)
+            leaseHeld = true
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                releaseLease = { continuation.resume() }
+            }
+        }
+        model.mode = .live
+        model.client = primaryClient
+        model.launchWorldRestoreCompleted = true
+        model.bots = [Bot(id: target, job: "", shape: .circle, hue: .violet)]
+        model.chats[target] = ChatState()
+        LiveRuntime.shared.gatewayID = primary.id
+        LiveRuntime.shared.baseURL = primaryURL
+
+        defer {
+            releaseLease?()
+            SessionsRuntime.shared.exactOpenAfterPoolLeaseForTesting = oldLeaseHook
+            model.client = oldClient
+            model.mode = oldMode
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            LiveRuntime.shared.baseURL = oldBaseURL
+            model.exactStoredSessionSourceInvalidations.remove(secondary.id)
+            model.exactStoredSessionSourceTeardownCounts.removeValue(forKey: secondary.id)
+            registry.remove(id: primary.id)
+            registry.remove(id: secondary.id)
+        }
+
+        model.openExactStoredSession(route, origin: .notification)
+        for _ in 0..<100 where !leaseHeld { await Task.yield() }
+        XCTAssertTrue(leaseHeld, "exact navigation must hold the source pool lease")
+
+        let teardownTask = Task { @MainActor in
+            if remove {
+                await model.removeGateway(secondary)
+            } else {
+                await model.signOutGateway(secondary)
+            }
+        }
+        for _ in 0..<100 where !model.exactStoredSessionSourceIsInvalidated(
+            gatewayID: secondary.id) {
+            await Task.yield()
+        }
+        XCTAssertTrue(model.exactStoredSessionSourceIsInvalidated(gatewayID: secondary.id))
+        releaseLease?()
+        releaseLease = nil
+
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+        await teardownTask.value
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+
+        XCTAssertNil(model.openBotID,
+                     "a teardown-invalidated exact open must not publish navigation")
+        XCTAssertNil(MultiGatewayRuntime.shared.routedEvents[secondary.id],
+                     "post-disconnect exact detach must leave no routed pump")
+        XCTAssertFalse(model.exactStoredSessionSourceIsInvalidated(gatewayID: secondary.id),
+                       "durable row/credential removal makes the transient mark unnecessary")
+        if remove {
+            XCTAssertNil(registry.saved.first(where: { $0.id == secondary.id }))
+        } else {
+            let retained = try XCTUnwrap(registry.saved.first(where: { $0.id == secondary.id }))
+            XCTAssertNil(registry.credential(for: retained))
+            registry.setCredential(.sessionToken("exact-teardown-reauth-token"), for: retained)
+            model.clearExactStoredSessionSourceInvalidationIfCredentialed(
+                gatewayID: secondary.id)
+            XCTAssertFalse(model.exactStoredSessionSourceIsInvalidated(gatewayID: secondary.id),
+                           "a later credentialed reauth can recover the source")
+        }
+        await pool.disconnect(gatewayID: secondary.id)
+    }
+
+    func testSignOutInvalidatesInFlightExactOpenBeforePoolDisconnect() async throws {
+        try await runExactOpenTeardownRace(remove: false)
+    }
+
+    func testRemoveInvalidatesInFlightExactOpenBeforePoolDisconnect() async throws {
+        try await runExactOpenTeardownRace(remove: true)
+    }
+
     func testDeepLinkParserRetainsUnknownSourceForVisibleAuthorityFailure() throws {
         let url = try XCTUnwrap(URL(
             string: "talaria://bot/inbox?session_id=stored-42&gateway_id=not-saved-yet"))

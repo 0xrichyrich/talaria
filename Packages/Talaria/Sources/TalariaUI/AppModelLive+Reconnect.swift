@@ -587,6 +587,8 @@ extension AppModel {
     /// Forget the credential but keep the row: the gateway stays listed and
     /// probeable, and the next tap runs sign-in again.
     public func signOutGateway(_ gateway: SavedGateway) async {
+        beginExactStoredSessionSourceTeardown(gatewayID: gateway.id)
+        defer { finishExactStoredSessionSourceTeardown(gatewayID: gateway.id) }
         guard let base = gateway.baseURL else { return }
         if isActiveGateway(gateway) {
             await disconnectGateway()
@@ -594,6 +596,10 @@ extension AppModel {
         } else {
             await detachRoutedEvents(gatewayID: gateway.id)
             await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gateway.id)
+            // The first detach closes the old owner before the pool barrier.
+            // This second pass closes anything that was already committed by
+            // an exact open while that barrier was held.
+            await detachRoutedEvents(gatewayID: gateway.id)
         }
         ConnectionSupervisor.shared.keychain.delete(for: base)
         if ConnectionSupervisor.shared.reauthGateway?.absoluteString == base.absoluteString {
@@ -604,12 +610,18 @@ extension AppModel {
 
     /// Remove the gateway entirely — registry row and Keychain credential.
     public func removeGateway(_ gateway: SavedGateway) async {
+        beginExactStoredSessionSourceTeardown(gatewayID: gateway.id)
+        defer { finishExactStoredSessionSourceTeardown(gatewayID: gateway.id) }
         if isActiveGateway(gateway) {
             await disconnectGateway()
             flushWorldForGatewaySwitch()
         } else {
             await detachRoutedEvents(gatewayID: gateway.id)
             await ConnectionRegistry.shared.clientPool.disconnect(gatewayID: gateway.id)
+            // A pool lease can keep an exact open alive across the first
+            // detach. Scrub again after disconnect so no committed handler or
+            // source-qualified runtime survives removal.
+            await detachRoutedEvents(gatewayID: gateway.id)
         }
         let supervisor = ConnectionSupervisor.shared
         if let base = gateway.baseURL,
