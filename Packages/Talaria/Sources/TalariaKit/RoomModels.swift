@@ -979,11 +979,13 @@ public struct RoomProjectionEnvelope: Codable, Equatable, Sendable {
             if localRevision > remoteRevision {
                 identity = localRoom ?? remoteRoom!
                 members = localRoom?.members ?? []
-                image = localRoom?.image
+                // Image is optional because envelope bounding may remove it.
+                // Absence is therefore omission, not an explicit clear.
+                image = localRoom?.image ?? remoteRoom?.image
             } else if remoteRevision > localRevision {
                 identity = remoteRoom ?? localRoom!
                 members = remoteRoom?.members ?? []
-                image = remoteRoom?.image
+                image = remoteRoom?.image ?? localRoom?.image
             } else {
                 identity = localRoom ?? remoteRoom!
                 members = unionMembers(remoteRoom?.members ?? [], localRoom?.members ?? [])

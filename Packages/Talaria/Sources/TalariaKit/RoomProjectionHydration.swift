@@ -32,7 +32,8 @@ enum RoomProjectionHydration {
         projection: RoomProjectionEnvelope,
         tombstones: [String: UInt64],
         existing: [RoomID: RoomRecord],
-        preservingRoomIDs: Set<RoomID>
+        preservingRoomIDs: Set<RoomID>,
+        allowedGatewayIDs: Set<String>
     ) -> Result {
         var rooms = existing
         var deletedRoomIDs = Set<RoomID>()
@@ -65,10 +66,14 @@ enum RoomProjectionHydration {
                 // but never let one projection identity claim the other.
                 guard current.rawProjectionRoomKey == nil
                         || current.rawProjectionRoomKey == key else { continue }
-                let hydrated = hydrate(projected, key: key, into: current)
+                let hydrated = hydrate(projected, key: key, into: current,
+                                       allowedGatewayIDs: allowedGatewayIDs)
                 rooms[roomID] = hydrated.room
                 if hydrated.acceptedIdentityOverlay { imageEligibleKeys.insert(key) }
-            } else if let hydrated = hydrateNew(projected, key: key, id: roomID) {
+            } else if let hydrated = hydrateNew(
+                projected, key: key, id: roomID,
+                allowedGatewayIDs: allowedGatewayIDs
+            ) {
                 rooms[roomID] = hydrated
                 imageEligibleKeys.insert(key)
             }
@@ -103,9 +108,12 @@ enum RoomProjectionHydration {
     }
 
     private static func hydrateNew(_ projected: RoomProjectionRoom,
-                                   key: String, id: RoomID) -> RoomRecord? {
+                                   key: String, id: RoomID,
+                                   allowedGatewayIDs: Set<String>) -> RoomRecord? {
         guard !projected.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let members = routableMembers(projected.members, preserving: []),
+              let members = routableMembers(
+                projected.members, preserving: [],
+                allowedGatewayIDs: allowedGatewayIDs),
               members.count >= RoomEngine.minimumMembers else { return nil }
 
         let seed = RoomRecord(
@@ -129,7 +137,8 @@ enum RoomProjectionHydration {
     }
 
     private static func hydrate(_ projected: RoomProjectionRoom,
-                                key: String, into existing: RoomRecord) -> ExistingHydration {
+                                key: String, into existing: RoomRecord,
+                                allowedGatewayIDs: Set<String>) -> ExistingHydration {
         var room = existing
         room.rawProjectionRoomKey = key
         // A first exact-key association may safely consume revision zero. Once
@@ -143,7 +152,8 @@ enum RoomProjectionHydration {
             if !projected.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                let members = routableMembers(
                 projected.members,
-                preserving: existing.members + existing.formerMembers
+                preserving: existing.members + existing.formerMembers,
+                allowedGatewayIDs: allowedGatewayIDs
             ), members.count >= RoomEngine.minimumMembers {
                 var identityCandidate = room
                 identityCandidate.name = projected.name
@@ -179,7 +189,8 @@ enum RoomProjectionHydration {
     }
 
     private static func routableMembers(_ projected: [RoomProjectionMember],
-                                        preserving rich: [RoomMember]) -> [RoomMember]? {
+                                        preserving rich: [RoomMember],
+                                        allowedGatewayIDs: Set<String>) -> [RoomMember]? {
         var richByRoute: [GatewayBotRoute: RoomMember] = [:]
         for member in rich where richByRoute[member.route] == nil {
             richByRoute[member.route] = member
@@ -192,7 +203,12 @@ enum RoomProjectionHydration {
             let profile = value.name.trimmingCharacters(in: .whitespacesAndNewlines)
             // Modern descriptors must prove their source. Bare v1/v2 member
             // names remain in the ledger but cannot become routable seats.
-            guard value.sourceScoped, !gateway.isEmpty, !profile.isEmpty,
+            // Desktop connection ids are host-registry identities. They are
+            // routable on this device only after the caller proves an exact
+            // configured Talaria gateway id; labels are display data and must
+            // never be used as an identity fallback.
+            guard value.sourceScoped, allowedGatewayIDs.contains(gateway),
+                  !gateway.isEmpty, !profile.isEmpty,
                   !gateway.contains(GatewayBotRoute.separator) else { continue }
             let route = GatewayBotRoute(gatewayID: gateway, profile: profile)
             guard GatewayBotRoute(qualifiedID: route.qualifiedID) == route,

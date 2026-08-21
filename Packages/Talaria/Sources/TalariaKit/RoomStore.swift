@@ -251,6 +251,7 @@ public actor RoomStore {
         _ incoming: RoomProjectionEnvelope,
         intent: RoomProjectionMergeIntent = RoomProjectionMergeIntent(),
         preservingRoomIDs: Set<RoomID> = [],
+        allowedGatewayIDs: Set<String> = [],
         updatedAt: UInt64? = nil
     ) throws -> RoomProjectionReconcileResult {
         let existing = try ensureLoaded()
@@ -262,7 +263,8 @@ public actor RoomStore {
             updatedAt: updatedAt)
         let hydrated = RoomProjectionHydration.reconciling(
             projection: merged, tombstones: tombstones,
-            existing: existing, preservingRoomIDs: preservingRoomIDs)
+            existing: existing, preservingRoomIDs: preservingRoomIDs,
+            allowedGatewayIDs: allowedGatewayIDs)
         let committedRooms = sorted(hydrated.rooms.values)
 
         // One atomic index replacement contains both the merged ledger and
@@ -392,6 +394,8 @@ public actor RoomStore {
     public func mutate(
         roomID: RoomID,
         metadataMutations: [RoomMetadataMutation] = [],
+        projectionIntent: RoomProjectionMergeIntent? = nil,
+        projectionUpdatedAt: UInt64? = nil,
         _ body: @Sendable (inout RoomRecord) throws -> Void
     ) throws -> RoomRecord {
         var rooms = try ensureLoaded()
@@ -408,14 +412,21 @@ public actor RoomStore {
         try validateAttachmentFiles(in: room)
         removedBlobIDs.formUnion(previousBlobIDs.subtracting(referencedBlobIDs(room)))
         rooms[roomID] = room
+        var projection = cachedRoomProjection ?? RoomProjectionEnvelope()
+        if let projectionIntent {
+            projection = applyProjectionIntent(
+                projectionIntent, to: &rooms, updatedAt: projectionUpdatedAt)
+            room = rooms[roomID] ?? room
+        }
         outbox.append(contentsOf: metadataMutations.filter {
             !retiredRoutes.contains($0.route)
         })
         try persist(Array(rooms.values), outbox: outbox,
-                    retiredRoutes: Array(retiredRoutes))
+                    retiredRoutes: Array(retiredRoutes), roomProjection: projection)
         cachedRooms = rooms
         cachedMetadataOutbox = outbox
         cachedRetiredMetadataRoutes = retiredRoutes
+        cachedRoomProjection = projection
         try? removeBlobs(removedBlobIDs, roomID: room.id)
         return room
     }
@@ -457,6 +468,7 @@ public actor RoomStore {
         var retired = cachedRetiredMetadataRoutes ?? []
         var ignored = cachedIgnoredMetadataMutationIDs ?? []
         var changed = false
+        var projectionRoomIDs = Set<RoomID>()
         var migratedMutations = 0
         for id in rooms.keys {
             guard var room = rooms[id] else { continue }
@@ -464,6 +476,7 @@ public actor RoomStore {
             migrate(&room, from: source, to: destination)
             if room != before {
                 rooms[id] = room
+                projectionRoomIDs.insert(id)
                 changed = true
             }
         }
@@ -481,12 +494,19 @@ public actor RoomStore {
         try validateMetadataOutbox(outbox)
         try validateRetiredMetadataRoutes(Array(retired))
         for room in rooms.values { try RoomEngine.validate(room) }
+        var projection = cachedRoomProjection ?? RoomProjectionEnvelope()
+        if !projectionRoomIDs.isEmpty {
+            let intent = projectionIntent(
+                for: projectionRoomIDs, rooms: rooms, projection: projection)
+            projection = applyProjectionIntent(intent, to: &rooms, updatedAt: nil)
+        }
         try persist(Array(rooms.values), outbox: outbox, retiredRoutes: Array(retired),
-                    ignoredMutationIDs: Array(ignored))
+                    ignoredMutationIDs: Array(ignored), roomProjection: projection)
         cachedRooms = rooms
         cachedMetadataOutbox = outbox
         cachedRetiredMetadataRoutes = retired
         cachedIgnoredMetadataMutationIDs = ignored
+        cachedRoomProjection = projection
         return RoomProfileRouteMutationResult(
             rooms: sorted(rooms.values), migratedMutationCount: migratedMutations)
     }
@@ -509,21 +529,30 @@ public actor RoomStore {
         let ids = outbox.filter { $0.route == route }.map(\.id)
         ignored.formUnion(ids)
         var changed = inserted || !ids.isEmpty
+        var projectionRoomIDs = Set<RoomID>()
         for id in rooms.keys {
             guard var room = rooms[id] else { continue }
             let before = room
             retire(&room, route: route)
             changed = room != before || changed
+            if room != before { projectionRoomIDs.insert(id) }
             rooms[id] = room
         }
         guard changed else { return RoomProfileRouteMutationResult(rooms: sorted(rooms.values)) }
         for room in rooms.values { try RoomEngine.validate(room) }
+        var projection = cachedRoomProjection ?? RoomProjectionEnvelope()
+        if !projectionRoomIDs.isEmpty {
+            let intent = projectionIntent(
+                for: projectionRoomIDs, rooms: rooms, projection: projection)
+            projection = applyProjectionIntent(intent, to: &rooms, updatedAt: nil)
+        }
         try persist(Array(rooms.values), outbox: outbox,
                     retiredRoutes: Array(retired),
-                    ignoredMutationIDs: Array(ignored))
+                    ignoredMutationIDs: Array(ignored), roomProjection: projection)
         cachedRooms = rooms
         cachedRetiredMetadataRoutes = retired
         cachedIgnoredMetadataMutationIDs = ignored
+        cachedRoomProjection = projection
         return RoomProfileRouteMutationResult(
             rooms: sorted(rooms.values), retiredMutationCount: ids.count)
     }
@@ -794,6 +823,91 @@ public actor RoomStore {
             for key in resolved where !changed.contains(key) {
                 result[key] = max(result[key] ?? 0, intent.writeRevision)
             }
+        }
+        return result
+    }
+
+    /// Convert an already-committed rich mutation into the same bounded ledger
+    /// transition the network worker would publish. Keeping this inside the
+    /// actor makes the room record, legacy-key tombstone, and new revision one
+    /// atomic index replacement; a process death cannot lose the only evidence
+    /// that the old identity was retired.
+    private func applyProjectionIntent(
+        _ intent: RoomProjectionMergeIntent,
+        to rooms: inout [RoomID: RoomRecord],
+        updatedAt: UInt64?
+    ) -> RoomProjectionEnvelope {
+        let previous = cachedRoomProjection ?? RoomProjectionEnvelope()
+        let local = RoomProjectionEnvelope.projecting(
+            Array(rooms.values),
+            revisions: Dictionary(uniqueKeysWithValues: rooms.values.map {
+                ($0.id, $0.rawProjectionRevision)
+            }),
+            updatedAt: updatedAt ?? previous.updatedAt)
+        let merged = RoomProjectionEnvelope.merging(
+            remote: previous, local: local, intent: intent,
+            updatedAt: updatedAt)
+
+        let changedKeys = resolvedProjectionKeys(
+            intent.changedRooms, in: local)
+        for id in rooms.keys {
+            guard var room = rooms[id] else { continue }
+            let key = room.rawProjectionRoomKey
+                ?? RoomProjectionEnvelope.idKey(room.id.description)
+            guard changedKeys.contains(key), let projected = merged.rooms[key]
+            else { continue }
+            // Once a local room participates in the shared ledger its immutable
+            // id key is durable. This is also what makes a promoted legacy rename
+            // pass the strict key-to-UUID disk validator.
+            room.rawProjectionRoomKey = key
+            room.rawProjectionRevision = projected.revision
+            rooms[id] = room
+        }
+        return merged
+    }
+
+    /// Profile lifecycle has no gateway revision yet, but its local protected
+    /// commit still needs a strictly newer room revision so an intent-less
+    /// restart/reseed cannot union the retired route back into the room.
+    private func projectionIntent(
+        for roomIDs: Set<RoomID>,
+        rooms: [RoomID: RoomRecord],
+        projection: RoomProjectionEnvelope
+    ) -> RoomProjectionMergeIntent {
+        let keys = roomIDs.compactMap { id -> String? in
+            guard let room = rooms[id] else { return nil }
+            return room.rawProjectionRoomKey
+                ?? RoomProjectionEnvelope.idKey(room.id.description)
+        }
+        var revision: UInt64 = 0
+        for id in roomIDs {
+            if let room = rooms[id] { revision = max(revision, room.rawProjectionRevision) }
+        }
+        for key in keys {
+            revision = max(revision, projection.rooms[key]?.revision ?? 0)
+        }
+        if revision < .max { revision += 1 }
+        return RoomProjectionMergeIntent(
+            changedRooms: keys, writeRevision: revision)
+    }
+
+    private func resolvedProjectionKeys(
+        _ labels: [String], in envelope: RoomProjectionEnvelope
+    ) -> Set<String> {
+        var result = Set<String>()
+        for label in labels {
+            var matches = Set<String>()
+            for (key, room) in envelope.rooms {
+                if key == label || room.name == label
+                    || key == RoomProjectionEnvelope.legacyNameKey(label) {
+                    matches.insert(key)
+                }
+            }
+            if RoomProjectionEnvelope.isRoomKey(label) { matches.insert(label) }
+            else if matches.isEmpty {
+                matches.insert(RoomProjectionEnvelope.legacyNameKey(label))
+            }
+            result.formUnion(matches)
         }
         return result
     }
