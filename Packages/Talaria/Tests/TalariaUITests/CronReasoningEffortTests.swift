@@ -185,6 +185,63 @@ final class CronReasoningEffortTests: XCTestCase {
         XCTAssertEqual(restPatchCount, 0)
     }
 
+    func testDelayedExistingMutationRejectsCompletionAfterSourceReplacement() async {
+        let gate = DelayedCronAddGate()
+        let oldFence = CronSourceMutationFence(
+            gatewayID: "homelab", profile: "default", generation: .retained(4))
+        let write = Task {
+            await gate.waitForRelease()
+            let stillOwned = CronSourceMutationFence.accepts(
+                oldFence, primaryGatewayID: "primary", primaryGeneration: 10,
+                retainedGenerations: ["homelab": 5])
+            return CronAsyncFencePolicy(sourceAccepted: stillOwned)
+        }
+        while !(await gate.hasArrived()) { await Task.yield() }
+
+        // The pool replacement happens while the existing-job write is
+        // suspended. The completion must be an explicit stale outcome, not a
+        // successful no-op that lets the editor pop or records a success toast.
+        await gate.release()
+        let outcome = await write.value
+        XCTAssertEqual(outcome, .sourceChanged)
+        XCTAssertFalse(outcome.mayPublish)
+        XCTAssertTrue(outcome.shouldRollbackOptimisticState)
+    }
+
+    func testStaleTogglePolicyRollsBackAndNeverSettlesAsSuccess() {
+        let outcome = CronAsyncFencePolicy(sourceAccepted: false)
+        XCTAssertTrue(outcome.shouldRollbackOptimisticState)
+        XCTAssertFalse(outcome.mayPublish)
+    }
+
+    func testDelayedReadCannotClearReplacementAuthority() {
+        let target = RoutineTarget(
+            route: GatewayRoutineRoute(gatewayID: "homelab", jobID: "same-id"),
+            bot: GatewayBotRoute(gatewayID: "homelab", profile: "default"),
+            profile: "default")
+        let oldFence = CronRoutineMutationFence(
+            routineID: "routine", target: target,
+            source: CronSourceMutationFence(
+                gatewayID: "homelab", profile: "default", generation: .retained(4)))
+        let replacementFence = CronRoutineMutationFence(
+            routineID: "routine", target: target,
+            source: CronSourceMutationFence(
+                gatewayID: "homelab", profile: "default", generation: .retained(5)))
+
+        XCTAssertFalse(CronReadCachePolicy.shouldClearBeforeRead(
+            sourceAccepted: false, cacheFence: replacementFence, operationFence: oldFence))
+        XCTAssertTrue(CronReadCachePolicy.shouldClearBeforeRead(
+            sourceAccepted: true, cacheFence: oldFence, operationFence: replacementFence))
+    }
+
+    func testQuarantinePauseFailureLeavesVictimRetryable() {
+        var quarantined: Set<String> = ["legacy-job"]
+        if !CronQuarantinePolicy.retainMarkerAfterPauseFailure {
+            quarantined.remove("legacy-job")
+        }
+        XCTAssertTrue(quarantined.isEmpty)
+    }
+
     func testRoutineEditorLocksExistingMutationUntilDetailIsAuthoritative() {
         XCTAssertFalse(RoutineEditorDetailPolicy.allowsEditingExisting(
             restAvailable: true, hasAuthoritativeDetail: false, quarantined: false))

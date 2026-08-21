@@ -39,10 +39,12 @@ reasoning. Approval/clarify sends now preserve registrations when connector
 delivery times out ambiguously, and prompt lifecycle acknowledgements no longer
 block the relay read loop or seal a live draft. Those are gateway fixes with no
 new Talaria wire shape, but they extend the live certification matrix. Cron raw
-jobs now expose an optional user-owned `reasoning_effort` override; Talaria does
-not yet decode or edit that field, so it remains a management gap. Formatting,
-React build, contributor, and Windows test-only commits do not create portable
-iOS behavior.
+jobs now expose an optional `reasoning_effort` override. Talaria's explicit
+mobile product decision authorizes a source-fenced REST mutation for this
+job-owned field: the phone preserves unknown values on unrelated edits and
+canonicalizes/clears only authored values, while the model tool remains
+read-only. Live certification remains open. Formatting, React build,
+contributor, and Windows test-only commits do not create portable iOS behavior.
 
 The final audited `18a15a46..efb6b40f` window contains exactly 19 commits
 across two parents and their merge. All five authority files remain

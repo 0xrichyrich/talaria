@@ -109,6 +109,16 @@ public struct RoutineEditorView: View {
         return runtime.detail[routine.id]
     }
 
+    /// A detail dictionary entry is only authoritative when its exact source
+    /// fence still matches the row. A stale display snapshot may remain visible
+    /// while a retry is pending, but it must never unlock an existing-job save.
+    private var hasAuthoritativeDetail: Bool {
+        guard let routine, job != nil,
+              let currentFence = model.cronRoutineMutationFence(routine.id) else { return false }
+        return runtime.detailAuthority[routine.id] == currentFence
+            && model.cronRoutineAuthorityIsCurrent(currentFence)
+    }
+
     /// The socket projection remains useful on a legacy gateway without the
     /// REST detail router: current Hermes includes a non-empty per-job effort
     /// pin in this row, so it can still be inspected even when it cannot be
@@ -183,7 +193,7 @@ public struct RoutineEditorView: View {
         if isCreating { return normalizedSchedule != nil }
         return RoutineEditorDetailPolicy.allowsSubmittingExisting(
             restAvailable: restAvailable,
-            hasAuthoritativeDetail: job != nil,
+            hasAuthoritativeDetail: hasAuthoritativeDetail,
             quarantined: quarantined,
             dirty: dirty,
             saving: saving,
@@ -357,8 +367,12 @@ public struct RoutineEditorView: View {
 
     @ViewBuilder private var rowMenu: some View {
         Menu {
-            Button(copy.runNow(theme.id)) { runNow() }
-                .disabled(quarantined)
+            if restAvailable {
+                Button(copy.runNow(theme.id)) { runNow() }
+                    .disabled(quarantined)
+            } else {
+                Text(copy.needsRESTNote(theme.id))
+            }
             Button(copy.deleteRoutineLabel(theme.id), role: .destructive) {
                 confirmingDelete = true
             }
@@ -393,7 +407,7 @@ public struct RoutineEditorView: View {
     /// failed read an explicit retry state rather than letting Save become a
     /// no-op behind an absent `job`.
     @ViewBuilder private var detailStatusBlock: some View {
-        if !isCreating, let routine, job == nil, restAvailable {
+        if !isCreating, let routine, !hasAuthoritativeDetail, restAvailable {
             VStack(alignment: .leading, spacing: 7) {
                 if runtime.loadingDetail.contains(routine.id) {
                     noticeLine(copy.routineDetailLoading(theme.id), tone: theme.faint)
@@ -489,7 +503,7 @@ public struct RoutineEditorView: View {
     /// True when at least one axis is unpinned AND carries a snapshot — i.e.
     /// the drift guard is armed on it and there is a recorded value to pin to.
     private func canPin(_ job: CronJobDetail) -> Bool {
-        guard restAvailable, !quarantined else { return false }
+        guard restAvailable, hasAuthoritativeDetail, !quarantined else { return false }
         return (job.model == nil && job.modelSnapshot != nil)
             || (job.provider == nil && job.providerSnapshot != nil)
     }
@@ -541,7 +555,7 @@ public struct RoutineEditorView: View {
         // fields would take input that could never be saved.
         let editable = isCreating || RoutineEditorDetailPolicy.allowsEditingExisting(
             restAvailable: restAvailable,
-            hasAuthoritativeDetail: job != nil,
+            hasAuthoritativeDetail: hasAuthoritativeDetail,
             quarantined: quarantined)
 
         return VStack(alignment: .leading, spacing: 7) {
@@ -672,7 +686,7 @@ public struct RoutineEditorView: View {
                 sectionLabel(copy.routineInferenceLabel(theme.id))
                 let editable = isCreating || RoutineEditorDetailPolicy.allowsEditingExisting(
                     restAvailable: restAvailable,
-                    hasAuthoritativeDetail: job != nil,
+                    hasAuthoritativeDetail: hasAuthoritativeDetail,
                     quarantined: quarantined)
                 field(providerPlaceholder, text: $providerPin, lines: 1, editable: editable)
                 field(modelPlaceholder, text: $modelPin, lines: 1, editable: editable)
@@ -888,7 +902,7 @@ public struct RoutineEditorView: View {
     // MARK: - Run history
 
     @ViewBuilder private var historyBlock: some View {
-        if let routine, restAvailable {
+        if let routine, restAvailable, hasAuthoritativeDetail {
             let runs = runtime.runs[routine.id]
             // Three states, and the third is not an error: a history that has
             // not been read yet says so, and one that failed to read says
@@ -1040,7 +1054,7 @@ public struct RoutineEditorView: View {
     }
 
     private func save() {
-        guard let job else {
+        guard hasAuthoritativeDetail, let job else {
             errorLine = copy.routineDetailUnavailable(theme.id)
             return
         }
@@ -1091,6 +1105,11 @@ public struct RoutineEditorView: View {
 
     private func runNow() {
         guard let routine else { return }
+        guard restAvailable else {
+            errorLine = copy.needsRESTNote(theme.id)
+            noteLine = nil
+            return
+        }
         busy = true; errorLine = nil; noteLine = nil
         Task { @MainActor in
             defer { busy = false }

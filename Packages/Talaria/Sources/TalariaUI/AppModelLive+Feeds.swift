@@ -386,18 +386,29 @@ public extension AppModel {
     private func subscribe(to client: GatewayClient) {
         Task { @MainActor in
             let token = await client.addEventHandler { event in
-                Task { @MainActor [weak self] in self?.journal(event: event) }
+                Task { @MainActor [weak self] in
+                    self?.journal(event: event, sourceClient: client)
+                }
             }
             FeedsRuntime.shared.eventToken = token
         }
     }
 
-    private func journal(event: GatewayEvent) {
-        guard mode == .live else { return }
+    private func journal(event: GatewayEvent, sourceClient: GatewayClient) {
+        let fallback = LiveRuntime.shared.defaultBotID ?? bots.first?.id ?? "default"
+        guard mode == .live, client === sourceClient,
+              let gatewayID = LiveRuntime.shared.gatewayID,
+              let sourceFence = cronSourceMutationFence(gatewayID: gatewayID, profile: nil),
+              cronMutationFenceAccepts(sourceFence, expectedClient: sourceClient),
+              let profileToken = profileLifecycleGenerationToken(for: fallback),
+              profileLifecycleAccepts(profileToken) else { return }
         let botID = LiveRuntime.shared.sessionToBot[event.sessionID]
         switch TypedGatewayEvent(event) {
         case .messageComplete(let payload):
-            guard let botID, payload.status != .error else { return }
+            guard let botID,
+                  let eventProfileToken = profileLifecycleGenerationToken(for: botID),
+                  profileLifecycleAccepts(eventProfileToken),
+                  payload.status != .error else { return }
             let text = payload.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return }
             if let sender = Self.a2aSender(in: text) {
@@ -423,7 +434,9 @@ public extension AppModel {
             // Files and images a tool just produced go straight into the
             // artifact index — the transcript sweep would only find them on the
             // next scan.
-            guard let botID else { return }
+            guard let botID,
+                  let eventProfileToken = profileLifecycleGenerationToken(for: botID),
+                  profileLifecycleAccepts(eventProfileToken) else { return }
             ingestArtifacts(fromTool: tool, botID: botID, sessionID: event.sessionID)
 
         case .changed(let what) where what == "cron.changed":
@@ -433,9 +446,17 @@ public extension AppModel {
             FeedsRuntime.shared.cronDebounce?.cancel()
             FeedsRuntime.shared.cronDebounce = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(450))
-                guard !Task.isCancelled, let self else { return }
+                guard !Task.isCancelled, let self,
+                      self.client === sourceClient,
+                      self.cronMutationFenceAccepts(sourceFence, expectedClient: sourceClient),
+                      self.profileLifecycleAccepts(profileToken) else { return }
                 await self.refreshRoutinesLive(force: true)
-                self.journalRoutineRuns()
+                guard self.client === sourceClient,
+                      self.cronMutationFenceAccepts(sourceFence, expectedClient: sourceClient),
+                      self.profileLifecycleAccepts(profileToken) else { return }
+                self.journalRoutineRuns(sourceClient: sourceClient,
+                                        sourceFence: sourceFence,
+                                        profileToken: profileToken)
             }
 
         default:
@@ -444,9 +465,18 @@ public extension AppModel {
     }
 
     /// After a cron.changed refresh, journal every job whose last run is new.
-    private func journalRoutineRuns() {
+    private func journalRoutineRuns(sourceClient: GatewayClient,
+                                    sourceFence: CronSourceMutationFence,
+                                    profileToken: ProfileLifecycleGenerationToken) {
+        guard client === sourceClient,
+              cronMutationFenceAccepts(sourceFence, expectedClient: sourceClient),
+              profileLifecycleAccepts(profileToken) else { return }
         let runtime = FeedsRuntime.shared
         for routine in routines {
+            guard let target = runtime.routineTargets[routine.id],
+                  target.route.gatewayID == sourceFence.gatewayID,
+                  let routineFence = cronRoutineMutationFence(routine.id),
+                  cronMutationFenceAccepts(routineFence, expectedClient: sourceClient) else { continue }
             guard let job = runtime.cronJobs[routine.id], let last = job.lastRun,
                   last.timeIntervalSinceNow > -900 else { continue }
             let status = (job.lastStatus ?? "").lowercased()
@@ -454,7 +484,9 @@ public extension AppModel {
                            text: theme.copy.feedRoutineRan(theme.themeID) + " — " + routine.name,
                            subtext: status == "error" ? theme.copy.feedRoutineFailed(theme.themeID)
                                                       : theme.copy.feedRoutineOK(theme.themeID),
-                           key: "cron-run:\(routine.id):\(Int(last.timeIntervalSince1970))",
+                           key: "cron-run:\(target.route.gatewayID):\(target.route.jobID):"
+                               + "\(target.profile ?? ""):\(sourceFence.generation.activityIdentity):"
+                               + "\(Int(last.timeIntervalSince1970))",
                            at: last)
         }
     }
@@ -463,6 +495,22 @@ public extension AppModel {
 // MARK: - Routines (cron)
 
 public extension AppModel {
+
+    /// Remove every authoritative and in-flight detail artifact for a row that
+    /// no longer belongs to the current source. Keeping only `detail` clear
+    /// would let a late editor/history task repopulate the replacement screen.
+    func clearCronRoutineCaches(_ routineID: String) {
+        let detail = CronDetailRuntime.shared
+        detail.detail.removeValue(forKey: routineID)
+        detail.runs.removeValue(forKey: routineID)
+        detail.detailError.removeValue(forKey: routineID)
+        detail.detailAuthority.removeValue(forKey: routineID)
+        detail.runsAuthority.removeValue(forKey: routineID)
+        detail.detailLoadingAuthority.removeValue(forKey: routineID)
+        detail.runsLoadingAuthority.removeValue(forKey: routineID)
+        detail.loadingDetail.remove(routineID)
+        detail.loadingRuns.remove(routineID)
+    }
 
     func dropRoutineScope(gatewayID: String) {
         let runtime = FeedsRuntime.shared
@@ -477,15 +525,14 @@ public extension AppModel {
             runtime.cronJobs.removeValue(forKey: id)
             runtime.cronScope.removeValue(forKey: id)
             runtime.routineTargets.removeValue(forKey: id)
-            let detail = CronDetailRuntime.shared
-            detail.detail.removeValue(forKey: id)
-            detail.runs.removeValue(forKey: id)
-            detail.detailError.removeValue(forKey: id)
-            detail.quarantined.remove(id)
+            clearCronRoutineCaches(id)
+            CronDetailRuntime.shared.quarantined.remove(id)
         }
         CronDetailRuntime.shared.deliveryTargets.removeValue(forKey: gatewayID)
         CronDetailRuntime.shared.deliveryLoaded.remove(gatewayID)
+        CronDetailRuntime.shared.deliveryGeneration.removeValue(forKey: gatewayID)
         CronDetailRuntime.shared.restSupported.removeValue(forKey: gatewayID)
+        CronDetailRuntime.shared.restSupportGeneration.removeValue(forKey: gatewayID)
     }
 
     /// Every live row carries an exact gateway/job/profile destination. Full
@@ -501,6 +548,9 @@ public extension AppModel {
     func refreshRoutinesLive(force: Bool = false) async {
         guard mode == .live, let client, let primaryGatewayID = LiveRuntime.shared.gatewayID
         else { return }
+        guard let sourceFence = cronSourceMutationFence(gatewayID: primaryGatewayID, profile: nil),
+              cronMutationFenceAccepts(sourceFence, expectedClient: client),
+              self.client === client else { return }
         let runtime = FeedsRuntime.shared
         // One list sweep at a time: a toggle, a cron.changed broadcast and a
         // screen appearing can all land within the same second. `force` skips
@@ -511,12 +561,23 @@ public extension AppModel {
         defer { runtime.routinesBusy = false; runtime.lastRoutinesRefresh = Date() }
 
         let fallback = LiveRuntime.shared.defaultBotID ?? bots.first?.id ?? "default"
+        guard let primaryFallbackToken = profileLifecycleGenerationToken(for: fallback),
+              profileLifecycleAccepts(primaryFallbackToken) else { return }
+        let primaryProfileIDs = bots.prefix(10).map(\.id)
+            .filter { $0 != fallback }
+        let primaryProfileTokens = Dictionary(uniqueKeysWithValues: primaryProfileIDs.compactMap {
+            profileID in
+            profileLifecycleGenerationToken(for: profileID).map { token in (profileID, token) }
+        })
         var jobs: [String: (job: CronJobRecord, botID: String, scope: String?)] = [:]
         var scopedCount = 0
         var failed: String?
 
         do {
             let listing = try await client.cronJobs(includeDisabled: true)
+            guard self.client === client,
+                  cronMutationFenceAccepts(sourceFence, expectedClient: client),
+                  profileLifecycleAccepts(primaryFallbackToken) else { return }
             for job in listing.jobs where !job.id.isEmpty {
                 jobs[job.id] = (job, job.taggedBotID ?? fallback, nil)
             }
@@ -527,15 +588,49 @@ public extension AppModel {
         // Per-profile stores: only trust the rows when the gateway echoes the
         // scope marker — an older gateway ignores `profile` and would hand the
         // launch store back once per bot.
-        for bot in bots.prefix(10) where bot.id != fallback {
-            guard let listing = try? await client.cronJobs(profile: bot.id, includeDisabled: true),
-                  listing.scopedProfile == bot.id else { continue }
+        for botID in primaryProfileIDs {
+            guard self.client === client,
+                  cronMutationFenceAccepts(sourceFence, expectedClient: client),
+                  let token = primaryProfileTokens[botID], profileLifecycleAccepts(token)
+            else { return }
+            guard let listing = try? await client.cronJobs(profile: botID, includeDisabled: true),
+                  listing.scopedProfile == botID else { continue }
+            guard self.client === client,
+                  cronMutationFenceAccepts(sourceFence, expectedClient: client),
+                  profileLifecycleAccepts(token) else { return }
             scopedCount += 1
             for job in listing.jobs where !job.id.isEmpty {
-                jobs[job.id] = (job, job.taggedBotID ?? bot.id, bot.id)
+                jobs[job.id] = (job, job.taggedBotID ?? botID, botID)
             }
         }
 
+        guard self.client === client,
+              cronMutationFenceAccepts(sourceFence, expectedClient: client),
+              profileLifecycleAccepts(primaryFallbackToken),
+              primaryProfileTokens.values.allSatisfy({ profileLifecycleAccepts($0) }) else {
+            return
+        }
+        guard failed == nil else {
+            runtime.routinesError = failed
+            runtime.routinesLoaded = false
+            return
+        }
+
+        let oldPrimaryIDs = Set(runtime.routineTargets.compactMap { id, target in
+            target.route.gatewayID == primaryGatewayID ? id : nil
+        })
+        // Keep the previous source-qualified rows before pruning them. The
+        // comparison below decides whether a same-id row is actually a new
+        // target; consulting the already-filtered dictionary would make every
+        // refresh look like a replacement and clear every open detail cache.
+        let priorPrimaryTargets = runtime.routineTargets.filter {
+            $0.value.route.gatewayID == primaryGatewayID
+        }
+        let newPrimaryIDs = Set(jobs.keys)
+        for id in oldPrimaryIDs.subtracting(newPrimaryIDs) {
+            clearCronRoutineCaches(id)
+            CronDetailRuntime.shared.quarantined.remove(id)
+        }
         runtime.cronJobs = runtime.cronJobs.filter {
             runtime.routineTargets[$0.key]?.route.gatewayID != primaryGatewayID
         }
@@ -546,12 +641,25 @@ public extension AppModel {
             $0.value.route.gatewayID != primaryGatewayID
         }
         for (jobID, entry) in jobs {
-            runtime.cronJobs[jobID] = entry.job
-            runtime.cronScope[jobID] = entry.scope
-            runtime.routineTargets[jobID] = RoutineTarget(
+            let nextTarget = RoutineTarget(
                 route: GatewayRoutineRoute(gatewayID: primaryGatewayID, jobID: jobID),
                 bot: GatewayBotRoute(gatewayID: primaryGatewayID, profile: entry.botID),
                 profile: entry.scope)
+            let priorTarget = priorPrimaryTargets[jobID]
+            let priorDetailAuthority = CronDetailRuntime.shared.detailAuthority[jobID]
+            runtime.routineTargets[jobID] = nextTarget
+            // A list refresh can reuse the same raw job id after a profile or
+            // source replacement. Do not let the old detail/history become
+            // editable against the new row while its fresh REST read is still
+            // pending.
+            if priorTarget != nextTarget
+                || (priorDetailAuthority != nil
+                    && cronRoutineMutationFence(jobID) != priorDetailAuthority) {
+                clearCronRoutineCaches(jobID)
+                CronDetailRuntime.shared.quarantined.remove(jobID)
+            }
+            runtime.cronJobs[jobID] = entry.job
+            runtime.cronScope[jobID] = entry.scope
         }
         runtime.cronPerProfile = scopedCount > 0
         runtime.routinesError = failed
@@ -566,10 +674,16 @@ public extension AppModel {
                         last: Self.lastRunLine(entry.job, theme: theme.themeID),
                         isOn: entry.job.isActive)
             }
-        routines.removeAll { GatewayBotRoute(qualifiedID: $0.botID) == nil }
+        routines.removeAll { routine in
+            oldPrimaryIDs.contains(routine.id)
+                || (GatewayBotRoute(qualifiedID: routine.botID) == nil
+                    && !newPrimaryIDs.contains(routine.id))
+        }
         routines.append(contentsOf: primaryRows)
 
         await refreshSecondaryRoutines()
+        guard self.client === client,
+              cronMutationFenceAccepts(sourceFence, expectedClient: client) else { return }
         routines.sort { lhs, rhs in
             let left = runtime.cronJobs[lhs.id]?.nextRun ?? .distantFuture
             let right = runtime.cronJobs[rhs.id]?.nextRun ?? .distantFuture
@@ -592,47 +706,83 @@ public extension AppModel {
             guard let client = await ConnectionRegistry.shared.clientPool.client(for: gatewayID)
             else { continue }
             await attachRoutedEventsIfNeeded(client: client, gatewayID: gatewayID)
+            guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
+                  current.client === client,
+                  let sourceFence = cronSourceMutationFence(gatewayID: gatewayID, profile: nil),
+                  cronMutationFenceAccepts(sourceFence, expectedClient: client) else { continue }
             let profiles = (try? await client.listProfiles(includeSessions: false)) ?? []
+            guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
+                  current.client === client,
+                  cronMutationFenceAccepts(sourceFence, expectedClient: client) else { continue }
             guard let fallback = profiles.first(where: \.isDefault)?.name ?? profiles.first?.name
             else { continue }
             var jobs: [String: (job: CronJobRecord, botID: String, scope: String?)] = [:]
+            guard let fallbackToken = profileLifecycleGenerationToken(
+                for: GatewayBotRoute(gatewayID: gatewayID, profile: fallback).qualifiedID),
+                  profileLifecycleAccepts(fallbackToken) else { continue }
             guard let launchListing = try? await client.cronJobs(
                 includeDisabled: true) else { continue }
+            guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
+                  current.client === client,
+                  cronMutationFenceAccepts(sourceFence, expectedClient: client),
+                  profileLifecycleAccepts(fallbackToken) else { continue }
             for job in launchListing.jobs where !job.id.isEmpty {
                 jobs[job.id] = (job, job.taggedBotID ?? fallback, nil)
             }
             for profile in profiles.prefix(10) where profile.name != fallback {
+                guard let profileToken = profileLifecycleGenerationToken(
+                    for: GatewayBotRoute(gatewayID: gatewayID, profile: profile.name).qualifiedID),
+                      profileLifecycleAccepts(profileToken) else { continue }
                 guard let listing = try? await client.cronJobs(
                     profile: profile.name, includeDisabled: true),
                       listing.scopedProfile == profile.name else { continue }
+                guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
+                      current.client === client,
+                      cronMutationFenceAccepts(sourceFence, expectedClient: client),
+                      profileLifecycleAccepts(profileToken) else { continue }
                 for job in listing.jobs where !job.id.isEmpty {
                     jobs[job.id] = (job, job.taggedBotID ?? profile.name, profile.name)
                 }
             }
 
             guard let current = MultiGatewayRuntime.shared.routedEvents[gatewayID],
-                  current.client === client else { continue }
+                  current.client === client,
+                      cronMutationFenceAccepts(sourceFence, expectedClient: client) else { continue }
 
-            let stale = Set(feeds.routineTargets.compactMap { key, target in
+            let oldIDs = Set(feeds.routineTargets.compactMap { key, target in
                 target.route.gatewayID == gatewayID ? key : nil
             })
+            let newIDs = Set(jobs.values.map {
+                GatewayRoutineRoute(gatewayID: gatewayID, jobID: $0.job.id).qualifiedID
+            })
+            let stale = oldIDs.subtracting(newIDs)
             routines.removeAll { routine in
-                stale.contains(routine.id)
+                oldIDs.contains(routine.id)
                     || GatewayBotRoute(qualifiedID: routine.botID)?.gatewayID == gatewayID
             }
             for id in stale {
                 feeds.cronJobs.removeValue(forKey: id)
                 feeds.cronScope.removeValue(forKey: id)
                 feeds.routineTargets.removeValue(forKey: id)
+                clearCronRoutineCaches(id)
+                CronDetailRuntime.shared.quarantined.remove(id)
             }
             for entry in jobs.values {
                 let route = GatewayRoutineRoute(gatewayID: gatewayID, jobID: entry.job.id)
                 let bot = GatewayBotRoute(gatewayID: gatewayID, profile: entry.botID)
                 let id = route.qualifiedID
+                let nextTarget = RoutineTarget(route: route, bot: bot, profile: entry.scope)
+                let priorTarget = feeds.routineTargets[id]
+                let priorDetailAuthority = CronDetailRuntime.shared.detailAuthority[id]
+                feeds.routineTargets[id] = nextTarget
+                if priorTarget != nextTarget
+                    || (priorDetailAuthority != nil
+                        && cronRoutineMutationFence(id) != priorDetailAuthority) {
+                    clearCronRoutineCaches(id)
+                    CronDetailRuntime.shared.quarantined.remove(id)
+                }
                 feeds.cronJobs[id] = entry.job
                 feeds.cronScope[id] = entry.scope
-                feeds.routineTargets[id] = RoutineTarget(route: route, bot: bot,
-                                                         profile: entry.scope)
                 routines.append(Routine(
                     id: id, botID: bot.qualifiedID, name: entry.job.displayTitle,
                     schedule: entry.job.schedule,
@@ -661,11 +811,13 @@ public extension AppModel {
     func setRoutineEnabled(_ routine: Routine, enabled: Bool) {
         guard let idx = routines.firstIndex(where: { $0.id == routine.id }) else { return }
         routines[idx].isOn = enabled
-        let key = "routine-toggle:\(routine.id)"
+        let capturedFence = mode == .live ? cronRoutineMutationFence(routine.id) : nil
+        let key = capturedFence.map { "routine-toggle:\($0.activityIdentity)" }
+            ?? "routine-toggle:\(routine.id)"
         toast(kind: .info,
               title: theme.copy.toastRoutinePaused(routine.name, on: enabled, theme.themeID),
               botID: routine.botID, key: key)
-        guard mode == .live, let fence = cronRoutineMutationFence(routine.id),
+        guard mode == .live, let fence = capturedFence,
               let target = FeedsRuntime.shared.routineTargets[routine.id],
               target == fence.target else {
             routines[idx].isOn = !enabled
@@ -676,15 +828,32 @@ public extension AppModel {
             let runtime = FeedsRuntime.shared
             do {
                 let client = try await self.routedClient(gatewayID: target.route.gatewayID)
-                guard self.cronMutationFenceAccepts(fence) else { return }
+                guard self.cronMutationFenceAccepts(fence, expectedClient: client) else {
+                    self.rollbackRoutineToggle(routine.id, enabled: enabled, fence: fence)
+                    self.retractToast(key: key)
+                    return
+                }
                 try await client.cronSetPaused(jobID: target.route.jobID, paused: !enabled,
                                                profile: target.profile)
-                guard self.cronMutationFenceAccepts(fence) else { return }
+                guard self.cronMutationFenceAccepts(fence, expectedClient: client) else {
+                    self.rollbackRoutineToggle(routine.id, enabled: enabled, fence: fence)
+                    self.retractToast(key: key)
+                    return
+                }
                 runtime.routinesError = nil
                 await refreshRoutinesLive(force: true)
+                guard self.cronMutationFenceAccepts(fence, expectedClient: client) else {
+                    self.rollbackRoutineToggle(routine.id, enabled: enabled, fence: fence)
+                    self.retractToast(key: key)
+                    return
+                }
                 settleToast(key: key)
             } catch {
-                guard self.cronMutationFenceAccepts(fence) else { return }
+                guard self.cronMutationFenceAccepts(fence, expectedClient: client) else {
+                    self.rollbackRoutineToggle(routine.id, enabled: enabled, fence: fence)
+                    self.retractToast(key: key)
+                    return
+                }
                 if let i = routines.firstIndex(where: { $0.id == routine.id }) {
                     routines[i].isOn = !enabled
                 }
@@ -694,6 +863,18 @@ public extension AppModel {
                       title: theme.copy.toastRoutineUpdateFailed(theme.themeID),
                       message: reason, botID: routine.botID, key: key)
             }
+        }
+    }
+
+    private func rollbackRoutineToggle(_ routineID: String, enabled: Bool,
+                                       fence: CronRoutineMutationFence) {
+        // Do not put the old optimistic bit onto a replacement row that reused
+        // the same UI/job id. Target equality alone is insufficient when the
+        // gateway generation or profile store changed underneath the await.
+        guard FeedsRuntime.shared.routineTargets[routineID] == fence.target,
+              cronRoutineMutationFence(routineID) == fence else { return }
+        if let index = routines.firstIndex(where: { $0.id == routineID }) {
+            routines[index].isOn = !enabled
         }
     }
 
@@ -725,17 +906,33 @@ public extension AppModel {
         guard mode == .live, let client else {
             throw GatewayError(code: -3, message: "connect a gateway to schedule routines")
         }
+        let launchProfile = LiveRuntime.shared.defaultBotID ?? bots.first?.id ?? "default"
         guard let gatewayID = LiveRuntime.shared.gatewayID,
-              let fence = cronSourceMutationFence(gatewayID: gatewayID, profile: nil),
-              cronMutationFenceAccepts(fence) else { throw GatewayRouteError.noRoute }
-        try await client.cronAdd(name: "[bot:\(botID)] \(cleanTitle)",
-                                 schedule: normalized,
-                                 prompt: routinePrompt(botID: botID, title: cleanTitle,
-                                                       instruction: cleanPrompt),
-                                 repeatCount: repeatCount,
-                                 continuity: continuity)
-        guard cronMutationFenceAccepts(fence) else { return }
+              let fence = cronSourceMutationFence(
+                  gatewayID: gatewayID, profile: nil, lifecycleProfile: launchProfile),
+              cronMutationFenceAccepts(fence, expectedClient: client) else {
+            throw GatewayRouteError.noRoute
+        }
+        do {
+            try await client.cronAdd(name: "[bot:\(botID)] \(cleanTitle)",
+                                     schedule: normalized,
+                                     prompt: routinePrompt(botID: botID, title: cleanTitle,
+                                                           instruction: cleanPrompt),
+                                     repeatCount: repeatCount,
+                                     continuity: continuity)
+        } catch {
+            if !cronMutationFenceAccepts(fence, expectedClient: client) {
+                throw cronSourceChangedError()
+            }
+            throw error
+        }
+        guard cronMutationFenceAccepts(fence, expectedClient: client) else {
+            throw cronSourceChangedError()
+        }
         await refreshRoutinesLive(force: true)
+        guard cronMutationFenceAccepts(fence, expectedClient: client) else {
+            throw cronSourceChangedError()
+        }
         recordActivity(kind: .routine, botID: botID,
                        text: theme.copy.feedRoutineAdded(theme.themeID) + " — " + cleanTitle,
                        subtext: normalized)
@@ -765,16 +962,34 @@ public extension AppModel {
         else { throw GatewayRouteError.noRoute }
         guard mode == .live else { return }
         let client = try await routedClient(gatewayID: target.route.gatewayID)
-        guard cronMutationFenceAccepts(fence) else { throw CancellationError() }
-        try await client.cronRemove(jobID: target.route.jobID, profile: target.profile)
-        guard cronMutationFenceAccepts(fence) else { return }
+        guard cronMutationFenceAccepts(fence, expectedClient: client) else {
+            throw cronSourceChangedError()
+        }
+        do {
+            try await client.cronRemove(jobID: target.route.jobID, profile: target.profile)
+        } catch {
+            if !cronMutationFenceAccepts(fence, expectedClient: client) {
+                throw cronSourceChangedError()
+            }
+            throw error
+        }
+        guard cronMutationFenceAccepts(fence, expectedClient: client) else {
+            throw cronSourceChangedError()
+        }
+        await refreshRoutinesLive(force: true)
+        // The row is intentionally gone now, so the routine fence (which
+        // includes `currentTarget == fence.target`) cannot be used after the
+        // accepted remove. The source fence still proves that the refresh and
+        // local cache clear belong to the same client/generation.
+        guard cronMutationFenceAccepts(fence.source, expectedClient: client) else {
+            throw cronSourceChangedError()
+        }
         routines.removeAll { $0.id == routine.id }
         FeedsRuntime.shared.cronJobs.removeValue(forKey: routine.id)
         FeedsRuntime.shared.cronScope.removeValue(forKey: routine.id)
         FeedsRuntime.shared.routineTargets.removeValue(forKey: routine.id)
-        CronDetailRuntime.shared.detail.removeValue(forKey: routine.id)
-        CronDetailRuntime.shared.runs.removeValue(forKey: routine.id)
-        await refreshRoutinesLive(force: true)
+        clearCronRoutineCaches(routine.id)
+        CronDetailRuntime.shared.quarantined.remove(routine.id)
     }
 
     /// Fire a job now. `cron.manage` has no run action (4016) — the trigger
@@ -789,18 +1004,35 @@ public extension AppModel {
               let target = FeedsRuntime.shared.routineTargets[routine.id], target == fence.target
         else { throw GatewayRouteError.noRoute }
         guard mode == .live else { return false }
-        guard let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
+        guard cronRESTReady(routineID: routine.id),
+              let sourceClient = cronSourceClient(gatewayID: target.route.gatewayID),
+              let (base, credential) = gatewayRESTContext(gatewayID: target.route.gatewayID) else {
             throw GatewayError(code: -3, message: theme.copy.needsRESTNote(theme.themeID))
         }
-        guard cronMutationFenceAccepts(fence) else { throw CancellationError() }
-        let finished = try await GatewayREST.triggerCronJob(
-            baseURL: base, credential: credential, jobID: target.route.jobID,
-            profile: target.profile)
-        guard cronMutationFenceAccepts(fence) else { return finished }
+        guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+            throw cronSourceChangedError()
+        }
+        let finished: Bool
+        do {
+            finished = try await GatewayREST.triggerCronJob(
+                baseURL: base, credential: credential, jobID: target.route.jobID,
+                profile: target.profile)
+        } catch {
+            if !cronMutationFenceAccepts(fence, expectedClient: sourceClient) {
+                throw cronSourceChangedError()
+            }
+            throw error
+        }
+        guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+            throw cronSourceChangedError()
+        }
+        await refreshRoutinesLive(force: true)
+        guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+            throw cronSourceChangedError()
+        }
         recordActivity(kind: .routine, botID: routine.botID,
                        text: theme.copy.feedRoutineTriggered(theme.themeID) + " — " + routine.name,
                        subtext: routine.schedule)
-        await refreshRoutinesLive(force: true)
         return finished
     }
 

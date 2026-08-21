@@ -893,6 +893,12 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         let model = AppModel()
         model.mode = .live
         LiveRuntime.shared.gatewayID = "primary"
+        // The cache is valid only for the exact live client that produced its
+        // generation fence; seed that client so this remains a cache-isolation
+        // test rather than an offline/no-authority case.
+        model.client = GatewayClient(
+            baseURL: URL(string: "http://primary.test")!,
+            credential: .sessionToken("test"))
         let primary = routine(id: "same", botID: "default")
         let remoteID = GatewayRoutineRoute(gatewayID: "homelab", jobID: "same").qualifiedID
         let remote = routine(id: remoteID, botID: "homelab::default")
@@ -907,6 +913,24 @@ final class SourceQualifiedRoutingTests: XCTestCase {
         runtime.restSupported["homelab"] = true
         runtime.deliveryTargets["primary"] = [CronDeliveryTarget(["id": "local"])]
         runtime.deliveryTargets["homelab"] = [CronDeliveryTarget(["id": "telegram"])]
+        let remoteClient = GatewayClient(
+            baseURL: URL(string: "http://homelab.test")!,
+            credential: .sessionToken("test"))
+        let remotePump = Task<Void, Never> {}
+        MultiGatewayRuntime.shared.routedEventGenerations["homelab"] = 1
+        MultiGatewayRuntime.shared.routedEvents["homelab"] = MultiGatewayRuntime.RoutedEvents(
+            client: remoteClient, handlerID: UUID(), pump: remotePump, generation: 1)
+        runtime.deliveryGeneration["primary"] = model.cronDeliverySourceFence(
+            routineID: primary.id)?.fence
+        runtime.deliveryGeneration["homelab"] = model.cronDeliverySourceFence(
+            routineID: remote.id)?.fence
+        defer {
+            runtime.deliveryGeneration.removeValue(forKey: "primary")
+            runtime.deliveryGeneration.removeValue(forKey: "homelab")
+            MultiGatewayRuntime.shared.routedEvents.removeValue(forKey: "homelab")
+            MultiGatewayRuntime.shared.routedEventGenerations.removeValue(forKey: "homelab")
+            remotePump.cancel()
+        }
 
         XCTAssertEqual(model.cronDeliveryTargets(routineID: primary.id).map(\.id), ["local"])
         XCTAssertEqual(model.cronDeliveryTargets(routineID: remote.id).map(\.id), ["telegram"])

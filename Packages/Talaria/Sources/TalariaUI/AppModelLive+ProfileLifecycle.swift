@@ -1929,9 +1929,7 @@ extension AppModel {
                 feeds.cronJobs.removeValue(forKey: key)
                 feeds.cronScope.removeValue(forKey: key)
                 feeds.routineTargets.removeValue(forKey: key)
-                CronDetailRuntime.shared.detail.removeValue(forKey: key)
-                CronDetailRuntime.shared.runs.removeValue(forKey: key)
-                CronDetailRuntime.shared.detailError.removeValue(forKey: key)
+                clearCronRoutineCaches(key)
                 CronDetailRuntime.shared.quarantined.remove(key)
                 continue
             }

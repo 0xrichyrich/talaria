@@ -376,18 +376,35 @@ public extension AppModel {
     /// may have already flicked away.
     @discardableResult
     func deleteRoutineWithFeedback(_ routine: Routine) async -> String? {
-        let key = "routine-delete:\(routine.id)"
+        let fence = cronRoutineMutationFence(routine.id)
+        let key = fence.map { "routine-delete:\($0.activityIdentity)" }
+            ?? "routine-delete:\(routine.id)"
         toast(kind: .info, title: theme.copy.toastDeleting(theme.themeID),
               message: routine.name, botID: routine.botID, key: key)
         do {
+            guard let fence,
+                  let sourceClient = cronSourceClient(gatewayID: fence.source.gatewayID),
+                  cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+                throw cronSourceChangedError()
+            }
             try await deleteRoutine(routine)
+            guard cronMutationFenceAccepts(fence.source, expectedClient: sourceClient) else {
+                throw cronSourceChangedError()
+            }
             toast(kind: .success, title: theme.copy.toastRoutineDeleted(theme.themeID),
                   message: routine.name, botID: routine.botID, key: key)
             return nil
         } catch {
             let reason = Self.reason(error)
-            toast(kind: .failure, title: theme.copy.toastDeleteFailed(theme.themeID),
-                  message: reason, botID: routine.botID, key: key)
+            if (error as? GatewayError)?.code == CronMutationFenceError.sourceChanged {
+                // There was no authoritative result for this source. Remove
+                // the optimistic card/ledger pending state instead of claiming
+                // that the replacement gateway failed the delete.
+                retractToast(key: key)
+            } else {
+                toast(kind: .failure, title: theme.copy.toastDeleteFailed(theme.themeID),
+                      message: reason, botID: routine.botID, key: key)
+            }
             return reason
         }
     }
@@ -412,7 +429,20 @@ public extension AppModel {
                                      model: String? = nil, provider: String? = nil,
                                      reasoningEffort: String? = nil) async throws {
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let key = "routine-add:\(botID):\(clean)"
+        let sourceFence = mode == .live
+            ? routineGatewayID(botID: botID).flatMap { gatewayID in
+                let launchProfile = gatewayID == LiveRuntime.shared.gatewayID
+                    ? (LiveRuntime.shared.defaultBotID ?? bots.first?.id ?? "default")
+                    : nil
+                return cronSourceMutationFence(
+                    gatewayID: gatewayID, profile: nil, lifecycleProfile: launchProfile)
+            }
+            : nil
+        let key = sourceFence.map {
+            "routine-add:\($0.gatewayID):\($0.generation.activityIdentity):"
+                + "\($0.lifecycleProfile ?? ""):\($0.profileGeneration.map(String.init) ?? ""):"
+                + "\(botID):\(clean)"
+        } ?? "routine-add:\(botID):\(clean)"
         toast(kind: .info, title: theme.copy.toastSchedulingRoutine(clean, theme.themeID),
               botID: botID, key: key)
         do {
@@ -448,20 +478,34 @@ public extension AppModel {
                                  reasoningEffort: String? = nil,
                                  continuity: Bool?) async throws {
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let key = "routine-save:\(routineID)"
+        let fence = cronRoutineMutationFence(routineID)
+        let key = fence.map { "routine-save:\($0.activityIdentity)" }
+            ?? "routine-save:\(routineID)"
         toast(kind: .info, title: theme.copy.toastSavingRoutine(clean, theme.themeID),
               botID: botID, key: key)
         do {
+            guard let fence,
+                  let sourceClient = cronSourceClient(gatewayID: fence.source.gatewayID),
+                  cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+                throw cronSourceChangedError()
+            }
             try await saveRoutine(job, routineID: routineID, botID: botID,
                                   title: clean, schedule: schedule,
                                   instruction: instruction, deliver: deliver, model: model,
                                   provider: provider, reasoningEffort: reasoningEffort,
                                   continuity: continuity)
+            guard cronMutationFenceAccepts(fence, expectedClient: sourceClient) else {
+                throw cronSourceChangedError()
+            }
             toast(kind: .success, title: theme.copy.toastRoutineSaved(clean, theme.themeID),
                   botID: botID, key: key)
         } catch {
-            toast(kind: .failure, title: theme.copy.toastRoutineUpdateFailed(theme.themeID),
-                  message: Self.reason(error), botID: botID, key: key)
+            if (error as? GatewayError)?.code == CronMutationFenceError.sourceChanged {
+                retractToast(key: key)
+            } else {
+                toast(kind: .failure, title: theme.copy.toastRoutineUpdateFailed(theme.themeID),
+                      message: Self.reason(error), botID: botID, key: key)
+            }
             throw error
         }
     }
