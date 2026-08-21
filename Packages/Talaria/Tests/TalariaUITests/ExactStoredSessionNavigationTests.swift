@@ -3,6 +3,12 @@ import XCTest
 @testable import TalariaKit
 @testable import TalariaUI
 
+private actor RoutedEventProbe {
+    private(set) var events: [GatewayEvent] = []
+
+    func record(_ event: GatewayEvent) { events.append(event) }
+}
+
 @MainActor
 final class ExactStoredSessionNavigationTests: XCTestCase {
     private func route(gateway: String = "primary", profile: String = "inbox",
@@ -622,6 +628,341 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         }
     }
 
+    func testResumeSnapshotEvidenceKeepsNonSnapshotEventsAndRequiresExactMessageProof() {
+        let session = LiveSession(.object([
+            "session_id": .string("runtime-evidence"),
+            "stored_session_id": .string("stored-evidence"),
+            "messages": .array([
+                .object(["role": .string("assistant"),
+                         "text": .string("already in resume")]),
+            ]),
+            "info": .object(["profile_name": .string("researcher")]),
+        ]))
+        let evidence = session.snapshotEvidence
+        let complete = GatewayEvent(
+            type: "message.complete", sessionID: session.sessionID,
+            payload: .object(["text": .string("already in resume"),
+                              "status": .string("complete")]),
+            inboundSequence: 4)
+        XCTAssertTrue(evidence.represents(complete))
+
+        // These frames can precede the response but are not durable rows in
+        // the resume projection. Sequence alone must never discard them.
+        XCTAssertFalse(evidence.represents(GatewayEvent(
+            type: "tool.start", sessionID: session.sessionID,
+            payload: .object(["tool_id": .string("tool-1"),
+                              "name": .string("search")]), inboundSequence: 5)))
+        XCTAssertFalse(evidence.represents(GatewayEvent(
+            type: "status.update", sessionID: session.sessionID,
+            payload: .object(["kind": .string("working"),
+                              "text": .string("Searching")]), inboundSequence: 6)))
+
+        let duplicateText = LiveSession(.object([
+            "session_id": .string("runtime-evidence"),
+            "stored_session_id": .string("stored-evidence"),
+            "messages": .array([
+                .object(["role": .string("assistant"),
+                         "text": .string("already in resume")]),
+                .object(["role": .string("assistant"),
+                         "text": .string("already in resume")]),
+            ]),
+            "info": .object(["profile_name": .string("researcher")]),
+        ]))
+        XCTAssertFalse(duplicateText.snapshotEvidence.represents(complete),
+                       "duplicate text without a durable row id is not proof")
+    }
+
+    func testRoutedGateSameClientHandoffAndRollbackAreLossless() throws {
+        let client = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://gate-\(UUID().uuidString).example")),
+            credential: .sessionToken("gate-token"))
+        let gate = RoutedEventGate(client: client, generation: 12)
+        let target = GatewayEvent(
+            type: "message.complete", sessionID: "new-runtime",
+            payload: .object(["text": .string("target")]), inboundSequence: 11)
+        let unrelated = GatewayEvent(
+            type: "tool.start", sessionID: "other-runtime",
+            payload: .object(["name": .string("search")]), inboundSequence: 12)
+        let global = GatewayEvent(
+            type: "status.update", sessionID: "",
+            payload: .object(["text": .string("global")]), inboundSequence: 13)
+
+        gate.beginStaging()
+        XCTAssertFalse(gate.claimForPump(target))
+        XCTAssertFalse(gate.claimForPump(unrelated))
+        XCTAssertTrue(gate.claimForPump(global), "global stays with old pump")
+
+        let returned = gate.finishStaging(targetSessionID: "new-runtime")
+        XCTAssertEqual(returned.count, 1)
+        XCTAssertEqual(returned.first?.type, unrelated.type)
+        XCTAssertEqual(returned.first?.inboundSequence, unrelated.inboundSequence)
+        gate.prepareOldReplay(returned)
+        XCTAssertTrue(gate.claimForPump(unrelated), "old pump owns returned unrelated frame")
+        XCTAssertTrue(gate.claimForStaged(target), "staged pump owns target frame")
+        XCTAssertFalse(gate.claimForStaged(unrelated), "no duplicate cross-pump delivery")
+
+        let replayed = gate.restoreForRollback()
+        XCTAssertEqual(replayed.count, 1)
+        XCTAssertEqual(replayed.first?.inboundSequence, target.inboundSequence)
+        XCTAssertTrue(gate.claimForPump(target), "rollback restores old target authority")
+
+        gate.retire()
+        XCTAssertFalse(gate.claimForPump(GatewayEvent(
+            type: "message.complete", sessionID: "old-runtime", payload: nil,
+            inboundSequence: 14)), "retired generation rejects stale frames")
+    }
+
+    func testForeignExactOpenStagesAlongsideExistingSameClientPump() async throws {
+        let model = AppModel()
+        let gatewayID = "foreign-existing-pump-(UUID().uuidString)"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: "researcher")
+        let target = route.qualifiedID
+        let client = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://existing-pump-(UUID().uuidString).example")),
+            credential: .sessionToken("existing-pump-token"))
+        let pool = ConnectionRegistry.shared.clientPool
+        await pool.adopt(client, for: gatewayID)
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        let oldMode = model.mode
+        let oldHandler = await client.addEventHandler { _ in }
+        let oldPump = Task<Void, Never> {}
+        let runtime = MultiGatewayRuntime.shared
+        let previousGeneration = runtime.routedEventGenerations[gatewayID, default: 0]
+        runtime.routedEvents[gatewayID] = .init(
+            client: client, handlerID: oldHandler, pump: oldPump,
+            generation: previousGeneration)
+        model.mode = .live
+        model.bots = [Bot(id: target, job: "", shape: .circle, hue: .violet)]
+        model.chats[target] = ChatState()
+        LiveRuntime.shared.gatewayID = "primary-existing-pump"
+        defer {
+            oldPump.cancel()
+            Task { await client.removeEventHandler(oldHandler) }
+            runtime.routedEvents[gatewayID] = nil
+            runtime.routedEventGenerations[gatewayID] = nil
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            model.mode = oldMode
+            Task { await pool.disconnect(gatewayID: gatewayID) }
+        }
+
+        let opened = try await model.openStoredSessionAwaiting(
+            "wanted-stored", botID: target, route: route, client: client,
+            validateBeforeBinding: {},
+            catchUpResumeForTesting: {
+                (LiveSession(.object([
+                    "session_id": .string("existing-pump-runtime"),
+                    "stored_session_id": .string("wanted-stored"),
+                    "info": .object(["profile_name": .string("researcher")]),
+                ])), 3)
+            })
+
+        XCTAssertTrue(opened)
+        XCTAssertNotEqual(runtime.routedEvents[gatewayID]?.handlerID, oldHandler,
+                          "exact foreign open installs an additional staged handler")
+        XCTAssertEqual(runtime.routedEvents[gatewayID].map {
+            ObjectIdentifier($0.client) == ObjectIdentifier(client)
+        }, true)
+        await model.removeRoutedEventSubscription(gatewayID: gatewayID)
+        await pool.disconnect(gatewayID: gatewayID)
+    }
+
+    func testExistingSameClientPumpPartitionsDurableTransientAndGlobalFramesOnce() async throws {
+        let model = AppModel()
+        let gatewayID = "foreign-existing-events-\(UUID().uuidString)"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: "researcher")
+        let target = route.qualifiedID
+        let otherRoute = GatewayBotRoute(gatewayID: gatewayID, profile: "other")
+        let other = otherRoute.qualifiedID
+        let client = GatewayClient(
+            baseURL: try XCTUnwrap(URL(
+                string: "https://existing-events-\(UUID().uuidString).example")),
+            credential: .sessionToken("existing-events-token"))
+        let pool = ConnectionRegistry.shared.clientPool
+        await pool.adopt(client, for: gatewayID)
+
+        let (oldStream, oldContinuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let oldHandler = await client.addEventHandler { oldContinuation.yield($0) }
+        let oldGate = RoutedEventGate(client: client, generation: 30)
+        let oldProbe = RoutedEventProbe()
+        let oldPump = Task { @MainActor in
+            for await event in oldStream {
+                guard oldGate.claimForPump(event) else { continue }
+                await oldProbe.record(event)
+                model.handle(event: event, sourceGatewayID: gatewayID)
+            }
+        }
+        let runtime = MultiGatewayRuntime.shared
+        let oldGeneration: UInt64 = 30
+        runtime.routedEventGenerations[gatewayID] = oldGeneration
+        runtime.routedEvents[gatewayID] = .init(
+            client: client, handlerID: oldHandler, pump: oldPump,
+            continuation: oldContinuation, gate: oldGate, generation: oldGeneration)
+
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        let oldMode = model.mode
+        model.mode = .live
+        model.bots = [
+            Bot(id: target, job: "", shape: .circle, hue: .violet),
+            Bot(id: other, job: "", shape: .circle, hue: .blue),
+        ]
+        let targetChat = ChatState(messages: [
+            ChatMessage(author: .bot, text: "old target"),
+        ])
+        let otherChat = ChatState()
+        model.chats[target] = targetChat
+        model.chats[other] = otherChat
+        LiveRuntime.shared.gatewayID = "primary-existing-events"
+        defer {
+            oldGate.retire()
+            oldPump.cancel()
+            oldContinuation.finish()
+            Task { await client.removeEventHandler(oldHandler) }
+            runtime.routedEvents[gatewayID] = nil
+            runtime.routedEventGenerations[gatewayID] = nil
+            LiveRuntime.shared.routedSessionToBot.removeValue(forKey:
+                GatewaySessionRoute(gatewayID: gatewayID, sessionID: "other-runtime"))
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            model.mode = oldMode
+            Task { await pool.disconnect(gatewayID: gatewayID) }
+        }
+
+        LiveRuntime.shared.routedSessionToBot[GatewaySessionRoute(
+            gatewayID: gatewayID, sessionID: "other-runtime")] = other
+
+        let opened = try await model.openStoredSessionAwaiting(
+            "wanted-stored", botID: target, route: route, client: client,
+            validateBeforeBinding: {},
+            catchUpResumeForTesting: {
+                // The old and staged handlers both observe these frames. The
+                // gate must keep the old pump's unrelated/global ownership,
+                // while allowing the staged pump to retain transient target
+                // state that the resume projection cannot represent.
+                await client.emitEventForTesting(GatewayEvent(
+                    type: "message.complete", sessionID: "new-runtime",
+                    payload: .object([
+                        "text": .string("already in resume"),
+                        "status": .string("complete"),
+                    ]), inboundSequence: 1))
+                await client.emitEventForTesting(GatewayEvent(
+                    type: "tool.start", sessionID: "new-runtime",
+                    payload: .object(["tool_id": .string("tool-1"),
+                                     "name": .string("search")]), inboundSequence: 2))
+                await client.emitEventForTesting(GatewayEvent(
+                    type: "message.complete", sessionID: "other-runtime",
+                    payload: .object([
+                        "text": .string("other once"),
+                        "status": .string("complete"),
+                    ]), inboundSequence: 3))
+                await client.emitEventForTesting(GatewayEvent(
+                    type: "status.update", sessionID: "",
+                    payload: .object(["text": .string("global once")]),
+                    inboundSequence: 4))
+                for _ in 0..<4 { await Task.yield() }
+                return (LiveSession(.object([
+                    "session_id": .string("new-runtime"),
+                    "stored_session_id": .string("wanted-stored"),
+                    "messages": .array([
+                        .object(["role": .string("assistant"),
+                                 "text": .string("already in resume")]),
+                    ]),
+                    "info": .object(["profile_name": .string("researcher")]),
+                ])), 10)
+            })
+
+        XCTAssertTrue(opened)
+        XCTAssertEqual(targetChat.messages.map(\.text), ["already in resume"],
+                       "the pre-response durable row is represented once")
+        for _ in 0..<100 where targetChat.messages.flatMap(\.toolCalls).isEmpty {
+            await Task.yield()
+        }
+        XCTAssertEqual(targetChat.messages.flatMap(\.toolCalls).map(\.name), ["search"],
+                       "transient tool state is retained even below the resume boundary")
+        XCTAssertEqual(otherChat.messages.map(\.text), ["other once"],
+                       "unrelated same-client frames stay with the old pump")
+        let oldSequences = await oldProbe.events.map(\.inboundSequence)
+        XCTAssertEqual(oldSequences.filter { $0 == 3 }.count, 1)
+        XCTAssertEqual(oldSequences.filter { $0 == 4 }.count, 1)
+        XCTAssertFalse(oldSequences.contains(1), "snapshot-owned target row is staged")
+        XCTAssertFalse(oldSequences.contains(2), "target transient is staged")
+
+        await model.removeRoutedEventSubscription(gatewayID: gatewayID)
+        await pool.disconnect(gatewayID: gatewayID)
+    }
+
+    func testRollbackRestoresOldGenerationAndRejectsQueuedOldClientEvents() async throws {
+        let model = AppModel()
+        let gatewayID = "foreign-rollback-gate-\(UUID().uuidString)"
+        let oldClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://old-gate-\(UUID().uuidString).example")),
+            credential: .sessionToken("old-gate-token"))
+        let newClient = GatewayClient(
+            baseURL: try XCTUnwrap(URL(string: "https://new-gate-\(UUID().uuidString).example")),
+            credential: .sessionToken("new-gate-token"))
+        let pool = ConnectionRegistry.shared.clientPool
+        await pool.adopt(newClient, for: gatewayID)
+        let (oldStream, oldContinuation) = AsyncStream.makeStream(of: GatewayEvent.self)
+        let oldHandler = await oldClient.addEventHandler { oldContinuation.yield($0) }
+        let oldGate = RoutedEventGate(client: oldClient, generation: 27)
+        let probe = RoutedEventProbe()
+        let oldPump = Task { @MainActor in
+            for await event in oldStream {
+                guard oldGate.claimForPump(event) else { continue }
+                await probe.record(event)
+            }
+        }
+        let runtime = MultiGatewayRuntime.shared
+        let oldGeneration: UInt64 = 27
+        runtime.routedEventGenerations[gatewayID] = oldGeneration
+        runtime.routedEvents[gatewayID] = .init(
+            client: oldClient, handlerID: oldHandler, pump: oldPump,
+            continuation: oldContinuation, gate: oldGate, generation: oldGeneration)
+        let oldApprovalEpoch = ApprovalBridges.shared.sweepEpochs[gatewayID]
+        ApprovalBridges.shared.sweepEpochs[gatewayID] = 19
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        LiveRuntime.shared.gatewayID = "primary-rollback-gate"
+        defer {
+            oldPump.cancel()
+            oldContinuation.finish()
+            Task { await oldClient.removeEventHandler(oldHandler) }
+            runtime.routedEvents[gatewayID] = nil
+            runtime.routedEventGenerations[gatewayID] = nil
+            ApprovalBridges.shared.sweepEpochs[gatewayID] = oldApprovalEpoch
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            Task { await pool.disconnect(gatewayID: gatewayID) }
+        }
+
+        let preparedValue = await model.prepareExactRoutedEvents(
+            client: newClient, gatewayID: gatewayID)
+        let prepared = try XCTUnwrap(preparedValue)
+        let transaction = try model.commitExactRoutedEvents(
+            prepared, snapshotSequence: 10, snapshotSessionID: "new-runtime")
+
+        await oldClient.emitEventForTesting(GatewayEvent(
+            type: "message.complete", sessionID: "old-runtime",
+            payload: .object(["text": .string("stale")]), inboundSequence: 9))
+        await Task.yield()
+        let observedOldEvents = await probe.events
+        XCTAssertTrue(observedOldEvents.isEmpty,
+                      "retired old client/generation cannot deliver queued frames")
+
+        transaction.rollback()
+        await transaction.prepared.discardAfterRollback()
+        XCTAssertEqual(runtime.routedEvents[gatewayID]?.handlerID, oldHandler)
+        XCTAssertEqual(runtime.routedEventGenerations[gatewayID], oldGeneration)
+        XCTAssertEqual(ApprovalBridges.shared.sweepEpochs[gatewayID], 19)
+        XCTAssertTrue(oldGate.isOpen, "rollback restores old gate authority")
+        await oldClient.emitEventForTesting(GatewayEvent(
+            type: "message.complete", sessionID: "old-runtime",
+            payload: .object(["text": .string("restored")]), inboundSequence: 15))
+        for _ in 0..<20 {
+            if await probe.events.count > 0 { break }
+            await Task.yield()
+        }
+        let restoredEvents = await probe.events
+        XCTAssertEqual(restoredEvents.map(\.inboundSequence), [15],
+                       "rollback returns delivery to the old pump exactly once")
+    }
+
     func testExactOpenAuthorityFailuresPreserveVisibleChatTranscriptAndUnread() async throws {
         let model = AppModel()
         let gatewayID = "foreign-exact-transaction-\(UUID().uuidString)"
@@ -889,6 +1230,19 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
                             "text": .string("snapshot response"),
                             "status": .string("complete"),
                         ]), inboundSequence: 9))
+                    await client.emitEventForTesting(GatewayEvent(
+                        type: "tool.start", sessionID: "new-runtime",
+                        payload: .object([
+                            "tool_id": .string("pre-response-tool"),
+                            "name": .string("search"),
+                            "context": .string("before resume"),
+                        ]), inboundSequence: 7))
+                    await client.emitEventForTesting(GatewayEvent(
+                        type: "status.update", sessionID: "new-runtime",
+                        payload: .object([
+                            "kind": .string("working"),
+                            "text": .string("still working"),
+                        ]), inboundSequence: 8))
                     return (LiveSession(.object([
                         "session_id": .string("new-runtime"),
                         "stored_session_id": .string("wanted-stored"),
@@ -916,9 +1270,13 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         XCTAssertTrue(model.chats[target] === targetChat)
         XCTAssertEqual(targetChat.sessionID, "new-runtime")
         XCTAssertEqual(targetChat.storedSessionID, "wanted-stored")
-        for _ in 0..<20 where targetChat.messages.count < 2 { await Task.yield() }
+        for _ in 0..<100 where !targetChat.messages.contains(where: {
+            $0.text == "post-snapshot response"
+        }) { await Task.yield() }
         XCTAssertEqual(targetChat.messages.map(\.text),
                        ["snapshot response", "post-snapshot response"])
+        XCTAssertEqual(targetChat.messages.flatMap(\.toolCalls).map(\.name), ["search"],
+                       "pre-response tool state is not a durable message-row snapshot")
         XCTAssertEqual(otherChat.messages.map(\.text), ["other before snapshot"],
                        "a pre-resume event for another session must not be dropped")
         XCTAssertNil(MultiGatewayRuntime.shared.routedUnread[route])

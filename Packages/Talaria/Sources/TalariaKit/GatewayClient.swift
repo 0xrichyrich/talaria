@@ -280,6 +280,13 @@ public struct LiveSession: Sendable {
         pendingApproval = v["pending_approval"].map { ApprovalRequest($0, sessionID: v["session_id"]?.stringValue ?? "") }
         pendingClarify = v["pending_clarify"]
     }
+
+    /// The exact durable/state evidence represented by this resume payload.
+    /// Consumers must use this rather than treating the transport sequence as
+    /// proof that every earlier event was included in the snapshot.
+    public var snapshotEvidence: ResumeSnapshotEvidence {
+        ResumeSnapshotEvidence(session: self)
+    }
 }
 
 public struct CronJob: Sendable, Identifiable {

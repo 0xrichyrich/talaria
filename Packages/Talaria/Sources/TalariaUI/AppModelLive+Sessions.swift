@@ -288,15 +288,22 @@ extension AppModel {
         // boundary. Resume and validate both durable/profile identity and the
         // caller's fresh source authority before `beginStoredSessionOpen`
         // clears the current chat, unread mark, or navigation selection.
+        let isPrimaryRoute = route.gatewayID == activeGatewayID
         let prepared = await prepareExactRoutedEvents(
             client: client, gatewayID: route.gatewayID)
         let resumed: (session: LiveSession, inboundSequence: UInt64)
         do {
-            if prepared != nil {
+            if !isPrimaryRoute {
                 // A new/replacement secondary must stage before this ONE
                 // authoritative sequenced resume. Every event from the first
                 // response request onward is therefore buffered for the later
                 // snapshot-boundary replay.
+                guard prepared != nil else {
+                    // A foreign exact route never falls back to the legacy
+                    // unsequenced resume: without staged intake there is no
+                    // safe handoff authority.
+                    throw CancellationError()
+                }
                 if let catchUpResumeForTesting {
                     resumed = try await catchUpResumeForTesting()
                 } else if let resumeForTesting {
@@ -365,7 +372,8 @@ extension AppModel {
             do {
                 transaction = try commitExactRoutedEvents(
                     prepared, snapshotSequence: snapshotSequence,
-                    snapshotSessionID: authoritative.sessionID)
+                    snapshotSessionID: authoritative.sessionID,
+                    snapshotEvidence: authoritative.snapshotEvidence)
             } catch {
                 await prepared.discard()
                 throw error
@@ -390,6 +398,7 @@ extension AppModel {
         } catch {
             if let transaction {
                 transaction.rollback()
+                await transaction.cleanupSupersededPrevious()
                 await transaction.prepared.discardAfterRollback()
             }
             throw error
@@ -403,14 +412,16 @@ extension AppModel {
                 let opened = try await finishStoredSessionOpen(
                     attempt, presentsFailure: false)
                 if let transaction {
-                    await transaction.finalize(model: self)
-                    transaction.prepared.activate()
+                    if await transaction.finalize(model: self) {
+                        transaction.prepared.activate()
+                    }
                 }
                 return opened
             } catch {
                 if let transaction {
-                    await transaction.finalize(model: self)
-                    transaction.prepared.activate()
+                    if await transaction.finalize(model: self) {
+                        transaction.prepared.activate()
+                    }
                 }
                 throw error
             }

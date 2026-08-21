@@ -157,7 +157,7 @@ public struct MessageCompletePayload: Sendable {
     }
 }
 
-public struct SessionInfo: Sendable {
+public struct SessionInfo: Sendable, Equatable {
     public var model: String
     public var provider: String?
     public var yolo: Bool
@@ -247,7 +247,7 @@ public enum ApprovalChoice: String, Sendable {
     case once, session, always, deny
 }
 
-public struct ClarifyRequest: Sendable {
+public struct ClarifyRequest: Sendable, Equatable {
     public var sessionID: String
     public var requestID: String
     public var question: String
@@ -260,6 +260,103 @@ public struct ClarifyRequest: Sendable {
         question = v?["question"]?.stringValue ?? ""
         choices = v?["choices"]?.arrayValue?.compactMap(\.stringValue) ?? []
         multiSelect = v?["multi_select"]?.boolValue ?? false
+    }
+}
+
+/// The small, explicit part of a `session.resume` projection that can prove
+/// an already-buffered event is represented by that projection. Hermes' cold
+/// resume also carries inflight/tool/status/notification state, but those
+/// shapes are not durable message rows and therefore must never be inferred
+/// from a transport sequence alone.
+public struct ResumeMessageEvidence: Sendable, Equatable {
+    public let rowID: String?
+    public let role: String
+    public let text: String
+
+    public init(_ value: JSONValue) {
+        rowID = Self.identity(value["row_id"] ?? value["id"])
+        role = value["role"]?.stringValue ?? ""
+        text = value["text"]?.stringValue
+            ?? value["content"]?.stringValue
+            ?? ""
+    }
+
+    private static func identity(_ value: JSONValue?) -> String? {
+        if let string = value?.stringValue, !string.isEmpty { return string }
+        if let number = value?.intValue { return String(number) }
+        return nil
+    }
+}
+
+/// Evidence carried by the authoritative `session.resume` response. This is
+/// deliberately conservative: only events with an exact row/state match are
+/// suppressible. Tool/status/notification/voice events are not represented
+/// here and are always replayed even when their frame is older than resume.
+public struct ResumeSnapshotEvidence: Sendable, Equatable {
+    public let messages: [ResumeMessageEvidence]
+    public let info: SessionInfo
+    public let pendingApproval: ApprovalRequest?
+    public let pendingClarify: JSONValue?
+
+    public init(session: LiveSession) {
+        messages = session.messages.map(ResumeMessageEvidence.init)
+        info = session.info
+        pendingApproval = session.pendingApproval
+        pendingClarify = session.pendingClarify
+    }
+
+    /// A sequence position is only a replay-boundary hint; it is not evidence
+    /// that an arbitrary event was included in the snapshot.
+    public func represents(_ event: GatewayEvent) -> Bool {
+        switch event.type {
+        case "message.complete":
+            let payload = event.payload
+            let status = payload?["status"]?.stringValue ?? "complete"
+            guard status == "complete" else { return false }
+            let text = payload?["text"]?.stringValue
+                ?? payload?["content"]?.stringValue
+                ?? ""
+            let rowID = payload?["row_id"]?.stringValue
+                ?? payload?["id"]?.stringValue
+                ?? payload?["row_id"]?.intValue.map(String.init)
+                ?? payload?["id"]?.intValue.map(String.init)
+            let matches = messages.filter { message in
+                guard message.role == "assistant", message.text == text else {
+                    return false
+                }
+                if let rowID { return message.rowID == rowID }
+                return true
+            }
+            // Duplicate assistant text is not enough evidence without the
+            // durable row id; retaining it is safer than dropping a message.
+            return matches.count == 1
+
+        case "session.info":
+            return SessionInfo(event.payload) == info
+
+        case "session.title":
+            guard let stored = event.payload?["session_id"]?.stringValue,
+                  stored == info.storedSessionID else { return false }
+            return event.payload?["title"]?.stringValue == info.title
+
+        case "session.usage":
+            let usageValue = event.payload?["usage"] ?? event.payload
+            return Usage(usageValue) == info.usage
+
+        case "approval.request":
+            guard let pendingApproval else { return false }
+            return ApprovalRequest(event.payload, sessionID: event.sessionID)
+                == pendingApproval
+
+        case "clarify.request":
+            return pendingClarify == event.payload
+
+        default:
+            // message.delta, tool.*, status.update, notifications, voice,
+            // and every other event have no exact durable representation in
+            // this snapshot and must not be filtered by sequence.
+            return false
+        }
     }
 }
 

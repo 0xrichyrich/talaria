@@ -32,6 +32,23 @@ final class MultiGatewayRuntime {
         var client: GatewayClient
         var handlerID: UUID
         var pump: Task<Void, Never>
+        /// Kept so rollback can return the exact target events that were
+        /// temporarily parked by a same-client handoff.
+        var continuation: AsyncStream<GatewayEvent>.Continuation?
+        var gate: RoutedEventGate?
+        var generation: UInt64
+
+        @MainActor
+        init(client: GatewayClient, handlerID: UUID, pump: Task<Void, Never>,
+             continuation: AsyncStream<GatewayEvent>.Continuation? = nil,
+             gate: RoutedEventGate? = nil, generation: UInt64 = 0) {
+            self.client = client
+            self.handlerID = handlerID
+            self.pump = pump
+            self.continuation = continuation
+            self.gate = gate ?? RoutedEventGate(client: client, generation: generation)
+            self.generation = generation
+        }
     }
 
     var routedEvents: [String: RoutedEvents] = [:]
@@ -40,6 +57,263 @@ final class MultiGatewayRuntime {
     /// Primary rows keep the existing `Bot.unread` storage for compatibility;
     /// gateway switches move counts between the two representations.
     var routedUnread: [GatewayBotRoute: Int] = [:]
+}
+
+/// Main-actor delivery authority for one routed pump generation. A client can
+/// briefly have two handlers during an exact-session handoff, so the handler
+/// identity alone is not enough to decide which queued frame owns a route.
+/// The gate provides a small sequence ledger and a target-session quarantine:
+/// the old same-client pump keeps global/unrelated events, while target events
+/// are handed to the staged pump. A different or retired client cannot inject
+/// frames after the atomic swap.
+@MainActor
+final class RoutedEventGate {
+    let clientIdentity: ObjectIdentifier
+    let generation: UInt64
+
+    private enum State {
+        case active
+        case staging
+        case handingOff(targetSessionID: String)
+        case retired
+    }
+
+    private var state: State = .active
+    /// Frames already assigned to the old pump. The same-client handoff has
+    /// two fan-out handlers, so the staged handler must be able to recognize
+    /// these frames without consuming them a second time.
+    private var oldSequences: Set<UInt64> = []
+    private var oldUnsequenced: [GatewayEvent] = []
+    /// Frames whose ownership moved to the staged pump. Keeping this separate
+    /// from `delivered` matters when the old handler observes a frame before
+    /// the staged handler: the latter still has to deliver it once.
+    private var targetSequences: Set<UInt64> = []
+    private var targetUnsequenced: [GatewayEvent] = []
+    private var deliveredSequences: Set<UInt64> = []
+    private var deliveredUnsequenced: [GatewayEvent] = []
+    private var stagedEvents: [GatewayEvent] = []
+    private var deferredTargetEvents: [GatewayEvent] = []
+    private var replayOldSequences: Set<UInt64> = []
+    private var replayOldEvents: [GatewayEvent] = []
+    /// A prior gate is allowed to hand its client over after it is retired;
+    /// the replacement pump then owns all subsequent frames. A replacement
+    /// gate itself never allows delivery after retirement.
+    private var allowsStagedAfterRetire = false
+
+    init(client: GatewayClient, generation: UInt64) {
+        clientIdentity = ObjectIdentifier(client)
+        self.generation = generation
+    }
+
+    func beginHandoff(targetSessionID: String) {
+        guard case .active = state else { return }
+        state = .handingOff(targetSessionID: targetSessionID)
+    }
+
+    /// Freeze session-specific ownership before the staged handler starts its
+    /// resume. Global broadcasts remain with the old pump; session frames are
+    /// held until the authoritative runtime session id is known.
+    func beginStaging() {
+        guard case .active = state else { return }
+        state = .staging
+    }
+
+    /// Resolve the pre-resume hold at the atomic swap. Target frames stay in
+    /// the staged stream; unrelated session frames are returned to the old
+    /// stream so they retain their old source ownership.
+    func finishStaging(targetSessionID: String) -> [GatewayEvent] {
+        guard case .staging = state else { return [] }
+        state = .handingOff(targetSessionID: targetSessionID)
+        let held = stagedEvents
+        stagedEvents.removeAll(keepingCapacity: false)
+        var unrelated: [GatewayEvent] = []
+        for event in held {
+            if event.sessionID == targetSessionID {
+                markTarget(event, deferForRollback: true)
+            } else {
+                _ = markOld(event)
+                unrelated.append(event)
+            }
+        }
+        return unrelated
+    }
+
+    func retire() {
+        state = .retired
+        allowsStagedAfterRetire = false
+    }
+
+    /// Retire the old same-client gate after visible adoption. Its handler is
+    /// still being removed asynchronously, but the replacement must own every
+    /// frame that arrives during that removal window.
+    func retireForStagedReplacement() {
+        state = .retired
+        allowsStagedAfterRetire = true
+    }
+
+    var isOpen: Bool {
+        if case .retired = state { return false }
+        return true
+    }
+
+    /// Claim a frame for the pump that currently owns this gate. During a
+    /// same-client handoff, only the exact target session is parked; unrelated
+    /// sessions and global broadcasts remain with the old pump.
+    func claimForPump(_ event: GatewayEvent) -> Bool {
+        guard isOpen else { return false }
+        if case .staging = state, !event.sessionID.isEmpty {
+            guard !stagedEvents.contains(where: { sameEvent($0, event) }) else {
+                return false
+            }
+            stagedEvents.append(event)
+            return false
+        }
+        if case .handingOff(let targetSessionID) = state,
+           event.sessionID == targetSessionID {
+            markTarget(event, deferForRollback: true)
+            return false
+        }
+        if consumeOldReplay(event) { return true }
+        return markOld(event)
+    }
+
+    /// Claim a frame for the staged pump. A target frame parked by the old
+    /// pump becomes staged-owned; frames already claimed by the old generation
+    /// (including global/unrelated frames) stay there and are not duplicated.
+    func claimForStaged(_ event: GatewayEvent) -> Bool {
+        switch state {
+        case .active:
+            return markDelivered(event)
+        case .staging:
+            return false
+        case .handingOff(let targetSessionID):
+            guard event.sessionID == targetSessionID else { return false }
+            markTarget(event, deferForRollback: false)
+            return markDelivered(event)
+        case .retired:
+            guard allowsStagedAfterRetire else { return false }
+            return markDelivered(event)
+        }
+    }
+
+    /// Restore the old generation after a failed visible adoption and return
+    /// only the target frames it parked. The caller yields these synchronously
+    /// back into the old stream before the transaction is considered settled.
+    func restoreForRollback() -> [GatewayEvent] {
+        state = .active
+        allowsStagedAfterRetire = false
+        let replay = uniqueEvents(stagedEvents + deferredTargetEvents)
+        for event in replay {
+            removeTarget(event)
+            removeDelivered(event)
+        }
+        stagedEvents.removeAll(keepingCapacity: false)
+        deferredTargetEvents.removeAll(keepingCapacity: false)
+        targetSequences.removeAll(keepingCapacity: false)
+        targetUnsequenced.removeAll(keepingCapacity: false)
+        deliveredSequences.removeAll(keepingCapacity: false)
+        deliveredUnsequenced.removeAll(keepingCapacity: false)
+        return replay
+    }
+
+    /// Mark frames that were consumed by the old pump while staging as
+    /// explicitly replayable to that same pump. This is used only for held
+    /// unrelated events; target events remain staged-owned.
+    func prepareOldReplay(_ events: [GatewayEvent]) {
+        for event in events {
+            if event.inboundSequence != 0 {
+                replayOldSequences.insert(event.inboundSequence)
+            } else if !replayOldEvents.contains(where: { sameEvent($0, event) }) {
+                replayOldEvents.append(event)
+            }
+        }
+    }
+
+    private func markTarget(_ event: GatewayEvent, deferForRollback: Bool) {
+        if event.inboundSequence != 0 {
+            guard targetSequences.insert(event.inboundSequence).inserted else {
+                if deferForRollback,
+                   !deferredTargetEvents.contains(where: { sameEvent($0, event) }) {
+                    deferredTargetEvents.append(event)
+                }
+                return
+            }
+        }
+        else if targetUnsequenced.contains(where: { sameEvent($0, event) }) {
+            if deferForRollback,
+               !deferredTargetEvents.contains(where: { sameEvent($0, event) }) {
+                deferredTargetEvents.append(event)
+            }
+            return
+        }
+        if event.inboundSequence == 0 { targetUnsequenced.append(event) }
+        if deferForRollback,
+           !deferredTargetEvents.contains(where: { sameEvent($0, event) }) {
+            deferredTargetEvents.append(event)
+        }
+    }
+
+    private func markOld(_ event: GatewayEvent) -> Bool {
+        if event.inboundSequence != 0 {
+            return oldSequences.insert(event.inboundSequence).inserted
+        }
+        guard !oldUnsequenced.contains(where: { sameEvent($0, event) }) else {
+            return false
+        }
+        oldUnsequenced.append(event)
+        return true
+    }
+
+    private func markDelivered(_ event: GatewayEvent) -> Bool {
+        if event.inboundSequence != 0 {
+            return deliveredSequences.insert(event.inboundSequence).inserted
+        }
+        guard !deliveredUnsequenced.contains(where: { sameEvent($0, event) }) else {
+            return false
+        }
+        deliveredUnsequenced.append(event)
+        return true
+    }
+
+    private func consumeOldReplay(_ event: GatewayEvent) -> Bool {
+        if event.inboundSequence != 0 {
+            return replayOldSequences.remove(event.inboundSequence) != nil
+        }
+        guard let index = replayOldEvents.firstIndex(where: { sameEvent($0, event) })
+        else { return false }
+        replayOldEvents.remove(at: index)
+        return true
+    }
+
+    private func removeTarget(_ event: GatewayEvent) {
+        if event.inboundSequence != 0 {
+            targetSequences.remove(event.inboundSequence)
+        } else {
+            targetUnsequenced.removeAll { sameEvent($0, event) }
+        }
+    }
+
+    private func removeDelivered(_ event: GatewayEvent) {
+        if event.inboundSequence != 0 {
+            deliveredSequences.remove(event.inboundSequence)
+        } else {
+            deliveredUnsequenced.removeAll { sameEvent($0, event) }
+        }
+    }
+
+    private func uniqueEvents(_ events: [GatewayEvent]) -> [GatewayEvent] {
+        var result: [GatewayEvent] = []
+        for event in events where !result.contains(where: { sameEvent($0, event) }) {
+            result.append(event)
+        }
+        return result
+    }
+
+    private func sameEvent(_ lhs: GatewayEvent, _ rhs: GatewayEvent) -> Bool {
+        lhs.type == rhs.type && lhs.sessionID == rhs.sessionID
+            && lhs.payload == rhs.payload
+            && lhs.inboundSequence == rhs.inboundSequence
+    }
 }
 
 /// The old routed subscription remains live while a staged exact-session open
@@ -56,6 +330,7 @@ final class ExactRoutedEventsTransaction {
     private let previousGeneration: UInt64
     private let previousApprovalSweepEpoch: Int?
     private var settled = false
+    private var finalizing = false
 
     init(gatewayID: String,
          replacement: MultiGatewayRuntime.RoutedEvents,
@@ -75,7 +350,7 @@ final class ExactRoutedEventsTransaction {
     /// decide visible adoption and restore the old source as one MainActor
     /// transaction.
     func rollback() {
-        guard !settled else { return }
+        guard !settled, !finalizing else { return }
         let runtime = MultiGatewayRuntime.shared
         guard let current = runtime.routedEvents[gatewayID],
               current.handlerID == replacement.handlerID,
@@ -83,10 +358,17 @@ final class ExactRoutedEventsTransaction {
             // A source teardown/replacement already won.  Do not resurrect an
             // older subscription over that newer authority.
             settled = true
+            replacement.gate?.retire()
+            prepared.forgetStagedPrior()
             prepared.abandonCommitted()
             return
         }
+        replacement.gate?.retire()
         replacement.pump.cancel()
+        if let previous {
+            let replay = previous.gate?.restoreForRollback() ?? []
+            for event in replay { previous.continuation?.yield(event) }
+        }
         runtime.routedEvents[gatewayID] = previous
         runtime.routedEventGenerations[gatewayID] = previousGeneration
         if let previousApprovalSweepEpoch {
@@ -98,21 +380,72 @@ final class ExactRoutedEventsTransaction {
         settled = true
     }
 
+    /// If a source teardown/replacement won before rollback could restore the
+    /// old runtime slot, retire and remove that stale prior handler as well.
+    /// The normal rollback path is a no-op here because the restored prior
+    /// subscription is again the current runtime owner.
+    func cleanupSupersededPrevious() async {
+        let runtime = MultiGatewayRuntime.shared
+        guard let previous, !ownsRuntime(previous, runtime: runtime) else { return }
+        previous.gate?.retire()
+        previous.continuation?.finish()
+        previous.pump.cancel()
+        await previous.client.removeEventHandler(previous.handlerID)
+    }
+
     /// Remove the old handler only after visible adoption has succeeded.  The
     /// replacement remains installed throughout; broad routed-state teardown
     /// would erase the newly bound session and approvals, so finalization only
     /// retires the old subscription and starts a fresh approval sweep epoch.
-    func finalize(model: AppModel) async {
-        guard !settled else { return }
+    @discardableResult
+    func finalize(model: AppModel) async -> Bool {
+        guard !settled, !finalizing else { return false }
+        let runtime = MultiGatewayRuntime.shared
+        guard ownsCurrentRuntime(runtime) else {
+            replacement.gate?.retire()
+            prepared.abandonCommitted()
+            if let previous, !ownsRuntime(previous, runtime: runtime) {
+                previous.gate?.retire()
+                previous.continuation?.finish()
+                previous.pump.cancel()
+                await previous.client.removeEventHandler(previous.handlerID)
+            }
+            settled = true
+            return false
+        }
+        finalizing = true
         if let previous,
            previous.handlerID != replacement.handlerID
             || ObjectIdentifier(previous.client) != ObjectIdentifier(replacement.client) {
+            // Retire the authority synchronously before cancellation/removal;
+            // a queued old-client frame must fail its exact generation gate
+            // even if the actor hop below has not completed yet.
+            previous.gate?.retireForStagedReplacement()
+            previous.continuation?.finish()
             previous.pump.cancel()
             await previous.client.removeEventHandler(previous.handlerID)
+        }
+        guard ownsCurrentRuntime(runtime) else {
+            replacement.gate?.retire()
+            prepared.abandonCommitted()
+            settled = true
+            return false
         }
         ApprovalBridges.shared.resetSweepScope(gatewayID: gatewayID)
         Task { @MainActor [weak model] in await model?.replayPendingApprovals() }
         settled = true
+        return true
+    }
+
+    private func ownsCurrentRuntime(_ runtime: MultiGatewayRuntime) -> Bool {
+        ownsRuntime(replacement, runtime: runtime)
+    }
+
+    private func ownsRuntime(_ candidate: MultiGatewayRuntime.RoutedEvents,
+                             runtime: MultiGatewayRuntime) -> Bool {
+        guard let current = runtime.routedEvents[gatewayID] else { return false }
+        return current.handlerID == candidate.handlerID
+            && ObjectIdentifier(current.client) == ObjectIdentifier(candidate.client)
     }
 }
 
@@ -125,9 +458,11 @@ final class PreparedExactRoutedEvents {
     let gatewayID: String
     let handlerID: UUID
     let stream: AsyncStream<GatewayEvent>
-    private let continuation: AsyncStream<GatewayEvent>.Continuation
+    let continuation: AsyncStream<GatewayEvent>.Continuation
     private var committed = false
     private var activation: AsyncStream<Void>.Continuation?
+    private var stagedPriorGate: RoutedEventGate?
+    private var stagedPriorContinuation: AsyncStream<GatewayEvent>.Continuation?
 
     init(client: GatewayClient, gatewayID: String, handlerID: UUID,
          stream: AsyncStream<GatewayEvent>,
@@ -142,6 +477,27 @@ final class PreparedExactRoutedEvents {
     func markCommitted(_ activation: AsyncStream<Void>.Continuation) {
         committed = true
         self.activation = activation
+    }
+
+    func rememberStagedPrior(_ gate: RoutedEventGate,
+                             continuation: AsyncStream<GatewayEvent>.Continuation?) {
+        stagedPriorGate = gate
+        stagedPriorContinuation = continuation
+    }
+
+    /// Resume/authority failure happens before a transaction exists. Restore
+    /// the old gate synchronously before removing the invisible handler.
+    func restoreStagedPrior() {
+        guard let stagedPriorGate else { return }
+        let replay = stagedPriorGate.restoreForRollback()
+        for event in replay { stagedPriorContinuation?.yield(event) }
+        self.stagedPriorGate = nil
+        stagedPriorContinuation = nil
+    }
+
+    func forgetStagedPrior() {
+        stagedPriorGate = nil
+        stagedPriorContinuation = nil
     }
 
     /// Mark a published intake as abandoned during a synchronous transaction
@@ -164,11 +520,13 @@ final class PreparedExactRoutedEvents {
 
     func discard() async {
         guard !committed else { return }
+        restoreStagedPrior()
         continuation.finish()
         await client.removeEventHandler(handlerID)
     }
 
     func discardAfterRollback() async {
+        forgetStagedPrior()
         abandonCommitted()
         await client.removeEventHandler(handlerID)
     }
@@ -179,10 +537,14 @@ final class PreparedExactRoutedEvents {
 public extension AppModel {
 
     private func consumeRoutedEvent(_ event: GatewayEvent, gatewayID: String,
-                                    client: GatewayClient) async {
+                                    client: GatewayClient,
+                                    gate: RoutedEventGate? = nil) async {
+        guard gate?.isOpen ?? true else { return }
         handle(event: event, sourceGatewayID: gatewayID)
+        guard gate?.isOpen ?? true else { return }
         await handleMCPSetupWireEvent(event, sourceGatewayID: gatewayID,
                                       sourceClient: client)
+        guard gate?.isOpen ?? true else { return }
         handleBridgeEvent(event, sourceGatewayID: gatewayID)
         routeToolEvent(event, sourceGatewayID: gatewayID)
         routeSessionEvent(event, sourceGatewayID: gatewayID)
@@ -196,21 +558,41 @@ public extension AppModel {
                                            gatewayID: String) async
         -> PreparedExactRoutedEvents? {
         guard gatewayID != activeGatewayID else { return nil }
-        if let existing = MultiGatewayRuntime.shared.routedEvents[gatewayID],
-           ObjectIdentifier(existing.client) == ObjectIdentifier(client) {
-            return nil
+        let existing = MultiGatewayRuntime.shared.routedEvents[gatewayID]
+        let sameClient = existing.map {
+            ObjectIdentifier($0.client) == ObjectIdentifier(client)
+        } == true
+        if sameClient {
+            existing?.gate?.beginStaging()
+        } else {
+            // The pool has already selected this client as the source's
+            // current identity. Keep the old handler attached for rollback,
+            // but reject its stale frames while the exact resume is in flight.
+            existing?.gate?.retire()
         }
         let (stream, continuation) = AsyncStream.makeStream(of: GatewayEvent.self)
         let handlerID = await client.addEventHandler { continuation.yield($0) }
         let current = await ConnectionRegistry.shared.clientPool.client(for: gatewayID)
-        guard current.map(ObjectIdentifier.init) == ObjectIdentifier(client) else {
+        // A missing pool entry is tolerated for deterministic/test clients;
+        // the caller's captured source fence remains authoritative in live
+        // navigation. If a slot exists, however, identity must be exact.
+        guard current == nil
+            || current.map(ObjectIdentifier.init) == ObjectIdentifier(client) else {
+            if let existing {
+                let replay = existing.gate?.restoreForRollback() ?? []
+                for event in replay { existing.continuation?.yield(event) }
+            }
             await client.removeEventHandler(handlerID)
             continuation.finish()
             return nil
         }
-        return PreparedExactRoutedEvents(
+        let prepared = PreparedExactRoutedEvents(
             client: client, gatewayID: gatewayID, handlerID: handlerID,
             stream: stream, continuation: continuation)
+        if let gate = existing?.gate {
+            prepared.rememberStagedPrior(gate, continuation: existing?.continuation)
+        }
+        return prepared
     }
 
     /// Synchronously swap a prepared intake into the routed runtime without
@@ -219,7 +601,8 @@ public extension AppModel {
     /// restore it synchronously or finalize it after hydration.
     internal func commitExactRoutedEvents(_ prepared: PreparedExactRoutedEvents,
                                           snapshotSequence: UInt64,
-                                          snapshotSessionID: String) throws
+                                          snapshotSessionID: String,
+                                          snapshotEvidence: ResumeSnapshotEvidence? = nil) throws
         -> ExactRoutedEventsTransaction {
         let gatewayID = prepared.gatewayID
         guard gatewayID != activeGatewayID else { throw CancellationError() }
@@ -229,26 +612,54 @@ public extension AppModel {
         let previousApprovalSweepEpoch = ApprovalBridges.shared.sweepEpochs[gatewayID]
         let generation = previousGeneration &+ 1
         let (activationStream, activation) = AsyncStream.makeStream(of: Void.self)
+        let priorGate: RoutedEventGate?
+        if let previous {
+            if ObjectIdentifier(previous.client) == ObjectIdentifier(prepared.client) {
+                let unrelated = previous.gate?.finishStaging(
+                    targetSessionID: snapshotSessionID) ?? []
+                previous.gate?.prepareOldReplay(unrelated)
+                for event in unrelated { previous.continuation?.yield(event) }
+                priorGate = previous.gate
+            } else {
+                // A different client/generation can never be allowed to race
+                // the staged source after this synchronous swap.
+                previous.gate?.retire()
+                priorGate = nil
+            }
+        } else {
+            priorGate = nil
+        }
+        let replacementGate = RoutedEventGate(
+            client: prepared.client, generation: generation)
         let pump = Task { @MainActor [weak self] in
             for await _ in activationStream { break }
             guard let self else { return }
             for await event in prepared.stream {
-                // The catch-up resume includes every target-session event at or
-                // before its response frame. Other sessions/global broadcasts
-                // were never represented by that snapshot and retain all rows.
+                if let priorGate, !priorGate.claimForStaged(event) {
+                    continue
+                }
+                guard replacementGate.claimForStaged(event) else { continue }
+                // The sequence is only a boundary. Suppress a target event
+                // below it only when durable/state evidence proves that the
+                // exact event is already present in the resume projection.
                 if event.sessionID == snapshotSessionID,
                    event.inboundSequence != 0,
-                   event.inboundSequence <= snapshotSequence {
+                   event.inboundSequence <= snapshotSequence,
+                   snapshotEvidence?.represents(event) == true {
                     continue
                 }
                 await self.consumeRoutedEvent(
-                    event, gatewayID: gatewayID, client: prepared.client)
+                    event, gatewayID: gatewayID, client: prepared.client,
+                    gate: replacementGate)
             }
         }
         let replacement = MultiGatewayRuntime.RoutedEvents(
-            client: prepared.client, handlerID: prepared.handlerID, pump: pump)
+            client: prepared.client, handlerID: prepared.handlerID, pump: pump,
+            continuation: prepared.continuation, gate: replacementGate,
+            generation: generation)
         runtime.routedEventGenerations[gatewayID] = generation
         runtime.routedEvents[gatewayID] = replacement
+        prepared.forgetStagedPrior()
         prepared.markCommitted(activation)
         return ExactRoutedEventsTransaction(
             gatewayID: gatewayID, replacement: replacement, previous: previous,
@@ -383,16 +794,21 @@ public extension AppModel {
               runtime.routedEvents[gatewayID] == nil,
               currentClient.map(ObjectIdentifier.init) == ObjectIdentifier(client) else {
             await client.removeEventHandler(handlerID)
+            continuation.finish()
             return
         }
+        let gate = RoutedEventGate(client: client, generation: generation)
         let pump = Task { @MainActor [weak self] in
             for await event in stream {
                 guard let self else { return }
-                await self.consumeRoutedEvent(event, gatewayID: gatewayID, client: client)
+                guard gate.claimForPump(event) else { continue }
+                await self.consumeRoutedEvent(
+                    event, gatewayID: gatewayID, client: client, gate: gate)
             }
         }
         runtime.routedEvents[gatewayID] = MultiGatewayRuntime.RoutedEvents(
-            client: client, handlerID: handlerID, pump: pump)
+            client: client, handlerID: handlerID, pump: pump,
+            continuation: continuation, gate: gate, generation: generation)
         ApprovalBridges.shared.resetSweepScope(gatewayID: gatewayID)
         Task { @MainActor [weak self] in await self?.replayPendingApprovals() }
     }
@@ -439,6 +855,8 @@ public extension AppModel {
         MultiGatewayRuntime.shared.routedEventGenerations[gatewayID, default: 0] &+= 1
         if let subscription = MultiGatewayRuntime.shared.routedEvents.removeValue(
             forKey: gatewayID) {
+            subscription.gate?.retire()
+            subscription.continuation?.finish()
             subscription.pump.cancel()
             await subscription.client.removeEventHandler(subscription.handlerID)
         }
