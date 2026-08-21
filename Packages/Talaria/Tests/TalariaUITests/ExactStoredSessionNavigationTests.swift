@@ -944,6 +944,71 @@ final class ExactStoredSessionNavigationTests: XCTestCase {
         LiveRuntime.shared.gatewayID = oldGatewayID
     }
 
+    func testLifecycleMutationDuringFinalPoolFenceCannotPublish() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let gatewayID = "foreign-fence-race-\(UUID().uuidString)"
+        let profile = "researcher"
+        let route = GatewayBotRoute(gatewayID: gatewayID, profile: profile)
+        let target = route.qualifiedID
+        let baseURL = try XCTUnwrap(URL(
+            string: "https://fence-race-\(UUID().uuidString).example"))
+        let saved = try XCTUnwrap(registry.upsert(
+            urlString: baseURL.absoluteString,
+            name: "Fence race",
+            credential: .sessionToken("fence-race-token")))
+        let client = GatewayClient(
+            baseURL: baseURL,
+            credential: .sessionToken("fence-race-token"))
+        let pool = registry.clientPool
+        await pool.adopt(client, for: gatewayID)
+        let snapshot = try await pool.connectWithGeneration(
+            gatewayID: gatewayID, baseURL: baseURL,
+            credential: .sessionToken("fence-race-token"))
+        let oldGatewayID = LiveRuntime.shared.gatewayID
+        let oldHook = SessionsRuntime.shared.sourceFenceAfterPoolCheckForTesting
+        model.mode = .live
+        model.chats[target] = ChatState(messages: [
+            ChatMessage(author: .bot, text: "old transcript"),
+        ])
+        model.bots = [Bot(id: target, job: "", shape: .circle, hue: .violet)]
+        LiveRuntime.shared.gatewayID = "primary-fence-race"
+        SessionsRuntime.shared.sourceFenceAfterPoolCheckForTesting = {
+            // This bumps the captured route generation while the pool actor
+            // query is in flight. The post-await fence must reject the stale
+            // resume before it can commit its prepared handler.
+            try? await model.activateProfileLifecycleRoute(
+                gatewayID: gatewayID, profile: profile)
+        }
+        defer {
+            SessionsRuntime.shared.sourceFenceAfterPoolCheckForTesting = oldHook
+            LiveRuntime.shared.gatewayID = oldGatewayID
+            registry.remove(id: saved.id)
+        }
+
+        do {
+            _ = try await model.openStoredSessionAwaiting(
+                "wanted-stored", botID: target, route: route, client: client,
+                validateBeforeBinding: {},
+                catchUpResumeForTesting: {
+                    (LiveSession(.object([
+                        "session_id": .string("fence-runtime"),
+                        "stored_session_id": .string("wanted-stored"),
+                        "info": .object(["profile_name": .string(profile)]),
+                    ])), 10)
+                },
+                sourceSnapshot: snapshot)
+            XCTFail("a lifecycle mutation during the final pool fence must reject the open")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        XCTAssertNil(model.openBotID)
+        XCTAssertNil(MultiGatewayRuntime.shared.routedEvents[gatewayID])
+        XCTAssertNil(MultiGatewayRuntime.shared.routedEventGenerations[gatewayID])
+        await pool.disconnect(gatewayID: gatewayID)
+    }
+
     func testDeepLinkParserRetainsUnknownSourceForVisibleAuthorityFailure() throws {
         let url = try XCTUnwrap(URL(
             string: "talaria://bot/inbox?session_id=stored-42&gateway_id=not-saved-yet"))

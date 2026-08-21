@@ -49,6 +49,10 @@ final class SessionsRuntime {
     /// boundary to fail after a staged routed swap, without touching ordinary
     /// manual/session paths.
     var beginFailureForTesting: Error?
+    /// Runs after the final pool identity await and before the synchronous
+    /// source/lifecycle fence. Tests use this to model a profile mutation
+    /// winning during that actor hop.
+    var sourceFenceAfterPoolCheckForTesting: (@MainActor () async -> Void)?
 
     static func key(botID: String, sessionID: String) -> String {
         botID + "\u{0}" + sessionID
@@ -419,16 +423,6 @@ extension AppModel {
         _ fence: ExactStoredSessionSourceFence
     ) async throws {
         try Task.checkCancellation()
-        guard mode == .live,
-              stateRoute(for: fence.botID) == fence.route,
-              profileLifecycleAccepts(fence.lifecycle) else {
-            throw CancellationError()
-        }
-        if let expectedURL = fence.savedURLString {
-            guard ConnectionRegistry.shared.saved.contains(where: {
-                $0.id == fence.route.gatewayID && $0.urlString == expectedURL
-            }) else { throw CancellationError() }
-        }
         if let snapshot = fence.snapshot {
             guard await ConnectionRegistry.shared.clientPool.isCurrent(
                 snapshot, for: fence.route.gatewayID) else {
@@ -439,6 +433,24 @@ extension AppModel {
             guard ObjectIdentifier(current) == ObjectIdentifier(fence.client) else {
                 throw CancellationError()
             }
+        }
+        if let hook = SessionsRuntime.shared.sourceFenceAfterPoolCheckForTesting {
+            await hook()
+        }
+        // Everything below is synchronous on MainActor. This is deliberately
+        // the last authority read before commit/begin: source removal or a
+        // profile lifecycle mutation that wins the pool actor hop is rejected
+        // here rather than publishing from the pre-await snapshot.
+        try Task.checkCancellation()
+        guard mode == .live,
+              stateRoute(for: fence.botID) == fence.route,
+              profileLifecycleAccepts(fence.lifecycle) else {
+            throw CancellationError()
+        }
+        if let expectedURL = fence.savedURLString {
+            guard ConnectionRegistry.shared.saved.contains(where: {
+                $0.id == fence.route.gatewayID && $0.urlString == expectedURL
+            }) else { throw CancellationError() }
         }
         if fence.route.gatewayID == activeGatewayID {
             guard LiveRuntime.shared.generation == fence.connectionGeneration,
