@@ -88,11 +88,25 @@ public final class AppModel {
 
     // Live mode
     public var client: GatewayClient?
+    /// Out-of-process exact-session navigation is retained outside the visible
+    /// chat tree until launch restore and source/profile authority are ready.
+    let exactStoredSessionRouteQueue = ExactStoredSessionRouteQueue()
+    /// Focused integration-test seams around network/RPC boundaries. Queue,
+    /// launch readiness, source/credential validation, and retry behavior stay
+    /// on the production path.
+    var exactStoredSessionSourceReadinessOverride:
+        (@MainActor (ExactStoredSessionRoute) async throws -> Bool)?
+    var exactStoredSessionOpenOverride:
+        (@MainActor (ExactStoredSessionRoute) async throws -> Void)?
+    var launchWorldRestoreCompleted = false
 
     public init() {
         showOnboarding = !UserDefaults.standard.bool(forKey: "talaria-onboarded")
         ConnectionRegistry.shared.setSecondaryTeardown { [weak self] gatewayID, expected in
             await self?.detachRoutedEvents(gatewayID: gatewayID, expected: expected)
+        }
+        ConnectionRegistry.shared.setSecondaryRefresh { [weak self] gatewayIDs in
+            self?.exactStoredSessionSecondarySourcesDidRefresh(gatewayIDs)
         }
     }
 
@@ -149,6 +163,7 @@ public final class AppModel {
     /// gateway; else reload the demo world if that was the explicit choice;
     /// else stay on the honest empty state.
     public func restoreWorldAtLaunch() async {
+        defer { completeLaunchWorldRestore() }
         guard mode == .demo, bots.isEmpty, !showOnboarding else { return }
         let registry = ConnectionRegistry.shared
         for gateway in registry.saved {

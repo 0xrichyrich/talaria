@@ -6,7 +6,8 @@ import TalariaKit
 // gateway relay. The relay sends `mutable-content: 1` with a data payload
 // mirroring the design DB's PUSHES shape:
 //
-//     { kind, gateway_id, bot, title, body, approval_request_id, session_id }
+//     { kind, gateway_id, bot, bot_display_name, bot_avatar, title, body,
+//       approval_request_id, session_id }
 //
 // where `kind` is one of approval | response | routine | mention | task |
 // gateway.
@@ -18,8 +19,9 @@ import TalariaKit
 //   - stamps the TALARIA_RESPONSE display-only category on completed agent
 //     replies; response pushes never gain approval actions,
 //   - threads notifications per bot,
-//   - dresses mentions as communication-style notifications when the intent
-//     machinery cooperates, and passes through untouched otherwise.
+//   - dresses mentions, and portrait-bearing final responses, as communication-
+//     style notifications when the intent machinery cooperates. Response
+//     portraits are bounded self-contained bytes; no URL is ever fetched.
 //
 // Key and identifier literals are duplicated from TalariaUI's PushCoordinator
 // (`PushPayloadKey` / `PushIdentifiers`) so this extension stays lean — it
@@ -31,6 +33,8 @@ final class NotificationService: UNNotificationServiceExtension {
     private enum Key {
         static let kind = "kind"
         static let bot = "bot"
+        static let gatewayID = "gateway_id"
+        static let botDisplayName = "bot_display_name"
         static let title = "title"
         static let body = "body"
         static let approvalRequestID = "approval_request_id"
@@ -60,6 +64,10 @@ final class NotificationService: UNNotificationServiceExtension {
         let wireKind = info[Key.kind] as? String
         let kind = PushNotificationPolicy.kind(for: wireKind)
         let bot = info[Key.bot] as? String
+        let identity = NotificationCommunicationIdentity.resolve(
+            rawProfile: bot,
+            configuredDisplayName: info[Key.botDisplayName] as? String,
+            gatewayID: info[Key.gatewayID] as? String)
 
         // Display strings from the data payload win over the aps alert.
         if let title = info[Key.title] as? String, !title.isEmpty {
@@ -71,6 +79,9 @@ final class NotificationService: UNNotificationServiceExtension {
 
         // One thread per bot so a chatty roster stays grouped.
         if let bot, !bot.isEmpty {
+            // Raw profile remains the grouping/filter identity. Friendly title
+            // and source-qualified INPerson identifiers are display metadata;
+            // neither is allowed to rewrite the relay's route/thread field.
             content.threadIdentifier = bot
         }
 
@@ -95,11 +106,34 @@ final class NotificationService: UNNotificationServiceExtension {
             // never authority to answer or approve work.
             content.categoryIdentifier = Identifier.responseCategory
             content.interruptionLevel = .active
-            contentHandler(content)
+            // A valid tiny local portrait opts this response into iOS'
+            // communication rendering. Missing/malformed bytes intentionally
+            // retain the ordinary notification and its app icon.
+            guard let identity,
+                  let avatar = NotificationAvatarPayload.decode(info) else {
+                contentHandler(content)
+                return
+            }
+            let presentation = ResponseNotificationPresentation.resolve(
+                identity: identity, body: content.body)
+            content.title = presentation.title
+            content.body = presentation.body
+            content.threadIdentifier = presentation.threadIdentifier
+            content.categoryIdentifier = presentation.categoryIdentifier
+            content.interruptionLevel = .active
+            deliverAsCommunication(content, identity: identity,
+                                   avatar: avatar, requiresAvatar: true)
         case .mention:
             // A bot speaking to you — try the communication style; any
             // failure delivers the undecorated content.
-            deliverAsCommunication(content, from: bot)
+            guard let identity else {
+                contentHandler(content)
+                return
+            }
+            deliverAsCommunication(
+                content, identity: identity,
+                avatar: NotificationAvatarPayload.decode(info),
+                requiresAvatar: false)
         default:
             contentHandler(content)
         }
@@ -117,27 +151,32 @@ final class NotificationService: UNNotificationServiceExtension {
     /// renders it like a message from the bot. Needs the communication-
     /// notifications capability on the app; without it `updating(from:)`
     /// simply fails and the plain content ships.
-    private func deliverAsCommunication(_ content: UNMutableNotificationContent,
-                                        from bot: String?) {
+    private func deliverAsCommunication(
+        _ content: UNMutableNotificationContent,
+        identity: NotificationCommunicationIdentity,
+        avatar: NotificationAvatarImage?,
+        requiresAvatar: Bool
+    ) {
         guard let contentHandler else { return }
-        guard let bot, !bot.isEmpty else {
+        guard !requiresAvatar || avatar != nil else {
             contentHandler(content)
             return
         }
 
         let sender = INPerson(
-            personHandle: INPersonHandle(value: "bot:\(bot)", type: .unknown),
+            personHandle: INPersonHandle(
+                value: identity.sourceQualifiedIdentifier, type: .unknown),
             nameComponents: nil,
-            displayName: bot,
-            image: nil,
+            displayName: identity.displayName,
+            image: avatar.map { INImage(imageData: $0.data) },
             contactIdentifier: nil,
-            customIdentifier: "bot:\(bot)")
+            customIdentifier: identity.sourceQualifiedIdentifier)
         let intent = INSendMessageIntent(
             recipients: nil,
             outgoingMessageType: .outgoingMessageText,
             content: content.body,
             speakableGroupName: nil,
-            conversationIdentifier: bot,
+            conversationIdentifier: identity.sourceQualifiedIdentifier,
             serviceName: nil,
             sender: sender,
             attachments: nil)
@@ -146,8 +185,18 @@ final class NotificationService: UNNotificationServiceExtension {
         interaction.direction = .incoming
         interaction.donate(completion: nil)
 
-        if let styled = try? content.updating(from: intent) {
-            contentHandler(styled)
+        if let styled = try? content.updating(from: intent),
+           let restamped = styled.mutableCopy() as? UNMutableNotificationContent {
+            // INInteraction owns the sender/avatar presentation, not Talaria's
+            // routing or response policy. Reassert every exact field iOS is
+            // allowed to rewrite while adapting the intent.
+            restamped.title = content.title
+            restamped.subtitle = content.subtitle
+            restamped.body = content.body
+            restamped.threadIdentifier = content.threadIdentifier
+            restamped.categoryIdentifier = content.categoryIdentifier
+            restamped.interruptionLevel = content.interruptionLevel
+            contentHandler(restamped)
         } else {
             contentHandler(content)
         }

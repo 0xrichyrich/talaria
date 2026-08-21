@@ -18,76 +18,6 @@ import Foundation
 import TalariaKit
 import TalariaUI
 
-/// A parsed talaria:// destination.
-enum DeepLink: Equatable {
-
-    case approvals
-    case connections
-    case bot(id: String)
-    case storedSession(id: String, sessionID: String, gatewayID: String?)
-
-    /// Strict parse — unknown hosts and empty bot ids are rejected so a bad
-    /// URL can never scramble navigation state.
-    @MainActor
-    init?(url: URL) {
-        guard url.scheme?.lowercased() == "talaria" else { return nil }
-        // The custom scheme has no authority-bearing routes. Reject userinfo,
-        // ports, and fragments so a crafted URL cannot smuggle routing data
-        // outside the path/query contract.
-        guard url.user == nil, url.password == nil, url.port == nil,
-              url.fragment == nil else { return nil }
-        switch url.host?.lowercased() {
-        case "approvals":
-            self = .approvals
-        case "connections":
-            self = .connections
-        case "bot":
-            // talaria://bot/<id> — the id is the first real path component.
-            let components = url.pathComponents.filter { $0 != "/" }
-            guard let id = components.first, !id.isEmpty else { return nil }
-            let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-            let sessionItems = query.filter { $0.name == "session_id" }
-            let gatewayItems = query.filter { $0.name == "gateway_id" }
-            guard query.allSatisfy({ $0.name == "session_id" || $0.name == "gateway_id" }),
-                  sessionItems.count <= 1, gatewayItems.count <= 1,
-                  sessionItems.allSatisfy({ !($0.value ?? "").isEmpty }),
-                  gatewayItems.allSatisfy({ !($0.value ?? "").isEmpty }) else {
-                return nil
-            }
-            let sessionID = sessionItems.first?.value
-            let gatewayID = gatewayItems.first?.value
-            if let sessionID, !sessionID.isEmpty {
-                // A qualified path already carries its source; accepting a
-                // second gateway query would make the URL ambiguous.
-                if let qualified = GatewayBotRoute(qualifiedID: id) {
-                    guard gatewayID == nil,
-                          Self.savedGatewayIDs.contains(qualified.gatewayID) else {
-                        return nil
-                    }
-                } else {
-                    guard let gatewayID,
-                          Self.savedGatewayIDs.contains(gatewayID) else {
-                        return nil
-                    }
-                }
-                self = .storedSession(id: id, sessionID: sessionID, gatewayID: gatewayID)
-            } else {
-                // A source without a durable session is not a usable response
-                // deep link. Ordinary bot links remain query-free.
-                guard gatewayID == nil else { return nil }
-                self = .bot(id: id)
-            }
-        default:
-            return nil
-        }
-    }
-
-    @MainActor
-    private static var savedGatewayIDs: Set<String> {
-        Set(ConnectionRegistry.shared.saved.map(\.id))
-    }
-}
-
 /// Applies a deep link to the app's navigation state.
 @MainActor
 struct DeepLinkRouter {
@@ -102,12 +32,12 @@ struct DeepLinkRouter {
         // no navigation — a Solo turn is parked on it — so it is answered here
         // and never reaches the navigation switch below.
         if SoloToolHost.shared.deliver(url) { return true }
-        guard let link = DeepLink(url: url) else { return false }
+        guard let link = TalariaDeepLink(url: url) else { return false }
         route(link)
         return true
     }
 
-    func route(_ link: DeepLink) {
+    func route(_ link: TalariaDeepLink) {
         switch link {
         case .approvals:
             model.openBotID = nil
@@ -122,27 +52,16 @@ struct DeepLinkRouter {
             // canonical forever-chat and hydrates the transcript.
             model.openChat(botID: id)
 
-        case .storedSession(let id, let sessionID, let gatewayID):
-            let botID: String
-            if let gatewayID, GatewayBotRoute(qualifiedID: id) == nil {
-                guard ConnectionRegistry.shared.saved.contains(where: { $0.id == gatewayID }) else {
-                    return
-                }
-                // Match push routing: the active source keeps its bare roster
-                // id, while a saved foreign source must remain qualified.
-                botID = gatewayID == model.activeGatewayID
-                    ? id
-                    : GatewayBotRoute(gatewayID: gatewayID, profile: id).qualifiedID
+        case .storedSession(let route):
+            // Unlike a generic bot URL, response links are retained as one
+            // immutable source/profile/session identity through cold restore.
+            // `.demo` is also the model's cold-launch placeholder, so only a
+            // loaded canned world may bypass live exact-session authority.
+            if model.demoDataLoaded {
+                model.openStoredSession(route.storedSessionID, botID: route.profile)
             } else {
-                if let route = GatewayBotRoute(qualifiedID: id),
-                   !ConnectionRegistry.shared.saved.contains(where: { $0.id == route.gatewayID }) {
-                    return
-                }
-                botID = id
+                model.openExactStoredSession(route, origin: .deepLink)
             }
-            // Unlike a generic bot URL, response links must reopen the exact
-            // durable session and never fall back to the canonical chat.
-            model.openStoredSession(sessionID, botID: botID)
 
         case .connections:
             // Connections is pushed off the roster, not a tab; surface the

@@ -731,6 +731,25 @@ enum SteerMutationStage: String, Equatable {
     case queuedSubmit
 }
 
+enum SteerReceiptDisposition: Equatable {
+    case acceptedCurrentTurn
+    case mirrorNextTurn
+    case advanceCascade
+
+    static func resolve(stage: SteerMutationStage, status: String) -> Self? {
+        switch (stage, status) {
+        case (.steer, "queued"), (.redirect, "redirected"):
+            return .acceptedCurrentTurn
+        case (.redirect, "queued"), (.queuedSubmit, "queued"):
+            return .mirrorNextTurn
+        case (.steer, "rejected"), (.redirect, "rejected"):
+            return .advanceCascade
+        default:
+            return nil
+        }
+    }
+}
+
 struct SteerMutationLease: Equatable {
     var id: UUID
     var botID: String
@@ -1539,19 +1558,20 @@ extension AppModel {
                     ? ChatRuntime.shared.steerActions[botID]?.sessionID ?? sessionID
                     : sessionID
                 let steered = try await client.steerTurn(sessionID: wireSessionID, text: text)
-                switch steered {
-                case "queued":
-                    acceptQueuedSubmission(submission, text: text)
-                    finishSteerMutation(lease)
-                    return
-                case "rejected":
-                    // A wire-level rejection is definitive. It is the only
-                    // answer that permits trying the next operation.
-                    break
-                default:
+                guard let steerDisposition = settleSteerReceipt(
+                    submission, text: text, stage: lease.stage, status: steered) else {
                     throw AckValidationError(
                         operation: "session.steer",
                         detail: "Hermes did not return an authoritative steer status.")
+                }
+                switch steerDisposition {
+                case .acceptedCurrentTurn, .mirrorNextTurn:
+                    finishSteerMutation(lease)
+                    return
+                case .advanceCascade:
+                    // A wire-level rejection is definitive. It is the only
+                    // answer that permits trying the next operation.
+                    break
                 }
 
                 // Too late to steer: re-aim the turn, and failing that queue
@@ -1564,23 +1584,20 @@ extension AppModel {
                     : sessionID
                 let redirected = try await client.redirectTurn(
                     sessionID: redirectSessionID, text: text)
-                switch redirected {
-                case "redirected":
-                    discardQueuedSubmission(submission)
-                    finishSteerMutation(lease)
-                    return
-                case "queued":
-                    acceptQueuedSubmission(submission, text: text)
-                    finishSteerMutation(lease)
-                    return
-                case "rejected":
-                    // A definitive redirect rejection permits the queued
-                    // submit fallback below; no ambiguous answer was seen.
-                    break
-                default:
+                guard let redirectDisposition = settleSteerReceipt(
+                    submission, text: text, stage: lease.stage, status: redirected) else {
                     throw AckValidationError(
                         operation: "session.redirect",
                         detail: "Hermes did not return an authoritative redirect status.")
+                }
+                switch redirectDisposition {
+                case .acceptedCurrentTurn, .mirrorNextTurn:
+                    finishSteerMutation(lease)
+                    return
+                case .advanceCascade:
+                    // A definitive redirect rejection permits the queued
+                    // submit fallback below; no ambiguous answer was seen.
+                    break
                 }
 
                 lease.stage = .queuedSubmit
@@ -1593,7 +1610,14 @@ extension AppModel {
                     sessionID: queuedSessionID, text: text, queued: true)
                 try PromptSubmitReceipt.requireQueued(receipt,
                                                       operation: "Queued steer")
-                acceptQueuedSubmission(submission, text: text)
+                guard let queuedStatus = receipt["status"]?.stringValue,
+                      settleSteerReceipt(
+                        submission, text: text, stage: lease.stage,
+                        status: queuedStatus) == .mirrorNextTurn else {
+                    throw AckValidationError(
+                        operation: "Queued steer",
+                        detail: "Hermes did not return an authoritative queued status.")
+                }
                 finishSteerMutation(lease)
             } catch {
                 discardQueuedSubmission(submission)
@@ -2406,6 +2430,27 @@ extension AppModel {
             storedID: submission.session.storedID, route: submission.session.route,
             eligibleAfterCurrentTurn: now.completions > pending.lifecycle.completions,
             order: pending.order)
+    }
+
+    /// Settle the actual wire receipt at the shared cascade boundary. Hermes
+    /// overloads `queued`: `session.steer` has injected into the running turn,
+    /// while redirect and explicit queued-submit acknowledgements describe
+    /// genuine next-turn work.
+    @discardableResult
+    func settleSteerReceipt(_ submission: PendingQueuedSubmission, text: String,
+                            stage: SteerMutationStage,
+                            status: String) -> SteerReceiptDisposition? {
+        guard let disposition = SteerReceiptDisposition.resolve(
+            stage: stage, status: status) else { return nil }
+        switch disposition {
+        case .acceptedCurrentTurn:
+            discardQueuedSubmission(submission)
+        case .mirrorNextTurn:
+            acceptQueuedSubmission(submission, text: text)
+        case .advanceCascade:
+            break
+        }
+        return disposition
     }
 
     func enqueuePrompt(_ text: String, botID: String, sessionID: String) {

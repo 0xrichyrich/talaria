@@ -268,6 +268,10 @@ public final class ConnectionRegistry {
     /// model, and invoke it before releasing a failed secondary client.
     @ObservationIgnored private var secondaryTeardown:
         (@MainActor (String, GatewayClientPool.ConnectionSnapshot) async -> Void)?
+    /// Owner callback after one or more secondary sources publish a fresh,
+    /// authenticated roster. One enumeration pass produces at most one signal.
+    @ObservationIgnored private var secondaryRefresh:
+        (@MainActor (Set<String>) -> Void)?
     /// gateway id → when we last *attempted* a dial, so a gateway that refuses
     /// to answer is not re-dialled on every probe tick.
     @ObservationIgnored private var lastEnumerationAttempt: [String: Date] = [:]
@@ -421,6 +425,10 @@ public final class ConnectionRegistry {
         secondaryTeardown = handler
     }
 
+    internal func setSecondaryRefresh(_ handler: (@MainActor (Set<String>) -> Void)?) {
+        secondaryRefresh = handler
+    }
+
     /// Probe every saved gateway in parallel.
     public func probeAll() async {
         let rows = saved
@@ -496,22 +504,26 @@ public final class ConnectionRegistry {
     /// probe tick — desktop's own inventory is equally conservative about
     /// re-enumerating a source that is not the active one
     /// (`shouldRetrySshInventory`, connection-registry.ts:288-302).
+    @discardableResult
     public func enumerateSecondaryRosters(excluding: Set<String>,
-                                          minInterval: TimeInterval = 90) async {
+                                          minInterval: TimeInterval = 90) async -> Set<String> {
         let now = Date()
         let targets = saved.filter { gateway in
             guard !excluding.contains(gateway.urlString) else { return false }
             guard let attempted = lastEnumerationAttempt[gateway.id] else { return true }
             return now.timeIntervalSince(attempted) >= minInterval
         }
-        guard !targets.isEmpty else { return }
+        guard !targets.isEmpty else { return [] }
         // Cache whatever we learned even if the pass is cut short — a
         // half-finished sweep still leaves the roster better than it found it.
         defer { persistRosters() }
+        var succeeded: Set<String> = []
         for gateway in targets {
-            if Task.isCancelled { return }
-            await enumerate(gateway)
+            if Task.isCancelled { break }
+            if await enumerate(gateway) { succeeded.insert(gateway.id) }
         }
+        if !succeeded.isEmpty { secondaryRefresh?(succeeded) }
+        return succeeded
     }
 
     /// Refresh one retained source in response to that gateway's own change
@@ -521,30 +533,31 @@ public final class ConnectionRegistry {
         guard let gateway = saved.first(where: { $0.id == gatewayID }) else { return }
         if gateway.urlString == liveGatewayURL?.absoluteString { return }
         lastEnumerationAttempt[gatewayID] = Date()
-        await enumerate(gateway)
+        let succeeded = await enumerate(gateway)
         persistRosters()
+        if succeeded { secondaryRefresh?([gatewayID]) }
     }
 
     /// One gateway's roster. Every failure keeps whatever was listed before —
     /// an unreachable homelab should read "last seen 3h ago", not go blank.
-    private func enumerate(_ gateway: SavedGateway) async {
-        guard let base = gateway.baseURL else { return }
+    private func enumerate(_ gateway: SavedGateway) async -> Bool {
+        guard let base = gateway.baseURL else { return false }
         // Re-checked here, not only when the sweep was planned: a connect that
         // lands mid-sweep makes this gateway the live one, and a second socket
         // to a host we already hold open is never worth a roster refresh the
         // live link is about to deliver anyway. Not recorded as an attempt —
         // this gateway was skipped, not tried.
-        guard base.absoluteString != liveGatewayURL?.absoluteString else { return }
+        guard base.absoluteString != liveGatewayURL?.absoluteString else { return false }
         lastEnumerationAttempt[gateway.id] = Date()
         guard let credential = credential(for: gateway) else {
             mark(gateway.id, .needsSignIn)
-            return
+            return false
         }
         // A gateway the status probe just found asleep or offline will not
         // answer a WebSocket either; skip the dial and keep the cache.
         if let state = health[gateway.id]?.state, state == .offline || state == .asleep {
             mark(gateway.id, .stale)
-            return
+            return false
         }
 
         let capture = SecondaryConnectionCapture()
@@ -587,7 +600,7 @@ public final class ConnectionRegistry {
             guard base.absoluteString != liveGatewayURL?.absoluteString,
                   let lease = await clientPool.acquireLease(
                       fetched.connection, for: gateway.id) else {
-                return
+                return false
             }
             // The live source can switch while lease acquisition suspends on
             // the pool actor. Re-check the same source fence immediately
@@ -595,7 +608,7 @@ public final class ConnectionRegistry {
             // roster fetched while it was secondary.
             guard base.absoluteString != liveGatewayURL?.absoluteString else {
                 await clientPool.release(lease)
-                return
+                return false
             }
             let projection = Self.secondaryRosterProjection(from: fetched.profiles)
             secondaryRosters[gateway.id] = SecondaryRoster(
@@ -604,29 +617,33 @@ public final class ConnectionRegistry {
                 freshness: projection.freshness)
             noteBotCountForSecondary(projection.profiles.count, gatewayID: gateway.id)
             await clientPool.release(lease)
+            return true
         } catch let error as GatewayError where error.code == GatewayClient.methodNotFound {
             guard let expected = await capture.snapshot,
                   await teardownSecondaryConnection(gatewayID: gateway.id, expected: expected) else {
-                return
+                return false
             }
             // A gateway too old for profiles.list has no roster to contribute.
             // Hide the surface rather than showing an error nobody can act on.
             mark(gateway.id, .unsupported)
+            return false
         } catch AuthError.sessionExpired {
             guard let expected = await capture.snapshot,
                   await teardownSecondaryConnection(gatewayID: gateway.id, expected: expected) else {
-                return
+                return false
             }
             // The credential is gone/rejected; ConnectionSupervisor owns the
             // re-auth prompt for the LIVE gateway, and a secondary simply
             // reads as needing sign-in until the user switches to it.
             mark(gateway.id, .needsSignIn)
+            return false
         } catch {
             guard let expected = await capture.snapshot,
                   await teardownSecondaryConnection(gatewayID: gateway.id, expected: expected) else {
-                return
+                return false
             }
             mark(gateway.id, .stale)
+            return false
         }
     }
 

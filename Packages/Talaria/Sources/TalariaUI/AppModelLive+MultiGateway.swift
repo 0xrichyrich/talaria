@@ -423,6 +423,15 @@ public extension AppModel {
         await flushRoomMetadataOutbox()
     }
 
+    /// One periodic enumeration pass may reconnect the pending route's foreign
+    /// source without any foreground/NWPath transition. Coalesce the whole pass
+    /// into one queue signal, and ignore successes from unrelated gateways.
+    func exactStoredSessionSecondarySourcesDidRefresh(_ gatewayIDs: Set<String>) {
+        guard let pending = exactStoredSessionRouteQueue.pending,
+              gatewayIDs.contains(pending.route.gatewayID) else { return }
+        retryExactStoredSessionNavigation()
+    }
+
     /// Keep the union roster warm while the roster screen is on-stage. Driven
     /// by a SwiftUI `.task`, so it dies with the view rather than dialling
     /// other people's machines in the background forever.

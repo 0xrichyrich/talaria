@@ -97,7 +97,7 @@ final class ResponsePushTests: XCTestCase {
                        .active)
         XCTAssertFalse(PushNotificationPolicy.allowsApprovalAction(for: "response"))
         XCTAssertTrue(PushNotificationPolicy.allowsApprovalAction(for: "approval"))
-        XCTAssertFalse(PushNotificationPolicy.usesCommunicationStyle(for: "response"))
+        XCTAssertTrue(PushNotificationPolicy.usesCommunicationStyle(for: "response"))
         XCTAssertTrue(PushNotificationPolicy.usesCommunicationStyle(for: "mention"))
     }
 
@@ -111,6 +111,102 @@ final class ResponsePushTests: XCTestCase {
         }
 
         XCTAssertTrue(DemoData.notificationPrefs.contains { $0.kind == .response })
+    }
+
+    func testNotificationCommunicationIdentityKeepsRawRouteSeparateFromDisplayName() throws {
+        let identity = try XCTUnwrap(NotificationCommunicationIdentity.resolve(
+            rawProfile: "default", configuredDisplayName: "Mercury",
+            gatewayID: "homelab"))
+
+        XCTAssertEqual(identity.rawProfile, "default")
+        XCTAssertEqual(identity.displayName, "Mercury")
+        XCTAssertEqual(identity.sourceQualifiedIdentifier, "bot:7:homelabdefault")
+        XCTAssertNotEqual(identity.displayName, identity.rawProfile)
+    }
+
+    func testNotificationCommunicationIdentityUsesTruthfulFallbacksPerSource() throws {
+        let primary = try XCTUnwrap(NotificationCommunicationIdentity.resolve(
+            rawProfile: "default", configuredDisplayName: nil,
+            gatewayID: "primary"))
+        let foreign = try XCTUnwrap(NotificationCommunicationIdentity.resolve(
+            rawProfile: "researcher", configuredDisplayName: " ",
+            gatewayID: "foreign"))
+
+        XCTAssertEqual(primary.displayName, "Hermes")
+        XCTAssertEqual(primary.rawProfile, "default")
+        XCTAssertEqual(foreign.displayName, "researcher")
+        XCTAssertEqual(foreign.rawProfile, "researcher")
+        XCTAssertNotEqual(primary.sourceQualifiedIdentifier,
+                          try XCTUnwrap(NotificationCommunicationIdentity.resolve(
+                            rawProfile: "default", configuredDisplayName: nil,
+                            gatewayID: "foreign")).sourceQualifiedIdentifier)
+    }
+
+    func testResponseCommunicationRestampPreservesExactPresentationContract() throws {
+        let identity = try XCTUnwrap(NotificationCommunicationIdentity.resolve(
+            rawProfile: "default", configuredDisplayName: "Skynet",
+            gatewayID: "homelab"))
+        let presentation = ResponseNotificationPresentation.resolve(
+            identity: identity, body: "The exact answer body.")
+
+        XCTAssertEqual(presentation.title, "Skynet")
+        XCTAssertEqual(presentation.body, "The exact answer body.")
+        XCTAssertEqual(presentation.threadIdentifier, "default",
+                       "friendly/source display metadata must not rewrite raw thread identity")
+        XCTAssertEqual(presentation.categoryIdentifier, PushIdentifiers.responseCategory)
+        XCTAssertEqual(presentation.interruptionLevel, .active)
+    }
+
+    func testNotificationAvatarPayloadAcceptsOnlyBoundedMatchingInlineImage() throws {
+        let png = try XCTUnwrap(Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="))
+        let decoded = NotificationAvatarPayload.decode([
+            NotificationAvatarPayload.key: [
+                "mime": "image/png",
+                "data": png.base64EncodedString(),
+            ],
+        ])
+
+        XCTAssertEqual(decoded?.mimeType, "image/png")
+        XCTAssertEqual(decoded?.data, png)
+        XCTAssertLessThanOrEqual(decoded?.data.count ?? .max,
+                                 NotificationAvatarPayload.maximumDecodedBytes)
+    }
+
+    func testNotificationAvatarMalformedMissingOrURLPayloadFallsBackToAppIcon() {
+        let jpegHeader = Data([0xFF, 0xD8, 0xFF, 0x00])
+        let truncatedPNG = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        let hugeDimensions = Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAJxAAACcQCAQAAAAQR6qsAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")!
+        let oversized = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            + Data(repeating: 0, count: NotificationAvatarPayload.maximumDecodedBytes)
+
+        XCTAssertNil(NotificationAvatarPayload.decode([:]))
+        XCTAssertNil(NotificationAvatarPayload.decode(["bot_avatar_url": "https://example.invalid/a.png"]))
+        XCTAssertNil(NotificationAvatarPayload.decode([
+            NotificationAvatarPayload.key: ["mime": "image/svg+xml", "data": "PHN2Zy8+"],
+        ]))
+        XCTAssertNil(NotificationAvatarPayload.decode([
+            NotificationAvatarPayload.key: [
+                "mime": "image/png", "data": jpegHeader.base64EncodedString(),
+            ],
+        ]))
+        XCTAssertNil(NotificationAvatarPayload.decode([
+            NotificationAvatarPayload.key: [
+                "mime": "image/png", "data": oversized.base64EncodedString(),
+            ],
+        ]))
+        XCTAssertNil(NotificationAvatarPayload.decode([
+            NotificationAvatarPayload.key: [
+                "mime": "image/png", "data": truncatedPNG.base64EncodedString(),
+            ],
+        ]))
+        XCTAssertNil(NotificationAvatarPayload.decode([
+            NotificationAvatarPayload.key: [
+                "mime": "image/png", "data": hugeDimensions.base64EncodedString(),
+            ],
+        ]))
+        XCTAssertTrue(PushNotificationPolicy.usesCommunicationStyle(for: "response"))
     }
 }
 #endif

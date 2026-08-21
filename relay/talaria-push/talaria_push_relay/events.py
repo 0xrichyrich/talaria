@@ -29,7 +29,8 @@ pre_llm_call            records the turn start time per (session_id,
 post_llm_call           fires once when Hermes has a final assistant response
                         ready (the pinned hook is non-interrupted and carries
                         no completed/failed flags). Used for ``response``
-                        pushes; kwargs follow b545's shape: session_id,
+                        pushes only for Talaria/Desktop-addressable turns;
+                        kwargs follow the pinned Hermes 18a15 shape: session_id,
                         task_id, turn_id, user_message, assistant_response,
                         conversation_history, model, platform.
 on_session_end          fires at the end of every turn with completed /
@@ -73,6 +74,12 @@ _TURN_MAP_MAX = 512
 # human is already at the terminal; "smart" means an auxiliary LLM decides
 # without a human prompt (unless it escalates, which re-fires as "gateway").
 _DEFAULT_APPROVAL_SURFACES = {"gateway"}
+
+# Only these Hermes session platforms have a Talaria/Desktop conversation that
+# can truthfully receive a source-qualified response push. Standalone TUI,
+# messaging adapters, CLI/server/tool sessions, cron, and missing/future
+# platform values fail closed.
+_RESPONSE_PUSH_PLATFORMS = frozenset({"talaria", "desktop"})
 
 
 def _safe_text(value: Any) -> str:
@@ -190,12 +197,8 @@ def on_post_llm_call(**kwargs: Any) -> None:
     if not isinstance(response, str) or not response.strip():
         return None
 
-    platform = _strict_text(kwargs.get("platform"))
-    if platform is None:
-        return None
-    platform = platform.lower()
-    if platform == "cron":
-        # Cron turns are routine notifications, not chat responses.
+    platform = kwargs.get("platform")
+    if not isinstance(platform, str) or platform not in _RESPONSE_PUSH_PLATFORMS:
         return None
 
     bot = _strict_text(current_bot())
@@ -207,12 +210,15 @@ def on_post_llm_call(**kwargs: Any) -> None:
         # on the receiving device, so fail closed.
         return None
 
+    presentation = push_mod.current_profile_presentation(bot)
     push_mod.get_dispatcher().notify(push_mod.response_event(
         bot=bot,
         session_id=session_id,
         turn_id=turn_id,
         task_id=task_id,
         assistant_response=response,
+        display_name=presentation.display_name,
+        avatar=presentation.avatar,
     ))
     return None
 

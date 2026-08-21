@@ -2,6 +2,7 @@ import os
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,10 +13,15 @@ from talaria_push_relay.devices import DeviceStore, DeviceValidationError
 from talaria_push_relay.apns import APNsResult
 from talaria_push_relay.apns import APNsClient
 from talaria_push_relay import events
+from talaria_push_relay import push as push_module
 from talaria_push_relay.config import ALL_EVENT_KINDS, RelaySettings, current_bot
 from talaria_push_relay.push import (
     DEFAULT_TEST_KIND,
     APNS_PAYLOAD_SAFE_BYTES,
+    BOT_AVATAR_KEY,
+    BOT_DISPLAY_NAME_KEY,
+    ProfileAvatar,
+    ProfilePresentation,
     PushDispatcher,
     PushEvent,
     payload_for_device,
@@ -104,8 +110,95 @@ class SourceQualifiedPushTests(unittest.TestCase):
             self.assertLessEqual(len(encoded), APNS_PAYLOAD_SAFE_BYTES)
             self.assertEqual(payload["body"], payload["aps"]["alert"]["body"])
             self.assertEqual(payload["gateway_id"], "gateway-with-a-long-but-valid-id")
-            self.assertIn("session_id=session-42", payload["deeplink"])
-            self.assertIn("gateway_id=gateway-with-a-long-but-valid-id", payload["deeplink"])
+            # The URL is an optional duplicate of these immutable raw route
+            # fields and is deliberately the first metadata shed at the byte
+            # boundary. When retained, it must still encode the exact source.
+            if "deeplink" in payload:
+                self.assertIn("session_id=session-42", payload["deeplink"])
+                self.assertIn(
+                    "gateway_id=gateway-with-a-long-but-valid-id",
+                    payload["deeplink"])
+
+    def test_post_stamp_adversarial_unicode_display_preserves_raw_route_under_budget(self):
+        raw_bot = "default"
+        raw_session = "session-" + ("s" * 2_300)
+        raw_gateway = "g" * 128
+        event = response_event(
+            bot=raw_bot,
+            display_name="🛰️" * 120,
+            session_id=raw_session,
+            response="✅" * 900,
+        )
+
+        payload = payload_for_device(event, {"gateway_id": raw_gateway})
+        encoded = json.dumps(
+            payload, ensure_ascii=True, separators=(",", ":"),
+            allow_nan=False).encode("utf-8")
+
+        self.assertLessEqual(len(encoded), APNS_PAYLOAD_SAFE_BYTES)
+        self.assertEqual(payload["bot"], raw_bot)
+        self.assertEqual(payload["session_id"], raw_session)
+        self.assertEqual(payload["gateway_id"], raw_gateway)
+
+    def test_emoji_display_and_max_gateway_never_crowd_out_short_response(self):
+        raw_gateway = "g" * 128
+        for emoji_count in (90, 120):
+            for session_id in ("stored-emoji", "s" * 3_425):
+                with self.subTest(
+                    emoji_count=emoji_count, session_length=len(session_id),
+                ):
+                    display_name = "🛰️" * emoji_count
+                    event = response_event(
+                        bot="default",
+                        display_name=display_name,
+                        session_id=session_id,
+                        turn_id="turn",
+                        task_id="task",
+                        response="Done.",
+                    )
+
+                    payload = payload_for_device(
+                        event, {"gateway_id": raw_gateway})
+                    encoded = json.dumps(
+                        payload, ensure_ascii=True, separators=(",", ":"),
+                        allow_nan=False).encode("utf-8")
+
+                    self.assertLessEqual(len(encoded), APNS_PAYLOAD_SAFE_BYTES)
+                    self.assertEqual(payload["bot"], "default")
+                    self.assertEqual(payload["session_id"], session_id)
+                    self.assertEqual(payload["gateway_id"], raw_gateway)
+                    self.assertEqual(payload["aps"]["alert"]["body"], "Done.")
+                    if "body" in payload:
+                        self.assertEqual(payload["body"], "Done.")
+                    if session_id == "stored-emoji":
+                        self.assertTrue(payload["aps"]["alert"]["title"])
+
+    def test_ordinary_skynet_title_and_avatar_are_unchanged(self):
+        avatar = ProfileAvatar("image/png", b"small-skynet-avatar")
+        event = response_event(
+            bot="default", display_name="Skynet", avatar=avatar,
+            session_id="stored-skynet", response="Done.")
+
+        payload = payload_for_device(event, {"gateway_id": "mini"})
+
+        self.assertEqual(payload["title"], "Skynet")
+        self.assertEqual(payload[BOT_DISPLAY_NAME_KEY], "Skynet")
+        self.assertEqual(payload["aps"]["alert"]["title"], "Skynet")
+        self.assertEqual(payload["body"], "Done.")
+        self.assertIn(BOT_AVATAR_KEY, payload)
+        self.assertEqual(
+            payload[BOT_AVATAR_KEY][push_module.BOT_AVATAR_DATA_KEY],
+            __import__("base64").b64encode(avatar.data).decode("ascii"))
+
+    def test_payload_fails_closed_when_fixed_raw_authority_cannot_fit(self):
+        event = response_event(
+            bot="default",
+            display_name="Skynet",
+            session_id="s" * 4_000,
+            response="Done.",
+        )
+        with self.assertRaisesRegex(ValueError, "fixed routing authority"):
+            payload_for_device(event, {"gateway_id": "g" * 128})
 
     def test_current_bot_honors_hermes_context_home_override(self):
         try:
@@ -141,6 +234,8 @@ class SourceQualifiedPushTests(unittest.TestCase):
 
         self.assertEqual(payload["kind"], "response")
         self.assertEqual(payload["bot"], "researcher")
+        self.assertEqual(payload["title"], "researcher")
+        self.assertEqual(payload[BOT_DISPLAY_NAME_KEY], "researcher")
         self.assertEqual(payload["session_id"], "session-42")
         self.assertEqual(payload["task_id"], "task-3")
         self.assertEqual(payload["turn_id"], "turn-7")
@@ -175,6 +270,8 @@ class SourceQualifiedPushTests(unittest.TestCase):
         settings = RelaySettings(enabled_events=list(ALL_EVENT_KINDS))
         with patch.object(events, "current_bot", return_value="ops-bot"), \
              patch.object(events, "relay_settings", return_value=settings), \
+             patch.object(events.push_mod, "current_profile_presentation",
+                          return_value=ProfilePresentation("Operations")), \
              patch.object(events.push_mod, "get_dispatcher", return_value=dispatcher):
             events.on_post_llm_call(
                 session_id="durable-session",
@@ -184,15 +281,310 @@ class SourceQualifiedPushTests(unittest.TestCase):
                 assistant_response="Done.",
                 conversation_history=[],
                 model="hermes-test",
-                platform="cli",
+                platform="talaria",
             )
 
         self.assertEqual(len(dispatcher.events), 1)
         event = dispatcher.events[0]
         self.assertEqual(event.kind, "response")
         self.assertEqual(event.bot, "ops-bot")
+        self.assertEqual(event.title, "Operations")
         self.assertEqual(event.session_id, "durable-session")
-        self.assertEqual(event.extra, {"task_id": "task-9", "turn_id": "turn-4"})
+        self.assertEqual(event.extra, {
+            "task_id": "task-9",
+            "turn_id": "turn-4",
+            BOT_DISPLAY_NAME_KEY: "Operations",
+        })
+
+    def test_response_platform_policy_allows_only_talaria_addressable_surfaces(self):
+        settings = RelaySettings(enabled_events=["response"])
+        cases = (
+            ("talaria", True),
+            ("desktop", True),
+            (None, False),
+            ("", False),
+            (" ", False),
+            (123, False),
+            ([], False),
+            ("cli", False),
+            ("tui", False),
+            ("api_server", False),
+            ("webui", False),
+            ("tool", False),
+            ("subagent", False),
+            ("relay", False),
+            ("slack", False),
+            ("webhook", False),
+            ("telegram", False),
+            ("discord", False),
+            ("whatsapp", False),
+            ("signal", False),
+            ("cron", False),
+            ("unknown", False),
+            ("TALARIA", False),
+            ("tui_gateway", False),
+        )
+
+        for platform, should_push in cases:
+            with self.subTest(platform=platform):
+                dispatcher = _Dispatcher()
+                with patch.object(events, "current_bot", return_value="ops-bot"), \
+                     patch.object(events, "relay_settings", return_value=settings), \
+                     patch.object(events.push_mod, "current_profile_presentation",
+                                  return_value=ProfilePresentation("Operations")), \
+                     patch.object(events.push_mod, "get_dispatcher",
+                                  return_value=dispatcher):
+                    events.on_post_llm_call(
+                        session_id="durable-session",
+                        task_id="task-9",
+                        turn_id="turn-4",
+                        assistant_response="Done.",
+                        platform=platform,
+                    )
+
+                self.assertEqual(len(dispatcher.events), int(should_push))
+
+    def test_response_hook_does_not_fan_messaging_finals_out_to_talaria(self):
+        dispatcher = _Dispatcher()
+        settings = RelaySettings(enabled_events=["response"])
+        common = {
+            "task_id": "task",
+            "turn_id": "turn",
+            "assistant_response": "Done.",
+        }
+
+        with patch.object(events, "current_bot", return_value="ops-bot"), \
+             patch.object(events, "relay_settings", return_value=settings), \
+             patch.object(events.push_mod, "current_profile_presentation",
+                          return_value=ProfilePresentation("Operations")), \
+             patch.object(events.push_mod, "get_dispatcher", return_value=dispatcher):
+            events.on_post_llm_call(
+                session_id="agent:main:slack:channel:qa",
+                platform="slack",
+                **common,
+            )
+            events.on_post_llm_call(
+                session_id="agent:main:webhook:qa-pr-watch",
+                platform="webhook",
+                **common,
+            )
+
+            self.assertEqual(dispatcher.events, [])
+
+            events.on_post_llm_call(
+                session_id="talaria-session",
+                platform="talaria",
+                **common,
+            )
+            events.on_post_llm_call(
+                session_id="desktop-chat",
+                platform="desktop",
+                **common,
+            )
+
+        self.assertEqual(
+            [(event.kind, event.session_id) for event in dispatcher.events],
+            [("response", "talaria-session"), ("response", "desktop-chat")],
+        )
+
+    def test_response_title_uses_configured_name_but_raw_profile_still_routes(self):
+        event = response_event(
+            bot="default",
+            display_name="Mercury",
+            session_id="stored-42",
+            response="Done.",
+        )
+        payload = payload_for_device(event, {"gateway_id": "foreign"})
+
+        self.assertEqual(payload["title"], "Mercury")
+        self.assertEqual(payload["aps"]["alert"]["title"], "Mercury")
+        self.assertEqual(payload[BOT_DISPLAY_NAME_KEY], "Mercury")
+        self.assertEqual(payload["bot"], "default")
+        self.assertIn("/default?", payload["deeplink"])
+        self.assertIn("gateway_id=foreign", payload["deeplink"])
+
+    def test_response_title_default_falls_back_to_hermes_without_suffix(self):
+        default = response_event(bot="default", session_id="stored", response="Done")
+        named = response_event(bot="researcher", session_id="stored", response="Done")
+
+        self.assertEqual(default.title, "Hermes")
+        self.assertEqual(default.extra[BOT_DISPLAY_NAME_KEY], "Hermes")
+        self.assertEqual(named.title, "researcher")
+        self.assertNotIn("response ready", default.title.lower())
+        self.assertNotIn("response ready", named.title.lower())
+
+    def test_context_profile_metadata_is_authoritative_for_display_name(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root)
+            (home / "profile.yaml").write_text(
+                json.dumps({"ui_meta": {"hermes-bots": {"title": "Skynet"}}}),
+                encoding="utf-8")
+            safe_yaml = types.SimpleNamespace(safe_load=json.loads)
+            with patch.dict(sys.modules, {"yaml": safe_yaml}), \
+                 patch.object(push_module, "_current_profile_home", return_value=home):
+                presentation = push_module.current_profile_presentation("default")
+
+        self.assertEqual(presentation.display_name, "Skynet")
+        self.assertIsNone(presentation.avatar)
+        ordinary = payload_for_device(response_event(
+            bot="default",
+            display_name=presentation.display_name,
+            session_id="stored-skynet",
+            response="Done."), {"gateway_id": "mini"})
+        self.assertEqual(ordinary["aps"]["alert"]["title"], "Skynet")
+        self.assertEqual(ordinary["title"], "Skynet")
+        self.assertEqual(ordinary[BOT_DISPLAY_NAME_KEY], "Skynet")
+
+    def test_bot_mode_title_precedes_core_display_name_and_bad_yaml_falls_back(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root)
+            profile = home / "profile.yaml"
+            safe_yaml = types.SimpleNamespace(safe_load=json.loads)
+            with patch.dict(sys.modules, {"yaml": safe_yaml}), \
+                 patch.object(push_module, "_current_profile_home", return_value=home):
+                profile.write_text(
+                    json.dumps({
+                        "display_name": "Core Name",
+                        "ui_meta": {"hermes-bots": {"title": "Bot Mode Name"}},
+                    }),
+                    encoding="utf-8")
+                self.assertEqual(
+                    push_module.current_profile_presentation("raw").display_name,
+                    "Bot Mode Name")
+
+                profile.write_text(
+                    json.dumps({"display_name": "Core Name"}), encoding="utf-8")
+                self.assertEqual(
+                    push_module.current_profile_presentation("raw").display_name,
+                    "Core Name")
+
+                for malformed in (
+                    json.dumps(["not", "a", "mapping"]),
+                    json.dumps({"ui_meta": ["wrong"], "display_name": {"wrong": "type"}}),
+                    json.dumps({"ui_meta": {"hermes-bots": {"title": ["wrong"]}}}),
+                    "{malformed",
+                ):
+                    profile.write_text(malformed, encoding="utf-8")
+                    self.assertEqual(
+                        push_module.current_profile_presentation("raw").display_name,
+                        "raw")
+
+    def test_missing_or_malformed_context_avatar_falls_back_without_payload_bytes(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root)
+            (home / "assets").mkdir()
+            (home / "assets" / "avatar.png").write_bytes(b"not-an-image")
+            with patch.object(push_module, "_current_profile_home", return_value=home), \
+                 patch.object(push_module, "_read_current_profile_meta",
+                              return_value={"display_name": "Configured Bot"}):
+                presentation = push_module.current_profile_presentation("raw-profile")
+        event = response_event(
+            bot="raw-profile", display_name=presentation.display_name,
+            avatar=presentation.avatar, session_id="stored", response="Done")
+
+        self.assertIsNone(presentation.avatar)
+        self.assertNotIn(BOT_AVATAR_KEY, event.apns_payload())
+
+    def test_context_avatar_uses_assets_layout_and_ignores_root_decoy(self):
+        # Valid 1x1 PNG; small enough for the no-Pillow fallback and also safe
+        # for an installed Pillow to decode/re-encode.
+        png = __import__("base64").b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root)
+            assets = home / "assets"
+            assets.mkdir()
+            (assets / "avatar.png").write_bytes(png)
+            # A root-level decoy must never be consulted.
+            (home / "avatar.png").write_bytes(b"not-the-profile-asset")
+
+            avatar = push_module._bounded_profile_avatar(home)
+
+        self.assertIsNotNone(avatar)
+        self.assertIn(avatar.mime, {"image/png", "image/jpeg"})
+        self.assertLessEqual(len(avatar.data), 1400)
+
+    def test_context_avatar_rejects_symlink_even_inside_assets_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root)
+            assets = home / "assets"
+            assets.mkdir()
+            target = home / "decoy.png"
+            target.write_bytes(b"\x89PNG\r\n\x1a\nsecret-decoy")
+            (assets / "avatar.png").symlink_to(target)
+
+            self.assertIsNone(push_module._bounded_profile_avatar(home))
+
+    def test_context_avatar_rejects_symlinked_assets_parent(self):
+        png = __import__("base64").b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        with tempfile.TemporaryDirectory() as root, \
+             tempfile.TemporaryDirectory() as outside:
+            home = Path(root)
+            outside_assets = Path(outside)
+            (outside_assets / "avatar.png").write_bytes(png)
+            (home / "assets").symlink_to(outside_assets, target_is_directory=True)
+
+            self.assertIsNone(push_module._bounded_profile_avatar(home))
+
+    def test_context_avatar_open_fd_ignores_path_swap_decoy(self):
+        png = __import__("base64").b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root)
+            assets = home / "assets"
+            assets.mkdir()
+            avatar_path = assets / "avatar.png"
+            opened_inode = assets / "opened-avatar.png"
+            avatar_path.write_bytes(png)
+            real_fstat = os.fstat
+            swapped = False
+
+            def swap_after_open(fd):
+                nonlocal swapped
+                info = real_fstat(fd)
+                if not swapped:
+                    swapped = True
+                    avatar_path.rename(opened_inode)
+                    avatar_path.write_bytes(b"not-the-opened-image")
+                return info
+
+            with patch.object(push_module.os, "fstat", side_effect=swap_after_open):
+                avatar = push_module._bounded_profile_avatar(home)
+
+            self.assertTrue(swapped)
+            self.assertIsNotNone(avatar)
+            self.assertEqual(avatar_path.read_bytes(), b"not-the-opened-image")
+
+    def test_bounded_inline_avatar_keeps_payload_under_safe_limit_or_drops_first(self):
+        tiny_png = (
+            b"\x89PNG\r\n\x1a\n" + b"bounded-avatar"
+        )
+        short = response_event(
+            bot="default", display_name="Hermes", session_id="stored",
+            response="Done.", avatar=ProfileAvatar("image/png", tiny_png))
+        short_payload = payload_for_device(short, {"gateway_id": "homelab"})
+        short_bytes = json.dumps(
+            short_payload, ensure_ascii=True, separators=(",", ":"),
+            allow_nan=False).encode("utf-8")
+
+        self.assertIn(BOT_AVATAR_KEY, short_payload)
+        self.assertLessEqual(len(short_bytes), APNS_PAYLOAD_SAFE_BYTES)
+        self.assertEqual(short_payload["bot"], "default")
+
+        large_avatar = ProfileAvatar(
+            "image/png", b"\x89PNG\r\n\x1a\n" + b"x" * 1390)
+        long = response_event(
+            bot="default", display_name="Hermes", session_id="stored",
+            response="answer " * 500, avatar=large_avatar)
+        long_payload = payload_for_device(long, {"gateway_id": "homelab"})
+        long_bytes = json.dumps(
+            long_payload, ensure_ascii=True, separators=(",", ":"),
+            allow_nan=False).encode("utf-8")
+
+        self.assertNotIn(BOT_AVATAR_KEY, long_payload,
+                         "portrait must drop before response text is over-truncated")
+        self.assertLessEqual(len(long_bytes), APNS_PAYLOAD_SAFE_BYTES)
 
     def test_response_hook_filters_cron_empty_and_malformed_payloads(self):
         dispatcher = _Dispatcher()
@@ -210,10 +602,16 @@ class SourceQualifiedPushTests(unittest.TestCase):
                 assistant_response="scheduled answer",
                 platform="cron",
             )
-            events.on_post_llm_call(session_id="session", assistant_response="  ")
-            events.on_post_llm_call(session_id="session", assistant_response=None)
-            events.on_post_llm_call(session_id="session", assistant_response={"text": "x"})
-            events.on_post_llm_call(session_id=_BadString(), assistant_response="answer")
+            events.on_post_llm_call(
+                session_id="session", assistant_response="  ", platform="talaria")
+            events.on_post_llm_call(
+                session_id="session", assistant_response=None, platform="talaria")
+            events.on_post_llm_call(
+                session_id="session", assistant_response={"text": "x"},
+                platform="talaria")
+            events.on_post_llm_call(
+                session_id=_BadString(), assistant_response="answer",
+                platform="talaria")
 
         self.assertEqual(dispatcher.events, [])
 

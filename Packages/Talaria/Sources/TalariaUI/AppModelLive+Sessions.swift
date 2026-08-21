@@ -252,7 +252,15 @@ extension AppModel {
                 validateBeforeBinding: validateBeforeBinding
             )
         )
-        return try await finishStoredSessionOpen(attempt, presentsFailure: false)
+        // Cancelling the outer navigation task must also cancel the unstructured
+        // resume/hydration task created by beginStoredSessionOpen. Without this
+        // propagation, a superseded cold route could still bind after its newer
+        // successor had become the sole queued intent.
+        return try await withTaskCancellationHandler {
+            try await finishStoredSessionOpen(attempt, presentsFailure: false)
+        } onCancel: {
+            attempt.task.cancel()
+        }
     }
 
     private func beginStoredSessionOpen(
@@ -406,13 +414,24 @@ extension AppModel {
                 throw GatewayError(code: -8, message: "session.resume returned no id")
             }
             let stored = live.storedSessionID.isEmpty ? id : live.storedSessionID
-            if exactSource != nil, stored != id {
-                throw AckValidationError(
-                    operation: "Resume session",
-                    detail: "Hermes returned a different durable session identity."
-                )
-            }
             if let exactSource {
+                do {
+                    try ExactStoredSessionResumeAckAuthority.requireExact(
+                        route: exactSource.route,
+                        requestedStoredSessionID: id,
+                        returnedStoredSessionID: stored,
+                        returnedProfile: live.info.profileName)
+                } catch ExactStoredSessionResumeAckAuthorityError.durableSessionMismatch {
+                    throw AckValidationError(
+                        operation: "Resume session",
+                        detail: "Hermes returned a different durable session identity."
+                    )
+                } catch {
+                    throw AckValidationError(
+                        operation: "Resume session",
+                        detail: "Hermes returned a different profile identity."
+                    )
+                }
                 // The resume response can itself have crossed c1e25's
                 // unknown-profile fallback. Re-prove the captured profile
                 // after that response and before any chat/session binding.

@@ -43,13 +43,17 @@ event kind is enabled in both processes (otherwise the phone buzzes twice).
 left commented in `.env.example`), all six kinds are enabled in that process:
 `approval`, `long_task`, `response`, `mention`, `routine`, and `gateway`. The
 setting is checked before an event enters the APNs queue; it is not a per-device
-or per-profile preference. A normal hook-mode turn emits `response`; when
-`response` is enabled, the legacy duration-only `long_task` notification is
-suppressed so one turn cannot buzz twice. A sidecar has no `post_llm_call`
-producer, so a sidecar-only deployment must explicitly omit `response` if it
-needs the polling-based `long_task` event. Use `TALARIA_PUSH_DISABLE=1` as the
-process kill switch. In a hook+sidecar deployment, configure each process
-explicitly so a kind is owned by exactly one producer.
+or per-profile preference. A normal hook-mode turn emits `response` only when
+its Hermes `platform` is exactly `talaria` (Talaria GatewayClient) or `desktop`
+(Desktop chat panel). Standalone TUI, messaging-adapter, CLI, server/tool,
+subagent, relay, cron, missing, and unknown platforms do not emit a Talaria
+response push. When `response` is enabled, the legacy duration-only `long_task`
+notification is suppressed so one turn cannot buzz twice. A sidecar has no
+`post_llm_call` producer, so a sidecar-only deployment must explicitly omit
+`response` if it needs the polling-based `long_task` event. Use
+`TALARIA_PUSH_DISABLE=1` as the process kill switch. In a hook+sidecar
+deployment, configure each process explicitly so a kind is owned by exactly
+one producer.
 
 ## What fires today vs. needs upstream hooks (honest table)
 
@@ -59,7 +63,7 @@ Sources verified against the upstream checkout (paths relative to
 | Event (HANDOFF spec) | Hook mode today | Sidecar mode today | Gap / upstream ask |
 |---|---|---|---|
 | **Approval request** | ✅ `pre_approval_request` hook (`tools/approval.py`) fires in the process running the blocked agent, before the notify callback. **But the hook kwargs carry no `request_id`** — pushes send `approval_request_id: ""`; the iOS client fetches the concrete id via the `approval.pending` RPC, or answers FIFO (`approval.respond` without `request_id` resolves the oldest, ws-protocol.md §8). | ✅ Polls `approval.pending` per active session (~2 s) — full fidelity incl. `request_id`, at polling latency. | Upstream ask: add `request_id` to the `pre_approval_request` kwargs (one-line change at the fire sites; `approval_data` already holds it). Then hook mode is exact and the sidecar's approval poller can be retired. |
-| **Final response** | ✅ `post_llm_call` fires once when a non-interrupted turn has any non-empty final response (including fallback/error summaries); emits a source-qualified `response` push. Cron turns are excluded so they remain `routine` notifications. | ❌ A fresh sidecar WS connection does not receive session-bound `message.complete` / response events. | The hook payload is the pinned Hermes contract (`session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform`). |
+| **Final response** | ✅ `post_llm_call` fires once when a non-interrupted turn has any non-empty final response (including fallback/error summaries); emits a source-qualified `response` push only for `platform="talaria"` or `platform="desktop"`. Standalone TUI, Slack, webhook, Telegram, other messaging adapters, CLI, server/tool, subagent, relay, cron, missing, and unknown platforms fail closed. | ❌ A fresh sidecar WS connection does not receive session-bound `message.complete` / response events. | The hook payload is the pinned Hermes contract (`session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform`). Talaria GatewayClient hardcodes `talaria`, the Desktop chat panel hardcodes `desktop`, and standalone Hermes TUI resolves to `tui`. |
 | **Long task done (>10 min)** | ✅ `pre_llm_call` + `on_session_end` remain the fallback when `response` is disabled. With the default response event enabled, the duration-only push is suppressed. | ⚠️ Approximated from idle↔streaming transitions in `session.active_list`; set `TALARIA_PUSH_EVENTS` without `response` if this is the sidecar's completion signal (resolution = 2 s poll; can't tell success from in-turn error). | The response event supersedes the legacy duration-only notification for normal hook turns. |
 | **Routine (cron) finished** | ✅ `on_session_end` with `platform == "cron"` (cron jobs run their agent with `platform="cron"`, `cron/scheduler.py`). **The hook cannot see the job name** — push says "routine finished" generically. | ✅ Diffs `GET /api/cron/jobs?profile=all` on `cron.changed` broadcasts (+5 min backstop) — has the job name, parses the Talaria `[bot:<name>] <routine>` namespace. | Upstream ask: a `cron_job_completed` hook (mirroring the existing `kanban_task_*` observer family) carrying `job_id`, `job_name`, `status`. |
 | **@mention in A2A / gateway messages** | ✅ `pre_gateway_dispatch` observer sees every user-originated inbound `MessageEvent` in the messaging gateway — all platforms including `a2a` — and scans for `@<handle>` (`TALARIA_PUSH_MENTION_HANDLES`, default = profile name). Always returns `None` (never alters dispatch). | ❌ Messaging-gateway inbound traffic never crosses the `/api/ws` surface. | None — hook mode covers it. Caveat: fires per *gateway process*, so mentions of bot B are seen by B's gateway; install/enable the plugin for each bot profile that should push. |
@@ -73,7 +77,7 @@ enable covers them — but a bare `hermes chat` in an env without
 
 ### Hook details and the expected log line
 
-The pinned Hermes revision (`b5455fdd`) does expose a real
+The pinned Hermes 18a15 revision does expose a real
 `post_llm_call` observer. It fires **once per turn when the tool loop has
 produced any non-empty final response and the turn is not interrupted**. The
 response may be a normal answer or a fallback/error summary; success is not a
@@ -85,9 +89,12 @@ Its response payload includes `session_id`, `task_id`, `turn_id`,
 it is not the session-bound WebSocket `message.complete` event.
 
 The current `talaria-push` 0.1 plugin registers `post_llm_call` and emits a
-source-qualified `response` push from it. Cron turns are filtered out of this
-path and continue to emit `routine`; `post_approval_response` only clears
-approval dedupe state. This distinction matters when reading logs:
+source-qualified `response` push from it only when `platform` is exactly
+`talaria` or `desktop`. Standalone TUI, messaging adapters (`slack`, `webhook`,
+`telegram`, and peers), CLI, API server/web UI, tool, subagent, relay, cron,
+missing, and unknown platforms fail closed; cron continues to emit `routine`.
+`post_approval_response` only clears approval dedupe state. This distinction
+matters when reading logs:
 `events.py` registers six hooks and should emit one line like this **per
 Hermes process that loads the plugin** after restart:
 

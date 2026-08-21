@@ -1,0 +1,648 @@
+#if canImport(XCTest)
+import XCTest
+@testable import TalariaKit
+@testable import TalariaUI
+
+@MainActor
+final class ExactStoredSessionNavigationTests: XCTestCase {
+    private func route(gateway: String = "primary", profile: String = "inbox",
+                       session: String = "stored-42") throws -> ExactStoredSessionRoute {
+        try XCTUnwrap(ExactStoredSessionRoute(
+            gatewayID: gateway, profile: profile, storedSessionID: session))
+    }
+
+    func testColdLaunchRequestWaitsForRestoreThenOpensExactlyOnce() async throws {
+        let queue = ExactStoredSessionRouteQueue()
+        let exact = try route()
+        var restored = false
+        var opened: [ExactStoredSessionRoute] = []
+        var failures: [String] = []
+
+        XCTAssertEqual(queue.submit(
+            ExactStoredSessionRouteRequest(
+                route: exact, origin: .deepLink, waitsForLaunchRestore: true),
+            alreadyVisible: false,
+            execute: { request in
+                guard restored else { return .deferred }
+                opened.append(request.route)
+                return .opened
+            },
+            reject: { _, message in failures.append(message) }), .started)
+        await queue.awaitCurrentAttempt()
+
+        XCTAssertEqual(queue.pending?.route, exact)
+        XCTAssertTrue(opened.isEmpty)
+        restored = true
+        queue.nudge()
+        await queue.awaitCurrentAttempt()
+
+        XCTAssertEqual(opened, [exact])
+        XCTAssertEqual(queue.completedOpenCount, 1)
+        XCTAssertNil(queue.pending)
+        XCTAssertTrue(failures.isEmpty)
+    }
+
+    func testColdLaunchResponseNotificationDoesNotUseTransientDemoMode() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let baseURL = try XCTUnwrap(URL(
+            string: "https://cold-push-\(UUID().uuidString).example"))
+        let saved = try XCTUnwrap(registry.upsert(
+            urlString: baseURL.absoluteString,
+            name: "Cold push",
+            credential: .sessionToken("cold-push-token")))
+        let exact = try route(gateway: saved.id)
+        var authoritativeOpens: [ExactStoredSessionRoute] = []
+        var attempts = 0
+        model.exactStoredSessionSourceReadinessOverride = { _ in
+            attempts += 1
+            guard model.launchWorldRestoreCompleted, model.mode == .live else {
+                return false
+            }
+            return true
+        }
+        model.exactStoredSessionOpenOverride = { route in
+            authoritativeOpens.append(route)
+        }
+        defer {
+            model.exactStoredSessionSourceReadinessOverride = nil
+            model.exactStoredSessionOpenOverride = nil
+            registry.remove(id: saved.id)
+        }
+
+        // AppModel deliberately initializes in `.demo` while launch restore
+        // chooses a real saved world. That transient value is not permission
+        // to use openStoredSession's canned-world path.
+        XCTAssertEqual(model.mode, .demo)
+        XCTAssertFalse(model.demoDataLoaded)
+        PushDefaultActionRouter.route(
+            PushNotificationPayload(
+                wireKind: PushKind.response.rawValue,
+                kind: .response,
+                gatewayID: exact.gatewayID,
+                bot: exact.profile,
+                title: "inbox",
+                body: "Response ready",
+                approvalRequestID: nil,
+                sessionID: exact.storedSessionID,
+                deeplink: URL(string: "talaria://bot/inbox?session_id=stored-42&gateway_id=\(saved.id)")),
+            in: model,
+            knownGatewayIDs: [exact.gatewayID])
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+
+        XCTAssertEqual(attempts, 0,
+                       "launch-pending route must not cross the source boundary")
+        XCTAssertEqual(model.exactStoredSessionRouteQueue.pending?.route, exact)
+        XCTAssertNil(model.openBotID, "cold response must not mutate demo navigation")
+        XCTAssertTrue(model.chats.isEmpty, "cold response must not create a demo/shadow chat")
+        XCTAssertTrue(authoritativeOpens.isEmpty)
+
+        model.mode = .live
+        model.completeLaunchWorldRestore()
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+
+        XCTAssertEqual(attempts, 1)
+        XCTAssertEqual(authoritativeOpens, [exact])
+        XCTAssertEqual(model.exactStoredSessionRouteQueue.completedOpenCount, 1)
+        XCTAssertNil(model.exactStoredSessionRouteQueue.pending)
+    }
+
+    func testOfflineColdTapRetriesExactSavedSourceAfterNetworkRestores() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let baseURL = try XCTUnwrap(URL(
+            string: "https://offline-push-\(UUID().uuidString).example"))
+        let saved = try XCTUnwrap(registry.upsert(
+            urlString: baseURL.absoluteString,
+            name: "Offline push",
+            credential: .sessionToken("offline-push-token")))
+        let exact = try route(gateway: saved.id)
+        var networkAvailable = false
+        var dialAttempts = 0
+        var authoritativeOpens: [ExactStoredSessionRoute] = []
+        model.exactStoredSessionSourceReadinessOverride = { requested in
+            XCTAssertEqual(requested.gatewayID, saved.id,
+                           "retry must dial only the stamped saved source")
+            dialAttempts += 1
+            guard networkAvailable else { throw URLError(.notConnectedToInternet) }
+            model.mode = .live
+            return true
+        }
+        model.exactStoredSessionOpenOverride = { route in
+            authoritativeOpens.append(route)
+        }
+        defer {
+            model.exactStoredSessionSourceReadinessOverride = nil
+            model.exactStoredSessionOpenOverride = nil
+            registry.remove(id: saved.id)
+        }
+
+        PushDefaultActionRouter.route(
+            PushNotificationPayload(
+                wireKind: PushKind.response.rawValue,
+                kind: .response,
+                gatewayID: saved.id,
+                bot: exact.profile,
+                title: "inbox",
+                body: "Response ready",
+                approvalRequestID: nil,
+                sessionID: exact.storedSessionID,
+                deeplink: nil),
+            in: model,
+            knownGatewayIDs: [saved.id])
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+        XCTAssertEqual(dialAttempts, 0, "launch restore owns the first connection pass")
+
+        // The launch pass exhausted this saved source while offline. Its
+        // completion immediately attempts the retained route's exact source.
+        model.completeLaunchWorldRestore()
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+        XCTAssertEqual(dialAttempts, 1)
+        XCTAssertTrue(authoritativeOpens.isEmpty)
+        XCTAssertEqual(model.exactStoredSessionRouteQueue.pending?.route, exact)
+
+        networkAvailable = true
+        model.retryExactStoredSessionNavigation()
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+
+        XCTAssertEqual(dialAttempts, 2)
+        XCTAssertEqual(authoritativeOpens, [exact])
+        XCTAssertEqual(model.exactStoredSessionRouteQueue.completedOpenCount, 1)
+        XCTAssertNil(model.exactStoredSessionRouteQueue.pending)
+    }
+
+    func testAdoptedExactLiveSourceOpensOnceWhenInitialRosterRefreshTimesOut() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let runtime = LiveRuntime.shared
+        let baseURL = try XCTUnwrap(URL(
+            string: "https://adopted-push-\(UUID().uuidString).example"))
+        let fallbackURL = try XCTUnwrap(URL(
+            string: "https://fallback-push-\(UUID().uuidString).example"))
+        let credential = GatewayCredential.sessionToken("adopted-push-token")
+        let saved = try XCTUnwrap(registry.upsert(
+            urlString: baseURL.absoluteString,
+            name: "Adopted push",
+            credential: credential))
+        let fallback = try XCTUnwrap(registry.upsert(
+            urlString: fallbackURL.absoluteString,
+            name: "Must not fallback",
+            credential: .sessionToken("fallback-push-token")))
+        let exact = try route(gateway: saved.id)
+        let client = GatewayClient(baseURL: baseURL, credential: credential)
+        let previousBaseURL = runtime.baseURL
+        let previousGatewayID = runtime.gatewayID
+        var authoritativeOpens: [ExactStoredSessionRoute] = []
+        var refreshObservedExactAdoption = false
+        model.exactStoredSessionOpenOverride = { route in
+            authoritativeOpens.append(route)
+        }
+        defer {
+            model.exactStoredSessionOpenOverride = nil
+            model.client = nil
+            runtime.baseURL = previousBaseURL
+            runtime.gatewayID = previousGatewayID
+            runtime.monitorTask?.cancel()
+            runtime.monitorTask = nil
+            registry.remove(id: saved.id)
+            registry.remove(id: fallback.id)
+        }
+
+        // Retain the cold route without allowing its first attempt to cross the
+        // launch/source boundary. No source-readiness override is installed.
+        model.openExactStoredSession(exact, origin: .notification)
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+        XCTAssertNil(model.exactStoredSessionSourceReadinessOverride)
+        XCTAssertEqual(model.exactStoredSessionRouteQueue.pending?.route, exact)
+        XCTAssertTrue(authoritativeOpens.isEmpty)
+
+        model.launchWorldRestoreCompleted = true
+        model.client = client
+        model.mode = .live
+        runtime.baseURL = baseURL
+
+        do {
+            try await model.finishConnectedGatewayAdoption(
+                client, baseURL: baseURL, credential: credential,
+                rosterRefresh: {
+                    let adopted = await registry.clientPool.client(for: saved.id)
+                    refreshObservedExactAdoption = model.activeGatewayID == saved.id
+                        && adopted.map(ObjectIdentifier.init) == ObjectIdentifier(client)
+                    throw GatewayError(code: -5, message: "RPC timed out")
+                })
+            XCTFail("the injected ancillary roster timeout must propagate")
+        } catch let error as GatewayError {
+            XCTAssertEqual(error.code, -5)
+        }
+
+        // The adoption-boundary nudge survives the thrown ancillary refresh.
+        // It proves production readiness from the saved live source and opens
+        // through the exact route seam once; no alternate saved source is used.
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+        XCTAssertTrue(refreshObservedExactAdoption)
+        XCTAssertEqual(model.activeGatewayID, saved.id)
+        XCTAssertEqual(authoritativeOpens, [exact])
+        XCTAssertEqual(model.exactStoredSessionRouteQueue.completedOpenCount, 1)
+        XCTAssertNil(model.exactStoredSessionRouteQueue.pending)
+        let fallbackClient = await registry.clientPool.client(for: fallback.id)
+        XCTAssertNil(fallbackClient)
+
+        model.retryExactStoredSessionNavigation()
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+        XCTAssertEqual(authoritativeOpens, [exact], "later nudges must not double-open")
+
+        await registry.clientPool.disconnect(gatewayID: saved.id)
+    }
+
+    func testSupervisedReconnectSuccessReplaysDeferredRouteExactlyOnce() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let baseURL = try XCTUnwrap(URL(
+            string: "https://supervised-push-\(UUID().uuidString).example"))
+        let saved = try XCTUnwrap(registry.upsert(
+            urlString: baseURL.absoluteString,
+            name: "Supervised push",
+            credential: .sessionToken("supervised-push-token")))
+        let exact = try route(gateway: saved.id)
+        var reconnected = false
+        var opens: [ExactStoredSessionRoute] = []
+        model.mode = .live
+        model.launchWorldRestoreCompleted = true
+        model.exactStoredSessionSourceReadinessOverride = { _ in reconnected }
+        model.exactStoredSessionOpenOverride = { opens.append($0) }
+        defer {
+            model.exactStoredSessionSourceReadinessOverride = nil
+            model.exactStoredSessionOpenOverride = nil
+            registry.remove(id: saved.id)
+        }
+
+        PushDefaultActionRouter.route(
+            PushNotificationPayload(
+                wireKind: PushKind.response.rawValue,
+                kind: .response,
+                gatewayID: saved.id,
+                bot: exact.profile,
+                title: "inbox",
+                body: "Response ready",
+                approvalRequestID: nil,
+                sessionID: exact.storedSessionID,
+                deeplink: nil),
+            in: model,
+            knownGatewayIDs: [saved.id])
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+        XCTAssertEqual(model.exactStoredSessionRouteQueue.pending?.route, exact)
+        XCTAssertTrue(opens.isEmpty)
+
+        reconnected = true
+        model.exactStoredSessionSourceDidReconnect()
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+
+        XCTAssertEqual(opens, [exact])
+        XCTAssertEqual(model.exactStoredSessionRouteQueue.completedOpenCount, 1)
+        XCTAssertNil(model.exactStoredSessionRouteQueue.pending)
+    }
+
+    func testPeriodicSecondaryReconnectReplaysOnlyMatchingForeignRoute() async throws {
+        let model = AppModel()
+        let registry = ConnectionRegistry.shared
+        let baseURL = try XCTUnwrap(URL(
+            string: "https://foreign-push-\(UUID().uuidString).example"))
+        let saved = try XCTUnwrap(registry.upsert(
+            urlString: baseURL.absoluteString,
+            name: "Foreign push",
+            credential: .sessionToken("foreign-push-token")))
+        let exact = try route(gateway: saved.id)
+        var secondaryReady = false
+        var attempts = 0
+        var opens: [ExactStoredSessionRoute] = []
+        model.mode = .live
+        model.launchWorldRestoreCompleted = true
+        model.exactStoredSessionSourceReadinessOverride = { _ in
+            attempts += 1
+            return secondaryReady
+        }
+        model.exactStoredSessionOpenOverride = { opens.append($0) }
+        defer {
+            model.exactStoredSessionSourceReadinessOverride = nil
+            model.exactStoredSessionOpenOverride = nil
+            registry.remove(id: saved.id)
+        }
+
+        PushDefaultActionRouter.route(
+            PushNotificationPayload(
+                wireKind: PushKind.response.rawValue,
+                kind: .response,
+                gatewayID: saved.id,
+                bot: exact.profile,
+                title: "inbox",
+                body: "Response ready",
+                approvalRequestID: nil,
+                sessionID: exact.storedSessionID,
+                deeplink: nil),
+            in: model,
+            knownGatewayIDs: [saved.id])
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+        XCTAssertEqual(attempts, 1)
+
+        model.exactStoredSessionSecondarySourcesDidRefresh(["unrelated-source"])
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+        XCTAssertEqual(attempts, 1, "unrelated enumeration must not retry the route")
+
+        secondaryReady = true
+        model.exactStoredSessionSecondarySourcesDidRefresh([saved.id])
+        await model.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(opens, [exact])
+        XCTAssertEqual(model.exactStoredSessionRouteQueue.completedOpenCount, 1)
+        XCTAssertNil(model.exactStoredSessionRouteQueue.pending)
+    }
+
+    func testRPCTimeoutDefersAndNextNudgeReplaysOnce() async throws {
+        XCTAssertTrue(ExactStoredSessionRouteRetryPolicy.isTransient(
+            GatewayError(code: -5, message: "RPC timed out")))
+        XCTAssertFalse(ExactStoredSessionRouteRetryPolicy.isTransient(
+            GatewayError(code: 401, message: "Unauthorized")))
+
+        let queue = ExactStoredSessionRouteQueue()
+        let exact = try route()
+        var attempts = 0
+        var opens = 0
+        _ = queue.submit(
+            ExactStoredSessionRouteRequest(
+                route: exact, origin: .notification, waitsForLaunchRestore: false),
+            alreadyVisible: false,
+            execute: { _ in
+                attempts += 1
+                if attempts == 1 {
+                    let timeout = GatewayError(code: -5, message: "RPC timed out")
+                    return ExactStoredSessionRouteRetryPolicy.isTransient(timeout)
+                        ? .deferred : .rejected(timeout.localizedDescription)
+                }
+                opens += 1
+                return .opened
+            },
+            reject: { _, message in XCTFail("timeout must remain retryable: \(message)") })
+        await queue.awaitCurrentAttempt()
+        XCTAssertEqual(queue.pending?.route, exact)
+
+        queue.nudge()
+        await queue.awaitCurrentAttempt()
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(opens, 1)
+        XCTAssertEqual(queue.completedOpenCount, 1)
+        XCTAssertNil(queue.pending)
+    }
+
+    func testDuplicateURLAndNotificationDelegateCoalesceAcrossColdRestore() async throws {
+        let url = try XCTUnwrap(URL(
+            string: "talaria://bot/inbox?session_id=stored-42&gateway_id=primary"))
+        guard case .storedSession(let exact) = try XCTUnwrap(TalariaDeepLink(url: url)) else {
+            return XCTFail("expected exact stored-session route")
+        }
+        let queue = ExactStoredSessionRouteQueue()
+        var ready = false
+        var opens = 0
+        let execute: ExactStoredSessionRouteQueue.Execute = { _ in
+            guard ready else { return .deferred }
+            opens += 1
+            return .opened
+        }
+        let reject: ExactStoredSessionRouteQueue.Reject = { _, _ in
+            XCTFail("duplicate route must not reject")
+        }
+
+        XCTAssertEqual(queue.submit(
+            ExactStoredSessionRouteRequest(
+                route: exact, origin: .deepLink, waitsForLaunchRestore: true),
+            alreadyVisible: false, execute: execute, reject: reject), .started)
+        await queue.awaitCurrentAttempt()
+        XCTAssertEqual(queue.submit(
+            ExactStoredSessionRouteRequest(
+                route: exact, origin: .notification, waitsForLaunchRestore: true),
+            alreadyVisible: false, execute: execute, reject: reject), .duplicate)
+
+        ready = true
+        queue.nudge()
+        await queue.awaitCurrentAttempt()
+        XCTAssertEqual(opens, 1)
+        XCTAssertEqual(queue.completedOpenCount, 1)
+    }
+
+    func testActiveAndForeignRosterKeysPreserveSameExactAuthority() throws {
+        let primary = try route(gateway: "primary", profile: "same", session: "collision")
+        let foreign = try route(gateway: "homelab", profile: "same", session: "collision")
+
+        XCTAssertEqual(primary.rosterID(activeGatewayID: "primary"), "same")
+        XCTAssertEqual(foreign.rosterID(activeGatewayID: "primary"), "homelab::same")
+        XCTAssertEqual(primary.botRoute,
+                       GatewayBotRoute(gatewayID: "primary", profile: "same"))
+        XCTAssertEqual(foreign.botRoute,
+                       GatewayBotRoute(gatewayID: "homelab", profile: "same"))
+        XCTAssertNotEqual(primary, foreign,
+                          "colliding profile/session ids on two gateways are distinct routes")
+    }
+
+    func testLatestDistinctRouteSupersedesAndCancelsOlderOpen() async throws {
+        let queue = ExactStoredSessionRouteQueue()
+        let first = try route(session: "stored-old")
+        let second = try route(gateway: "homelab", session: "stored-new")
+        var firstStarted = false
+        var opened: [ExactStoredSessionRoute] = []
+        let execute: ExactStoredSessionRouteQueue.Execute = { request in
+            if request.route == first {
+                firstStarted = true
+                do {
+                    try await Task.sleep(for: .seconds(30))
+                    opened.append(request.route)
+                    return .opened
+                } catch {
+                    return .deferred
+                }
+            }
+            opened.append(request.route)
+            return .opened
+        }
+        let reject: ExactStoredSessionRouteQueue.Reject = { _, message in
+            XCTFail("unexpected rejection: \(message)")
+        }
+
+        _ = queue.submit(
+            ExactStoredSessionRouteRequest(
+                route: first, origin: .notification, waitsForLaunchRestore: false),
+            alreadyVisible: false, execute: execute, reject: reject)
+        while !firstStarted { await Task.yield() }
+        _ = queue.submit(
+            ExactStoredSessionRouteRequest(
+                route: second, origin: .deepLink, waitsForLaunchRestore: false),
+            alreadyVisible: false, execute: execute, reject: reject)
+        await queue.awaitCurrentAttempt()
+
+        XCTAssertEqual(opened, [second])
+        XCTAssertEqual(queue.completedOpenCount, 1)
+        XCTAssertNil(queue.pending)
+    }
+
+    func testReconnectNudgeDuringCancellationIsNotLostOrDoubleOpened() async throws {
+        let queue = ExactStoredSessionRouteQueue()
+        let exact = try route()
+        var attempts = 0
+        var firstAttemptStarted = false
+        var opens = 0
+
+        _ = queue.submit(
+            ExactStoredSessionRouteRequest(
+                route: exact, origin: .notification, waitsForLaunchRestore: false),
+            alreadyVisible: false,
+            execute: { _ in
+                attempts += 1
+                if attempts == 1 {
+                    firstAttemptStarted = true
+                    await Task.yield()
+                    return .deferred
+                }
+                opens += 1
+                return .opened
+            },
+            reject: { _, message in XCTFail("unexpected rejection: \(message)") })
+        while !firstAttemptStarted { await Task.yield() }
+        queue.nudge()
+        await queue.awaitCurrentAttempt()
+
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(opens, 1)
+        XCTAssertEqual(queue.completedOpenCount, 1)
+        XCTAssertNil(queue.pending)
+    }
+
+    func testUnknownOrDeletedSourceRejectsWithoutOpening() async throws {
+        let queue = ExactStoredSessionRouteQueue()
+        let exact = try route(gateway: "deleted")
+        var rejection: (ExactStoredSessionRoute, String)?
+
+        _ = queue.submit(
+            ExactStoredSessionRouteRequest(
+                route: exact, origin: .deepLink, waitsForLaunchRestore: true),
+            alreadyVisible: false,
+            execute: { _ in
+                .rejected("That response came from a gateway that is no longer saved.")
+            },
+            reject: { route, message in rejection = (route, message) })
+        await queue.awaitCurrentAttempt()
+
+        XCTAssertEqual(rejection?.0, exact)
+        XCTAssertTrue(rejection?.1.contains("no longer saved") == true)
+        XCTAssertNil(queue.pending)
+        XCTAssertEqual(queue.completedOpenCount, 0)
+    }
+
+    func testUnknownAndMissingCredentialRejectBeforeAnyConnectionRetry() async throws {
+        let unknownModel = AppModel()
+        unknownModel.launchWorldRestoreCompleted = true
+        var sourceAttempts = 0
+        unknownModel.exactStoredSessionSourceReadinessOverride = { _ in
+            sourceAttempts += 1
+            return true
+        }
+        unknownModel.openExactStoredSession(
+            try route(gateway: "definitely-not-saved"), origin: .deepLink)
+        await unknownModel.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+        XCTAssertEqual(sourceAttempts, 0)
+        XCTAssertNil(unknownModel.exactStoredSessionRouteQueue.pending)
+        XCTAssertEqual(unknownModel.exactStoredSessionRouteQueue.completedOpenCount, 0)
+
+        let registry = ConnectionRegistry.shared
+        let baseURL = try XCTUnwrap(URL(
+            string: "https://signed-out-push-\(UUID().uuidString).example"))
+        let saved = try XCTUnwrap(registry.upsert(
+            urlString: baseURL.absoluteString,
+            name: "Signed out push",
+            credential: nil))
+        let signedOutModel = AppModel()
+        signedOutModel.launchWorldRestoreCompleted = true
+        signedOutModel.exactStoredSessionSourceReadinessOverride = { _ in
+            sourceAttempts += 1
+            return true
+        }
+        defer {
+            unknownModel.exactStoredSessionSourceReadinessOverride = nil
+            signedOutModel.exactStoredSessionSourceReadinessOverride = nil
+            registry.remove(id: saved.id)
+            ToastBus.shared.clear()
+        }
+
+        signedOutModel.openExactStoredSession(
+            try route(gateway: saved.id), origin: .notification)
+        await signedOutModel.exactStoredSessionRouteQueue.awaitCurrentAttempt()
+        XCTAssertEqual(sourceAttempts, 0)
+        XCTAssertNil(signedOutModel.exactStoredSessionRouteQueue.pending)
+        XCTAssertEqual(signedOutModel.exactStoredSessionRouteQueue.completedOpenCount, 0)
+        XCTAssertNil(signedOutModel.openBotID)
+    }
+
+    func testFreshProfileAuthorityRejectsStaleDeletedAndAmbiguousProfiles() throws {
+        let exact = try route(profile: "researcher")
+        XCTAssertNoThrow(try ExactStoredSessionRouteAuthority.requireCurrent(
+            exact, profileNames: ["default", "researcher"]))
+        XCTAssertThrowsError(try ExactStoredSessionRouteAuthority.requireCurrent(
+            exact, profileNames: ["default"])) { error in
+                XCTAssertEqual(error as? ExactStoredSessionRouteAuthorityError,
+                               .missingProfile(exact))
+            }
+        XCTAssertThrowsError(try ExactStoredSessionRouteAuthority.requireCurrent(
+            exact, profileNames: ["Researcher", "researcher"])) { error in
+                XCTAssertEqual(error as? ExactStoredSessionRouteAuthorityError,
+                               .invalidProfileInventory)
+        }
+    }
+
+    func testSameStoredIDAckFromWrongProfileFailsClosedAcrossABA() throws {
+        let exact = try route(profile: "researcher", session: "same-stored-key")
+        XCTAssertNoThrow(try ExactStoredSessionResumeAckAuthority.requireExact(
+            route: exact.botRoute,
+            requestedStoredSessionID: exact.storedSessionID,
+            returnedStoredSessionID: "same-stored-key",
+            returnedProfile: "researcher"))
+
+        XCTAssertThrowsError(try ExactStoredSessionResumeAckAuthority.requireExact(
+            route: exact.botRoute,
+            requestedStoredSessionID: exact.storedSessionID,
+            returnedStoredSessionID: "same-stored-key",
+            returnedProfile: "default")) { error in
+                XCTAssertEqual(error as? ExactStoredSessionResumeAckAuthorityError,
+                               .profileMismatch)
+            }
+        XCTAssertThrowsError(try ExactStoredSessionResumeAckAuthority.requireExact(
+            route: exact.botRoute,
+            requestedStoredSessionID: exact.storedSessionID,
+            returnedStoredSessionID: "same-stored-key",
+            returnedProfile: "")) { error in
+                XCTAssertEqual(error as? ExactStoredSessionResumeAckAuthorityError,
+                               .profileMismatch)
+            }
+    }
+
+    func testDeepLinkParserRetainsUnknownSourceForVisibleAuthorityFailure() throws {
+        let url = try XCTUnwrap(URL(
+            string: "talaria://bot/inbox?session_id=stored-42&gateway_id=not-saved-yet"))
+        XCTAssertEqual(TalariaDeepLink(url: url), .storedSession(try route(
+            gateway: "not-saved-yet", profile: "inbox", session: "stored-42")))
+
+        let qualified = try XCTUnwrap(URL(
+            string: "talaria://bot/homelab::inbox?session_id=stored-43"))
+        XCTAssertEqual(TalariaDeepLink(url: qualified), .storedSession(try route(
+            gateway: "homelab", profile: "inbox", session: "stored-43")))
+    }
+
+    func testDeepLinkParserRejectsAmbiguousOrNonExactRoutes() throws {
+        XCTAssertNil(TalariaDeepLink(url: try XCTUnwrap(URL(
+            string: "talaria://bot/inbox?session_id=stored-42"))))
+        XCTAssertNil(TalariaDeepLink(url: try XCTUnwrap(URL(
+            string: "talaria://bot/homelab::inbox?session_id=stored-42&gateway_id=other"))))
+        XCTAssertNil(TalariaDeepLink(url: try XCTUnwrap(URL(
+            string: "talaria://bot/inbox/extra?session_id=stored-42&gateway_id=homelab"))))
+        XCTAssertNil(TalariaDeepLink(url: try XCTUnwrap(URL(
+            string: "talaria://bot/inbox?session_id=a&session_id=b&gateway_id=homelab"))))
+    }
+}
+#endif

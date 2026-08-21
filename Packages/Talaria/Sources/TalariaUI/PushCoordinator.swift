@@ -21,6 +21,8 @@ import TalariaTheme
 public enum PushPayloadKey {
     public static let kind = "kind"
     public static let bot = "bot"
+    public static let botDisplayName = "bot_display_name"
+    public static let botAvatar = "bot_avatar"
     public static let title = "title"
     public static let body = "body"
     public static let approvalRequestID = "approval_request_id"
@@ -34,6 +36,17 @@ public enum PushPayloadKey {
 /// source exists; multiple saved gateways make a bare profile ambiguous and
 /// therefore non-actionable.
 struct PushRouteResolver {
+    static func sourceGatewayID(stamped sourceGatewayID: String?,
+                                knownGatewayIDs: Set<String>,
+                                activeGatewayID: String?) -> String? {
+        if let sourceGatewayID {
+            return knownGatewayIDs.contains(sourceGatewayID) ? sourceGatewayID : nil
+        }
+        if knownGatewayIDs.count == 1 { return knownGatewayIDs.first }
+        if knownGatewayIDs.isEmpty { return activeGatewayID }
+        return nil
+    }
+
     static func botID(raw: String?, sourceGatewayID: String?,
                       knownGatewayIDs: Set<String>, activeGatewayID: String?) -> String? {
         guard let raw, !raw.isEmpty, raw != "gateway" else { return nil }
@@ -41,20 +54,29 @@ struct PushRouteResolver {
         // rejected rather than accepted under a second, possibly conflicting,
         // source identity.
         guard GatewayBotRoute(qualifiedID: raw) == nil else { return nil }
-        let source: String
-        if let sourceGatewayID, knownGatewayIDs.contains(sourceGatewayID) {
-            source = sourceGatewayID
-        } else if sourceGatewayID != nil {
-            return nil
-        } else if knownGatewayIDs.count == 1, let only = knownGatewayIDs.first {
-            source = only
-        } else if knownGatewayIDs.isEmpty, activeGatewayID != nil {
-            return raw
-        } else {
-            return nil
-        }
+        guard let source = Self.sourceGatewayID(
+            stamped: sourceGatewayID, knownGatewayIDs: knownGatewayIDs,
+            activeGatewayID: activeGatewayID) else { return nil }
         return source == activeGatewayID
             ? raw : GatewayBotRoute(gatewayID: source, profile: raw).qualifiedID
+    }
+
+    /// Build the immutable route used by notification taps that carry a
+    /// durable session. The stamped source is trusted only when it is saved;
+    /// the legacy source-less shape remains usable only with one unambiguous
+    /// saved gateway.
+    static func exactStoredSessionRoute(for payload: PushNotificationPayload,
+                                        knownGatewayIDs: Set<String>,
+                                        activeGatewayID: String?) -> ExactStoredSessionRoute? {
+        guard let profile = payload.bot, !profile.isEmpty, profile != "gateway",
+              GatewayBotRoute(qualifiedID: profile) == nil,
+              let storedSessionID = payload.sessionID, !storedSessionID.isEmpty,
+              let gatewayID = sourceGatewayID(
+                stamped: payload.gatewayID, knownGatewayIDs: knownGatewayIDs,
+                activeGatewayID: activeGatewayID) else { return nil }
+        return ExactStoredSessionRoute(
+            gatewayID: gatewayID, profile: profile,
+            storedSessionID: storedSessionID)
     }
 
     /// The destination a non-gateway push may safely open. The bot id is
@@ -97,6 +119,62 @@ struct PushRouteDestination: Sendable, Equatable {
     var botID: String
     var storedSessionID: String?
     var gatewayID: String?
+}
+
+/// Default-tap navigation shared by the iOS notification delegate and package
+/// integration tests. `mode == .demo` is only Talaria's launch placeholder;
+/// canned-session routing is authorized solely by an actually loaded demo
+/// world, otherwise a cold exact response must enter the retained live queue.
+@MainActor
+enum PushDefaultActionRouter {
+    static func route(_ payload: PushNotificationPayload, in model: AppModel,
+                      knownGatewayIDs: Set<String>) {
+        let scriptedDemo = model.demoDataLoaded
+        let destination = PushRouteResolver.destination(
+            for: payload,
+            knownGatewayIDs: knownGatewayIDs,
+            activeGatewayID: model.activeGatewayID,
+            demo: scriptedDemo)
+        let exactStoredSessionRoute = scriptedDemo ? nil
+            : PushRouteResolver.exactStoredSessionRoute(
+                for: payload,
+                knownGatewayIDs: knownGatewayIDs,
+                activeGatewayID: model.activeGatewayID)
+
+        switch payload.kind {
+        case .approval:
+            model.selectedTab = .approvals
+        case .gateway:
+            model.selectedTab = .home
+            model.openBotID = nil
+            NotificationCenter.default.post(name: .talariaOpenConnections, object: nil)
+        case .response:
+            // A real response without exact saved-source authority is fail
+            // closed; it must never fall through to a canonical chat.
+            if let exactStoredSessionRoute {
+                model.openExactStoredSession(
+                    exactStoredSessionRoute, origin: .notification)
+            } else if scriptedDemo,
+                      let destination, let sessionID = destination.storedSessionID {
+                model.openStoredSession(sessionID, botID: destination.botID)
+            }
+        default:
+            guard let destination, destination.botID != "gateway" else {
+                model.selectedTab = .activity
+                return
+            }
+            // Session-bearing live pushes use the exact queue. Only an
+            // actually loaded scripted world may use the demo session opener.
+            if let exactStoredSessionRoute {
+                model.openExactStoredSession(
+                    exactStoredSessionRoute, origin: .notification)
+            } else if scriptedDemo, let sessionID = payload.sessionID {
+                model.openStoredSession(sessionID, botID: destination.botID)
+            } else {
+                model.openChat(botID: destination.botID)
+            }
+        }
+    }
 }
 
 enum PushPayloadDecoder {
@@ -520,33 +598,6 @@ public final class PushCoordinator: NSObject {
 
     // MARK: - Routing
 
-    /// `talaria://bot/<id>` (island / widget tap) and `talaria://approvals`.
-    @discardableResult
-    public func handleDeepLink(_ url: URL) -> Bool {
-        guard url.scheme == "talaria", let model else { return false }
-        switch url.host {
-        case "bot":
-            let id = url.pathComponents.count > 1 ? url.pathComponents[1] : url.lastPathComponent
-            guard !id.isEmpty, id != "/" else { return false }
-            // openChat, not a raw openBotID write: it resumes the bot's
-            // canonical chat and hydrates it. A bare write lands in an empty
-            // transcript whose first send forks a new session.
-            model.openChat(botID: id)
-            return true
-        case "approvals":
-            model.selectedTab = .approvals
-            model.openBotID = nil
-            return true
-        case "connections":
-            model.selectedTab = .home
-            model.openBotID = nil
-            NotificationCenter.default.post(name: .talariaOpenConnections, object: nil)
-            return true
-        default:
-            return false
-        }
-    }
-
     /// Notification tap / action routing — same shape as the prototype's
     /// `bannerGo`: approval → approvals, gateway → roster (Connections is one
     /// tap deep), anything else → that bot's chat.
@@ -554,13 +605,6 @@ public final class PushCoordinator: NSObject {
         guard let model else { return }
         let info = response.notification.request.content.userInfo
         guard let payload = PushPayloadDecoder.decode(info) else { return }
-        let destination = PushRouteResolver.destination(
-            for: payload,
-            knownGatewayIDs: Set(ConnectionRegistry.shared.saved.map(\.id)),
-            activeGatewayID: model.activeGatewayID,
-            demo: model.mode == .demo)
-        let kind = payload.kind
-        let botID = destination?.botID
 
         switch response.actionIdentifier {
         case PushIdentifiers.approveAction:
@@ -578,36 +622,9 @@ public final class PushCoordinator: NSObject {
         case PushIdentifiers.laterAction:
             break // Explicitly deferred; the approval stays pending.
         case UNNotificationDefaultActionIdentifier:
-            switch kind {
-            case .approval:
-                model.selectedTab = .approvals
-            case .gateway:
-                model.selectedTab = .home
-                model.openBotID = nil
-                NotificationCenter.default.post(name: .talariaOpenConnections, object: nil)
-            case .response:
-                // Response pushes carry the durable session key. Keep the
-                // source-qualified roster id and reopen that exact session;
-                // unlike a summary/mention push, a missing session must not
-                // silently land in the bot's canonical chat.
-                guard let destination, let sessionID = destination.storedSessionID else {
-                    return
-                }
-                model.openStoredSession(sessionID, botID: destination.botID)
-            default:
-                if let botID, botID != "gateway" {
-                    // Prefer the exact pushed session; older/summary payloads
-                    // without one fall back to the bot's canonical chat.
-                    if let sessionID = info[PushPayloadKey.sessionID] as? String,
-                       !sessionID.isEmpty {
-                        model.openStoredSession(sessionID, botID: botID)
-                    } else {
-                        model.openChat(botID: botID)
-                    }
-                } else {
-                    model.selectedTab = .activity
-                }
-            }
+            PushDefaultActionRouter.route(
+                payload, in: model,
+                knownGatewayIDs: Set(ConnectionRegistry.shared.saved.map(\.id)))
         default:
             break
         }
@@ -675,7 +692,7 @@ public final class PushCoordinator: NSObject {
             for: payload,
             knownGatewayIDs: Set(ConnectionRegistry.shared.saved.map(\.id)),
             activeGatewayID: model.activeGatewayID,
-            demo: model.mode == .demo)?.botID
+            demo: model.demoDataLoaded)?.botID
     }
 
     // MARK: - Demo previews
@@ -792,8 +809,6 @@ public final class PushCoordinator {
     @discardableResult
     public func requestAuthorization() async -> Bool { false }
     public func registerForRemoteNotifications() {}
-    @discardableResult
-    public func handleDeepLink(_ url: URL) -> Bool { false }
 }
 
 #endif

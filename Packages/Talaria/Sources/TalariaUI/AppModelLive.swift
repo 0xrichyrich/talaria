@@ -196,6 +196,27 @@ extension AppModel {
         mode = .live
         isOffline = false
 
+        try await finishConnectedGatewayAdoption(
+            client, baseURL: baseURL, credential: credential,
+            rosterRefresh: { try await self.refreshRoster() })
+    }
+
+    /// Publish an authenticated post-dial client, then perform ancillary world
+    /// refreshes. Exact-route recovery is signalled at the publication boundary:
+    /// a later profiles.list timeout must not strand a retained notification or
+    /// URL until some unrelated lifecycle event happens to nudge it again.
+    ///
+    /// `rosterRefresh` is the real refresh in production and a focused failure
+    /// injection in the ordering regression; source readiness itself is never
+    /// overridden by that test.
+    func finishConnectedGatewayAdoption(
+        _ client: GatewayClient,
+        baseURL: URL,
+        credential: GatewayCredential,
+        rosterRefresh: () async throws -> Void
+    ) async throws {
+        let runtime = LiveRuntime.shared
+        let registry = ConnectionRegistry.shared
         guard let savedGateway = registry.upsert(urlString: baseURL.absoluteString,
                                                  credential: credential) else {
             await client.disconnect()
@@ -205,6 +226,10 @@ extension AppModel {
         }
         runtime.gatewayID = savedGateway.id
         await registry.clientPool.adopt(client, for: savedGateway.id)
+
+        // Source, credential and pooled-client authority are all installed now.
+        // Signal before profiles.list or any other ancillary refresh can fail.
+        retryExactStoredSessionNavigation()
         registry.noteState(.connected, forURL: baseURL)
 
         startDisconnectMonitor(for: client)
@@ -214,7 +239,7 @@ extension AppModel {
         PushCoordinator.shared.registerWithRelayIfConnected()
         #endif
 
-        try await refreshRoster()
+        try await rosterRefresh()
         try? await refreshRoutines()
         connections = registry.rows
         await hideOwnedBotSessions()

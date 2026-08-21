@@ -441,6 +441,14 @@ extension AppModel {
         try? await refreshRoutines()
         connections = ConnectionRegistry.shared.rows
         await flushComposeQueue()
+        exactStoredSessionSourceDidReconnect()
+    }
+
+    /// Supervised reconnect finishes after the foreground/network callbacks
+    /// that initiated it. Signal the retained exact-route queue only once the
+    /// replacement link, roster, and parked sessions have been adopted.
+    func exactStoredSessionSourceDidReconnect() {
+        retryExactStoredSessionNavigation()
     }
 
     /// The client's event pump finishes exactly when the socket dies; awaiting
@@ -612,6 +620,9 @@ extension AppModel {
         // ConnectionRegistry.remove deletes the Keychain credential with the row.
         ConnectionRegistry.shared.remove(id: gateway.id)
         connections = ConnectionRegistry.shared.rows
+        // Reject a retained exact-session route now that its source is no
+        // longer trusted, instead of leaving it parked until another launch.
+        retryExactStoredSessionNavigation()
     }
 
     /// Drop the outgoing gateway's world. flushDemoWorld() is the single place
