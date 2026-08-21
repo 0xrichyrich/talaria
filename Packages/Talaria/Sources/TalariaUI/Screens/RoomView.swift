@@ -521,12 +521,19 @@ private struct RoomSettingsView: View {
                     .font(theme.mono(8)).foregroundStyle(theme.faint)
             }
             Spacer()
-            Button {
-                if selected.count > RoomEngine.minimumMembers {
-                    selected.removeAll { $0.route == member.route }
-                }
-            } label: { Image(systemName: "minus.circle").frame(width: 44, height: 44) }
-                .buttonStyle(.plain).foregroundStyle(theme.danger)
+            if member.isFrozenProjection {
+                Image(systemName: "lock.fill")
+                    .frame(width: 44, height: 44)
+                    .foregroundStyle(theme.faint)
+                    .accessibilityLabel("Shared member is view only")
+            } else {
+                Button {
+                    if selected.count > RoomEngine.minimumMembers {
+                        selected.removeAll { $0.route == member.route }
+                    }
+                } label: { Image(systemName: "minus.circle").frame(width: 44, height: 44) }
+                    .buttonStyle(.plain).foregroundStyle(theme.danger)
+            }
         }.frame(minHeight: 44)
     }
 }

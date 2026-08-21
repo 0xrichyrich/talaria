@@ -1109,7 +1109,7 @@ final class RoomRoutingTests: XCTestCase {
         XCTAssertTrue(restarted.projectedImages.isEmpty)
     }
 
-    func testFrozenProjectionSettingsNeverQueueUnknownGatewayMetadata() async throws {
+    func testFrozenProjectionSettingsPreserveUnknownSeatsAndNeverQueueMetadata() async throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("talaria-room-frozen-settings-\(UUID().uuidString)",
                                    isDirectory: true)
@@ -1140,9 +1140,11 @@ final class RoomRoutingTests: XCTestCase {
         runtime.store = store
         runtime.rooms = hydrated.rooms
 
+        var attemptedMembers = Array(room.members.prefix(2))
+        attemptedMembers[0] = RoomMember(
+            route: attemptedMembers[0].route, title: "Spoofed local seat")
         try await AppModel().updateRoomSettings(
-            room.id, name: "Renamed on phone",
-            members: Array(room.members.prefix(2)))
+            room.id, name: "Renamed on phone", members: attemptedMembers)
 
         let outbox = try await store.metadataOutbox()
         XCTAssertTrue(outbox.isEmpty)
@@ -1150,9 +1152,14 @@ final class RoomRoutingTests: XCTestCase {
         let updated = try XCTUnwrap(updatedValue)
         let projection = try await store.roomProjection()
         XCTAssertEqual(updated.name, "Renamed on phone")
-        XCTAssertEqual(updated.members.count, 2)
+        XCTAssertEqual(updated.members.count, 3)
         XCTAssertTrue(updated.members.allSatisfy(\.isFrozenProjection))
+        XCTAssertFalse(updated.members.contains { $0.title == "Spoofed local seat" })
+        XCTAssertEqual(Set(updated.members.map(\.route.gatewayID)),
+                       ["desktop-home", "desktop-mini", "desktop-lab"])
         XCTAssertEqual(projection.rooms[key]?.revision, 4)
+        XCTAssertEqual(projection.rooms[key]?.members.map(\.connectionID),
+                       ["desktop-home", "desktop-mini", "desktop-lab"])
     }
 
     func testLateMetadataCompletionCannotRemoveRenamedDestinationMutation() async throws {

@@ -1107,8 +1107,20 @@ public extension AppModel {
             guard !otherNames.contains(normalized.lowercased()) else { throw RoomNameError.taken }
             await RoomRuntime.shared.roomNameCommitBarrier?()
 
-            let members = proposedMembers.reduce(into: [RoomMember]()) { result, member in
+            let proposed = proposedMembers.reduce(into: [RoomMember]()) { result, member in
                 if !result.contains(where: { $0.route == member.route }) { result.append(member) }
+            }
+            // A projected member whose connection is not configured on this
+            // device is a view-only seat. Preserve the authoritative record if
+            // a caller omits or attempts to rewrite it. Projection hydration,
+            // which verifies configured connection ids, owns thawing the seat.
+            let members = before.members.filter(\.isFrozenProjection).reduce(into: proposed) {
+                result, frozen in
+                if let proposedIndex = result.firstIndex(where: { $0.route == frozen.route }) {
+                    result[proposedIndex] = frozen
+                } else {
+                    result.append(frozen)
+                }
             }
             if let retired = members.first(where: { RoomRuntime.shared.retiredProfileRoutes.contains($0.route) }) {
                 throw RoomStoreError.retiredRoute(retired.route)
