@@ -18,6 +18,21 @@ private actor ProjectionReadbackGate {
     }
 }
 
+private actor ProjectionTargetsGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    var isWaiting: Bool { continuation != nil }
+
+    func wait() async {
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func open() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 private actor ProjectionTestBackend {
     struct CASWrite: Sendable {
         var gatewayID: String
@@ -48,11 +63,15 @@ private actor ProjectionTestBackend {
     private var gatedReadbackGatewayID: String?
     private var readbackGate: ProjectionReadbackGate?
     private var didGateReadback = false
+    private var targetsGate: ProjectionTargetsGate?
+    private var shouldGateTargets = false
+    private var foldReconcilesIntoLocal = false
     private var readCounts: [String: Int] = [:]
     private var casWriteLog: [CASWrite] = []
     private var legacyWriteLog: [LegacyWrite] = []
     private var reconcileLog: [ReconcileEvent] = []
     private var sleepLog: [Duration] = []
+    private var leasedGenerationLog: [UInt64] = []
 
     init(targets: [RoomProjectionSyncTarget], local: RoomProjectionEnvelope,
          remotes: [String: RoomProjectionRemoteState]) {
@@ -77,10 +96,25 @@ private actor ProjectionTestBackend {
         didGateReadback = false
     }
 
-    func targets() -> [RoomProjectionSyncTarget] { targetRows }
+    func gateNextTargets(_ gate: ProjectionTargetsGate) {
+        targetsGate = gate
+        shouldGateTargets = true
+    }
 
-    func read(_ target: RoomProjectionSyncTarget) async throws
+    func enableReconcileIntoLocal() { foldReconcilesIntoLocal = true }
+
+    func targets() async -> [RoomProjectionSyncTarget] {
+        if shouldGateTargets, let targetsGate {
+            shouldGateTargets = false
+            await targetsGate.wait()
+        }
+        return targetRows
+    }
+
+    func read(_ leased: RoomProjectionLeasedTarget) async throws
         -> RoomProjectionRemoteState {
+        leasedGenerationLog.append(leased.connectionGeneration)
+        let target = leased.target
         let gatewayID = target.gatewayID
         readCounts[gatewayID, default: 0] += 1
         if alwaysFailReads.contains(gatewayID) { throw InjectedFailure.read }
@@ -108,11 +142,17 @@ private actor ProjectionTestBackend {
             gatewayID: target.gatewayID,
             projection: projection,
             preservingKeys: preservingKeys))
+        if foldReconcilesIntoLocal {
+            local = RoomProjectionEnvelope.merging(
+                remote: projection, local: local)
+        }
     }
 
-    func writeCAS(target: RoomProjectionSyncTarget, profileName: String,
+    func writeCAS(leased: RoomProjectionLeasedTarget, profileName: String,
                   projection: RoomProjectionEnvelope, expected: Int)
         -> ProfileConfigureResult {
+        leasedGenerationLog.append(leased.connectionGeneration)
+        let target = leased.target
         casWriteLog.append(CASWrite(
             gatewayID: target.gatewayID, profileName: profileName,
             expected: expected, projection: projection))
@@ -148,8 +188,10 @@ private actor ProjectionTestBackend {
         ]))
     }
 
-    func writeLegacy(target: RoomProjectionSyncTarget, profileName: String,
+    func writeLegacy(leased: RoomProjectionLeasedTarget, profileName: String,
                      projection: RoomProjectionEnvelope) -> [String: Bool] {
+        leasedGenerationLog.append(leased.connectionGeneration)
+        let target = leased.target
         legacyWriteLog.append(LegacyWrite(
             gatewayID: target.gatewayID, profileName: profileName,
             projection: projection))
@@ -167,6 +209,7 @@ private actor ProjectionTestBackend {
     func reconciles() -> [ReconcileEvent] { reconcileLog }
     func sleeps() -> [Duration] { sleepLog }
     func localSnapshot() -> RoomProjectionEnvelope { local }
+    func leasedGenerations() -> [UInt64] { leasedGenerationLog }
 }
 
 @MainActor
@@ -269,6 +312,30 @@ final class RoomProjectionRuntimeTests: XCTestCase {
                        "configure must be followed by profiles.list")
         let reconciles = await backend.reconciles()
         XCTAssertEqual(reconciles.last?.projection.rooms[key]?.revision, 8)
+    }
+
+    func testEveryRPCUsesTheExactLeasedConnectionGeneration() async {
+        let key = RoomProjectionEnvelope.idKey("leased-room")
+        let backend = ProjectionTestBackend(
+            targets: [RoomProjectionSyncTarget(gatewayID: "home")],
+            local: envelope([(key, "Leased", 0)], updatedAt: 1),
+            remotes: ["home": RoomProjectionRemoteState(
+                projection: RoomProjectionEnvelope(updatedAt: 1),
+                revision: 0, supportsCAS: true)])
+        let runtime = makeRuntime(backend, leasedGeneration: 77)
+
+        runtime.schedule(model: AppModel(), changedRooms: [key])
+        await waitUntilIdle(runtime)
+
+        let leasedGenerations = await backend.leasedGenerations()
+        XCTAssertEqual(leasedGenerations, [77, 77, 77],
+                       "read, CAS write, and readback must share one lease")
+    }
+
+    func testProfileSelectionAcceptsOnlyLiteralDefaultName() {
+        XCTAssertTrue(RoomProjectionSyncOperations.isExactDefaultProfileName("default"))
+        XCTAssertFalse(RoomProjectionSyncOperations.isExactDefaultProfileName("primary"))
+        XCTAssertFalse(RoomProjectionSyncOperations.isExactDefaultProfileName("Default"))
     }
 
     func testPayloadNoopIgnoresUpdatedAt() async {
@@ -423,25 +490,114 @@ final class RoomProjectionRuntimeTests: XCTestCase {
         XCTAssertFalse(runtime.hasPendingWork)
     }
 
-    private func makeRuntime(_ backend: ProjectionTestBackend)
+    func testPrivacyResetWinsWhileReconnectTargetDiscoveryIsSuspended() async {
+        let key = RoomProjectionEnvelope.idKey("private-room")
+        let backend = ProjectionTestBackend(
+            targets: [RoomProjectionSyncTarget(gatewayID: "home")],
+            local: envelope([(key, "Private", 0)], updatedAt: 1),
+            remotes: ["home": RoomProjectionRemoteState(
+                projection: envelope([(key, "Remote", 1)], updatedAt: 2),
+                revision: 1, supportsCAS: true)])
+        let gate = ProjectionTargetsGate()
+        await backend.gateNextTargets(gate)
+        let runtime = makeRuntime(backend)
+
+        let pull = Task { await runtime.pullAndReseed(
+            model: AppModel(), gatewayID: "home") }
+        await waitUntil { await gate.isWaiting }
+        runtime.resetForPrivacyDeletion()
+        await gate.open()
+        await pull.value
+        for _ in 0..<20 { await Task.yield() }
+
+        let readCount = await backend.readCount("home")
+        let reconciles = await backend.reconciles()
+        XCTAssertEqual(readCount, 0)
+        XCTAssertTrue(reconciles.isEmpty)
+        XCTAssertFalse(runtime.hasPendingWork)
+    }
+
+    func testCancelWinsWhileReconnectTargetDiscoveryIsSuspended() async {
+        let key = RoomProjectionEnvelope.idKey("signed-out-room")
+        let backend = ProjectionTestBackend(
+            targets: [RoomProjectionSyncTarget(gatewayID: "home")],
+            local: envelope([(key, "Local", 0)], updatedAt: 1),
+            remotes: ["home": RoomProjectionRemoteState(
+                projection: envelope([(key, "Remote", 1)], updatedAt: 2),
+                revision: 1, supportsCAS: true)])
+        let gate = ProjectionTargetsGate()
+        await backend.gateNextTargets(gate)
+        let runtime = makeRuntime(backend)
+
+        let pull = Task { await runtime.pullAndReseed(
+            model: AppModel(), gatewayID: "home") }
+        await waitUntil { await gate.isWaiting }
+        runtime.cancel(gatewayID: "home")
+        await gate.open()
+        await pull.value
+        for _ in 0..<20 { await Task.yield() }
+
+        let readCount = await backend.readCount("home")
+        let reconciles = await backend.reconciles()
+        XCTAssertEqual(readCount, 0)
+        XCTAssertTrue(reconciles.isEmpty)
+        XCTAssertFalse(runtime.hasPendingWork)
+    }
+
+    func testSourceFinalRoomTombstoneReseedsStalePeerWithoutGenericAllowEmpty() async {
+        let key = RoomProjectionEnvelope.idKey("final-room")
+        let stale = envelope([(key, "Final", 1)], updatedAt: 1)
+        let tombstone = RoomProjectionEnvelope(
+            updatedAt: 5, rooms: [:], deleted: [key: 5])
+        let backend = ProjectionTestBackend(
+            targets: [
+                RoomProjectionSyncTarget(gatewayID: "source"),
+                RoomProjectionSyncTarget(gatewayID: "peer"),
+            ],
+            local: stale,
+            remotes: [
+                "source": RoomProjectionRemoteState(
+                    projection: tombstone, revision: 5, supportsCAS: true),
+                "peer": RoomProjectionRemoteState(
+                    projection: stale, revision: 2, supportsCAS: true),
+            ])
+        await backend.enableReconcileIntoLocal()
+        let runtime = makeRuntime(backend)
+
+        await runtime.pullAndReseed(model: AppModel(), gatewayID: "source")
+        await waitUntilIdle(runtime)
+
+        let peerWrites = await backend.casWrites().filter { $0.gatewayID == "peer" }
+        XCTAssertEqual(peerWrites.count, 1)
+        XCTAssertTrue(peerWrites[0].projection.rooms.isEmpty,
+                      "the final room must not be resurrected on the peer")
+        XCTAssertEqual(peerWrites[0].projection.deleted[key], 5,
+                       "the explicit outbound final-room tombstone must survive fanout")
+    }
+
+    private func makeRuntime(_ backend: ProjectionTestBackend,
+                             leasedGeneration: UInt64 = 0)
         -> RoomProjectionRuntime {
         let operations = RoomProjectionSyncOperations(
             targets: { _ in await backend.targets() },
-            withTargetLease: { _, _, operation in try await operation() },
-            read: { _, target in try await backend.read(target) },
+            withTargetLease: { _, target, operation in
+                try await operation(RoomProjectionLeasedTarget(
+                    target: target, connectionGeneration: leasedGeneration))
+            },
+            read: { leased in try await backend.read(leased) },
             localProjection: { await backend.localProjection(updatedAt: $0) },
             reconcile: { projection, target, preserving in
                 await backend.reconcile(
                     projection, target: target, preservingKeys: preserving)
             },
-            writeCAS: { _, target, profileName, projection, expected in
+            writeCAS: { leased, profileName, projection, expected in
                 await backend.writeCAS(
-                    target: target, profileName: profileName,
+                    leased: leased, profileName: profileName,
                     projection: projection, expected: expected)
             },
-            writeLegacy: { _, target, profileName, projection in
+            writeLegacy: { leased, profileName, projection in
                 await backend.writeLegacy(
-                    target: target, profileName: profileName,
+                    leased: leased, profileName: profileName,
                     projection: projection)
             },
             sleep: { duration in await backend.slept(duration) },

@@ -16,6 +16,23 @@ struct RoomProjectionSyncTarget: Equatable, Sendable {
     }
 }
 
+/// The exact pooled connection generation protected for one complete
+/// read/merge/write/read-back transaction. Production RPCs must use `client`
+/// directly: resolving the route again inside the lease could select a newly
+/// published AppModel client while the pool lease still protects its predecessor.
+struct RoomProjectionLeasedTarget: Sendable {
+    var target: RoomProjectionSyncTarget
+    var client: GatewayClient?
+    var connectionGeneration: UInt64
+
+    init(target: RoomProjectionSyncTarget, client: GatewayClient? = nil,
+         connectionGeneration: UInt64 = 0) {
+        self.target = target
+        self.client = client
+        self.connectionGeneration = connectionGeneration
+    }
+}
+
 struct RoomProjectionRemoteState: Equatable, Sendable {
     var projection: RoomProjectionEnvelope?
     var revision: Int
@@ -35,12 +52,16 @@ struct RoomProjectionSyncJob: Equatable, Sendable {
     var allowEmpty: Bool
     var changedRooms: [String]
     var deletedRooms: [String]
+    /// Internal transition intent: fan out only after this source lane has
+    /// converged (or exhausted retries), so stale local state cannot race ahead.
+    var reseedAfterAttempt: Bool
 
     init(allowEmpty: Bool = false, changedRooms: [String] = [],
-         deletedRooms: [String] = []) {
+         deletedRooms: [String] = [], reseedAfterAttempt: Bool = false) {
         self.allowEmpty = allowEmpty
         self.changedRooms = Self.unique(changedRooms)
         self.deletedRooms = Self.unique(deletedRooms)
+        self.reseedAfterAttempt = reseedAfterAttempt
     }
 
     var hasExplicitEdits: Bool { !changedRooms.isEmpty || !deletedRooms.isEmpty }
@@ -49,7 +70,8 @@ struct RoomProjectionSyncJob: Equatable, Sendable {
     func merging(_ newer: Self) -> Self {
         Self(allowEmpty: allowEmpty || newer.allowEmpty,
              changedRooms: changedRooms + newer.changedRooms,
-             deletedRooms: deletedRooms + newer.deletedRooms)
+             deletedRooms: deletedRooms + newer.deletedRooms,
+             reseedAfterAttempt: reseedAfterAttempt || newer.reseedAfterAttempt)
     }
 
     private static func unique(_ values: [String]) -> [String] {
@@ -63,22 +85,24 @@ struct RoomProjectionSyncJob: Equatable, Sendable {
 /// can replace only these boundaries without inventing a gateway transport.
 @MainActor
 struct RoomProjectionSyncOperations {
-    typealias LeasedOperation = @MainActor @Sendable () async throws -> Void
+    typealias LeasedOperation = @MainActor @Sendable (
+        RoomProjectionLeasedTarget
+    ) async throws -> Void
 
     var targets: (AppModel) async -> [RoomProjectionSyncTarget]
     var withTargetLease: (AppModel, RoomProjectionSyncTarget,
                           @escaping LeasedOperation) async throws -> Void
-    var read: (AppModel, RoomProjectionSyncTarget) async throws
+    var read: (RoomProjectionLeasedTarget) async throws
         -> RoomProjectionRemoteState
     var localProjection: (_ updatedAt: UInt64) async throws
         -> RoomProjectionEnvelope
     var reconcile: (_ incoming: RoomProjectionEnvelope,
                     _ target: RoomProjectionSyncTarget,
                     _ preservingKeys: Set<String>) async throws -> Void
-    var writeCAS: (AppModel, RoomProjectionSyncTarget, String,
+    var writeCAS: (RoomProjectionLeasedTarget, String,
                    RoomProjectionEnvelope, Int) async throws
         -> ProfileConfigureResult
-    var writeLegacy: (AppModel, RoomProjectionSyncTarget, String,
+    var writeLegacy: (RoomProjectionLeasedTarget, String,
                       RoomProjectionEnvelope) async throws -> [String: Bool]
     var sleep: (Duration) async throws -> Void
     var nowMilliseconds: () -> UInt64
@@ -109,16 +133,19 @@ struct RoomProjectionSyncOperations {
                 .withCommandConnectionAndTrafficLease(
                     snapshot, for: target.gatewayID
                 ) { @MainActor in
-                    try await operation()
+                    try await operation(RoomProjectionLeasedTarget(
+                        target: target, client: snapshot.client,
+                        connectionGeneration: snapshot.generation))
                     return true
                 }
             guard completed == true else { throw CancellationError() }
         },
-        read: { model, target in
-            let client = try await model.routedClient(gatewayID: target.gatewayID)
+        read: { leased in
+            guard let client = leased.client else { throw CancellationError() }
             let profiles = try await client.listProfiles(includeSessions: false)
-            let profile = profiles.first { $0.name == "default" }
-                ?? profiles.first(where: \.isDefault)
+            let profile = profiles.first {
+                RoomProjectionSyncOperations.isExactDefaultProfileName($0.name)
+            }
             guard let profile else {
                 return RoomProjectionRemoteState(
                     projection: nil, supportsCAS: false)
@@ -140,15 +167,15 @@ struct RoomProjectionSyncOperations {
             try await RoomProjectionRuntime.productionReconcile(
                 incoming, preservingKeys: preservingKeys)
         },
-        writeCAS: { model, target, profileName, projection, expected in
-            let client = try await model.routedClient(gatewayID: target.gatewayID)
+        writeCAS: { leased, profileName, projection, expected in
+            guard let client = leased.client else { throw CancellationError() }
             let edit = ProfileEdit(
                 uiMeta: projection.uiMetaPatch,
                 uiMetaExpectedRevisions: [RoomProjectionEnvelope.metadataKey: expected])
             return try await client.applyProfileEditResult(name: profileName, edit)
         },
-        writeLegacy: { model, target, profileName, projection in
-            let client = try await model.routedClient(gatewayID: target.gatewayID)
+        writeLegacy: { leased, profileName, projection in
+            guard let client = leased.client else { throw CancellationError() }
             return try await client.applyProfileEdit(
                 name: profileName, ProfileEdit(uiMeta: projection.uiMetaPatch))
         },
@@ -159,6 +186,10 @@ struct RoomProjectionSyncOperations {
             return milliseconds >= Double(UInt64.max)
                 ? UInt64.max : UInt64(milliseconds.rounded(.towardZero))
         })
+
+    static func isExactDefaultProfileName(_ name: String) -> Bool {
+        name == "default"
+    }
 }
 
 private enum RoomProjectionSyncFailure: Error {
@@ -193,6 +224,7 @@ final class RoomProjectionRuntime {
     private var workers: [String: TaskSlot] = [:]
     private var retryTasks: [String: TaskSlot] = [:]
     private var retryCounts: [String: Int] = [:]
+    private var reseedRequestGenerations: [String: UInt64] = [:]
 
     convenience init() {
         self.init(operations: .production)
@@ -261,18 +293,27 @@ final class RoomProjectionRuntime {
     /// its projection is observed before the debounced all-gateway reseed. The
     /// lane itself still performs the same serialized pull/merge transaction.
     func pullAndReseed(model: AppModel, gatewayID: String) async {
+        let expectedGeneration = generation
+        reseedRequestGenerations[gatewayID, default: 0] &+= 1
+        let expectedReseedGeneration = reseedRequestGenerations[gatewayID, default: 0]
+        suppressedGatewayIDs.remove(gatewayID)
         let targets = await operations.targets(model)
+        guard !Task.isCancelled,
+              generation == expectedGeneration,
+              reseedRequestGenerations[gatewayID, default: 0]
+                == expectedReseedGeneration,
+              !suppressedGatewayIDs.contains(gatewayID) else { return }
         guard let target = targets.first(where: { $0.gatewayID == gatewayID }) else {
             return
         }
-        suppressedGatewayIDs.remove(gatewayID)
-        enqueue(RoomProjectionSyncJob(), target: target, model: model)
-        schedule(model: model)
+        enqueue(RoomProjectionSyncJob(reseedAfterAttempt: true),
+                target: target, model: model)
     }
 
     func cancel(gatewayID: String) {
         suppressedGatewayIDs.insert(gatewayID)
         laneGenerations[gatewayID, default: 0] &+= 1
+        reseedRequestGenerations[gatewayID, default: 0] &+= 1
         workers[gatewayID]?.task.cancel()
         retryTasks[gatewayID]?.task.cancel()
         workers[gatewayID] = nil
@@ -297,6 +338,7 @@ final class RoomProjectionRuntime {
         workers.removeAll()
         retryTasks.removeAll()
         retryCounts.removeAll()
+        reseedRequestGenerations.removeAll()
         laneGenerations.removeAll()
         suppressedGatewayIDs.removeAll()
     }
@@ -359,9 +401,9 @@ final class RoomProjectionRuntime {
             try await RoomMutationGate.shared.withLock(
                 "room-projection-sync:\(gatewayID)"
             ) {
-                try await operations.withTargetLease(model, target) {
+                try await operations.withTargetLease(model, target) { leased in
                     try await self.perform(
-                        job: job, target: target, model: model,
+                        job: job, leased: leased,
                         generation: expectedGeneration,
                         laneGeneration: expectedLaneGeneration,
                         workerToken: token)
@@ -372,6 +414,7 @@ final class RoomProjectionRuntime {
                                   laneGeneration: expectedLaneGeneration) else { return }
             workers[gatewayID] = nil
             retryCounts[gatewayID] = nil
+            if job.reseedAfterAttempt { schedule(model: model) }
             startWorkerIfNeeded(gatewayID: gatewayID, model: model)
         } catch {
             guard workerIsCurrent(gatewayID: gatewayID, token: token,
@@ -382,6 +425,7 @@ final class RoomProjectionRuntime {
             let retries = (retryCounts[gatewayID] ?? 0) + 1
             if retries > maximumRetries {
                 retryCounts[gatewayID] = nil
+                if job.reseedAfterAttempt { schedule(model: model) }
                 // A newer job queued while this attempt was suspended remains
                 // independent and must not be discarded with the capped one.
                 startWorkerIfNeeded(gatewayID: gatewayID, model: model)
@@ -398,13 +442,13 @@ final class RoomProjectionRuntime {
     }
 
     private func perform(job: RoomProjectionSyncJob,
-                         target: RoomProjectionSyncTarget,
-                         model: AppModel,
+                         leased: RoomProjectionLeasedTarget,
                          generation expectedGeneration: UInt64,
                          laneGeneration expectedLaneGeneration: UInt64,
                          workerToken: UUID) async throws {
+        let target = leased.target
         let gatewayID = target.gatewayID
-        let remote = try await operations.read(model, target)
+        let remote = try await operations.read(leased)
         try ensureWorkerCurrent(gatewayID: gatewayID, token: workerToken,
                                 generation: expectedGeneration,
                                 laneGeneration: expectedLaneGeneration)
@@ -427,7 +471,9 @@ final class RoomProjectionRuntime {
                                 laneGeneration: expectedLaneGeneration)
         // A fresh install with no local cache pulls, but does not publish an
         // empty value. Explicit final-room deletion opts in through allowEmpty.
-        guard !local.rooms.isEmpty || job.allowEmpty else { return }
+        guard !local.rooms.isEmpty || !local.deleted.isEmpty || job.allowEmpty else {
+            return
+        }
 
         let (writeRevision, overflow) = remote.revision.addingReportingOverflow(1)
         guard !overflow, writeRevision >= 0,
@@ -450,7 +496,7 @@ final class RoomProjectionRuntime {
 
         if remote.supportsCAS {
             let result = try await operations.writeCAS(
-                model, target, remote.profileName, merged, remote.revision)
+                leased, remote.profileName, merged, remote.revision)
             let expected = [RoomProjectionEnvelope.metadataKey: remote.revision]
             guard ProfileUIMetaCASPolicy.confirmsCommit(
                 expectedRevisions: expected, result: result) else {
@@ -458,7 +504,7 @@ final class RoomProjectionRuntime {
             }
         } else {
             let applied = try await operations.writeLegacy(
-                model, target, remote.profileName, merged)
+                leased, remote.profileName, merged)
             let edit = ProfileEdit(uiMeta: merged.uiMetaPatch)
             guard edit.wasFullyApplied(applied) else {
                 throw RoomProjectionSyncFailure.rejectedLegacy
@@ -471,7 +517,7 @@ final class RoomProjectionRuntime {
         // A configure acknowledgement is not the convergence boundary. Always
         // read the profile again and fold the authoritative result into local
         // storage, preserving edits that arrived while configure was suspended.
-        let confirmed = try await operations.read(model, target)
+        let confirmed = try await operations.read(leased)
         try ensureWorkerCurrent(gatewayID: gatewayID, token: workerToken,
                                 generation: expectedGeneration,
                                 laneGeneration: expectedLaneGeneration)
