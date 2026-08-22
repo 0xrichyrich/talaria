@@ -472,8 +472,12 @@ extension AppModel {
         return true
     }
 
-    private func openAuthoritativeExactStoredSession(
-        _ route: ExactStoredSessionRoute
+    /// Awaited transactional entry point for an already source-qualified
+    /// in-app child, shared with message-level branch creation.
+    func openAuthoritativeExactStoredSession(
+        _ route: ExactStoredSessionRoute,
+        validateImmediatelyBeforeBinding:
+            (@MainActor () async throws -> Void)? = nil
     ) async throws {
         let registry = ConnectionRegistry.shared
         let pool = registry.clientPool
@@ -518,7 +522,8 @@ extension AppModel {
             let wasPrimary = route.gatewayID == activeGatewayID
             try await requireExactStoredSessionSourceCurrent(
                 route, snapshot: snapshot, wasPrimary: wasPrimary)
-            let profiles = try await snapshot.client.listProfiles(includeSessions: false)
+            let profiles = try await exactOpenProfiles(
+                client: snapshot.client, route: route)
             try ExactStoredSessionRouteAuthority.requireCurrent(
                 route, profileNames: profiles.map(\.name))
             try await requireExactStoredSessionSourceCurrent(
@@ -527,6 +532,12 @@ extension AppModel {
             let botID = route.rosterID(activeGatewayID: wasPrimary ? route.gatewayID : nil)
             guard stateRoute(for: botID) == route.botRoute else {
                 throw CancellationError()
+            }
+            let resumeForTesting: (@MainActor () async throws -> LiveSession)?
+            if let override = SessionsRuntime.shared.exactOpenResumeForTesting {
+                resumeForTesting = { try await override(snapshot.client, route) }
+            } else {
+                resumeForTesting = nil
             }
             let opened = try await openStoredSessionAwaiting(
                 route.storedSessionID,
@@ -537,12 +548,15 @@ extension AppModel {
                     guard let self else { throw CancellationError() }
                     try await self.requireExactStoredSessionSourceCurrent(
                         route, snapshot: snapshot, wasPrimary: wasPrimary)
-                    let current = try await snapshot.client.listProfiles(includeSessions: false)
+                    let current = try await self.exactOpenProfiles(
+                        client: snapshot.client, route: route)
                     try ExactStoredSessionRouteAuthority.requireCurrent(
                         route, profileNames: current.map(\.name))
                     try await self.requireExactStoredSessionSourceCurrent(
                         route, snapshot: snapshot, wasPrimary: wasPrimary)
                 },
+                validateImmediatelyBeforeBinding: validateImmediatelyBeforeBinding,
+                resumeForTesting: resumeForTesting,
                 sourceSnapshot: snapshot)
             guard opened,
                   openBotID == botID,
@@ -557,6 +571,15 @@ extension AppModel {
             await pool.release(poolLease)
             throw error
         }
+    }
+
+    private func exactOpenProfiles(
+        client: GatewayClient, route: ExactStoredSessionRoute
+    ) async throws -> [HermesProfile] {
+        if let override = SessionsRuntime.shared.exactOpenProfilesForTesting {
+            return try await override(client, route)
+        }
+        return try await client.listProfiles(includeSessions: false)
     }
 
     private func requireExactStoredSessionSourceCurrent(

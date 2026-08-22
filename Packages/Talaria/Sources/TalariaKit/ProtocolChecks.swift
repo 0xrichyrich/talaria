@@ -32,6 +32,7 @@ public enum ProtocolChecks {
         try toastPairing()
         try botModeNotices()
         try transcriptActing()
+        try messageBranching()
     }
 
     static func eventEnvelopeDecoding() throws {

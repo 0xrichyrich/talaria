@@ -211,8 +211,9 @@ Gateway Operations maintenance, files/git/projects, live pet presentation,
 Bot Mode kickoff, response-ready APNs delivery, native motion, the
 attachment-source redesign, and the current-Hermes contract corrections merged
 in PR #31; later reviewed slices add notification/session authority, cron
-reasoning effort, shared-room projection/CAS, and authenticated Advanced
-Terminal. Granular-ledger regeneration, remaining portable surfaces, App Store
+reasoning effort, shared-room projection/CAS, authenticated Advanced Terminal,
+and exact-source message-level child creation. Granular-ledger regeneration,
+remaining portable surfaces, App Store
 release, and independent live-gateway/device certification remain outstanding.
 
 Every item below ships as one or more independently reviewable PRs. A checked
@@ -243,8 +244,9 @@ partial until the unchecked certification gates are recorded.
 - [ ] Finish rich transcripts and full session interaction controls.
       Default working presentation is an animated agent avatar; tool activity
       and gateway-exposed reasoning summaries are opt-in advanced views.
-      Multiline full-width capped composition and edit/rewind/regenerate are
-      implemented; remaining work includes branch navigation, persistent rich
+      Multiline full-width capped composition, edit/rewind/regenerate, and
+      message-level child creation are implemented; remaining work includes the
+      N/M alternative-branch picker and lineage presentation, persistent rich
       media, grouped tool runs, advanced renderers, per-message TTS/timing, and
       a durable prompt queue.
 - [ ] Finish mobile management for providers, models, profiles, tools, skills,

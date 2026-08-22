@@ -240,6 +240,17 @@ private struct ProfileLifecycleMutationRollback {
 }
 
 extension AppModel {
+    /// Focused race-test seam: model a lifecycle mutation winning across an
+    /// RPC await without invoking a real profile filesystem operation.
+    func invalidateProfileLifecycleRouteForTesting(_ route: GatewayBotRoute) {
+        ProfileLifecycleRuntime.shared.block(route)
+    }
+
+    func clearProfileLifecycleRouteForTesting(_ route: GatewayBotRoute) {
+        ProfileLifecycleRuntime.shared.blockedRoutes.remove(route)
+        ProfileLifecycleRuntime.shared.routeGenerations.removeValue(forKey: route)
+    }
+
     /// Capture one route generation before an async profile-owned operation.
     /// Lifecycle mutation blocks the route and bumps this generation before it
     /// can retire the socket; completions must re-check before publishing.

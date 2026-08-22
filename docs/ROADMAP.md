@@ -368,8 +368,9 @@ create/edit/clone/run certification cases.
 
 ### 5. Remaining transcript and session depth
 
-Message edit, rewind/restore, and regenerate are implemented. Remaining depth
-includes branch navigation, persistent multimodal parts and generated-media
-lightboxes, grouped tool runs, diff/ANSI/search/math/diagram presentation,
-per-message TTS and timing, and the durable prompt queue. These should be split
+Message edit, rewind/restore, regenerate, and message-level child creation are
+implemented. Remaining depth includes the N/M alternative-branch picker and
+lineage presentation, persistent multimodal parts and generated-media lightboxes,
+grouped tool runs, diff/ANSI/search/math/diagram presentation, per-message TTS
+and timing, and the durable prompt queue. These should be split
 into independently reviewed slices after the certification critical path.

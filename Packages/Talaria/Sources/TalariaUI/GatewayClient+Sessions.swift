@@ -111,7 +111,45 @@ public struct SessionBranch: Sendable {
         storedSessionID = v["stored_session_id"]?.stringValue ?? ""
         title = v["title"]?.stringValue ?? ""
         parent = v["parent"]?.stringValue ?? ""
-        messageCount = v["message_count"]?.intValue ?? 0
+        messageCount = v["message_count"]?.doubleValue.flatMap(Int.init(exactly:)) ?? -1
+    }
+}
+
+/// The success envelope is the only proof that `session.branch` produced the
+/// child Talaria asked for. A malformed/wrong-parent/count response is an
+/// ambiguous mutation outcome: never open it and never replay the write.
+enum SessionBranchAckAuthority {
+    static func requireExact(_ branch: SessionBranch,
+                             parentRuntimeSessionID: String,
+                             parentStoredSessionID: String,
+                             requestedCount: Int) throws {
+        let trim = CharacterSet.whitespacesAndNewlines
+        guard requestedCount > 0,
+              !branch.sessionID.isEmpty,
+              branch.sessionID == branch.sessionID.trimmingCharacters(in: trim),
+              !branch.storedSessionID.isEmpty,
+              branch.storedSessionID
+                == branch.storedSessionID.trimmingCharacters(in: trim) else {
+            throw AckValidationError(
+                operation: "Branch session",
+                detail: "Hermes returned no usable child session identity.")
+        }
+        guard branch.sessionID != parentRuntimeSessionID,
+              branch.storedSessionID != parentStoredSessionID else {
+            throw AckValidationError(
+                operation: "Branch session",
+                detail: "Hermes returned the parent as the branch child.")
+        }
+        guard branch.parent == parentStoredSessionID else {
+            throw AckValidationError(
+                operation: "Branch session",
+                detail: "Hermes returned a different parent session identity.")
+        }
+        guard branch.messageCount == requestedCount else {
+            throw AckValidationError(
+                operation: "Branch session",
+                detail: "Hermes returned a different branch message count.")
+        }
     }
 }
 

@@ -57,6 +57,16 @@ final class SessionsRuntime {
     /// production path has no pause here; the seam makes sign-out/remove race
     /// ordering explicit without opening a real gateway socket.
     var exactOpenAfterPoolLeaseForTesting: (@MainActor (String) async -> Void)?
+    /// Lower-wire seams that keep exact-open transaction and authority logic
+    /// intact in focused races without requiring a live Hermes transport.
+    var exactOpenProfilesForTesting:
+        (@MainActor (GatewayClient, ExactStoredSessionRoute) async throws -> [HermesProfile])?
+    var exactOpenResumeForTesting:
+        (@MainActor (GatewayClient, ExactStoredSessionRoute) async throws -> LiveSession)?
+    /// Lower network-boundary seam for exact-source list recovery tests. The
+    /// production authority checks and publication path remain intact.
+    var listSessionsForTesting:
+        (@MainActor (GatewayClient, String) async throws -> [StoredSession])?
 
     static func key(botID: String, sessionID: String) -> String {
         botID + "\u{0}" + sessionID
@@ -119,6 +129,29 @@ private struct StoredSessionOpenAttempt {
     var connectionGeneration: Int
 }
 
+/// Immutable authority for publishing a session-list reconciliation from one
+/// captured source. Foreign sources cannot use `AppModel.client` identity —
+/// that is the primary — so their captured pool generation is load-bearing.
+struct ExactSessionListRefreshAuthority {
+    var route: GatewayBotRoute
+    var client: GatewayClient
+    var snapshot: GatewayClientPool.ConnectionSnapshot
+    var lifecycle: ProfileLifecycleGenerationToken
+    var connectionGeneration: Int
+    var savedURLString: String
+    var wasPrimary: Bool
+    var chatID: ObjectIdentifier
+    var sessionID: String
+    var storedSessionID: String
+}
+
+private struct ExactSessionControlLease {
+    var claim: SessionControlMutationClaim
+    var lifecycle: ProfileLifecycleGenerationToken
+    var chatID: ObjectIdentifier
+    var connectionGeneration: Int
+}
+
 /// The result of a session action, ready to render as one themed line plus an
 /// optional detail line.
 public struct SessionActionOutcome: Sendable, Equatable {
@@ -171,34 +204,100 @@ extension AppModel {
                   gatewayRoute(for: botID) == route,
                   self.client.map(ObjectIdentifier.init) == ObjectIdentifier(client),
                   chats[botID].map({ ObjectIdentifier($0) == chatID }) == true else { return }
-            var summaries: [SessionSummary] = []
-            summaries.reserveCapacity(rows.count)
-            for row in rows where !row.id.isEmpty {
-                let preview = (row.preview ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if preview.isEmpty {
-                    runtime.previews[SessionsRuntime.key(botID: botID, sessionID: row.id)] = nil
-                } else {
-                    runtime.previews[SessionsRuntime.key(botID: botID, sessionID: row.id)] = preview
-                }
-                // The event overlay wins: an auto-title that landed since the
-                // list was built is newer than the row we just fetched.
-                let title = runtime.titles[SessionsRuntime.key(botID: botID, sessionID: row.id)]
-                    ?? (row.title.isEmpty
-                        ? GatewayClient.fallbackTitle(id: row.id, preview: preview)
-                        : row.title)
-                summaries.append(SessionSummary(id: row.id, title: title,
-                                                when: SessionClock.stamp(row.startedAt),
-                                                messageCount: row.messageCount))
-            }
-            chat(for: botID).storedSessions = summaries
-            // The bot sheet's "Recent sessions" group reads `sessions[botID]`
-            // (the demo-shaped index) — keep both in step so it goes live too.
-            sessions[botID] = summaries
-            runtime.loadErrors[botID] = nil
+            publishSessionRows(rows, botID: botID)
         } catch {
             guard profileLifecycleAccepts(lifecycle) else { return }
             runtime.loadErrors[botID] = Self.sessionFailure(error, theme: theme)
         }
+    }
+
+    /// Reconcile the session list through the exact source already used by a
+    /// mutation. This is the recovery path after an ambiguous branch receipt
+    /// or a created child that could not be opened. It never re-resolves the
+    /// client through the active primary and therefore works for foreign bots.
+    @discardableResult
+    func refreshSessionsFromExactSource(
+        botID: String, authority: ExactSessionListRefreshAuthority
+    ) async -> Bool {
+        let runtime = SessionsRuntime.shared
+        guard await exactSessionListRefreshIsCurrent(
+            botID: botID, authority: authority) else { return false }
+        do {
+            let rows: [StoredSession]
+            if let override = runtime.listSessionsForTesting {
+                rows = try await override(authority.client, authority.route.profile)
+            } else {
+                rows = try await authority.client.listSessions(
+                    limit: 200, profile: authority.route.profile, includeHidden: true)
+            }
+            guard await exactSessionListRefreshIsCurrent(
+                botID: botID, authority: authority) else { return false }
+            publishSessionRows(rows, botID: botID)
+            return true
+        } catch {
+            guard await exactSessionListRefreshIsCurrent(
+                botID: botID, authority: authority) else { return false }
+            runtime.loadErrors[botID] = Self.sessionFailure(error, theme: theme)
+            return false
+        }
+    }
+
+    private func exactSessionListRefreshIsCurrent(
+        botID: String, authority: ExactSessionListRefreshAuthority
+    ) async -> Bool {
+        guard await ConnectionRegistry.shared.clientPool.isCurrent(
+            authority.snapshot, for: authority.route.gatewayID) else { return false }
+        let nowPrimary = authority.route.gatewayID == activeGatewayID
+        let expectedBotID = nowPrimary
+            ? authority.route.profile : authority.route.qualifiedID
+        guard mode == .live,
+              nowPrimary == authority.wasPrimary,
+              botID == expectedBotID,
+              gatewayRoute(for: botID) == authority.route,
+              stateRoute(for: botID) == authority.route,
+              profileLifecycleAccepts(authority.lifecycle),
+              !exactStoredSessionSourceIsInvalidated(
+                gatewayID: authority.route.gatewayID),
+              let saved = ConnectionRegistry.shared.saved.first(where: {
+                  $0.id == authority.route.gatewayID
+                    && $0.urlString == authority.savedURLString
+              }), ConnectionRegistry.shared.credential(for: saved) != nil,
+              let chat = chats[botID],
+              ObjectIdentifier(chat) == authority.chatID,
+              chat.sessionID == authority.sessionID,
+              chat.storedSessionID == authority.storedSessionID else { return false }
+        if nowPrimary {
+            guard LiveRuntime.shared.generation == authority.connectionGeneration,
+                  client.map(ObjectIdentifier.init)
+                    == ObjectIdentifier(authority.client) else { return false }
+        }
+        return true
+    }
+
+    private func publishSessionRows(_ rows: [StoredSession], botID: String) {
+        let runtime = SessionsRuntime.shared
+        var summaries: [SessionSummary] = []
+        summaries.reserveCapacity(rows.count)
+        for row in rows where !row.id.isEmpty {
+            let preview = (row.preview ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = SessionsRuntime.key(botID: botID, sessionID: row.id)
+            runtime.previews[key] = preview.isEmpty ? nil : preview
+            // The event overlay wins: an auto-title that landed since the
+            // list was built is newer than the row we just fetched.
+            let title = runtime.titles[key]
+                ?? (row.title.isEmpty
+                    ? GatewayClient.fallbackTitle(id: row.id, preview: preview)
+                    : row.title)
+            summaries.append(SessionSummary(
+                id: row.id, title: title, when: SessionClock.stamp(row.startedAt),
+                messageCount: row.messageCount))
+        }
+        chat(for: botID).storedSessions = summaries
+        // The bot sheet's "Recent sessions" group reads `sessions[botID]`
+        // (the demo-shaped index) — keep both in step so it goes live too.
+        sessions[botID] = summaries
+        runtime.loadErrors[botID] = nil
     }
 
     /// Why the last `refreshSessions` failed, in the current theme's voice.
@@ -269,6 +368,8 @@ extension AppModel {
         _ id: String, botID: String, route: GatewayBotRoute,
         client: GatewayClient,
         validateBeforeBinding: @escaping @MainActor () async throws -> Void,
+        validateImmediatelyBeforeBinding:
+            (@MainActor () async throws -> Void)? = nil,
         resumeForTesting: (@MainActor () async throws -> LiveSession)? = nil,
         catchUpResumeForTesting:
             (@MainActor () async throws -> (LiveSession, UInt64))? = nil,
@@ -393,6 +494,15 @@ extension AppModel {
 
         let attempt: StoredSessionOpenAttempt
         do {
+            // Some callers own additional state outside the destination
+            // source itself. Run that authority check after every open
+            // preflight await and immediately before the synchronous visible
+            // commit; there must be no actor hop between this return and
+            // beginStoredSessionOpen.
+            if let validateImmediatelyBeforeBinding {
+                try await validateImmediatelyBeforeBinding()
+            }
+            try Task.checkCancellation()
             attempt = try beginStoredSessionOpen(
                 id, botID: botID,
                 exactSource: StoredSessionOpenSource(
@@ -841,15 +951,28 @@ extension AppModel {
     /// opened, so the conversation the user is reading never changes under
     /// them.
     public func branchSession(botID: String) async -> SessionActionOutcome {
-        guard let sid = await liveSessionID(botID: botID) else { return needsLiveSession }
-        guard let route = gatewayRoute(for: botID),
-              let client = try? await routedClient(for: route) else { return needsLiveSession }
-        let generation = LiveRuntime.shared.generation
+        guard let lease = await beginSessionControlMutation(
+            botID: botID, kind: .wholeSessionBranch) else { return needsLiveSession }
+        defer {
+            SessionMutationCoordinator.shared.release(lease.claim)
+            drainPendingMutationWork(botID: botID)
+        }
+        if let hook = SessionMutationCoordinator.shared.afterClaimForTesting {
+            await hook(lease.claim)
+        }
+        guard sessionControlAuthorityIsCurrent(lease) else { return needsLiveSession }
+        let route = lease.claim.target.route
+        guard let client = try? await routedClient(for: route),
+              sessionControlAuthorityIsCurrent(lease) else { return needsLiveSession }
         do {
-            let branch = try await client.branchSession(sid)
-            guard LiveRuntime.shared.generation == generation,
-                  gatewayRoute(for: botID) == route,
-                  chats[botID]?.sessionID == sid else { return needsLiveSession }
+            let branch: SessionBranch
+            if let override = SessionMutationCoordinator.shared.wholeBranchForTesting {
+                branch = try await override(client, lease.claim.target.runtimeSessionID)
+            } else {
+                branch = try await client.branchSession(
+                    lease.claim.target.runtimeSessionID)
+            }
+            guard sessionControlAuthorityIsCurrent(lease) else { return needsLiveSession }
             await refreshSessions(botID: botID)
             return SessionActionOutcome(
                 ok: true,
@@ -864,15 +987,28 @@ extension AppModel {
     /// Manual compaction, with the gateway's own before/after summary. The
     /// compacted transcript replaces the local one, matching desktop.
     public func compressSession(botID: String) async -> SessionActionOutcome {
-        guard let sid = await liveSessionID(botID: botID) else { return needsLiveSession }
-        guard let route = gatewayRoute(for: botID),
-              let client = try? await routedClient(for: route) else { return needsLiveSession }
-        let generation = LiveRuntime.shared.generation
+        guard let lease = await beginSessionControlMutation(
+            botID: botID, kind: .compression) else { return needsLiveSession }
+        defer {
+            SessionMutationCoordinator.shared.release(lease.claim)
+            drainPendingMutationWork(botID: botID)
+        }
+        if let hook = SessionMutationCoordinator.shared.afterClaimForTesting {
+            await hook(lease.claim)
+        }
+        guard sessionControlAuthorityIsCurrent(lease) else { return needsLiveSession }
+        let route = lease.claim.target.route
+        guard let client = try? await routedClient(for: route),
+              sessionControlAuthorityIsCurrent(lease) else { return needsLiveSession }
         do {
-            let result = try await client.compressSession(sid)
-            guard LiveRuntime.shared.generation == generation,
-                  gatewayRoute(for: botID) == route,
-                  chats[botID]?.sessionID == sid else { return needsLiveSession }
+            let result: SessionCompression
+            if let override = SessionMutationCoordinator.shared.compressionForTesting {
+                result = try await override(client, lease.claim.target.runtimeSessionID)
+            } else {
+                result = try await client.compressSession(
+                    lease.claim.target.runtimeSessionID)
+            }
+            guard sessionControlAuthorityIsCurrent(lease) else { return needsLiveSession }
             if !result.messages.isEmpty {
                 let rebuilt = Self.chatMessages(fromTranscript: .array(result.messages))
                 if !rebuilt.isEmpty { chat(for: botID).messages = rebuilt }
@@ -923,6 +1059,54 @@ extension AppModel {
 
     private var needsLiveSession: SessionActionOutcome {
         SessionActionOutcome(ok: false, headline: theme.copy.sessNoLiveSession(theme.themeID))
+    }
+
+    private func beginSessionControlMutation(
+        botID: String, kind: SessionControlMutationKind
+    ) async -> ExactSessionControlLease? {
+        guard let sessionID = await liveSessionID(botID: botID),
+              let route = gatewayRoute(for: botID),
+              stateRoute(for: botID) == route,
+              let lifecycle = profileLifecycleGenerationToken(for: botID),
+              lifecycle.route == route,
+              profileLifecycleAccepts(lifecycle),
+              let chat = chats[botID],
+              chat.sessionID == sessionID,
+              let storedSessionID = chat.storedSessionID,
+              let target = ExactSessionMutationTarget(
+                route: route, runtimeSessionID: sessionID,
+                storedSessionID: storedSessionID),
+              !chat.isRunning, !chat.isTyping,
+              !LiveRuntime.shared.workingBotIDs.contains(botID),
+              sessionMutationAdmissionIsAvailable(botID: botID, target: target),
+              let claim = SessionMutationCoordinator.shared.acquire(
+                target, botID: botID, kind: kind) else { return nil }
+        return ExactSessionControlLease(
+            claim: claim, lifecycle: lifecycle,
+            chatID: ObjectIdentifier(chat),
+            connectionGeneration: LiveRuntime.shared.generation)
+    }
+
+    private func sessionControlAuthorityIsCurrent(
+        _ lease: ExactSessionControlLease
+    ) -> Bool {
+        let claim = lease.claim
+        guard SessionMutationCoordinator.shared.owns(claim),
+              mode == .live,
+              LiveRuntime.shared.generation == lease.connectionGeneration,
+              gatewayRoute(for: claim.botID) == claim.target.route,
+              stateRoute(for: claim.botID) == claim.target.route,
+              profileLifecycleAccepts(lease.lifecycle),
+              let chat = chats[claim.botID],
+              ObjectIdentifier(chat) == lease.chatID,
+              chat.sessionID == claim.target.runtimeSessionID,
+              chat.storedSessionID == claim.target.storedSessionID,
+              !chat.isRunning, !chat.isTyping,
+              !LiveRuntime.shared.workingBotIDs.contains(claim.botID),
+              !turnMutationIsActive(botID: claim.botID, target: claim.target) else {
+            return false
+        }
+        return true
     }
 
     // MARK: - Cross-session search
