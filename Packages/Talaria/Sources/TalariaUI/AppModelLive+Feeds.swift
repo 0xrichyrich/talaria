@@ -72,10 +72,31 @@ final class FeedsRuntime {
     // Artifacts
     /// artifact id → the session that produced it.
     @ObservationIgnored var artifactSessions: [String: SessionRef] = [:]
+    /// Per retained gateway, the strongest truth the most recent exact-source
+    /// pass established. `complete` is representable for a future upstream
+    /// contract, but pinned Hermes' bounded session window cannot establish it.
+    @ObservationIgnored var artifactDiscoveryStatus: [String: ArtifactDiscoveryStatus] = [:]
+    @ObservationIgnored var artifactScannedSessions: [String: Int] = [:]
     var artifactsNote = ""
     var artifactsScanning = false
     @ObservationIgnored var artifactsTask: Task<Void, Never>?
+    @ObservationIgnored var artifactsTaskID: UUID?
+    @ObservationIgnored var artifactScanGeneration: UInt64 = 0
     @ObservationIgnored var lastArtifactScan: Date?
+
+    // Focused deterministic seams. They replace only network reads; captured
+    // pool, registry, lifecycle, scan-generation and publication fences remain
+    // on the production path in tests.
+    @ObservationIgnored var artifactProfilesReadForTesting:
+        ((String, GatewayClient) async throws -> [String])?
+    @ObservationIgnored var artifactSessionsReadForTesting:
+        ((String, String, GatewayClient, Int) async throws -> ArtifactSessionListWindow)?
+    @ObservationIgnored var artifactTranscriptReadForTesting:
+        ((String, String, ArtifactDiscoverySession, GatewayClient, Int, Int)
+            async throws -> ArtifactTranscriptPage)?
+    @ObservationIgnored var artifactAfterAuthorityCaptureForTesting: (() async -> Void)?
+    @ObservationIgnored var artifactBeforePublicationForTesting:
+        ((String, GatewayClientPool.ConnectionSnapshot) async -> Void)?
 
     // Agent Inbox
     /// message id → the "Agent Inbox" session it was read from.
@@ -94,12 +115,16 @@ final class FeedsRuntime {
         cronPerProfile = false
         routinesNote = ""; routinesError = nil; lastRoutinesRefresh = nil
         routinesLoaded = false
-        artifactSessions.removeAll(); artifactsNote = ""; lastArtifactScan = nil
+        artifactSessions.removeAll(); artifactDiscoveryStatus.removeAll()
+        artifactScannedSessions.removeAll()
+        artifactsNote = ""; lastArtifactScan = nil
         // Inbox refs are gateway-qualified and may belong to retained
         // secondary clients. Primary teardown removes only its scope through
         // dropA2AScope; a primary client identity change must preserve remotes.
         inboxNote = ""; lastInboxScan = nil
-        artifactsTask?.cancel(); artifactsTask = nil
+        artifactScanGeneration &+= 1
+        artifactsTask?.cancel(); artifactsTask = nil; artifactsTaskID = nil
+        artifactsScanning = false
         inboxTask?.cancel(); inboxTask = nil
         routinesTask?.cancel(); routinesTask = nil
     }
@@ -133,6 +158,60 @@ struct SessionRef: Sendable, Equatable {
         let route = GatewayBotRoute(gatewayID: gatewayID, profile: profile)
         return route.gatewayID == activeGatewayID ? route.profile : route.qualifiedID
     }
+}
+
+/// Informational offset for the next exact transcript page. It is deliberately
+/// not a gallery cursor: the visible artifact ledger is globally capped, so a
+/// future continuation API must redesign metadata retention before exposing
+/// this as user-driven paging.
+struct ArtifactDiscoveryCursor: Sendable, Equatable {
+    var profile: String
+    var storedSessionID: String
+    var resolvedSessionID: String
+    var offset: Int
+}
+
+enum ArtifactDiscoveryStatus: Sendable, Equatable {
+    case complete
+    case incomplete(cursor: ArtifactDiscoveryCursor?, reason: String)
+    case failed(reason: String)
+    case stale(reason: String)
+}
+
+private struct ArtifactDiscoveryScanFence {
+    var generation: UInt64
+    var primaryGatewayID: String?
+    var primaryGeneration: Int
+    var primaryClient: GatewayClient?
+}
+
+private struct ArtifactDiscoverySourceAuthority {
+    var gatewayID: String
+    var snapshot: GatewayClientPool.ConnectionSnapshot
+    var registryURLString: String
+    var registryCredential: GatewayCredential
+    var scanFence: ArtifactDiscoveryScanFence
+    var profiles: [String]
+    var lifecycleTokens: [ProfileLifecycleGenerationToken]
+}
+
+private struct ArtifactDiscoverySourceResult {
+    var artifacts: [Artifact] = []
+    var refs: [String: SessionRef] = [:]
+    var scannedSessions = 0
+    var successfulSessionWindows = 0
+    var failures: [String] = []
+    var sessionWindowSaturated = false
+    var continuation: ArtifactDiscoveryCursor?
+
+    var hasUsableResult: Bool {
+        successfulSessionWindows > 0
+    }
+}
+
+private enum ArtifactDiscoveryPublication {
+    case result(ArtifactDiscoverySourceResult)
+    case failure(String)
 }
 
 /// One journal row. `ActivityItem` carries a display clock string only, so the
@@ -1187,113 +1266,561 @@ public extension AppModel {
     /// artifacts RPC — desktop derives the same index client-side from
     /// transcripts, and so does this (artifact-utils.ts parity).
     func refreshArtifacts(force: Bool = false) async {
-        guard mode == .live, !bots.isEmpty,
-              let sourceGatewayID = LiveRuntime.shared.gatewayID else { return }
-        let sourceGeneration = LiveRuntime.shared.generation
         let runtime = FeedsRuntime.shared
-        if runtime.artifactsScanning { return }
+        guard mode == .live, LiveRuntime.shared.gatewayID != nil, client != nil else { return }
+
+        if let existing = runtime.artifactsTask {
+            if !force {
+                await existing.value
+                return
+            }
+            // A forced refresh supersedes the prior owner. Its completion is
+            // fenced by task id + scan generation and cannot clear or throttle
+            // the replacement scan.
+            existing.cancel()
+        }
         if !force, let last = runtime.lastArtifactScan, last.timeIntervalSinceNow > -120 { return }
-        guard let (base, credential) = gatewayRESTContext(gatewayID: sourceGatewayID) else {
-            runtime.artifactsNote = theme.copy.needsRESTNote(theme.themeID)
-            return
-        }
-        let sourceClient: GatewayClient
-        do {
-            sourceClient = try await routedClient(gatewayID: sourceGatewayID)
-        } catch {
-            runtime.artifactsNote = error.localizedDescription
-            return
-        }
-        guard LiveRuntime.shared.gatewayID == sourceGatewayID,
-              LiveRuntime.shared.generation == sourceGeneration else { return }
 
-        // `bots` can momentarily contain retained/qualified rows while a
-        // gateway switch reconciles. Bind each sweep row to the captured source
-        // and pass Hermes only its raw profile name.
-        let sourceProfiles: [String] = bots.compactMap { bot in
-            Self.artifactSweepProfile(route: stateRoute(for: bot.id),
-                                      sourceGatewayID: sourceGatewayID)
-        }
-
+        runtime.artifactScanGeneration &+= 1
+        let scanGeneration = runtime.artifactScanGeneration
+        let taskID = UUID()
+        runtime.artifactsTaskID = taskID
         runtime.artifactsScanning = true
-        defer { runtime.artifactsScanning = false; runtime.lastArtifactScan = Date() }
+        let task = Task { @MainActor [self] in
+            let completed = await self.performArtifactDiscovery(scanGeneration: scanGeneration)
+            self.finishArtifactDiscovery(
+                taskID: taskID,
+                scanGeneration: scanGeneration,
+                completed: completed
+            )
+        }
+        runtime.artifactsTask = task
+        if Task.isCancelled { task.cancel() }
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
 
-        var found: [Artifact] = []
-        var refs: [String: SessionRef] = [:]
-        var scanned = 0
-        var failures = 0
+    private func performArtifactDiscovery(scanGeneration: UInt64) async -> Bool {
+        let runtime = FeedsRuntime.shared
+        let scanFence = ArtifactDiscoveryScanFence(
+            generation: scanGeneration,
+            primaryGatewayID: LiveRuntime.shared.gatewayID,
+            primaryGeneration: LiveRuntime.shared.generation,
+            primaryClient: client
+        )
+        guard artifactScanFenceAccepts(scanFence) else { return false }
 
-        // One transcript resident at a time: recent sessions run to thousands
-        // of rows and the phone pays for every one of them.
-        for profile in sourceProfiles.prefix(8) {
-            // The forever chat is where a bot does most of its work, and it is
-            // hidden — scanning without the flag indexes artifacts from every
-            // session EXCEPT the one that matters (methods_session.py:180-186).
-            guard let sessions = try? await sourceClient.listSessions(
-                limit: 6, profile: profile, includeHidden: true) else {
-                failures += 1
+        let registry = ConnectionRegistry.shared
+        let pool = registry.clientPool
+        // This single actor hop captures the complete already-retained set.
+        // It never routes through `connect` and therefore cannot dial.
+        let retained = await pool.retainedConnectionSnapshots()
+        guard artifactScanFenceAccepts(scanFence) else { return false }
+
+        var sources: [ArtifactDiscoverySourceAuthority] = []
+        var rejected: [(source: GatewayClientPool.RetainedConnectionSnapshot, reason: String)] = []
+        for retainedSource in retained {
+            guard let saved = registry.saved.first(
+                where: { $0.id == retainedSource.gatewayID }),
+                  let credential = registry.credential(for: saved) else {
+                rejected.append((retainedSource, "Registry authority is unavailable."))
                 continue
             }
-            for session in sessions.prefix(3) where session.messageCount > 0 {
-                guard !Task.isCancelled else { return }
-                do {
-                    let rows = try await GatewayREST.sessionMessages(
-                        baseURL: base, credential: credential,
-                        storedID: session.id, profile: profile, limit: 150)
-                    scanned += 1
-                    let title = session.title.isEmpty ? (session.preview ?? "session") : session.title
-                    let harvest = Self.artifacts(in: rows, botID: profile,
-                                                 sessionID: session.id, sessionTitle: title,
-                                                 sessionStart: session.startedAt,
-                                                 sourceGatewayID: sourceGatewayID)
-                    for artifact in harvest {
-                        refs[artifact.id] = SessionRef(gatewayID: sourceGatewayID,
-                                                       botID: profile,
-                                                       storedID: session.id)
-                    }
-                    found.append(contentsOf: harvest)
-                } catch {
-                    failures += 1
+            guard retainedSource.connection.baseURL?.absoluteString == saved.urlString else {
+                rejected.append((retainedSource, "Registry endpoint authority changed."))
+                continue
+            }
+            if retainedSource.gatewayID == scanFence.primaryGatewayID {
+                guard let primary = scanFence.primaryClient,
+                      ObjectIdentifier(primary)
+                        == ObjectIdentifier(retainedSource.connection.client) else {
+                    rejected.append((retainedSource, "Primary client authority changed."))
+                    continue
                 }
             }
+            let profiles = artifactDiscoveryProfiles(gatewayID: retainedSource.gatewayID)
+            let tokens = profiles.compactMap { profile -> ProfileLifecycleGenerationToken? in
+                let route = GatewayBotRoute(gatewayID: retainedSource.gatewayID, profile: profile)
+                let rosterID = route.gatewayID == scanFence.primaryGatewayID
+                    ? route.profile : route.qualifiedID
+                guard let token = profileLifecycleGenerationToken(for: rosterID),
+                      token.route == route else { return nil }
+                return token
+            }
+            guard tokens.count == profiles.count else {
+                rejected.append((retainedSource, "Profile lifecycle authority changed."))
+                continue
+            }
+            sources.append(ArtifactDiscoverySourceAuthority(
+                gatewayID: retainedSource.gatewayID,
+                snapshot: retainedSource.connection,
+                registryURLString: saved.urlString,
+                registryCredential: credential,
+                scanFence: scanFence,
+                profiles: profiles,
+                lifecycleTokens: tokens
+            ))
         }
 
-        // Live tool.complete ingestion may have added rows this sweep did not
-        // see (the transcript row is written after the event). Keep those, but
-        // match on bot + value, not id: the same file ingested live and swept
-        // from the transcript carries two different timestamps.
-        let swept = Set(found.map {
-            Self.artifactSourceKey(gatewayID: sourceGatewayID, botID: $0.botID,
-                                   value: Self.artifactValue($0.id))
-        })
-        let foreign = artifacts.filter {
-            runtime.artifactSessions[$0.id]?.gatewayID != sourceGatewayID
+        for rejection in rejected {
+            guard !Task.isCancelled, artifactScanFenceAccepts(scanFence) else { return false }
+            _ = await markRejectedArtifactSourceStale(
+                gatewayID: rejection.source.gatewayID,
+                scanFence: scanFence,
+                reason: rejection.reason
+            )
+            guard artifactScanFenceAccepts(scanFence) else { return false }
         }
-        let liveOnly = artifacts.filter {
-            guard let ref = runtime.artifactSessions[$0.id], ref.gatewayID == sourceGatewayID else {
+
+        if let hook = runtime.artifactAfterAuthorityCaptureForTesting {
+            await hook()
+            guard artifactScanFenceAccepts(scanFence) else { return false }
+        }
+
+        if sources.isEmpty {
+            guard artifactScanFenceAccepts(scanFence) else { return false }
+            runtime.artifactsNote = "No retained gateway has current exact registry and profile authority for artifact discovery."
+            return retained.isEmpty
+        }
+
+        // Sources are deterministic and sequential. Within each source every
+        // transcript is released before the next begins, bounding resident
+        // message memory and avoiding a fan-out across retained gateways.
+        var completedEveryCapturedSource = sources.count == retained.count
+        for provisional in sources {
+            guard !Task.isCancelled, artifactScanFenceAccepts(scanFence) else { return false }
+            let completed = await scanArtifactSource(provisional)
+            completedEveryCapturedSource = completedEveryCapturedSource && completed
+            guard !Task.isCancelled, artifactScanFenceAccepts(scanFence) else { return false }
+        }
+        return completedEveryCapturedSource
+    }
+
+    private func scanArtifactSource(_ authority: ArtifactDiscoverySourceAuthority) async -> Bool {
+        let runtime = FeedsRuntime.shared
+        guard await artifactSourceAccepts(authority) else {
+            if !Task.isCancelled {
+                _ = await markRejectedArtifactSourceStale(
+                    gatewayID: authority.gatewayID,
+                    scanFence: authority.scanFence,
+                    reason: "Exact source authority changed before discovery admission."
+                )
+            }
+            return false
+        }
+        if hasPriorArtifactDiscoverySnapshot(gatewayID: authority.gatewayID) {
+            guard await markArtifactDiscoverySnapshotRefreshing(authority) else {
+                if !Task.isCancelled {
+                    _ = await markRejectedArtifactSourceStale(
+                        gatewayID: authority.gatewayID,
+                        scanFence: authority.scanFence,
+                        reason: "Exact source authority changed before discovery admission."
+                    )
+                }
                 return false
             }
-            return !swept.contains(Self.artifactSourceKey(
-                gatewayID: ref.gatewayID, botID: ref.botID,
-                value: Self.artifactValue($0.id)))
         }
-        for artifact in liveOnly { refs[artifact.id] = runtime.artifactSessions[artifact.id] }
+        let sourceClient = authority.snapshot.client
 
+        // The production union roster supplies the synchronously captured
+        // lifecycle identities. An exact profiles.list on that same retained
+        // client then proves the captured set still describes the source
+        // before any session read.
+        let listedProfiles: [String]
+        do {
+            if let read = runtime.artifactProfilesReadForTesting {
+                listedProfiles = try await read(authority.gatewayID, sourceClient)
+            } else {
+                listedProfiles = try await sourceClient.listProfiles(
+                    includeSessions: false).map(\.name)
+            }
+        } catch {
+            guard await artifactSourceAccepts(authority) else { return false }
+            return await publishArtifactDiscovery(
+                authority: authority,
+                publication: .failure("profiles.list failed: \(error.localizedDescription)")
+            )
+        }
+        guard await artifactSourceAccepts(authority) else { return false }
+        var seenListedProfiles = Set<String>()
+        let normalizedListedProfiles = listedProfiles.compactMap { raw -> String? in
+            let profile = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !profile.isEmpty,
+                  seenListedProfiles.insert(profile).inserted else { return nil }
+            return profile
+        }
+        guard normalizedListedProfiles.count == listedProfiles.count,
+              Set(normalizedListedProfiles) == Set(authority.profiles),
+              normalizedListedProfiles.count == authority.profiles.count else {
+            return await publishArtifactDiscovery(
+                authority: authority,
+                publication: .failure(
+                    "Exact profile inventory changed during artifact discovery."
+                )
+            )
+        }
+
+        var result = ArtifactDiscoverySourceResult()
+        if authority.profiles.isEmpty {
+            // A successful empty profile inventory is still a usable bounded
+            // result for this gateway.
+            result.successfulSessionWindows = 1
+        }
+        let sessionLimit = 6
+        let transcriptLimit = 150
+
+        for profile in authority.profiles {
+            guard !Task.isCancelled else { return false }
+            let window: ArtifactSessionListWindow
+            do {
+                if let read = runtime.artifactSessionsReadForTesting {
+                    window = try await read(
+                        authority.gatewayID, profile, sourceClient, sessionLimit)
+                } else {
+                    window = try await sourceClient.artifactDiscoverySessions(
+                        profile: profile, limit: sessionLimit)
+                }
+            } catch {
+                guard await artifactSourceAccepts(authority) else { return false }
+                result.failures.append("\(profile): \(error.localizedDescription)")
+                continue
+            }
+            guard await artifactSourceAccepts(authority) else { return false }
+            result.successfulSessionWindows += 1
+            result.sessionWindowSaturated = result.sessionWindowSaturated || window.saturated
+
+            for session in window.sessions where session.messageCount > 0 {
+                guard !Task.isCancelled else { return false }
+                let page: ArtifactTranscriptPage
+                do {
+                    if let read = runtime.artifactTranscriptReadForTesting {
+                        page = try await read(
+                            authority.gatewayID, profile, session, sourceClient, 0,
+                            transcriptLimit)
+                    } else {
+                        page = try await sourceClient.artifactTranscriptPage(
+                            storedID: session.id,
+                            profile: profile,
+                            offset: 0,
+                            limit: transcriptLimit
+                        )
+                    }
+                } catch {
+                    guard await artifactSourceAccepts(authority) else { return false }
+                    result.failures.append(
+                        "\(profile)/\(session.id): \(error.localizedDescription)")
+                    continue
+                }
+                guard await artifactSourceAccepts(authority) else { return false }
+                result.scannedSessions += 1
+                if result.continuation == nil, let nextOffset = page.continuationOffset {
+                    result.continuation = ArtifactDiscoveryCursor(
+                        profile: profile,
+                        storedSessionID: session.id,
+                        resolvedSessionID: page.resolvedSessionID,
+                        offset: nextOffset
+                    )
+                }
+                let title = session.title.isEmpty
+                    ? (session.preview ?? "session") : session.title
+                let harvested = Self.artifacts(
+                    in: page.messages,
+                    botID: profile,
+                    sessionID: session.id,
+                    sessionTitle: title,
+                    sessionStart: session.startedAt,
+                    sourceGatewayID: authority.gatewayID
+                )
+                for artifact in harvested {
+                    result.refs[artifact.id] = SessionRef(
+                        gatewayID: authority.gatewayID,
+                        botID: profile,
+                        storedID: session.id
+                    )
+                }
+                result.artifacts.append(contentsOf: harvested)
+            }
+        }
+
+        guard await artifactSourceAccepts(authority) else { return false }
+        let publication: ArtifactDiscoveryPublication
+        if result.hasUsableResult {
+            publication = .result(result)
+        } else {
+            publication = .failure(
+                result.failures.first ?? "No profile session window could be read."
+            )
+        }
+        return await publishArtifactDiscovery(authority: authority, publication: publication)
+    }
+
+    private func hasPriorArtifactDiscoverySnapshot(gatewayID: String) -> Bool {
+        let runtime = FeedsRuntime.shared
+        if runtime.artifactSessions.values.contains(where: { $0.gatewayID == gatewayID }) {
+            return true
+        }
+        guard let status = runtime.artifactDiscoveryStatus[gatewayID] else { return false }
+        if case .failed = status { return false }
+        return true
+    }
+
+    /// Conservative publication for a retained source that cannot form or no
+    /// longer accepts full registry/profile/client authority. A gateway-keyed
+    /// pool barrier still serializes this status write with replacement and
+    /// teardown even when no exact `ConnectionLease` can be acquired. Rows are
+    /// deliberately untouched.
+    private func markRejectedArtifactSourceStale(
+        gatewayID: String,
+        scanFence: ArtifactDiscoveryScanFence,
+        reason: String
+    ) async -> Bool {
+        let pool = ConnectionRegistry.shared.clientPool
+        guard let barrier = await pool.acquireGatewayBarrier(for: gatewayID) else { return false }
+        guard artifactScanFenceAccepts(scanFence) else {
+            await pool.release(barrier)
+            return false
+        }
+        if hasPriorArtifactDiscoverySnapshot(gatewayID: gatewayID) {
+            FeedsRuntime.shared.artifactDiscoveryStatus[gatewayID] = .stale(reason: reason)
+            updateArtifactDiscoveryNote()
+        }
+        await pool.release(barrier)
+        return true
+    }
+
+    /// Mark an existing result stale before its replacement scan starts. If
+    /// source/lifecycle/credential authority changes during a later await, the
+    /// old rows remain explicitly stale rather than continuing to look like a
+    /// current incomplete result. First-ever scans publish nothing here, so a
+    /// cancelled initial read does not fabricate a snapshot.
+    private func markArtifactDiscoverySnapshotRefreshing(
+        _ authority: ArtifactDiscoverySourceAuthority
+    ) async -> Bool {
+        let pool = ConnectionRegistry.shared.clientPool
+        guard let lease = await pool.acquireLease(
+            authority.snapshot, for: authority.gatewayID) else { return false }
+        guard artifactSourceAcceptsSynchronously(authority, checkLifecycle: true) else {
+            await pool.release(lease)
+            return false
+        }
+        FeedsRuntime.shared.artifactDiscoveryStatus[authority.gatewayID] = .stale(
+            reason: "Refresh in progress; prior exact-source snapshot retained."
+        )
+        updateArtifactDiscoveryNote()
+        await pool.release(lease)
+        return true
+    }
+
+    /// The only publication boundary. The optional test hook models work that
+    /// finishes after the final read but before the lease; adoption can win in
+    /// that gap, in which case acquiring the captured generation fails and no
+    /// old result reaches observable state.
+    @discardableResult
+    private func publishArtifactDiscovery(
+        authority: ArtifactDiscoverySourceAuthority,
+        publication: ArtifactDiscoveryPublication
+    ) async -> Bool {
+        let runtime = FeedsRuntime.shared
+        if let hook = runtime.artifactBeforePublicationForTesting {
+            await hook(authority.gatewayID, authority.snapshot)
+        }
+        let pool = ConnectionRegistry.shared.clientPool
+        guard let lease = await pool.acquireLease(
+            authority.snapshot, for: authority.gatewayID) else { return false }
+        guard artifactSourceAcceptsSynchronously(
+            authority, checkLifecycle: !authority.lifecycleTokens.isEmpty
+        ) else {
+            await pool.release(lease)
+            return false
+        }
+
+        publishArtifactDiscoverySynchronously(
+            gatewayID: authority.gatewayID,
+            publication: publication
+        )
+        await pool.release(lease)
+        return true
+    }
+
+    private func publishArtifactDiscoverySynchronously(
+        gatewayID: String,
+        publication: ArtifactDiscoveryPublication
+    ) {
+        let runtime = FeedsRuntime.shared
+        switch publication {
+        case .failure(let reason):
+            let hasPrior = hasPriorArtifactDiscoverySnapshot(gatewayID: gatewayID)
+            runtime.artifactDiscoveryStatus[gatewayID] = hasPrior
+                ? .stale(reason: reason) : .failed(reason: reason)
+
+        case .result(let result):
+            // A bounded pass never proves old values absent. Retain prior/live
+            // rows not rediscovered, while preferring the fresh row for the
+            // same source/profile/value tuple.
+            var sourceKeys = Set<String>()
+            var fresh: [Artifact] = []
+            var freshRefs: [String: SessionRef] = [:]
+            for artifact in result.artifacts.sorted(by: { Self.sortKey($0) > Self.sortKey($1) }) {
+                guard let ref = result.refs[artifact.id] else { continue }
+                let key = Self.artifactSourceKey(
+                    gatewayID: ref.gatewayID,
+                    botID: ref.botID,
+                    value: Self.artifactValue(artifact.id)
+                )
+                guard sourceKeys.insert(key).inserted else { continue }
+                fresh.append(artifact)
+                freshRefs[artifact.id] = ref
+            }
+
+            let retained = artifacts.filter { artifact in
+                guard let ref = runtime.artifactSessions[artifact.id],
+                      ref.gatewayID == gatewayID else { return false }
+                let key = Self.artifactSourceKey(
+                    gatewayID: ref.gatewayID,
+                    botID: ref.botID,
+                    value: Self.artifactValue(artifact.id)
+                )
+                return !sourceKeys.contains(key)
+            }
+            let otherSources = artifacts.filter {
+                runtime.artifactSessions[$0.id]?.gatewayID != gatewayID
+            }
+            var combinedRefs = runtime.artifactSessions
+            combinedRefs.merge(freshRefs) { _, fresh in fresh }
+            let published = (fresh + retained + otherSources)
+                .sorted { Self.sortKey($0) > Self.sortKey($1) }
+                .prefix(150)
+                .map { $0 }
+            let publishedIDs = Set(published.map(\.id))
+            artifacts = published
+            runtime.artifactSessions = combinedRefs.filter {
+                publishedIDs.contains($0.key)
+            }
+            runtime.artifactScannedSessions[gatewayID] = result.scannedSessions
+
+            let status: ArtifactDiscoveryStatus
+            if result.sessionWindowSaturated {
+                let suffix = result.failures.isEmpty
+                    ? ""
+                    : " One or more exact-source reads also failed; prior rows were retained."
+                status = .incomplete(
+                    cursor: nil,
+                    reason: "Hermes session.list reached its bounded upstream window; no continuation is available."
+                        + suffix
+                )
+            } else if !result.failures.isEmpty {
+                status = .incomplete(
+                    cursor: result.continuation,
+                    reason: "One or more exact-source reads failed; prior rows were retained."
+                )
+            } else if let continuation = result.continuation {
+                status = .incomplete(
+                    cursor: continuation,
+                    reason: "A transcript has an informational next offset; the global 150-artifact ledger is not pageable."
+                )
+            } else {
+                status = .incomplete(
+                    cursor: nil,
+                    reason: "Hermes session.list is a bounded window without a global continuation."
+                )
+            }
+            runtime.artifactDiscoveryStatus[gatewayID] = status
+        }
+        updateArtifactDiscoveryNote()
+    }
+
+    private func updateArtifactDiscoveryNote() {
+        let runtime = FeedsRuntime.shared
+        let statuses = runtime.artifactDiscoveryStatus.values
+        let unresolved = statuses.filter {
+            if case .complete = $0 { return false }
+            return true
+        }.count
+        let scanned = runtime.artifactScannedSessions.values.reduce(0, +)
+        runtime.artifactsNote = "Scanned \(scanned) exact session(s) across "
+            + "\(statuses.count) recorded gateway source(s). Discovery remains bounded for "
+            + "\(unresolved) source(s); retained host paths are not remote-file authority."
+    }
+
+    private func finishArtifactDiscovery(taskID: UUID, scanGeneration: UInt64,
+                                         completed: Bool) {
+        let runtime = FeedsRuntime.shared
+        guard runtime.artifactsTaskID == taskID,
+              runtime.artifactScanGeneration == scanGeneration else { return }
+        runtime.artifactsTask = nil
+        runtime.artifactsTaskID = nil
+        runtime.artifactsScanning = false
+        if completed, !Task.isCancelled {
+            runtime.lastArtifactScan = Date()
+        }
+    }
+
+    private func artifactScanFenceAccepts(_ fence: ArtifactDiscoveryScanFence) -> Bool {
         guard !Task.isCancelled,
-              LiveRuntime.shared.gatewayID == sourceGatewayID,
-              LiveRuntime.shared.generation == sourceGeneration else { return }
-        var combinedRefs = runtime.artifactSessions.filter { $0.value.gatewayID != sourceGatewayID }
-        combinedRefs.merge(refs) { _, fresh in fresh }
-        let published = (found + liveOnly + foreign)
-            .sorted { Self.sortKey($0) > Self.sortKey($1) }
-            .prefix(150)
-            .map { $0 }
-        let publishedIDs = Set(published.map(\.id))
-        runtime.artifactSessions = combinedRefs.filter { publishedIDs.contains($0.key) }
-        artifacts = published
-        runtime.artifactsNote = theme.copy.artifactsDerivationNote(theme.themeID,
-                                                                  sessions: scanned,
-                                                                  failures: failures)
+              mode == .live,
+              FeedsRuntime.shared.artifactScanGeneration == fence.generation,
+              LiveRuntime.shared.gatewayID == fence.primaryGatewayID,
+              LiveRuntime.shared.generation == fence.primaryGeneration else { return false }
+        switch (client, fence.primaryClient) {
+        case let (current?, captured?):
+            return ObjectIdentifier(current) == ObjectIdentifier(captured)
+        case (nil, nil):
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func artifactSourceAccepts(
+        _ authority: ArtifactDiscoverySourceAuthority,
+        checkLifecycle: Bool = true
+    ) async -> Bool {
+        guard await ConnectionRegistry.shared.clientPool.isCurrent(
+            authority.snapshot, for: authority.gatewayID) else { return false }
+        return artifactSourceAcceptsSynchronously(
+            authority, checkLifecycle: checkLifecycle
+        )
+    }
+
+    /// Called only after a pool await or while a short source lease is held.
+    /// Registry and lifecycle comparisons are synchronous, closing the final
+    /// actor-reentrancy gap before observable publication.
+    private func artifactSourceAcceptsSynchronously(
+        _ authority: ArtifactDiscoverySourceAuthority,
+        checkLifecycle: Bool
+    ) -> Bool {
+        let currentProfiles = artifactDiscoveryProfiles(gatewayID: authority.gatewayID)
+        guard artifactScanFenceAccepts(authority.scanFence),
+              profileLifecycleAllowsGatewayTraffic(authority.gatewayID),
+              currentProfiles.count == authority.profiles.count,
+              Set(currentProfiles) == Set(authority.profiles),
+              let saved = ConnectionRegistry.shared.saved.first(
+                where: { $0.id == authority.gatewayID }),
+              saved.urlString == authority.registryURLString,
+              authority.snapshot.baseURL?.absoluteString == saved.urlString,
+              ConnectionRegistry.shared.credential(for: saved)
+                == authority.registryCredential else { return false }
+        if authority.gatewayID == authority.scanFence.primaryGatewayID {
+            guard let primary = authority.scanFence.primaryClient,
+                  ObjectIdentifier(primary)
+                    == ObjectIdentifier(authority.snapshot.client) else { return false }
+        }
+        guard checkLifecycle else { return true }
+        return authority.lifecycleTokens.allSatisfy(profileLifecycleAccepts)
+    }
+
+    private func artifactDiscoveryProfiles(gatewayID: String) -> [String] {
+        var seen = Set<String>()
+        return unionRosterBots.compactMap { bot -> String? in
+            guard let route = stateRoute(for: bot.id),
+                  route.gatewayID == gatewayID,
+                  !route.profile.isEmpty,
+                  seen.insert(route.profile).inserted else { return nil }
+            return route.profile
+        }
     }
 
     /// Artifacts sort on the timestamp encoded in their id (see `artifactID`),

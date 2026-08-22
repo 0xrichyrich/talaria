@@ -19,10 +19,30 @@ public actor GatewayClientPool {
     public struct ConnectionSnapshot: Sendable {
         public let client: GatewayClient
         public let generation: UInt64
+        /// Endpoint captured when this client won the pool slot. Keeping it in
+        /// the pool-owned snapshot lets exact-source callers compare registry
+        /// identity without hopping onto the client actor and reopening the
+        /// enumeration race.
+        public let baseURL: URL?
 
-        public init(client: GatewayClient, generation: UInt64) {
+        public init(client: GatewayClient, generation: UInt64, baseURL: URL? = nil) {
             self.client = client
             self.generation = generation
+            self.baseURL = baseURL
+        }
+    }
+
+    /// One already-published connection retained by the pool. Enumeration is
+    /// an actor-isolated snapshot of the whole registry: callers never observe
+    /// half of a concurrent adoption and, unlike `connect`, this API can never
+    /// start or join a dial.
+    public struct RetainedConnectionSnapshot: Sendable {
+        public let gatewayID: String
+        public let connection: ConnectionSnapshot
+
+        public init(gatewayID: String, connection: ConnectionSnapshot) {
+            self.gatewayID = gatewayID
+            self.connection = connection
         }
     }
 
@@ -42,6 +62,16 @@ public actor GatewayClientPool {
         }
     }
 
+    /// Source-keyed barrier used when a caller must publish a conservative
+    /// stale result precisely because no exact connection authority survived.
+    /// Unlike `ConnectionLease`, this does not assert that a slot exists; it
+    /// only prevents adopt/disconnect from changing that gateway while the
+    /// synchronous source-qualified publication lands.
+    struct GatewayBarrierLease: Sendable {
+        let gatewayID: String
+        fileprivate let token: UUID
+    }
+
     private struct LeaseWaiter {
         let token: UUID
         let continuation: CheckedContinuation<Bool, Never>
@@ -49,6 +79,7 @@ public actor GatewayClientPool {
 
     private struct Slot {
         var generation: UInt64
+        var baseURL: URL
         var task: Task<GatewayClient, Error>?
         var client: GatewayClient?
         var leaseToken: UUID?
@@ -100,6 +131,21 @@ public actor GatewayClientPool {
         Set(slots.compactMap { key, slot in slot.client == nil ? nil : key })
     }
 
+    /// Atomically enumerate every connection that is already published.
+    /// Connecting slots are intentionally omitted and no connector is ever
+    /// invoked; background discovery must not wake or dial a gateway.
+    public func retainedConnectionSnapshots() -> [RetainedConnectionSnapshot] {
+        slots.compactMap { gatewayID, slot in
+            guard let client = slot.client, slot.task == nil else { return nil }
+            return RetainedConnectionSnapshot(
+                gatewayID: gatewayID,
+                connection: ConnectionSnapshot(
+                    client: client, generation: slot.generation, baseURL: slot.baseURL)
+            )
+        }
+        .sorted { $0.gatewayID < $1.gatewayID }
+    }
+
     /// Return the existing live client, share an in-flight dial, or start one.
     public func connect(gatewayID: String, baseURL: URL,
                         credential: GatewayCredential) async throws -> GatewayClient {
@@ -115,7 +161,8 @@ public actor GatewayClientPool {
         gatewayID: String, baseURL: URL, credential: GatewayCredential
     ) async throws -> ConnectionSnapshot {
         if let slot = slots[gatewayID], let client = slot.client {
-            return ConnectionSnapshot(client: client, generation: slot.generation)
+            return ConnectionSnapshot(
+                client: client, generation: slot.generation, baseURL: slot.baseURL)
         }
         if let slot = slots[gatewayID], let task = slot.task {
             return try await publishedConnection(
@@ -149,8 +196,8 @@ public actor GatewayClientPool {
                 throw error
             }
         }
-        slots[gatewayID] = Slot(generation: generation, task: task, client: nil,
-                                 leaseToken: nil)
+        slots[gatewayID] = Slot(generation: generation, baseURL: baseURL,
+                                 task: task, client: nil, leaseToken: nil)
         return try await publishedConnection(
             task, gatewayID: gatewayID, generation: generation)
     }
@@ -191,6 +238,16 @@ public actor GatewayClientPool {
         releaseLeaseBarrier(lease.token, gatewayID: lease.gatewayID)
     }
 
+    func acquireGatewayBarrier(for gatewayID: String) async -> GatewayBarrierLease? {
+        guard !gatewayID.isEmpty,
+              let token = await acquireLeaseBarrier(gatewayID: gatewayID) else { return nil }
+        return GatewayBarrierLease(gatewayID: gatewayID, token: token)
+    }
+
+    func release(_ lease: GatewayBarrierLease) {
+        releaseLeaseBarrier(lease.token, gatewayID: lease.gatewayID)
+    }
+
     /// Disconnect only if the slot still belongs to the expected connection.
     /// This check and removal are one actor operation, so an old roster
     /// failure cannot disconnect a client adopted after that failure began.
@@ -228,6 +285,7 @@ public actor GatewayClientPool {
     /// Replacing a different pooled client closes the old one after the new
     /// identity is installed, so a re-entrant lookup never returns the loser.
     public func adopt(_ client: GatewayClient, for gatewayID: String) async {
+        let baseURL = await client.baseURL
         // Install admission before entering the pool barrier. This actor hop
         // used to occur after `waitForLease`; a second operation could acquire
         // a lease during the hop and then be overwritten by this adoption.
@@ -235,8 +293,8 @@ public actor GatewayClientPool {
         guard let reservation = await acquireLeaseBarrier(gatewayID: gatewayID) else { return }
         let previous = slots[gatewayID]
         nextGeneration &+= 1
-        slots[gatewayID] = Slot(generation: nextGeneration, task: nil, client: client,
-                                 leaseToken: nil)
+        slots[gatewayID] = Slot(generation: nextGeneration, baseURL: baseURL,
+                                 task: nil, client: client, leaseToken: nil)
         releaseLeaseBarrier(reservation, gatewayID: gatewayID)
 
         previous?.task?.cancel()
@@ -288,8 +346,8 @@ public actor GatewayClientPool {
               current.client == nil, current.task != nil else {
             throw CancellationError()
         }
-        slots[gatewayID] = Slot(generation: generation, task: nil, client: client,
-                                leaseToken: nil)
+        slots[gatewayID] = Slot(generation: generation, baseURL: current.baseURL,
+                                task: nil, client: client, leaseToken: nil)
     }
 
     /// Await the one shared publication transaction, then validate that its
@@ -312,7 +370,8 @@ public actor GatewayClientPool {
               current.task == nil else {
             throw CancellationError()
         }
-        return ConnectionSnapshot(client: published, generation: generation)
+        return ConnectionSnapshot(
+            client: published, generation: generation, baseURL: current.baseURL)
     }
 
     private func clearConnectingSlotIfCurrent(gatewayID: String, generation: UInt64) {
