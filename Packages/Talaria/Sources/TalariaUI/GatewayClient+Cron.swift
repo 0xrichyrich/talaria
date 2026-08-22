@@ -355,6 +355,138 @@ public extension GatewayClient {
 
 // MARK: - REST (the parts cron.manage cannot do)
 
+/// The bounded `session.list` window used by artifact discovery. Hermes does
+/// not expose a cursor or total for this RPC, and its deny-source filtering is
+/// itself fed by a bounded overfetch, so even a short answer is not proof of a
+/// globally complete session inventory.
+struct ArtifactDiscoverySession: Sendable, Equatable {
+    var id: String
+    var title: String
+    var preview: String?
+    var startedAt: Double?
+    var messageCount: Int
+}
+
+struct ArtifactSessionListWindow: Sendable {
+    var sessions: [ArtifactDiscoverySession]
+    var requestedLimit: Int
+    var returnedCount: Int
+
+    var saturated: Bool { returnedCount >= requestedLimit }
+}
+
+/// One exact page from `GET /api/sessions/{id}/messages`. Retaining the
+/// resolved session id and echoed pagination is essential: the endpoint can
+/// resolve a compression tip on every request, and a changing tip cannot be
+/// silently stitched into an older page.
+struct ArtifactTranscriptPage: Sendable, Equatable {
+    var resolvedSessionID: String
+    var messages: [JSONValue]
+    var limit: Int
+    var offset: Int
+    var returnedCount: Int
+    var order: String
+
+    var continuationOffset: Int? {
+        guard limit > 0, returnedCount == limit else { return nil }
+        return offset + returnedCount
+    }
+
+    init(resolvedSessionID: String, messages: [JSONValue], limit: Int,
+         offset: Int, returnedCount: Int, order: String = "latest") {
+        self.resolvedSessionID = resolvedSessionID
+        self.messages = messages
+        self.limit = limit
+        self.offset = offset
+        self.returnedCount = returnedCount
+        self.order = order
+    }
+
+    init(payload: JSONValue) throws {
+        guard let resolvedSessionID = payload["session_id"]?.stringValue,
+              !resolvedSessionID.isEmpty,
+              let messages = payload["messages"]?.arrayValue,
+              let pagination = payload["pagination"],
+              let limit = Self.nonnegativeInteger(pagination["limit"]),
+              let offset = Self.nonnegativeInteger(pagination["offset"]),
+              let returned = Self.nonnegativeInteger(pagination["returned"]),
+              let order = pagination["order"]?.stringValue,
+              order == "latest" || order == "oldest",
+              returned == messages.count,
+              returned <= limit else {
+            throw GatewayError(code: -8, message: "transcript pagination malformed response")
+        }
+        self.resolvedSessionID = resolvedSessionID
+        self.messages = messages
+        self.limit = limit
+        self.offset = offset
+        self.returnedCount = returned
+        self.order = order
+    }
+
+    private static func nonnegativeInteger(_ value: JSONValue?) -> Int? {
+        guard let number = value?.doubleValue, number >= 0,
+              number.rounded(.towardZero) == number,
+              number <= Double(Int.max) else { return nil }
+        return Int(number)
+    }
+}
+
+extension GatewayClient {
+    /// Exact-client WS read for artifact discovery. The caller supplies a
+    /// captured client from `GatewayClientPool`; this method never consults the
+    /// registry and therefore cannot reroute a colliding profile or session id
+    /// to another gateway.
+    func artifactDiscoverySessions(profile: String,
+                                   limit: Int) async throws -> ArtifactSessionListWindow {
+        let boundedLimit = max(1, limit)
+        let stored = try await listSessions(
+            limit: boundedLimit, profile: profile, includeHidden: true)
+        let sessions = stored.map {
+            ArtifactDiscoverySession(
+                id: $0.id,
+                title: $0.title,
+                preview: $0.preview,
+                startedAt: $0.startedAt,
+                messageCount: $0.messageCount
+            )
+        }
+        return ArtifactSessionListWindow(
+            sessions: sessions,
+            requestedLimit: boundedLimit,
+            returnedCount: sessions.count
+        )
+    }
+
+    /// Exact-client REST transcript read. `include_compacted=true` retains
+    /// Hermes' compacted display rows; offset is measured from the latest tail
+    /// while each returned page remains chronological.
+    func artifactTranscriptPage(storedID: String, profile: String,
+                                offset: Int, limit: Int) async throws
+        -> ArtifactTranscriptPage {
+        let boundedOffset = max(0, offset)
+        let boundedLimit = min(500, max(1, limit))
+        let query = [
+            URLQueryItem(name: "profile", value: profile),
+            URLQueryItem(name: "limit", value: String(boundedLimit)),
+            URLQueryItem(name: "offset", value: String(boundedOffset)),
+            URLQueryItem(name: "order", value: "latest"),
+            URLQueryItem(name: "include_compacted", value: "true")
+        ]
+        let payload = try await restJSON(
+            path: "api/sessions/\(storedID)/messages",
+            query: query,
+            timeout: 25
+        )
+        let page = try ArtifactTranscriptPage(payload: payload)
+        guard page.limit == boundedLimit, page.offset == boundedOffset,
+              page.order == "latest" else {
+            throw GatewayError(code: -8, message: "transcript pagination changed request")
+        }
+        return page
+    }
+}
+
 /// Authenticated REST calls Talaria makes outside `GatewayClient`'s own surface.
 /// The client keeps its credential private, so callers pass the one held by the
 /// ConnectionRegistry (the Keychain copy the client refreshes on connect).

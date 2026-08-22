@@ -429,6 +429,14 @@ public final class ConnectionRegistry {
         secondaryRefresh = handler
     }
 
+    /// Focused roster-projection test seam. Runtime enumeration remains the
+    /// sole production writer; tests use this to seed the same cache consumed
+    /// by `foreignRosterEntries`/`unionRosterBots` without opening a socket.
+    internal func setSecondaryRosterForTesting(_ roster: SecondaryRoster?,
+                                               gatewayID: String) {
+        secondaryRosters[gatewayID] = roster
+    }
+
     /// Probe every saved gateway in parallel.
     public func probeAll() async {
         let rows = saved
